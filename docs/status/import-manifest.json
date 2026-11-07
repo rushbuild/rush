@@ -1,0 +1,55 @@
+{
+  "source_repository": "https://github.com/rushbuild/rush-status",
+  "source_revision": "844d03c2c47f2fd2094ee5592015018238258290",
+  "files": [
+    {
+      "source": "status/tensorflow.md",
+      "destination": "docs/status/history/tensorflow.md",
+      "source_sha256": "d80e120f38f1a24e97511e1c7b2ae728579cb3c6673aac2e5facdcfbd6b49cdb",
+      "destination_sha256": "229dbed0c9c7b9772a1b3934bb2087f3a1dc4c802f36f262f81cd970a3dcbbf8"
+    },
+    {
+      "source": "status/modular.md",
+      "destination": "docs/status/history/modular.md",
+      "source_sha256": "0f875150f2e6a864ae2f1d571f41b4b1d642f5da7322ea8d7155fa003ade7161",
+      "destination_sha256": "c193c47700145dd921446a3e0e45f422b64b1192816d0fb6462057336598bd46"
+    },
+    {
+      "source": "benchmarks.md",
+      "destination": "docs/benchmarks/modular.md",
+      "source_sha256": "d1192cc7ca1b10d54a8ec713557d6d32680fea1d15c304133d7543ecebc783d3",
+      "destination_sha256": "b593c0e3b64dedf086e22e06e23dfec2237ed4c91f584383d937634e87780eb8"
+    },
+    {
+      "source": "graphs/bench-full.svg",
+      "destination": "docs/benchmarks/graphs/bench-full.svg",
+      "source_sha256": "1eb278c40688f1ebad0c3a958a3aa90558d30048ba4bc6d8f6afab9aff42db19",
+      "destination_sha256": "1eb278c40688f1ebad0c3a958a3aa90558d30048ba4bc6d8f6afab9aff42db19"
+    },
+    {
+      "source": "graphs/bench-full-log.svg",
+      "destination": "docs/benchmarks/graphs/bench-full-log.svg",
+      "source_sha256": "102115c7690bd913a565913519a5e851d266a2bf80d1ce31715b23e778483553",
+      "destination_sha256": "102115c7690bd913a565913519a5e851d266a2bf80d1ce31715b23e778483553"
+    },
+    {
+      "source": "graphs/bench-stdlib.svg",
+      "destination": "docs/benchmarks/graphs/bench-stdlib.svg",
+      "source_sha256": "32a894e8442d63943cef6758bcd6fc0a9959b78005a192c1938a9c66b5bbb1cb",
+      "destination_sha256": "32a894e8442d63943cef6758bcd6fc0a9959b78005a192c1938a9c66b5bbb1cb"
+    },
+    {
+      "source": "graphs/bench-tensorflow-noop.svg",
+      "destination": "docs/benchmarks/graphs/bench-tensorflow-noop.svg",
+      "source_sha256": "90bb8881d8a6b8b77e549507fb321532fbff5532fda7688e28ca10a0e43fc68e",
+      "destination_sha256": "90bb8881d8a6b8b77e549507fb321532fbff5532fda7688e28ca10a0e43fc68e"
+    },
+    {
+      "source": "graphs/tensorflow-certification.svg",
+      "destination": "docs/benchmarks/graphs/tensorflow-certification.svg",
+      "source_sha256": "764642b0488f5dd06af51ec5d6219f460a96c831c8b3f9ac1786717370b9b167",
+      "destination_sha256": "764642b0488f5dd06af51ec5d6219f460a96c831c8b3f9ac1786717370b9b167"
+    }
+  ],
+  "policy": "No history, private Linux evidence or combined Linux graphs imported."
+}

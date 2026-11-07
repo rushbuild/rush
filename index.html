@@ -20,7 +20,7 @@ section{padding:42px 0;border-top:1px solid var(--line)}pre{overflow:auto;backgr
 </style>
 </head>
 <body>
-<nav aria-label="Main navigation"><strong>RUSH</strong><div><a href="README.md">Get started</a><a href="CONTRIBUTING.md">Contribute</a><a href="https://github.com/rushbuild/rush">Source ↗</a></div></nav>
+<nav aria-label="Main navigation"><strong>RUSH</strong><div><a href="README.md">Get started</a><a href="docs/status/README.md">Status</a><a href="https://github.com/rushbuild/rush">Source ↗</a></div></nav>
 <main>
 <header class="hero"><p class="eyebrow">Rust · incremental builds · experimental source release</p>
 <h1>Build on what<br>you already know.</h1>
@@ -41,6 +41,9 @@ cd examples/hello_cpp
 <section class="two"><div><p class="eyebrow">Maintenance by design</p><h2>Clear ownership.<br>Reviewable changes.</h2><p>Component specialists help investigate and repair bounded tasks. A coordinator tracks work and evidence; human maintainers control the project's decisions.</p><a href="maintenance/README.md">Read the maintenance design →</a></div>
 <div><h3>One workflow for Claude Code and Codex</h3><p>Rush adopts the <a href="https://chores.knlp.io/self-maintenance">Chores maintenance process</a>: reproduce, repair, test, review and complete the delegated work.</p><p class="note">The source includes component routing and a pinned policy starter. Scheduled workers, account budgets and automated GitHub writes still need qualification.</p></div></section>
 <section><p class="eyebrow">Evidence before promises</p><h2>Measure your build.</h2><p>Compatibility and performance depend on the target, flags, toolchain and cache state. This release makes no general speedup or full Bazel compatibility claim. Compare clean outputs, incremental edits and restored outputs before adopting Rush for a workload.</p>
+<p><a href="docs/status/README.md">Read workload status →</a> Historical TensorFlow and Modular reports retain their original scope. Their workload gates have not been rerun for the source-release baseline.</p>
+<h3>TensorFlow build performance</h3><p>The historical 30-sample warm no-op comparison for <code>//tensorflow/core:framework</code> reports 9.3 ms p50 for Rush and 64.2 ms for Bazel. <a href="docs/benchmarks/tensorflow.md">Read the target scope and missing reproduction details.</a></p>
+<h3>Modular build performance</h3><p>The published comparison separates cold builds, cache restores, unchanged commands, novel edits and repeated edits. <a href="docs/benchmarks/modular.md">Read the tables, plots and methodology corrections.</a></p>
 <p><a href="MAINTAINERS">Component ownership</a> · <a href="docs/architecture.md">Architecture</a> · <a href="TODO.md">Maintenance queue</a></p></section>
 </main>
 <footer>Rush · MIT licensed · <a href="LICENSES/MIT">License</a> · Source preview; no binary release is announced by this page.</footer>

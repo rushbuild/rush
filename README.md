@@ -47,8 +47,10 @@ evidence and human-delegation process. Its automation policy is a proposal;
 this checkout installs no recurring agent jobs.
 
 See [the release page](index.html) for the project overview and
-[TODO.md](TODO.md) for the first maintenance tasks. Historical experiments and
-raw build outputs are excluded from this source distribution. Preserve license
+[workload status](docs/status/README.md) for scoped compatibility reports and
+[build performance](docs/benchmarks/README.md). [TODO.md](TODO.md) lists the
+first maintenance tasks. Selected published historical reports are preserved;
+raw build outputs and private experiments are excluded. Preserve license
 notices when redistributing Rush and its included third-party material.
 
 ## License

@@ -6,6 +6,7 @@ before implementation. All remain open until their evidence is recorded.
 | Priority | Task | Completion condition |
 | --- | --- | --- |
 | P0 | Establish this source release's build/test baseline | Locked workspace check and component suites on an approved runner; classify every failure/skip |
+| P0 | Revalidate imported workload status | Recover exact historical TF/Modular ledgers, rerun the relevant gates, reconcile all runtime denominators and update docs/status with current evidence |
 | P0 | Run the Chores supervised pilot | One real repair plus denied, stale, missing-test and interrupted cases; patch and evidence retained |
 | P0 | Qualify provider/account and GitHub adapters | Both clients use explicit routes; quota exhaustion pauses; writes enforce reviewed head/target and reconcile receipts |
 | P1 | Add PR polling and bounded dispatch | Deduplication, exclusive claims, budgets, auth loss and restart tests; human adopts schedule |
@@ -15,6 +16,7 @@ before implementation. All remain open until their evidence is recorded.
 | P2 | Separate C/C++ compile and link planners | Preserve argv ordering, archive semantics and toolchain selection |
 | P2 | Separate evaluator and module-loader responsibilities | Preserve cycle handling, concurrency, cache and accounting behavior |
 | P2 | Publish reproducible compatibility/performance reports | Exact target/configuration/commands, artifact parity, samples and limitations |
+| P2 | Retire the separate status tracker after source publication | Replacement docs are public, relocation notice is published, history remains accessible and rush-status is archived |
 
 Route tasks through MAINTAINERS. Keep branch/head, owner, dependencies, findings,
 checks, review state and next action in the operational queue. Do not rewrite

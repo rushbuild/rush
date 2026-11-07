@@ -34,6 +34,12 @@ the affected invalidation cases. For process/sandbox changes, test real child
 process behavior. Keep physical platform claims tied to that platform's results.
 The maintenance test map adds more specific required assertions.
 
+Update the affected `docs/status/` or `docs/benchmarks/` report in the same PR
+as its code change. Bind results to the actual tested revision and case set,
+distinguish build/runtime/parity evidence, and keep historical measurements
+separate from current validation. Update plots with their source data. Use
+GitHub Issues for reproduced actionable work and TODO.md for the short queue.
+
 ## Submit and review
 
 Target `main` with an atomic branch. Open AI-assisted PRs as drafts; include the
