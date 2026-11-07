@@ -50,7 +50,7 @@ Code and Codex use [AGENTS.md](AGENTS.md). The
 evidence and human-delegation process. Its automation policy is a proposal;
 this checkout installs no recurring agent jobs.
 
-See [the release page](index.html) for the project overview and
+See [the release website](https://rushbuild.github.io/rush/) for the project overview and
 [workload status](docs/status/README.md) for scoped compatibility reports and
 [build performance](docs/benchmarks/README.md). [TODO.md](TODO.md) lists the
 first maintenance tasks. Selected published historical reports are preserved;
