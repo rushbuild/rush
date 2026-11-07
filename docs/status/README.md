@@ -48,10 +48,11 @@ published. Keep [TODO.md](../../TODO.md) as the short priority list and record
 task ownership in the maintenance queue. Historical open-work lists are inputs
 to triage, not an automatically reopened backlog.
 
-## Retire the separate tracker
+## Historical tracker archived
 
-Publish this directory with the source release, then publish the historical
-tracker's relocation notice and archive that GitHub repository. Preserve its
-commits, graphs, issues and links. Complete those steps in order so readers
-always have an available destination. Until the replacement is public, the
-historical tracker remains accessible and the archive transition is pending.
+The source reports became publicly readable on 2026-11-06. The separate
+tracker's relocation notice was then published at
+[`26e6a51ee374c5cea6f86d33c7edf3e20923dabc`](https://github.com/rushbuild/rush-status/commit/26e6a51ee374c5cea6f86d33c7edf3e20923dabc),
+and GitHub's archived state was verified. Its reports, graphs, issues and
+history remain available. Maintain current reports here and file new work in
+the source project; the separate tracker is retained for historical reference.

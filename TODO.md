@@ -16,8 +16,11 @@ before implementation. All remain open until their evidence is recorded.
 | P2 | Separate C/C++ compile and link planners | Preserve argv ordering, archive semantics and toolchain selection |
 | P2 | Separate evaluator and module-loader responsibilities | Preserve cycle handling, concurrency, cache and accounting behavior |
 | P2 | Publish reproducible compatibility/performance reports | Exact target/configuration/commands, artifact parity, samples and limitations |
-| P2 | Retire the separate status tracker after source publication | Replacement docs are public, relocation notice is published, history remains accessible and rush-status is archived |
 
 Route tasks through MAINTAINERS. Keep branch/head, owner, dependencies, findings,
 checks, review state and next action in the operational queue. Do not rewrite
 this proposal into a list of presumed successes.
+
+Completed on 2026-11-06: the replacement status docs were published, the
+separate tracker received its relocation notice, and its GitHub archived state
+was verified. See [the status index](docs/status/README.md) for the record.
