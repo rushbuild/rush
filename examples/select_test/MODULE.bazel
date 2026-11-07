@@ -1,0 +1,3 @@
+module(name = "rush_select_example")
+
+bazel_dep(name = "platforms", version = "1.0.0")

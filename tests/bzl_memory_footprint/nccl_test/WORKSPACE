@@ -1,0 +1,5 @@
+# Atomic test for nccl_configure.bzl memory footprint
+
+load("//third_party/nccl:nccl_configure.bzl", "nccl_configure")
+
+nccl_configure(name = "local_config_nccl")

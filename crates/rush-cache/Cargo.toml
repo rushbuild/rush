@@ -1,0 +1,32 @@
+[package]
+name = "rush-cache"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Content-addressable action cache"
+
+[features]
+default = []
+remote = ["rush-remote"]
+
+[dependencies]
+rush-action = { path = "../rush-action" }
+rush-exec = { path = "../rush-exec" }
+rush-remote = { path = "../rush-remote", optional = true }
+blake3.workspace = true
+dashmap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+# Disk cache dependencies
+# Temporarily disabled rocksdb due to GCC 15 compatibility issues
+# rocksdb = "0.22"
+lz4 = "1.24"
+moka = { version = "0.12", features = ["future"] }
+dirs = "5.0"
+walkdir = "2.4"

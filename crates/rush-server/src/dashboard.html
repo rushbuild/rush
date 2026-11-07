@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rush Build Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: #161b22;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border: 1px solid #30363d;
+        }
+
+        h1 {
+            color: #58a6ff;
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #8b949e;
+            font-size: 14px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 20px;
+        }
+
+        .card h2 {
+            color: #58a6ff;
+            font-size: 16px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid #21262d;
+            padding-bottom: 8px;
+        }
+
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #21262d;
+        }
+
+        .stat:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            color: #8b949e;
+            font-size: 14px;
+        }
+
+        .stat-value {
+            color: #c9d1d9;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .status-dot.idle {
+            background: #3fb950;
+        }
+
+        .status-dot.building {
+            background: #f0883e;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .metric-bar {
+            width: 100%;
+            height: 24px;
+            background: #21262d;
+            border-radius: 4px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+
+        .metric-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #238636 0%, #2ea043 100%);
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            padding: 0 8px;
+            color: white;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .refresh-btn {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 16px;
+        }
+
+        .refresh-btn:hover {
+            background: #2ea043;
+        }
+
+        .code-block {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            overflow-x: auto;
+            margin-top: 8px;
+        }
+
+        .loading {
+            color: #8b949e;
+            font-style: italic;
+        }
+
+        .error {
+            color: #f85149;
+            padding: 12px;
+            background: #1a1e24;
+            border-left: 3px solid #f85149;
+            border-radius: 4px;
+            margin-top: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Rush Build Dashboard</h1>
+            <p class="subtitle">Real-time build monitoring and statistics</p>
+        </header>
+
+        <div class="grid">
+            <!-- Build Status Card -->
+            <div class="card">
+                <h2>Build Status</h2>
+                <div id="status-content" class="loading">Loading...</div>
+            </div>
+
+            <!-- Build Metrics Card -->
+            <div class="card">
+                <h2>Build Metrics</h2>
+                <div id="metrics-content" class="loading">Loading...</div>
+            </div>
+
+            <!-- Remote Execution Card -->
+            <div class="card">
+                <h2>Remote Execution</h2>
+                <div id="remote-content" class="loading">Loading...</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Worker Pool Statistics</h2>
+            <div id="worker-content" class="loading">Loading...</div>
+        </div>
+
+        <button class="refresh-btn" onclick="refreshData()">🔄 Refresh Data</button>
+    </div>
+
+    <script>
+        let autoRefreshInterval;
+
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+
+                const statusHtml = `
+                    <div class="stat">
+                        <span class="stat-label">
+                            <span class="status-dot ${data.running ? 'building' : 'idle'}"></span>
+                            Status
+                        </span>
+                        <span class="stat-value">${data.running ? 'Building' : 'Idle'}</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Workspace</span>
+                        <span class="stat-value">${data.workspace_root}</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Tracked Files</span>
+                        <span class="stat-value">${data.tracked_files.toLocaleString()}</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Tracked Targets</span>
+                        <span class="stat-value">${data.tracked_targets.toLocaleString()}</span>
+                    </div>
+                `;
+
+                document.getElementById('status-content').innerHTML = statusHtml;
+            } catch (error) {
+                document.getElementById('status-content').innerHTML =
+                    `<div class="error">Failed to load status: ${error.message}</div>`;
+            }
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+
+                // Build Metrics
+                const metrics = data.metrics;
+                const cacheHitRate = metrics.total_actions > 0
+                    ? ((metrics.cache_hits / metrics.total_actions) * 100).toFixed(1)
+                    : 0;
+
+                const metricsHtml = `
+                    <div class="stat">
+                        <span class="stat-label">Total Actions</span>
+                        <span class="stat-value">${metrics.total_actions?.toLocaleString() || 0}</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Cache Hits</span>
+                        <span class="stat-value">${metrics.cache_hits?.toLocaleString() || 0}</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Cache Hit Rate</span>
+                        <span class="stat-value">${cacheHitRate}%</span>
+                    </div>
+                    <div class="metric-bar">
+                        <div class="metric-bar-fill" style="width: ${cacheHitRate}%">${cacheHitRate}%</div>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Build Time</span>
+                        <span class="stat-value">${metrics.total_build_time_ms ? (metrics.total_build_time_ms / 1000).toFixed(2) + 's' : 'N/A'}</span>
+                    </div>
+                `;
+
+                document.getElementById('metrics-content').innerHTML = metricsHtml;
+
+                // Remote Execution Stats
+                if (data.remote_stats) {
+                    const remote = data.remote_stats;
+                    const remoteCacheRate = remote.total_actions > 0
+                        ? ((remote.cache_hits / remote.total_actions) * 100).toFixed(1)
+                        : 0;
+
+                    const remoteHtml = `
+                        <div class="stat">
+                            <span class="stat-label">Total Actions</span>
+                            <span class="stat-value">${remote.total_actions.toLocaleString()}</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Remote Cache Hits</span>
+                            <span class="stat-value">${remote.cache_hits.toLocaleString()}</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Remote Executions</span>
+                            <span class="stat-value">${remote.remote_executions.toLocaleString()}</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Fallbacks to Local</span>
+                            <span class="stat-value">${remote.failures.toLocaleString()}</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Avg Wait Time</span>
+                            <span class="stat-value">${remote.total_actions > 0 ? Math.round(remote.total_wait_time_ms / remote.total_actions) : 0}ms</span>
+                        </div>
+                        <div class="metric-bar">
+                            <div class="metric-bar-fill" style="width: ${remoteCacheRate}%">Cache: ${remoteCacheRate}%</div>
+                        </div>
+                    `;
+
+                    document.getElementById('remote-content').innerHTML = remoteHtml;
+                } else {
+                    document.getElementById('remote-content').innerHTML =
+                        '<div class="stat"><span class="stat-label">Remote execution not configured</span></div>';
+                }
+
+                // Worker Pool Stats
+                const workers = data.worker_stats;
+                if (Object.keys(workers).length > 0) {
+                    let workerHtml = '';
+                    for (const [name, count] of Object.entries(workers)) {
+                        workerHtml += `
+                            <div class="stat">
+                                <span class="stat-label">${name}</span>
+                                <span class="stat-value">${count.toLocaleString()}</span>
+                            </div>
+                        `;
+                    }
+                    document.getElementById('worker-content').innerHTML = workerHtml;
+                } else {
+                    document.getElementById('worker-content').innerHTML =
+                        '<div class="stat"><span class="stat-label">No worker statistics available</span></div>';
+                }
+
+            } catch (error) {
+                document.getElementById('metrics-content').innerHTML =
+                    `<div class="error">Failed to load statistics: ${error.message}</div>`;
+            }
+        }
+
+        function refreshData() {
+            fetchStatus();
+            fetchStats();
+        }
+
+        // Initial load
+        refreshData();
+
+        // Auto-refresh every 5 seconds
+        autoRefreshInterval = setInterval(refreshData, 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+{
+  "source": "https://github.com/mcgrof/knlp/tree/19d0bb6f3de6500177887a7ceb41afe9da6dc554/research/chores/web/public/adopt",
+  "revision": "19d0bb6f3de6500177887a7ceb41afe9da6dc554",
+  "license": "MIT",
+  "public_skill_sha256_verified": "98e735200302444b8db4c2bed44174a1e8ed3d65cd766cac9232bb648775c742",
+  "sha256": {
+    "ASSESSMENT.md": "4301353b3b33cb6a1490fdc074660dad19fced56408ec9035508e95e0ac8bf04",
+    "HANDOFF.md": "a12f979672781ef332d7c9a9e1243579c4dfd27f332cc3a8bf49c52f504b4e9a",
+    "LICENSE": "231c474fed58e482f8e4613cdaababdb02051ce0caaf9517031530959e645eb3",
+    "PROJECTS.md": "2e8bcf211b92ea60a0473311f77cd619c11fd9183bb98522eee388f95c844206",
+    "README.md": "fd711c39e49e3748bdcae17a9f69866d66417ad45a133ce18be09ab17c337e47",
+    "REVIEW.md": "23ab66fafcdab54e4974790aced2627a00c96745e955a5b0739e2087ca3d58f9",
+    "SKILL.md": "98e735200302444b8db4c2bed44174a1e8ed3d65cd766cac9232bb648775c742",
+    "TEST-PLAN.md": "0b75eedfaa2cfe71f605645df2f086d6d239c6088c12bb15c7db606d3532d9bc",
+    "check_profile.py": "127cba35af6e1bbd778638ae708a40e33a7f88f764ded137e6f2df6d456c8884",
+    "maintenance.py": "a3c00535b2b9c36bab415301edbd2a8ac9e7f727ac24c73cabe316fa843d9b45",
+    "policy.json": "d87c9bc66102b501766f9992b55019272a6b86a8fb263b196383baae02592414",
+    "schemas/assessment-v1.json": "8b0304e8d3dbcb2572a7832f20c25f0c43caf12cafca27757bfe954715fccbe8",
+    "schemas/common-v1.json": "d6df272688311f09a11ba46b45cd71f1d580f112f94261632d1b3fd22663122a",
+    "schemas/evidence-v1.json": "3aa7ac66410037100558592672bf24eed6d6b43ee790d729061d6831cf031c9a",
+    "schemas/policy-v2.json": "549355a701af03f67b271b79c2dcd20c0d8779557bb3428bf8b8375c0f924e7d",
+    "schemas/snapshot-v1.json": "178bc1517b326794f3feb18c4b724ddf17875b710a2454f5489e20d289ea54e9",
+    "schemas/task-v1.json": "a60613913a84ae52cfee03da4ddab429e4715db1a37a13bf0b457057556bd0a0"
+  }
+}

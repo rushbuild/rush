@@ -1,0 +1,52 @@
+#!/bin/bash
+# Monitor Rush memory usage in real-time
+#
+# Usage: ./scripts/rush-monitor
+#
+# Shows current memory usage of the rush-build cgroup slice
+
+set -e
+
+SLICE_NAME="rush-build.slice"
+
+# Colors
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+echo "Monitoring Rush memory usage (Ctrl-C to stop)"
+echo "Slice: $SLICE_NAME"
+echo ""
+
+while true; do
+    # Get memory stats from cgroup
+    if systemctl --user show "$SLICE_NAME" --property=MemoryMax --property=MemoryCurrent 2>/dev/null | grep -q MemoryCurrent; then
+        MAX=$(systemctl --user show "$SLICE_NAME" --property=MemoryMax --value 2>/dev/null || echo "0")
+        CURRENT=$(systemctl --user show "$SLICE_NAME" --property=MemoryCurrent --value 2>/dev/null || echo "0")
+
+        if [ "$CURRENT" != "0" ]; then
+            # Convert to human readable
+            CURRENT_MB=$((CURRENT / 1024 / 1024))
+            MAX_MB=$((MAX / 1024 / 1024))
+            PERCENT=$((CURRENT * 100 / MAX))
+
+            # Color based on usage
+            if [ $PERCENT -lt 70 ]; then
+                COLOR=$GREEN
+            elif [ $PERCENT -lt 90 ]; then
+                COLOR=$YELLOW
+            else
+                COLOR=$RED
+            fi
+
+            echo -ne "\r${COLOR}Memory: ${CURRENT_MB} MB / ${MAX_MB} MB (${PERCENT}%)${NC}    "
+        else
+            echo -ne "\r${YELLOW}Rush not running or slice not active${NC}    "
+        fi
+    else
+        echo -ne "\r${YELLOW}Rush slice not found${NC}    "
+    fi
+
+    sleep 1
+done

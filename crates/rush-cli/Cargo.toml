@@ -1,0 +1,28 @@
+[package]
+name = "rush-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Command-line interface"
+
+[dependencies]
+rush-build = { path = "../rush-build" }
+rush-parse = { path = "../rush-parse" }
+rush-profiling = { path = "../rush-profiling" }
+rush-protocol = { path = "../rush-protocol" }
+rush-command-core = { path = "../rush-command-core" }
+rush-transport-grpc = { path = "../rush-transport-grpc" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+futures = "0.3"
+bytes = "1.7"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+owo-colors.workspace = true
+walkdir.workspace = true
+regex.workspace = true
+num_cpus.workspace = true
+libc.workspace = true

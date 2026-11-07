@@ -1,0 +1,1 @@
+workspace(name = "parallel_bzl_memory_test")

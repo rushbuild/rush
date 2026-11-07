@@ -1,0 +1,30 @@
+workspace(name = "tar_extraction_test")
+
+# Test various tar formats that fail in TensorFlow build
+# Error seen: "tar: Invalid number of elements"
+
+# This archive failed in TensorFlow:
+# rules_python-0.26.0.tar.gz
+http_archive(
+    name = "rules_python",
+    url = "https://github.com/bazelbuild/rules_python/releases/download/0.26.0/rules_python-0.26.0.tar.gz",
+    sha256 = "9d04041ac92a0985e344235f5d946f71ac543f1b1565f2cdbc9a2aaee8adf55b",
+)
+
+# This archive also failed:
+# rules_closure-308b05b2419edb5c8ee0471b67a40403df940149.tar.gz
+http_archive(
+    name = "rules_closure_test",
+    url = "https://storage.googleapis.com/mirror.tensorflow.org/github.com/bazelbuild/rules_closure/archive/308b05b2419edb5c8ee0471b67a40403df940149.tar.gz",
+    sha256 = "5b00383d08dd71f28503736db0500b6fb4dda47489ff5fc6bed42557c07c6ba9",
+    strip_prefix = "rules_closure-308b05b2419edb5c8ee0471b67a40403df940149",
+)
+
+# This archive also failed:
+# bazel-toolchains-8c717f8258cd5f6c7a45b97d974292755852b658.tar.gz
+http_archive(
+    name = "bazel_toolchains_test",
+    url = "http://mirror.tensorflow.org/github.com/bazelbuild/bazel-toolchains/archive/8c717f8258cd5f6c7a45b97d974292755852b658.tar.gz",
+    sha256 = "674234ec4c36b2cf1c0575ac24b1c5b6f726a0e2a4b6e4b5f3d64c83a4e8d5a2",
+    strip_prefix = "bazel-toolchains-8c717f8258cd5f6c7a45b97d974292755852b658",
+)

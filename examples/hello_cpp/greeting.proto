@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Luis Chamberlain <mcgrof@kernel.org>
+//
+// Phase 5.C.4 commit 11: minimal .proto target for the verifier
+// pipeline. The rule under test is cc_proto_library; the
+// proto_library wrapper exposes ProtoFilesInfo so cc_proto_library
+// can enumerate the closure via the typed path. Kept tiny on
+// purpose — one message, two scalar fields — so failure shapes
+// are obvious.
+
+syntax = "proto3";
+
+package hello_cpp;
+
+message Greeting {
+    string name = 1;
+    string text = 2;
+}

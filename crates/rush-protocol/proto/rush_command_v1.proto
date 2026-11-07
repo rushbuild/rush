@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package rush.command.v1;
+
+// RushCommandServer is the daemon-facing RPC surface (Bazel CommandServer shape).
+//
+// NOTE: prost-build (used by the rush-protocol crate) only generates the message
+// types from this file and IGNORES the service block. The tonic service traits are
+// generated separately by the rush-transport-grpc crate, which compiles this same
+// .proto with tonic-build. Keeping the service definition here lets both crates share
+// a single source of truth without rush-protocol gaining a tonic dependency.
+service RushCommandServer {
+  rpc Run(RunRequest) returns (stream RunEvent);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message RunRequest {
+  bytes auth_cookie = 1;
+  repeated bytes argv = 2;
+  bytes working_directory = 3;
+  repeated EnvironmentVariable environment = 4;
+  bool block_for_lock = 5;
+  string client_build_id = 6;
+  uint32 protocol_major = 7;
+  uint32 protocol_minor = 8;
+  // Workspace-config content captured at the CLIENT (the root `.bazelrc` and
+  // `WORKSPACE`/`WORKSPACE.bazel`). The daemon MUST NOT read its own disk on a
+  // client's behalf, so the client sends this content here; the daemon folds it
+  // into the command's config fingerprint identically to the in-process path,
+  // so editing these files invalidates a reused analysis graph.
+  repeated WorkspaceConfigFile workspace_config = 9;
+}
+
+// A single workspace-config file captured at the client. `name` is the relative
+// file name (".bazelrc"/"WORKSPACE"/"WORKSPACE.bazel"); `content` is the raw file
+// bytes (Unix files are not guaranteed UTF-8).
+message WorkspaceConfigFile {
+  bytes name = 1;
+  bytes content = 2;
+}
+
+message EnvironmentVariable {
+  bytes name = 1;
+  bytes value = 2;
+}
+
+message RunEvent {
+  oneof event {
+    CommandStarted started = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    Progress progress = 4;
+    Diagnostic diagnostic = 5;
+    CommandFinished finished = 6;
+  }
+}
+
+message CommandStarted {
+  bytes command_id = 1;
+}
+
+message Progress {
+  string stage = 1;
+  uint64 done = 2;
+  uint64 total = 3;
+}
+
+message Diagnostic {
+  enum Severity {
+    SEVERITY_UNSPECIFIED = 0;
+    INFO = 1;
+    WARNING = 2;
+    ERROR = 3;
+  }
+  Severity severity = 1;
+  bytes message = 2;
+  string location = 3;
+}
+
+message CommandFinished {
+  int32 exit_code = 1;
+  bytes command_id = 2;
+}
+
+message CancelRequest {
+  bytes command_id = 1;
+  bytes auth_cookie = 2;
+}
+
+message CancelResponse {
+  bool cancelled = 1;
+}
+
+message PingRequest {}
+
+message PingResponse {
+  uint64 uptime_secs = 1;
+  uint64 builds_executed = 2;
+}
+
+message ShutdownRequest {
+  bytes auth_cookie = 1;
+}
+
+message ShutdownResponse {
+  bool ack = 1;
+}
+
+// Raw-framed-UDS challenger envelope (the design doc keeps framed protobuf as a
+// measured alternative transport reusing these same message types).
+message WireFrame {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  uint64 request_id = 3;
+  oneof body {
+    Hello hello = 10;
+    HelloResponse hello_response = 11;
+    RunRequest run_request = 12;
+    RunEvent run_event = 13;
+    CancelRequest cancel_request = 14;
+    CancelResponse cancel_response = 15;
+    PingRequest ping_request = 16;
+    PingResponse ping_response = 17;
+    ProtocolError error = 18;
+  }
+}
+
+message Hello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  bytes auth_cookie = 3;
+}
+
+message HelloResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
+
+message ProtocolError {
+  uint32 code = 1;
+  string message = 2;
+}

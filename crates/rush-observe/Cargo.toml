@@ -1,0 +1,21 @@
+[package]
+name = "rush-observe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fail-closed process observation for Rush external builds"
+
+[features]
+test-fixtures = []
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+libc.workspace = true
+nix.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

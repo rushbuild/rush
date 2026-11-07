@@ -1,0 +1,9 @@
+# TensorFlow minimal test workspace
+
+workspace(name = "tensorflow_minimal")
+
+# Rush currently selects legacy WORKSPACE mode while this file exists.
+local_repository(
+    name = "platforms",
+    path = "../platforms",
+)

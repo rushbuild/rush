@@ -1,0 +1,61 @@
+#!/bin/bash
+# Rush with hard memory limit to prevent OOM killing your desktop
+#
+# Usage: ./scripts/rush-capped [rush arguments...]
+#
+# This uses systemd-run to create a transient cgroup with a hard memory cap.
+# When Rush hits the limit, the kernel OOM killer only kills processes in
+# the cgroup, NOT your desktop session.
+
+set -e
+
+MEMORY_LIMIT="20G"  # Hard cap at 20 GiB
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUSH_BIN="${SCRIPT_DIR}/../target/release/rush"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check if rush binary exists
+if [ ! -f "$RUSH_BIN" ]; then
+    echo -e "${RED}Error: Rush binary not found at $RUSH_BIN${NC}"
+    echo "Run: cargo build --release"
+    exit 1
+fi
+
+# Check if systemd-run is available
+if ! command -v systemd-run &> /dev/null; then
+    echo -e "${RED}Error: systemd-run not found${NC}"
+    echo "This script requires systemd (available on most Linux systems)"
+    exit 1
+fi
+
+# Check if running as root (not needed, but warn if trying)
+if [ "$EUID" -eq 0 ]; then
+    echo -e "${YELLOW}Warning: Running as root is not recommended${NC}"
+    echo "systemd-run with --user works fine for regular users"
+fi
+
+echo -e "${GREEN}🔒 Starting Rush with ${MEMORY_LIMIT} memory limit${NC}"
+echo -e "   This prevents OOM from killing your desktop session"
+echo ""
+
+# Run rush in a transient systemd scope with memory limit
+# --user: Run in user session (no root needed)
+# --scope: Create a transient scope unit (not a service)
+# --property=MemoryMax: Hard memory limit (cgroup v2)
+# --property=MemoryHigh: Soft limit for throttling before hard limit
+# --property=MemorySwapMax=0: Disable swap (fail fast instead of thrashing)
+# --slice=rush-build: Put in dedicated slice for easier monitoring
+exec systemd-run \
+    --user \
+    --scope \
+    --slice=rush-build \
+    --property=MemoryMax="$MEMORY_LIMIT" \
+    --property=MemoryHigh=$((19 * 1024 * 1024 * 1024)) \
+    --property=MemorySwapMax=0 \
+    --unit=rush-build-$$ \
+    "$RUSH_BIN" "$@"

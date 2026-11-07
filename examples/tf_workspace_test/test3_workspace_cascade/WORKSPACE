@@ -1,0 +1,14 @@
+workspace(name = "test3_workspace_cascade")
+
+# Test pattern: TensorFlow's cascading workspace functions
+# WORKSPACE calls workspace3() → workspace2() → workspace1()
+# This mimics tensorflow/WORKSPACE:78-92
+
+load("//tensorflow:workspace3.bzl", "tf_workspace3")
+tf_workspace3()
+
+load("//tensorflow:workspace2.bzl", "tf_workspace2")
+tf_workspace2()
+
+load("//tensorflow:workspace1.bzl", "tf_workspace1")
+tf_workspace1()

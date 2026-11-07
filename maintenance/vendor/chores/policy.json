@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "status": "draft",
+  "repository": null,
+  "target_branch": null,
+  "merge_method": "ff-only",
+  "endpoint": "review",
+  "approved_at": null,
+  "expires_at": null,
+  "model_access": {
+    "route": null,
+    "data_classes": [],
+    "request_limit": 0,
+    "token_limit": 0,
+    "cost_limit": 0,
+    "currency": "USD"
+  },
+  "classes": {},
+  "protected_paths": [
+    ".github/**",
+    "maintenance/**"
+  ],
+  "tests": {},
+  "post_merge_tests": [],
+  "applicability_rules": {},
+  "limits": {
+    "repair_attempts": 0,
+    "elapsed_seconds": 0,
+    "requests": 0,
+    "tokens": 0,
+    "cost": 0,
+    "ci_runs": 0
+  },
+  "retry": {
+    "limit": 0,
+    "transient_reasons": []
+  },
+  "delegation": {
+    "route": null,
+    "response_seconds": 0
+  },
+  "observation_max_age_seconds": 0
+}

@@ -1,0 +1,2 @@
+APP_NAME "GenruleTest"
+MAX_CONNECTIONS 100

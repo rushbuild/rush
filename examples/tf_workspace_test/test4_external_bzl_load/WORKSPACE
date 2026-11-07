@@ -1,0 +1,13 @@
+workspace(name = "test4_external_bzl_load")
+
+# Test pattern: Loading .bzl from external repository
+# This is THE critical pattern that causes TensorFlow to hang:
+#   BUILD loads: load("@local_tsl//tsl/platform/default:build_config_root.bzl", ...)
+# But @local_tsl was never registered because nested WORKSPACE not processed
+
+load("//third_party:repo.bzl", "tf_vendored")
+
+tf_vendored(
+    name = "local_tsl",
+    relpath = "external_tsl",
+)

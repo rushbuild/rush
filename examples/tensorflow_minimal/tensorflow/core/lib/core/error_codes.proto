@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package tensorflow;
+
+enum Code {
+  OK = 0;
+  CANCELLED = 1;
+  UNKNOWN = 2;
+}

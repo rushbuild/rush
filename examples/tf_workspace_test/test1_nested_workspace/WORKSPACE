@@ -1,0 +1,7 @@
+workspace(name = "test1_nested_workspace")
+
+# Test pattern: local_repository pointing to a directory with its own WORKSPACE
+# This mimics TensorFlow's pattern of loading external repos that have their own dependencies
+
+load("//:workspace_loader.bzl", "load_external_libs")
+load_external_libs()

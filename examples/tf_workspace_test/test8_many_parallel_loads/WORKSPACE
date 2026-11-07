@@ -1,0 +1,1 @@
+workspace(name = "test8_many_parallel_loads")

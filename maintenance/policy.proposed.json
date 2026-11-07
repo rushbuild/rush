@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "status": "draft",
+  "repository": "https://github.com/rushbuild/rush",
+  "target_branch": "main",
+  "merge_method": "ff-only",
+  "endpoint": "review",
+  "approved_at": null,
+  "expires_at": null,
+  "model_access": {
+    "route": null,
+    "data_classes": [],
+    "request_limit": 0,
+    "token_limit": 0,
+    "cost_limit": 0,
+    "currency": "USD"
+  },
+  "classes": {
+    "documentation": {
+      "paths": [
+        "README.md",
+        "docs/**"
+      ],
+      "actions": [
+        "edit",
+        "test"
+      ],
+      "required_tests": [],
+      "human_review": "before_publish",
+      "classification": {
+        "method": "reviewer",
+        "reviewer_ref": "rush-maintainer"
+      }
+    },
+    "implementation": {
+      "paths": [
+        "crates/**",
+        "src/**"
+      ],
+      "actions": [
+        "edit",
+        "test"
+      ],
+      "required_tests": [],
+      "human_review": "before_publish",
+      "classification": {
+        "method": "reviewer",
+        "reviewer_ref": "rush-maintainer"
+      }
+    },
+    "test-infrastructure": {
+      "paths": [
+        "tests/**",
+        "scripts/**",
+        "ci/**",
+        "verification/**"
+      ],
+      "actions": [
+        "edit",
+        "test"
+      ],
+      "required_tests": [],
+      "human_review": "before_publish",
+      "classification": {
+        "method": "reviewer",
+        "reviewer_ref": "rush-maintainer"
+      }
+    }
+  },
+  "protected_paths": [
+    ".github/**",
+    ".githooks/**",
+    "maintenance/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "MAINTAINERS",
+    "Cargo.toml",
+    "Cargo.lock",
+    "scripts/maintenance/**"
+  ],
+  "tests": {},
+  "post_merge_tests": [],
+  "applicability_rules": {},
+  "limits": {
+    "repair_attempts": 0,
+    "elapsed_seconds": 0,
+    "requests": 0,
+    "tokens": 0,
+    "cost": 0,
+    "ci_runs": 0
+  },
+  "retry": {
+    "limit": 0,
+    "transient_reasons": []
+  },
+  "delegation": {
+    "route": null,
+    "response_seconds": 0
+  },
+  "observation_max_age_seconds": 0
+}

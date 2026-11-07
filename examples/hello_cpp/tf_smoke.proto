@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Luis Chamberlain <mcgrof@kernel.org>
+//
+// Phase 5.C.4 commit 16: tf_proto_library smoke target.
+// Distinct .proto from greeting.proto so the smoke surface
+// covers tf_proto_library independently of cc_proto_library.
+// Pro's Q1: tf_proto_library coverage is "cheap maybe, not
+// free." This .proto exists to let the smoke run.
+
+syntax = "proto3";
+
+package hello_cpp.tf_smoke;
+
+message TfSmoke {
+    int32 id = 1;
+}

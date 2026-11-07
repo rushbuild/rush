@@ -1,0 +1,8 @@
+workspace(name = "external_lib")
+
+# This is the nested WORKSPACE that Rush should discover and process
+# when loading the local_repository above
+
+# Load a simple .bzl file to define a utility
+load("//:lib.bzl", "register_lib")
+register_lib()

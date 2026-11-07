@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Check narrative and portable contribution receipts without private logs."""
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+errors = []
+if not lines or not lines[0].strip():
+    errors.append('missing subject')
+if any(len(line) > 80 for line in lines):
+    errors.append('message lines must be at most 80 characters')
+if not any(line.strip() and ': ' not in line for line in lines[2:]):
+    errors.append('write a narrative body')
+fields = dict(line.split(': ', 1) for line in lines if ': ' in line)
+if not fields.get('Signed-off-by'):
+    errors.append('missing DCO sign-off')
+if fields.get('Generated-by') or fields.get('AI-Agent'):
+    required = ['AI-Agent', 'AI-Session-ID', 'AI-Task-Type', 'AI-Context-Tokens',
+                'AI-Handoff-From', 'AI-Handoff-To', 'AI-Thought-Trace',
+                'Generated-by']
+    if any(not fields.get(field) for field in required):
+        errors.append('incomplete AI contribution receipt')
+    generated = next((i for i, line in enumerate(lines)
+                      if line.startswith('Generated-by: ')), -1)
+    if generated < 0 or generated + 1 >= len(lines) or not lines[generated + 1].startswith('Signed-off-by: '):
+        errors.append('Generated-by must immediately precede Signed-off-by')
+for error in errors:
+    print('commit-msg: ' + error, file=sys.stderr)
+sys.exit(bool(errors))

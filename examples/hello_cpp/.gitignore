@@ -1,0 +1,5 @@
+*.o
+*.a
+hello
+bazel-*
+rush-bin

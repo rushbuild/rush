@@ -1,0 +1,15 @@
+workspace(name = "vendored_repos_test")
+
+# Simulate TensorFlow's vendored repos structure
+# local_tsl -> third_party/xla/third_party/tsl
+# local_xla -> third_party/xla
+
+local_repository(
+    name = "local_xla",
+    path = "third_party/xla",
+)
+
+local_repository(
+    name = "local_tsl",
+    path = "third_party/xla/third_party/tsl",
+)

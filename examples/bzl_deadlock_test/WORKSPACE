@@ -1,0 +1,3 @@
+workspace(name = "bzl_deadlock_test")
+
+# Empty workspace for testing .bzl loading patterns

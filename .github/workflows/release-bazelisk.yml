@@ -1,0 +1,103 @@
+name: Stage Rush release candidate for Bazelisk
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character Rush commit to stage
+        required: true
+        type: string
+      version:
+        description: Release candidate version, for example v0.1.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rush-release-staging-${{ inputs.source_sha }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  stage-linux-x86-64:
+    name: Stage Linux x86-64 candidate
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TARGET: x86_64-unknown-linux-gnu
+      RUST_TOOLCHAIN: 1.90.0
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Validate candidate identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${{ inputs.source_sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full lowercase commit ID" >&2
+            exit 2
+          fi
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "${{ inputs.source_sha }}"
+          test -z "$(git status --porcelain)"
+          scripts/release/prepare_bazelisk_name.sh \
+            "${{ inputs.version }}" linux x86_64 >>"$GITHUB_OUTPUT"
+
+      - name: Set up pinned Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ env.RELEASE_TARGET }}
+
+      - name: Build locked candidate
+        env:
+          RUSTFLAGS: ""
+        run: >-
+          cargo build --release --locked --target "$RELEASE_TARGET"
+          --bin rush
+
+      - name: Prepare staging artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir staging
+          binary="staging/${{ steps.identity.outputs.binary_name }}"
+          cp "target/$RELEASE_TARGET/release/rush" "$binary"
+          chmod 0755 "$binary"
+          lock_sha=$(sha256sum Cargo.lock | cut -d' ' -f1)
+          binary_sha=$(sha256sum "$binary" | cut -d' ' -f1)
+          cat >staging/MANIFEST <<EOF
+          source_sha=${{ inputs.source_sha }}
+          version=${{ steps.identity.outputs.version }}
+          rust_toolchain=$RUST_TOOLCHAIN
+          target=$RELEASE_TARGET
+          cargo_features=default
+          cargo_lock_sha256=$lock_sha
+          binary_sha256=$binary_sha
+          publication=staging-only
+          EOF
+          (cd staging && sha256sum -- * >SHA256SUMS)
+
+      - name: Upload staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rush-${{ steps.identity.outputs.version }}-linux-x86-64
+          path: staging/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record non-publication status
+        shell: bash
+        run: |
+          {
+            echo '### Rush release candidate staged'
+            echo
+            echo 'No tag, release, or distribution artifact was published.'
+            echo 'Final promotion requires a separate reviewed workflow.'
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,16 @@
+[package]
+name = "rush-graph"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Incremental evaluation engine (Skyframe equivalent)"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+blake3.workspace = true

@@ -1,0 +1,8 @@
+# Workspace for select test
+
+# Keep the example runnable in Rush's legacy WORKSPACE mode. Bazel uses the
+# matching platforms dependency in MODULE.bazel.
+local_repository(
+    name = "platforms",
+    path = "../platforms",
+)

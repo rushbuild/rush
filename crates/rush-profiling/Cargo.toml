@@ -1,0 +1,12 @@
+[package]
+name = "rush-profiling"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+once_cell = "1.19"
+dashmap = "5.5"
+
+[features]
+default = []
+enabled = []

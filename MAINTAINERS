@@ -1,0 +1,104 @@
+# Linux-style component routing. F: uses repository-relative shell globs.
+# Match every applicable entry. Catch-all ownership is always retained.
+# M: accountable human; A: on-demand specialist role, never authority.
+# T: first-line checks; behavior-specific gates also apply.
+
+PROJECT INTEGRATION
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: coordinator
+F: **
+T: python3 scripts/maintenance/check.py
+
+ANALYSIS AND LANGUAGE RULES
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: analysis
+F: crates/rush-starlark/**
+F: crates/rush-parse/**
+F: crates/rush-rules/**
+F: crates/tensorflow-rules/**
+T: cargo test -p rush-starlark -p rush-parse -p rush-rules -p tensorflow-rules -j8
+
+BUILD ORCHESTRATION
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: orchestration
+F: crates/rush-build/**
+T: cargo test -p rush-build --lib -j8 -- --test-threads=1
+
+EXTERNAL CAPTURE AND REPLAY
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: capture-replay
+F: crates/rush-observe/**
+F: crates/rush-build/src/kbuild*
+F: crates/rush-build/src/kbuild*/**
+F: crates/rush-build/src/external_*
+F: scripts/*kbuild*
+F: scripts/*external*analysis*
+T: cargo test -p rush-observe -j8
+T: cargo test -p rush-build kbuild -j8
+T: cargo test -p rush-build external_ -j8
+
+ACTIONS AND INCREMENTAL CORRECTNESS
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: incremental
+F: crates/rush-action/**
+F: crates/rush-graph/**
+F: crates/rush-incremental/**
+F: crates/rush-verified-core/**
+T: cargo test -p rush-action -p rush-graph -p rush-incremental -p rush-verified-core -j8
+
+EXECUTION AND RESOURCE ADMISSION
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: execution
+F: crates/rush-exec/**
+F: crates/rush-sandbox/**
+F: crates/rush-resource/**
+T: cargo test -p rush-exec -p rush-sandbox -p rush-resource -j8 -- --test-threads=1
+
+CACHE REPOSITORIES AND REMOTE SERVICES
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: cache-remote
+F: crates/rush-cache/**
+F: crates/rush-repo/**
+F: crates/rush-workspace/**
+F: crates/rush-remote/**
+T: cargo test -p rush-cache -p rush-repo -p rush-workspace -p rush-remote -j8
+
+COMMAND DAEMON AND TRANSPORT
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: command
+F: src/**
+F: crates/rush-cli/**
+F: crates/rush-server/**
+F: crates/rush-command-core/**
+F: crates/rush-protocol/**
+F: crates/rush-transport-grpc/**
+T: cargo test -p rush-cli -p rush-server -p rush-command-core -p rush-protocol -p rush-transport-grpc -j8
+
+PROFILING RELEASE AND TEST INFRASTRUCTURE
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: release
+F: crates/rush-profiling/**
+F: scripts/**
+F: ci/**
+F: verification/**
+F: tools/**
+F: benches/**
+F: benchmarks/**
+F: tests/**
+F: examples/**
+F: external/**
+F: third_party_patches/**
+F: .github/**
+T: python3 scripts/maintenance/check.py
+
+GOVERNANCE AND DOCUMENTATION
+M: Luis Chamberlain <mcgrof@do-not-panic.com>
+A: governance
+F: *.md
+F: index.html
+F: docs/**
+F: maintenance/**
+F: MAINTAINERS
+F: LICENSES/**
+F: .githooks/**
+T: python3 scripts/maintenance/check.py

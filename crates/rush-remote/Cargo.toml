@@ -1,0 +1,22 @@
+[package]
+name = "rush-remote"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Remote execution and caching client"
+
+[dependencies]
+rush-action = { path = "../rush-action" }
+rush-exec = { path = "../rush-exec" }
+anyhow.workspace = true
+tonic.workspace = true
+reqwest = { version = "0.11", features = ["json"] }
+bincode = "1.3"
+tokio.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

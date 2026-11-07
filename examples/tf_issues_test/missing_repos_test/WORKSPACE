@@ -1,0 +1,9 @@
+workspace(name = "missing_repos_test")
+
+# Test behavior when .bzl files reference non-existent external repos
+# This simulates TensorFlow's references to:
+# - @local_config_cuda
+# - @local_config_rocm
+# - @local_config_tensorrt
+# - @local_config_remote_execution
+# These are auto-configured repos that don't exist in our simplified test

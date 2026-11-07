@@ -1,0 +1,19 @@
+[package]
+name = "tensorflow-rules"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "TensorFlow-specific build rules for Rush"
+
+[dependencies]
+rush-rules = { path = "../rush-rules" }
+rush-action = { path = "../rush-action" }
+rush-verified-core = { path = "../rush-verified-core" }
+anyhow = "1.0"
+async-trait = "0.1"
+blake3 = { workspace = true }
+tokio = { version = "1.35", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3.8"

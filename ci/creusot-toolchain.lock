@@ -1,0 +1,47 @@
+# Creusot verification toolchain lock — cc-obj-name-v1 (and future scopes).
+#
+# spec-owned (tcb): this file pins the EXACT verifier stack used to discharge
+# the proof obligations in crates/rush-verified-core. A change to any pin here
+# is a trusted-computing-base change: it can alter what "proved" means, so it
+# is spec-sensitive (Spec-Change: toolchain) and routes through human
+# Spec-Review. See ci/spec-owned.tsv and the MACP agentic-maintenance doc.
+#
+# STATUS: intended pins. Creusot is NOT yet installed on the build hosts; the
+# proptest oracle + injective fix are the demonstrable PoC deliverable today,
+# and `cargo creusot prove` becomes a drop-in second layer once this stack is
+# provisioned (see "next steps" in the report / extension doc). The versions
+# below are the target set to install via:
+#   rustup toolchain install <rust-toolchain>
+#   cargo install --locked cargo-creusot --version <cargo-creusot>
+#   (why3 / why3find / solvers from the distro or opam as noted)
+#
+# Format: TOML. All fields REQUIRED before the proof gate may be marked
+# enforcing; an unset ("") field keeps the gate in "documented, not enforced"
+# mode so CI never silently passes a vacuous proof.
+
+[rust]
+# Creusot pins a specific nightly; cargo-creusot's `setup` prints the exact one.
+# Pin it in a rust-toolchain.toml scoped to the verified-core crate when the
+# proof gate goes enforcing.
+toolchain = ""              # e.g. "nightly-2025-09-01"
+
+[creusot]
+cargo_creusot = ""          # e.g. "0.6.0"  (cargo install cargo-creusot)
+creusot_rustc = ""          # reported by `cargo creusot --version`
+creusot_contracts = "0.6"   # crate version used in Cargo.toml [features.creusot]
+
+[why3]
+why3 = ""                   # e.g. "1.7.2"
+why3find = ""               # e.g. "1.1.0"
+
+[solvers]
+# At least one SMT solver must be pinned; multiple improves robustness.
+z3 = ""                     # e.g. "4.13.0"
+cvc5 = ""                   # e.g. "1.1.2"
+alt_ergo = ""               # e.g. "2.6.0"
+
+[gate]
+# When true, scripts/verify/spec-gate.sh (proof leg) and CI require a
+# successful `cargo creusot prove` for any contract change in this scope.
+# Kept false until the stack above is fully pinned AND installed in CI.
+enforce_proof = false

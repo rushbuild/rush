@@ -1,0 +1,21 @@
+[package]
+name = "rush-incremental"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Tracked-I/O dependency manifest for the rush persistent daemon: every filesystem/env/option observation an analysis makes is recorded so a retained graph can be re-validated (Fresh/Stale) before reuse. The reuse-admission key. No tonic, no tokio."
+repository = "https://github.com/mcgrof/rush"
+
+[dependencies]
+rush-command-core = { path = "../rush-command-core" }
+# Already in the graph via rush-command-core (its API takes a RunRequest);
+# named directly so tracked::test_scope can build one for tests in crates
+# that do not depend on the protocol themselves.
+rush-protocol = { path = "../rush-protocol" }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

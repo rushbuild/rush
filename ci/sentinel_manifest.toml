@@ -1,0 +1,98 @@
+# TF-corpus regression sentinel manifest for rush
+#
+# One witness tf_cc_test per STRUCTURAL CLASS that a rush fix made pass. The
+# sentinel suite covers rush's load-bearing build subsystems at minutes-scale
+# cost (vs the hours-scale full 466-label corpus). Source of truth for the T1
+# per-merge gate and change-based selection (see docs/ci/tf-regression-strategy.md).
+#
+# Every label here is in ci/expected_pass.txt (currently green). Run with:
+#   scripts/tf-regression.sh --tier t1
+#
+# Adding a sentinel: pick the smallest still-green test that FAILS if the named
+# subsystem regresses, tag it with the class + the commit that made it pass.
+
+[[sentinel]]
+label   = "//tensorflow/core/platform:enable_tf2_utils_test"
+class   = "cc_test compile/link layout"
+commit  = 318
+modules = ["rules_cc.rs"]
+tags    = ["link", "smoke"]
+
+[[sentinel]]
+label   = "//tensorflow/core/util/sparse:sparse_tensor_test"
+class   = "alwayslink-first link order (if_static / framework_internal)"
+commit  = 320
+modules = ["rules_cc.rs"]
+tags    = ["link"]
+
+[[sentinel]]
+label   = "//tensorflow/core/common_runtime/eager:eager_op_rewrite_registry_test"
+class   = "system-grpc absl DSO link arm"
+commit  = 322
+modules = ["tf_proto_library.rs", "external_deps.rs"]
+tags    = ["external", "link"]
+
+[[sentinel]]
+label   = "//tensorflow/core/graph:collective_order_test"
+class   = "googletest :gtest bundles gmock"
+commit  = 322
+modules = ["build_orchestrator_ext.rs"]
+tags    = ["external", "link"]
+
+[[sentinel]]
+label   = "//tensorflow/core/common_runtime:request_cost_test"
+class   = "googletest :gtest_main bundles gmock"
+commit  = 326
+modules = ["build_orchestrator_ext.rs", "external_deps.rs"]
+tags    = ["external", "link"]
+
+# context_test (//tensorflow/core/common_runtime/eager:context_test) is the
+# "full eager closure + resource/RSS" witness. It is GREEN in the corpus, but
+# it is NOT part of the functional T1 multi-root batch: its closure builds
+# reliably only within its package-coherent eager sweep batch (which supplies
+# the tpu-proto archives), not alongside a diverse 11-sentinel set, and its
+# build is far heavier than the others. Per docs/ci/tf-regression-strategy.md
+# it is the T1 RESOURCE gate (PASS-A wall + peak RSS) and a T3 cold-cache
+# witness, run on its own — see [resource_sentinel] below.
+
+[[resource_sentinel]]
+rlabel  = "//tensorflow/core/common_runtime/eager:context_test"
+class   = "full eager closure; PASS-A wall + peak-RSS gate (run alone)"
+commit  = 322
+modules = ["external_deps.rs"]
+tags    = ["external", "heavy", "resource"]
+
+[[sentinel]]
+label   = "//tensorflow/core/tfrt/mlrt/interpreter:interpreter_test"
+class   = "prebuilt .a in cc_library srcs -> linker_input (cc_import; TFRT BlockingCounter)"
+commit  = 327
+modules = ["rules_cc.rs", "external_deps.rs", "bootstrap_tf_runtime.sh"]
+tags    = ["link", "tfrt"]
+
+[[sentinel]]
+label   = "//tensorflow/core/tfrt/runtime:work_queue_interface_test"
+class   = "@tf_runtime include roots (llvm_derived, cpp_tests) + libtfrt.a dtype/tensor"
+commit  = 327
+modules = ["external_deps.rs", "bootstrap_tf_runtime.sh"]
+tags    = ["external", "tfrt"]
+
+[[sentinel]]
+label   = "//tensorflow/core/kernels:ragged_tensor_to_variant_op_test"
+class   = "cc_test/cc_binary skip header srcs (PCH-clobber)"
+commit  = 328
+modules = ["rules_cc.rs"]
+tags    = ["link", "compile"]
+
+[[sentinel]]
+label   = "//tensorflow/core:lib_strings_ordered_code_test"
+class   = "cc_test filegroup srcs expansion + label-srcs deps; drop $(VAR) make-var copts"
+commit  = "329,330"
+modules = ["rules_cc.rs", "cc_command_spec.rs"]
+tags    = ["analysis", "compile", "link"]
+
+[[sentinel]]
+label   = "//tensorflow/core/data/service/snapshot:path_utils_test"
+class   = "plain-green control (any rush-wide breakage trips this)"
+commit  = 0
+modules = []
+tags    = ["control"]

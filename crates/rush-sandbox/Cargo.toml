@@ -1,0 +1,18 @@
+[package]
+name = "rush-sandbox"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Hermetic execution via Linux namespaces"
+
+[dependencies]
+rush-action = { path = "../rush-action" }
+rush-exec = { path = "../rush-exec" }
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true

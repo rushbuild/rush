@@ -1,0 +1,21 @@
+workspace(name = "memory_test_tsl")
+
+# Point to TSL within TensorFlow's nested structure
+# Path is relative to this WORKSPACE file
+# Assumes TensorFlow is cloned at ../tensorflow relative to rush repo root
+local_repository(
+    name = "local_tsl",
+    path = "../../../tensorflow/third_party/xla/third_party/tsl",
+)
+
+# Add required dependencies for tsl.bzl
+local_repository(
+    name = "bazel_skylib",
+    path = "../../../tensorflow/third_party/bazel_skylib",
+)
+
+# Add TensorFlow itself as org_tensorflow so relative paths work
+local_repository(
+    name = "org_tensorflow",
+    path = "../../../tensorflow",
+)

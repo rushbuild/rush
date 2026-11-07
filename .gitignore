@@ -1,0 +1,46 @@
+# Rust
+/target
+# Cargo.lock IS committed: rush is a binary/application workspace, so the lock
+# must be checked in for reproducible builds. allocative 0.3.6 breaks
+# starlark_map 0.12.0 (RawTable: Allocative unsatisfied) — a fresh clone with
+# no lock floats to the broken combo and fails to compile. Pinning here keeps
+# `git clone && cargo build` working and lets main build TensorFlow.
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+/output/
+/bazel-*
+/rush-out/
+/rush-bin
+
+# Logs (general exclusion)
+*.log
+__pycache__/
+*.pyc
+*.orig
+*.rej
+.ai-traces/
+
+# Build artifacts
+compile_commands.json
+.build-state.json
+
+# Cache directories
+.cache/
+.rush-cache/
+external/
+
+# Test artifacts
+examples/tensorflow_scale_test/bzl_segments/

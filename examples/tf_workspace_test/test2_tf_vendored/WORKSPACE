@@ -1,0 +1,12 @@
+workspace(name = "test2_tf_vendored")
+
+# Test pattern: tf_vendored() custom repository rule
+# This mimics TensorFlow's exact pattern:
+#   tf_vendored(name = "local_tsl", relpath = "third_party/xla/third_party/tsl")
+
+load("//third_party:repo.bzl", "tf_vendored")
+
+tf_vendored(
+    name = "local_vendor",
+    relpath = "third_party/vendor_lib",
+)

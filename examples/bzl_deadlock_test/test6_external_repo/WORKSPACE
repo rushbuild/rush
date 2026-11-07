@@ -1,0 +1,7 @@
+workspace(name = "test6_external_repo")
+
+# Register mock_external_repo as a local repository
+local_repository(
+    name = "mock_external_repo",
+    path = "../.cache/rush/external/mock_external_repo",
+)

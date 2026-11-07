@@ -1,0 +1,64 @@
+# Rush/Bazel configuration file
+# Copyright © 2025 Luis Chamberlain. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Common flags for all commands
+common --noenable_bzlmod
+
+# Build defaults
+build --color=yes
+build --show_timestamps
+build --experimental_ui_max_stdouterr_bytes=10485760
+
+# C++ settings
+build --cxxopt=-std=c++20
+build --cxxopt=-Wall
+build --host_cxxopt=-std=c++20
+
+# Release configuration
+build:release --compilation_mode=opt
+build:release --copt=-O3
+build:release --cxxopt=-O3
+build:release --linkopt=-Wl,--strip-all
+
+# Debug configuration
+build:debug --compilation_mode=dbg
+build:debug --copt=-g
+build:debug --cxxopt=-g
+build:debug --strip=never
+
+# Performance configuration
+build:perf --compilation_mode=opt
+build:perf --copt=-O3
+build:perf --copt=-march=native
+build:perf --linkopt=-flto
+
+# Sanitizer configurations
+build:asan --copt=-fsanitize=address
+build:asan --linkopt=-fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+
+build:tsan --copt=-fsanitize=thread
+build:tsan --linkopt=-fsanitize=thread
+
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --linkopt=-fsanitize=undefined
+
+# Test defaults
+test --test_output=errors
+test --test_verbose_timeout_warnings
+
+# Platform-specific settings
+build:linux --config=linux_gcc
+build:linux_gcc --action_env=CC=gcc
+build:linux_gcc --action_env=CXX=g++
+
+build:linux_clang --action_env=CC=clang
+build:linux_clang --action_env=CXX=clang++
+
+# Remote execution (example)
+# build:remote --remote_executor=grpc://build-server:8980
+# build:remote --remote_cache=https://cache.example.com
+
+# Disk cache (enable by default)
+build --disk_cache

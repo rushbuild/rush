@@ -1,0 +1,34 @@
+# Dafny-addendum toolchain lock (topo-roots-v1 and future model: scopes).
+#
+# Part of the TCB for any Dafny-addendum scope: the model's proof is valid only
+# relative to these pinned versions. Listed here so a change is caught by
+# scripts/verify/spec-gate.sh (tcb kind) and routed through Spec-Review, the
+# same way ci/creusot-toolchain.lock is.
+#
+# STATUS: NOT INSTALLED by default. The .dfy models are
+# the stabilized spec laboratory; `dafny verify` + `dafny build -t:py` + the
+# Rust differential test are the documented next layer. enforce_model=false
+# until the stack is installed and the gates are wired into CI.
+
+enforce_model = false
+enforce_differential = false
+
+# Intended pins (fill exact versions at install time):
+dafny            = "TBD (>= 4.x; verify uses bundled Boogie + Z3)"
+z3               = "TBD (bundled with the Dafny release)"
+boogie           = "TBD (bundled with the Dafny release)"
+# Executable golden-oracle backend (the model compiled to a runnable program
+# the Rust differential test diffs against). Rust backend is still partial in
+# Dafny, so use the Python backend for now:
+oracle_backend   = "python"
+python           = ">= 3.7"
+
+# Gate (run once installed; see the Dafny-addendum section of the MACP
+# agentic-maintenance extension):
+#   dafny verify --verify-included-files --warn-as-errors \
+#     --verification-time-limit:10 verification/dafny/topo_roots/TopSort.dfy
+#   dafny build -t:py --output target/dafny/topo_oracle \
+#     verification/dafny/topo_roots/Oracle.dfy
+#   python3 target/dafny/topo_oracle-py/Oracle.py > target/dafny/topo_golden.jsonl
+#   RUSH_DAFNY_TOPO_GOLDEN=target/dafny/topo_golden.jsonl \
+#     cargo test -p rush-verified-core topo_roots_dafny_diff

@@ -1,0 +1,26 @@
+[package]
+name = "rush-exec"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Execution strategies (local, sandbox, remote, worker)"
+
+[dependencies]
+rush-action = { path = "../rush-action" }
+rush-resource = { path = "../rush-resource" }
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rush-observe = { path = "../rush-observe" }
+
+[dev-dependencies]
+tempfile.workspace = true

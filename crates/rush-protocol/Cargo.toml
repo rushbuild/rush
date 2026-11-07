@@ -1,0 +1,16 @@
+[package]
+name = "rush-protocol"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "rush.command.v1 protobuf schema and generated message types for the rush daemon IPC (transport-independent; no tonic types in the public API)"
+repository = "https://github.com/mcgrof/rush"
+
+[dependencies]
+prost = { workspace = true }
+bytes = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

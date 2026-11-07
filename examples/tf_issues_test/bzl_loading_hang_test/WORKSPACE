@@ -1,0 +1,4 @@
+workspace(name = "bzl_loading_hang_test")
+
+# Test complex .bzl loading chains that cause hangs
+# Simulate TensorFlow's deep .bzl file dependency tree

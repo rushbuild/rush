@@ -1,0 +1,18 @@
+[package]
+name = "rush-action"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Action abstraction and definitions"
+
+[dependencies]
+blake3.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+bincode.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true

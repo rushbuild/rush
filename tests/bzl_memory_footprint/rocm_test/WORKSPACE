@@ -1,0 +1,5 @@
+# Atomic test for rocm_configure.bzl memory footprint
+
+load("//third_party/gpus:rocm_configure.bzl", "rocm_configure")
+
+rocm_configure(name = "local_config_rocm")

@@ -1,0 +1,2 @@
+# WORKSPACE for resource manager test
+workspace(name = "resource_test")

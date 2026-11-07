@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 607def4e190f531acb64e25a8620ca0dd2eeb76938b9064fa0d14576ca9e3c80 # shrinks to (dag, root) = (IndexDag { nodes: [DagNode { direct: [], children: [1, 2, 3] }, DagNode { direct: [], children: [3] }, DagNode { direct: [0], children: [] }, DagNode { direct: [1], children: [] }] }, 0)

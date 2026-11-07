@@ -1,0 +1,70 @@
+[package]
+name = "rush-build"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Build orchestration (analysis to execution)"
+
+[dependencies]
+rush-graph = { path = "../rush-graph" }
+rush-action = { path = "../rush-action" }
+rush-exec = { path = "../rush-exec" }
+rush-cache = { path = "../rush-cache", features = ["remote"] }
+rush-parse = { path = "../rush-parse" }
+rush-remote = { path = "../rush-remote" }
+rush-resource = { path = "../rush-resource" }
+rush-starlark = { path = "../rush-starlark" }
+rush-rules = { path = "../rush-rules" }
+rush-workspace = { path = "../rush-workspace" }
+rush-repo = { path = "../rush-repo" }
+rush-incremental = { path = "../rush-incremental" }
+rush-profiling = { path = "../rush-profiling" }
+rush-command-core = { path = "../rush-command-core" }
+rush-protocol = { path = "../rush-protocol" }
+tensorflow-rules = { path = "../tensorflow-rules" }
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+owo-colors.workspace = true
+indicatif.workspace = true
+blake3.workspace = true
+sha2.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+crossbeam.workspace = true
+num_cpus.workspace = true
+rayon.workspace = true
+once_cell.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+notify.workspace = true
+inotify.workspace = true
+memmap2.workspace = true
+regex.workspace = true
+flate2.workspace = true
+reqwest.workspace = true
+walkdir.workspace = true
+rand.workspace = true
+hostname = "0.4"
+nix.workspace = true
+bincode.workspace = true
+chrono = "0.4"
+futures = "0.3"
+bytes = "1.7"
+lru = "0.12"
+zip = "0.6"
+hex = "0.4"
+tar = "0.4"
+tempfile = "3.8"
+
+[features]
+profile = ["rush-profiling/enabled"]
+
+[target.'cfg(unix)'.dependencies]
+rush-observe = { path = "../rush-observe" }
+
+[target.'cfg(unix)'.dev-dependencies]
+rush-observe = { path = "../rush-observe", features = ["test-fixtures"] }

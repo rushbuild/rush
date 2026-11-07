@@ -1,0 +1,152 @@
+# spec-owned manifest for the formal-verification + agentic-maintenance track.
+#
+# Format: tab-separated rows  "<scope>\t<kind>\t<path>"
+#   scope : verified-scope id (matches Verify-Scope: commit trailer)
+#   kind  : contract | oracle | model | tcb | cfg
+#           contract -> verified-core source carrying proof obligations
+#           oracle   -> functional property/golden/fuzz test (the uDebug gate)
+#           model    -> Dafny addendum: a .dfy spec laboratory / golden model
+#                       (the abstract verified spec the Creusot contract mirrors;
+#                       ANY change is spec-sensitive — see the Dafny-addendum
+#                       layer in the MACP agentic-maintenance extension)
+#           tcb      -> trusted computing base / toolchain pins
+#           cfg      -> build configuration that can widen the verified base
+#   path  : repo-relative path
+#
+# A change to any path listed here is potentially spec-sensitive. The hook /
+# CI gate (scripts/verify/spec-gate.sh) inspects the diff of contract/oracle
+# files against the Codex regexes and, on a match (or any tcb/cfg change),
+# requires the Spec-Change + Spec-Review trailers. See the MACP
+# agentic-maintenance extension doc in ~/devel/agents.
+#
+# scope	kind	path
+cc-obj-name-v1	contract	crates/rush-verified-core/src/cc_obj_name.rs
+cc-obj-name-v1	contract	crates/rush-verified-core/src/lib.rs
+cc-obj-name-v1	contract	crates/rush-verified-core/src/contract_shim.rs
+cc-obj-name-v1	oracle	crates/rush-verified-core/tests/cc_obj_name_prop.rs
+cc-obj-name-v1	tcb	ci/creusot-toolchain.lock
+cc-obj-name-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# topo-roots-v1: first Dafny-ADDENDUM scope (Dafny+Creusot). The abstract
+# build-order model (ValidTopo: no-dup, == reachable set, deps precede) lives
+# in Dafny; the Creusot contract mirrors it; an executable Dafny->Python golden
+# oracle is diffed against the Rust in the differential test. Toolchain (dafny
+# CLI + Z3) not yet installed — model is the spec-laboratory seed; the
+# verify+build+diff gate is the documented next layer.
+topo-roots-v1	model	verification/dafny/topo_roots/TopSort.dfy
+topo-roots-v1	contract	crates/rush-verified-core/src/topo_roots.rs
+topo-roots-v1	oracle	crates/rush-verified-core/tests/topo_roots_prop.rs
+topo-roots-v1	oracle	crates/rush-verified-core/tests/topo_roots_dafny_diff.rs
+topo-roots-v1	tcb	ci/dafny-toolchain.lock
+topo-roots-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# link-dedup-v1: pure extraction of dedup_archive_link_flags (rules_cc.rs:5197)
+# — the C++ link-line archive de-dup that prevents "multiple definition" errors.
+# Creusot-alone tier (subsequence + idempotence in Pearlite; completeness /
+# at-most-once / whole-archive-triple matched-pair accounting are oracle-only).
+# The proptest oracle DISCOVERED that absolute marker-structure preservation is
+# false (loose markers can legitimately re-form a triple around a surviving
+# archive) — the true invariant is matched-pair removal accounting. Production
+# rules_cc.rs:5197 should delegate to the verified kernel (wire-up deferred).
+link-dedup-v1	contract	crates/rush-verified-core/src/link_dedup.rs
+link-dedup-v1	oracle	crates/rush-verified-core/tests/link_dedup_prop.rs
+link-dedup-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# include-dedup-v1: pure extraction of the -I search-order de-dup in
+# CcCompileCommandSpec::to_normalized_command_spec (cc_command_spec.rs:462-467).
+# Creusot-alone tier. Two-phase (anchor, deps) signature — production does NOT
+# self-dedup the anchor (linux-extras + direct includes push verbatim), only the
+# transitive dep includes are deduped first-occurrence-wins; a flat dedup would
+# wrongly collapse an anchor-internal duplicate. Load-bearing invariant =
+# first-occurrence/search-order preservation (the first -I for a dir wins).
+# fs probe (pinned_absl_root) excluded from the pure core (injected as a root).
+include-dedup-v1	contract	crates/rush-verified-core/src/include_dedup.rs
+include-dedup-v1	oracle	crates/rush-verified-core/tests/include_dedup_prop.rs
+include-dedup-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# label-parse-v1: Dafny-ADDENDUM scope (Dafny+Creusot+oracle). Bazel label
+# parse/render round-trip + canonicalization. Dafny-first because relative/
+# external-context resolution has enough cases to nail the abstract spec first.
+# TRUE-SEMANTICS finding: render-then-parse round-trip holds ONLY under neutral
+# (None) repo context for main-workspace labels (// inherits current_workspace);
+# external labels round-trip context-free. Render always emits explicit :target
+# (implicit/explicit collapse). Follow Label::parse (dependency_graph.rs:33) as
+# canonical; bare repository roots agree with BazelLabel, while the
+# file-oriented parse_external_repo_label retains its documented boundary.
+label-parse-v1	model	verification/dafny/label/Label.dfy
+label-parse-v1	contract	crates/rush-verified-core/src/label_parse.rs
+label-parse-v1	oracle	crates/rush-verified-core/tests/label_parse_prop.rs
+label-parse-v1	tcb	ci/dafny-toolchain.lock
+label-parse-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# nested-set-walk-v1: Dafny-ADDENDUM scope. The NestedSet dedup DAG walk
+# (nested_set.rs:158) that controls the 82GB graph-RSS hog. Real semantics:
+# preorder, direct-before-children, declaration order, NODE-identity (Arc) dedup
+# with GROUP-scheduling (a popped node's whole child group is scheduled before
+# any is expanded) — NOT element-value dedup. SPEC-DISCOVERY: a textbook
+# recursive DFS DIVERGES on cross-edges (a shared grandchild's position is fixed
+# by the first parent's declaration order, not its subtree); the oracle caught it
+# and both the Dafny WalkFrontier model + Rust reference were corrected to the
+# frontier/group-scheduling discipline (regression pinned in
+# nested_set_walk_prop.proptest-regressions). expanded_nodes().len() == the
+# accumulate_stats unique-node count = a verified check on the O(unique) bound.
+nested-set-walk-v1	model	verification/dafny/nested_set/NestedSet.dfy
+nested-set-walk-v1	contract	crates/rush-verified-core/src/nested_set_walk.rs
+nested-set-walk-v1	oracle	crates/rush-verified-core/tests/nested_set_walk_prop.rs
+nested-set-walk-v1	tcb	ci/dafny-toolchain.lock
+nested-set-walk-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# link-plan-v1: Dafny-ADDENDUM scope — the C++ test link-PLAN assembly
+# (CcTestInstance::link_binary, rules_cc.rs:3289-3403) that the link-dedup
+# sub-kernel sits inside. ValidLinkPlan P1-P6: bucket partition (alwayslink→
+# whole-archive, else→normal); ALWAYSLINK-WINS (a path alwayslink via ANY dep is
+# whole-archived only, never double-listed — the multiple-definition guard);
+# ORDER (objects → whole-archive triples → normal --start-group → passthrough);
+# GROUP iff >=1 normal lib (REAL condition, not >=2); COMPLETENESS; TESTMAIN
+# (-lbenchmark in passthrough iff test_main in closure, never -lbenchmark_main).
+# The oracle's mutant_omits_benchmark_arm_caught PROVES this kernel would have
+# caught tonight's latent -lbenchmark gap. Pearlite: whole-archive-precedes-group
+# (P3); alwayslink-wins/completeness/biconditionals oracle-only.
+link-plan-v1	model	verification/dafny/link_plan/LinkPlan.dfy
+link-plan-v1	contract	crates/rush-verified-core/src/link_plan.rs
+link-plan-v1	oracle	crates/rush-verified-core/tests/link_plan_prop.rs
+link-plan-v1	tcb	ci/dafny-toolchain.lock
+link-plan-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# cycle-detect-v1: Dafny-ADDENDUM scope — sibling of topo-roots-v1 (REUSES
+# topo_roots::IndexGraph so the two are provably over the same graph). Completes
+# the graph story: topo/nested-set assume acyclic; this verifies the cycle
+# detection rush's real topological_sort_from_roots does (Kahn residual:
+# sorted.len() != scope.len(), dependency_graph.rs:638 — NOT a DFS back-edge).
+# detect_cycle returns a witness cycle (residual-subgraph walk) iff the
+# reachable subgraph has one. ValidCycle = non-empty, in-bounds+reachable,
+# consecutive edges, closes. Dafny TopoSatisfiableIffNoCycle binds it to
+# TopSort.dfy (ValidTopo satisfiable IFF DetectCycle==None). Oracle cross-checks
+# detect_cycle(g,r).is_none() == topological_sort_from_roots(g,r).is_some().
+# Pearlite: witness non-empty+in-bounds; biconditional+edge-closure oracle-only.
+cycle-detect-v1	model	verification/dafny/cycle_detect/CycleDetect.dfy
+cycle-detect-v1	contract	crates/rush-verified-core/src/cycle_detect.rs
+cycle-detect-v1	oracle	crates/rush-verified-core/tests/cycle_detect_prop.rs
+cycle-detect-v1	tcb	ci/dafny-toolchain.lock
+cycle-detect-v1	cfg	crates/rush-verified-core/Cargo.toml
+
+# alwayslink-closure-v1: Dafny-ADDENDUM scope — the PRODUCER of correctly-tagged
+# link buckets that link-plan-v1 (the CONSUMER) assembles. Models the REAL bug
+# behind 4 corpus fails (api_test, backwards_compatibility, shuffle_dataset,
+# rewrite_utils): rules_cc.rs honors alwayslink on DIRECT deps' typed
+# CcInfo.linker_inputs (~3293-3309) but the TRANSITIVE artifact sweep (~3344-3357
+# iter_transitive_artifacts) pushes every reachable .a to the NORMAL bucket
+# UNCONDITIONALLY (the alwayslink bit doesn't ride on plain Artifacts) → a
+# REGISTER_OP/REGISTER_KERNEL static-init archive reached only transitively is
+# linker-stripped → "no registered op". alwayslink_closure(dag, root) over a
+# typed-linker-input DAG computes the bucket partition with ALWAYSLINK-WINS over
+# the FULL reachable closure. ValidBucketing P1 (alwayslink-wins transitive) /
+# P2 completeness / P3 disjoint / P4 no-spurious / P5 normal-not-alwayslink. P3+P5
+# discharge link-plan-v1's P2 assumption. Oracle's mutant_demotes_transitive_
+# alwayslink IS the production bug → proves the kernel catches it. Pearlite:
+# buckets_disjoint (P3); P1/P2/P4/P5 oracle-only. Reuses nested-set-walk IndexDag.
+alwayslink-closure-v1	model	verification/dafny/alwayslink_closure/AlwaysLinkClosure.dfy
+alwayslink-closure-v1	contract	crates/rush-verified-core/src/alwayslink_closure.rs
+alwayslink-closure-v1	oracle	crates/rush-verified-core/tests/alwayslink_closure_prop.rs
+alwayslink-closure-v1	tcb	ci/dafny-toolchain.lock
+alwayslink-closure-v1	cfg	crates/rush-verified-core/Cargo.toml

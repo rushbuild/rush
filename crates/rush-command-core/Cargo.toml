@@ -1,0 +1,19 @@
+[package]
+name = "rush-command-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Transport-independent CommandService for the rush daemon: Run/Cancel/Ping/Shutdown semantics and per-command CommandSemantics (the replacement for process-global env/flags). No tonic, no sockets."
+repository = "https://github.com/mcgrof/rush"
+
+[dependencies]
+rush-protocol = { path = "../rush-protocol" }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }

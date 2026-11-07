@@ -1,0 +1,35 @@
+# Rush verified-core crate
+# Copyright © 2026 Luis Chamberlain. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# spec-owned (cfg): this Cargo.toml is part of the cc-obj-name-v1 verified
+# scope. Adding dependencies, features, or cfg here is a spec-sensitive
+# change (it can widen the verified-core trusted base) and routes through
+# the Spec-Review gate. See ci/spec-owned.tsv and
+# docs/macp-agentic-maintenance-extension.md in ~/devel/agents.
+[package]
+name = "rush-verified-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Luis Chamberlain <mcgrof@kernel.org>"]
+license = "MIT"
+description = "Pure, deterministic, verification-targeted core logic for Rush (formal-verification second-stage track)"
+repository = "https://github.com/mcgrof/rush"
+
+[features]
+default = []
+# Enables Creusot contract annotations (`#[requires]`/`#[ensures]`/`logic`).
+# OFF by default so `cargo test -p rush-verified-core` works without a
+# Creusot toolchain installed. See ci/creusot-toolchain.lock for the
+# intended pinned verifier versions.
+creusot = ["dep:creusot-contracts"]
+
+[dependencies]
+# Optional: only pulled in under `--features creusot`. The default build and
+# test path has ZERO dependencies — keeping the verified core trivially
+# auditable and lock-free.
+creusot-contracts = { version = "0.6", optional = true }
+
+[dev-dependencies]
+# Property-based ORACLE for the anti-vacuity / collision-freedom gate.
+proptest = "1"

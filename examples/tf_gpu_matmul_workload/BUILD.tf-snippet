@@ -1,0 +1,29 @@
+# Description:
+#   A small self-contained TensorFlow C++ workload that runs real compute
+#   (power iteration via repeated MatMul) on an accelerator, with explicit
+#   device placement and log_device_placement enabled. No external data.
+
+load("//tensorflow:tensorflow.bzl", "tf_cc_binary")
+
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    default_visibility = ["//visibility:public"],
+    licenses = ["notice"],
+)
+
+tf_cc_binary(
+    name = "gpu_matmul_workload",
+    srcs = ["gpu_matmul_workload.cc"],
+    deps = [
+        "//tensorflow/cc:cc_ops",
+        "//tensorflow/cc:client_session",
+        "//tensorflow/cc:scope",
+        "//tensorflow/core:core_cpu",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core:tensorflow",
+        "@local_xla//xla/tsl/util:command_line_flags",
+        "@local_tsl//tsl/framework/contraction:eigen_contraction_kernel",
+    ],
+)
