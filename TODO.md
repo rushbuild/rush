@@ -6,7 +6,7 @@ before implementation. All remain open until their evidence is recorded.
 | Priority | Task | Completion condition |
 | --- | --- | --- |
 | P0 | Establish this source release's build/test baseline | Locked workspace check and component suites on an approved runner; classify every failure/skip |
-| P0 | Revalidate imported workload status | Recover exact historical TF/Modular ledgers, rerun the relevant gates, reconcile all runtime denominators and update docs/status with current evidence |
+| P0 | Complete the workload acceptance matrix | Recover exact TF/Modular ledgers, run the relevant gates, reconcile runtime denominators and update docs/status with candidate-bound evidence |
 | P0 | Run the Chores supervised pilot | One real repair plus denied, stale, missing-test and interrupted cases; patch and evidence retained |
 | P0 | Qualify provider/account and GitHub adapters | Both clients use explicit routes; quota exhaustion pauses; writes enforce reviewed head/target and reconcile receipts |
 | P1 | Add PR polling and bounded dispatch | Deduplication, exclusive claims, budgets, auth loss and restart tests; human adopts schedule |

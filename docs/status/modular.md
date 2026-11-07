@@ -1,42 +1,41 @@
-# Modular status
+# Build and test Modular
 
-The source-release baseline `8c6bb55e39de7d78283a3e57b0b89df11ee773ea`
-has not rerun Modular's workload gates. The
-[historical Modular report](history/modular.md) preserves the published pins,
-test scopes, reproduction example and unresolved findings.
+Use a pinned Modular tree, resolve its declared toolchains, and build the
+same target ledger with Rush and Bazel. Compare artifact bytes before
+counting a parity result. Execute tests with their runfiles and harness
+contracts before counting a runtime pass.
 
-## Historical coverage
+## Read the coverage results
 
-| Scope | Published result | Limit |
+| Scope | Result | Acceptance boundary |
 | --- | --- | --- |
-| Whole-repository non-GPU build ledger, pin `cc7155d854a0` | 4,175/4,175 targets build, including 1,063 Python targets | Build acceptance, not execution of every test |
-| Comparable Mojo library artifacts | 38/39 byte-identical | One `builtin_kernels` artifact differed |
-| stdlib non-GPU test target build | 335/335 build | Reported runtime success covered 264 tests; the full runtime census needs its original ledger |
-| Comparable H100 GPU kernel runtime tests | 222/222 agree on passing outcomes | The selected 287-case corpus came from 763 candidates; shared failures and exclusions remain visible in the benchmark report |
-| `generate_pycross_bzl_lock` | Generated lockfile bytes matched | One pinned generator/workspace/toolchain configuration |
+| Whole-repository non-GPU ledger, pin `cc7155d854a0` | 4,175/4,175 targets build, including 1,063 Python targets | Build acceptance |
+| Comparable Mojo library artifacts | 38/39 byte-identical | Retain the `builtin_kernels` difference |
+| stdlib non-GPU test targets | 335/335 build; 264 runtime passes reported | Recover the case ledger to reconcile every built target |
+| Comparable H100 GPU runtime tests | 222/222 Bazel-passing cases also pass under Rush | Keep the selected 287-case corpus and exclusions separate from 763 candidates |
+| `generate_pycross_bzl_lock` | Generated lockfile bytes match | One pinned generator/workspace/toolchain configuration |
 
-The stdlib and whole-repository reports use different pins and environments.
-The stdlib report names 23 failing tests but does not reconcile every remaining
-case with the 335 built targets in its summary. Recover the case ledger before
-claiming a complete runtime denominator; do not infer that all 335 passed.
+Do not combine whole-repository and stdlib denominators: they use different
+pins and environments. The stdlib runtime summary identifies 23 failures
+without accounting for every remaining built target. Recover the full ledger
+before expanding its runtime claim.
 
-## Modular build performance
+## Compare build performance
 
-Read the [Modular benchmark report](../benchmarks/modular.md) for its original
-data, plots and methodology corrections. The corrected whole-tree comparison
-separates a novel one-file edit (Rush 26.0 s versus Bazel 30.1 s) from repeating
-an edit whose bytes were already cached (Rush 0.15 s versus roughly 13 s).
-The earlier 14.6 s value mixed those situations and must not be reused as the
-novel-edit result. Cold results also carry the published cache-reset caveat.
+Use the [Modular benchmark tables](../benchmarks/modular.md) to separate
+populated-cache restoration, no-op commands, novel edits and repeated edits.
+A novel one-file edit takes **26.0 s** under Rush versus **30.1 s** under
+Bazel. Repeating an already-cached edit takes **0.15 s** versus roughly
+**13 s**. Clear the actual engine caches before measuring an uncached build.
 
-## Re-establish the release baseline
+## Extend the acceptance scope
 
-Freeze the source candidate, upstream pin, toolchains and target ledger. Build
-the exact Bazel-accepted set, compare artifacts, and execute tests with their
-actual FileCheck, expected-crash, runfiles and environment contracts. Account
-for every selected, passed, failed, skipped and excluded case. Rerun timings
-with distinct content per novel edit and explicitly controlled cache state.
+Freeze source revisions, toolchains and target ledgers. Execute FileCheck,
+expected-crash, Python and lit tests with the same environment semantics as
+the reference engine. Account for every selected, passed, failed, skipped
+and excluded case. Reconcile artifact differences and toolchain discovery
+with concrete reproductions.
 
-Revalidate the historical Python runtime corpus, `builtin_kernels` artifact
-difference, lit runner, test environments and toolchain discovery before
-opening current issues. A historical open item is not proof of a current bug.
+Read [measurement provenance](../benchmarks/PROVENANCE.md) for source records
+and missing coverage. Complete the release acceptance matrix before claiming
+support beyond the measured pins and configurations.

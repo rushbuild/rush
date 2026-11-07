@@ -18,7 +18,8 @@
       "source": "benchmarks.md",
       "destination": "docs/benchmarks/modular.md",
       "source_sha256": "d1192cc7ca1b10d54a8ec713557d6d32680fea1d15c304133d7543ecebc783d3",
-      "destination_sha256": "b593c0e3b64dedf086e22e06e23dfec2237ed4c91f584383d937634e87780eb8"
+      "destination_sha256": "f620500770c3bdcf788c71fc5ebe3ee2cf557ff21da4d74b7e0762d280442cc7",
+      "transformation": "Present the measurements as release-facing build modes; retain cache-reset and runtime-accounting limits."
     },
     {
       "source": "graphs/bench-full.svg",

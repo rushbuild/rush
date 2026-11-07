@@ -1,132 +1,78 @@
-# Build-time benchmarks — Modular tree
+# Compare Modular builds with Bazel
 
-> Historical report imported from the published rush-status revision
-> `844d03c2c47f2fd2094ee5592015018238258290`. Results below describe its original
-> candidates and workloads. They were not rerun for the source-release
-> baseline `8c6bb55e39de7d78283a3e57b0b89df11ee773ea`.
-> Statements such as "now", "current" and "what works" refer to that
-> report, not newly verified behavior of this checkout.
+Build the same 4,175-target ledger at Modular pin `cc7155d`. Prefetch external
+repositories for both engines and use the same configuration. The measurement
+host is a 96-core x86-64 system. Report medians of three runs except for the
+single-sample cold rows.
 
-Host: 96-core x86-64 (dual-socket Sapphire-Rapids class, 2 TB DDR +
-512 GiB CXL), Modular pin `cc7155d`, both engines building the identical
-label set with all external repositories pre-fetched. Values are medians
-of 3 runs (cold: single run). "Bazel (warm disk cache)" is Bazel with the
-tree's configured `--disk_cache` already populated — the best case Bazel
-ever sees; "no disk cache" is a true cold compile, matching what rush
-does. **Correction (2026-08-22):** the harness intended to clear rush's
-disk cache before a cold run, but cleared `$WORKSPACE/.cache/rush`,
-which holds no cache entries — the action cache and CAS live in
-`$HOME/.cache/rush`. For the cold numbers below this did not change the
-result (with the output tree wiped and no content-addressed store yet in
-existence, a warm action cache could not skip any work), but re-running
-that harness today would restore from the CAS and report a repeat-cold
-time labelled "cold". The cold rows are being re-measured with the
-correct path cleared.
+## Whole-repository results
 
-![Whole repo](graphs/bench-full.svg)
+| Operation | Rush | Bazel | Cache state |
+| --- | ---: | ---: | --- |
+| Compile the whole tree | **362 s** | 611 s | Cold-run intent; revalidate cache clearing |
+| Restore deleted outputs | **32 s** | 63 s | Warm disk caches; output trees removed |
+| Leave inputs unchanged | **0.05 s** | 12.6 s | Warm no-op; Bazel without disk cache |
+| Leave inputs unchanged | **0.05 s** | 13.2 s | Warm no-op; Bazel with disk cache |
+| Compile a novel one-file edit | **26.0 s** | 30.1 s | Distinct edit bytes for each run |
+| Repeat an already-cached edit | **0.15 s** | ~13 s | Reuse a known input state |
 
-![Stdlib slice](graphs/bench-stdlib.svg)
+Use the cache-restore row to compare output restoration: Rush takes about
+half the time in this scope. Use the novel-edit row to compare an actual
+recompile: 26.0 s versus 30.1 s. Keep the repeated-edit result separate;
+its compiler input state already exists in the cache.
 
-Each panel above carries its own linear scale. A single shared axis
-cannot show a 0.05 s no-op beside a 611 s cold build, and a single log
-axis shrinks a 252x difference to a couple of centimetres. The log view
-below is kept as a secondary index of the whole range.
+![Modular build modes](graphs/bench-full.svg)
 
 <details>
-<summary>Whole repo on one log axis (secondary view)</summary>
+<summary>View the same whole-repository data on a logarithmic axis</summary>
 
-![Whole repo, log scale](graphs/bench-full-log.svg)
+![Modular build modes on a logarithmic scale](graphs/bench-full-log.svg)
 
 </details>
 
-These charts are preserved historical artifacts. The original generator
-is retained in the [status archive](https://github.com/rushbuild/rush-status/blob/1aa0846a5fa82fe79816d014d6467d80c68251d8/tools/make_graphs.py).
-A new measurement must update its report and charts together; the
-archived generator also contains unrelated workload data.
+## Control cache state
 
-| Scenario (whole repo, 4,175 targets) | rush | Bazel (no disk cache) | Bazel (warm disk cache) |
-|---|---:|---:|---:|
-| Cold build | **362 s** | 611 s | — |
-| Repeat-cold (outputs wiped, caches warm) | **32 s** | — | 63 s |
-| Warm no-op | **0.05 s** | 12.6 s | 13.2 s |
-| Change one file (novel edit) | **26.0 s** | 30.1 s | — |
-| Repeat an edit seen before | **0.15 s** | — | ~13 s |
+Clear each engine's actual action cache and content-addressed store before
+measuring an uncached compile. Removing outputs alone measures restoration.
+Rush's default disk cache is under `$HOME/.cache/rush`; removing a workspace's
+`.cache/rush` directory does not clear that store. The 362 s / 611 s cold-run
+result has one sample and an incomplete cache-reset control. Revalidate that
+control before using it as a confirmed uncached speed ratio.
 
-| Scenario (stdlib slice, 945 targets) | rush | Bazel (no disk cache) | Bazel (warm disk cache) |
-|---|---:|---:|---:|
-| Cold build | **39 s** | 245 s | 42 s |
-| Warm no-op | **0.35 s** | 3.4 s | 3.5 s |
-| Incremental (1 file touched) | 23 s | 24 s | 24 s |
+Use distinct source bytes for every novel-edit sample. Repeating identical
+comment text measures a reusable input state. Retain that as a separate
+repeated-edit experiment rather than mixing its time into the compile median.
 
-Reading the table honestly:
+## Stdlib slice
 
-- **Cold compiles: rush is 1.7× faster whole-repo and 6× faster on the
-  stdlib slice** than a true-cold Bazel. Rush's parallel wavefront drives
-  all 96 cores with no JVM, no aspect overhead, and no sandbox setup tax.
-- **Warm no-op: rush is ~250× faster** (0.05 s vs ~13 s). The rushd
-  daemon's inotify dirty-set answers "nothing changed" without scanning.
-- **Correction (2026-08-26): the previously published "Incremental
-  14.6 s" was a cache-hit measurement, not an incremental build.** The
-  old harness appended the same comment text on every run, so runs 2-3
-  of the median-of-3 replayed run 1's compile from the action cache and
-  the median reported the hit path. Measured honestly - fresh comment
-  text per run, so no run can hit an earlier run's cache - a novel
-  one-file edit cost 31.3 s when this correction was first published
-  (31.6 s on the engine that published 14.6 s - the number was a
-  protocol artifact, not a regression). Bazel pays 30.1 s for the
-  identical edit. Both engines spend ~23 s of that in the one real
-  compile (`std`). Profiling the remaining rush overhead found every
-  action re-hashing every declared input file on every build - the Mojo
-  toolchain's 0.3 GB alone was re-read 889 times per incremental - and
-  a process-wide digest memo now hashes each distinct file once,
-  revalidated by stat. Measured on the same protocol, three fresh-text
-  runs, the serving daemon's binary identity asserted by inode:
-  **26.0 s median**, ahead of Bazel by 4 s. Upgrading to the memoized
-  key format costs one full rebuild per tree, once.
-- **Repeating an edit rush has seen before costs 0.15 s.** Content-based
-  early cutoff stamps every artifact with its value (a versioned BLAKE3
-  fingerprint), so restoring bytes the ledger has already certified -
-  reverting a change, toggling between two states, replaying a rebase -
-  short-circuits in the daemon without re-running anything. Bazel
-  re-analyzes and re-checks its cache for the same scenario: ~13 s.
-  The old table compared these hit paths (14.6 s vs 13 s) while calling
-  them "incremental"; both cells were repeat-edit numbers.
-- **Repeat-cold: rush now has a real CAS.** Action results record full
-  output records (fingerprints, content digests, modes, symlinks, tree
-  structure) and output bytes live in a content-addressed store; deleting
-  the entire output tree and rebuilding restores from cache in **32 s**
-  versus Bazel's 63 s. Every restored
-  blob is digest-verified during the copy — corrupt or truncated cache
-  content becomes a miss, never a wrong build. Storing into the CAS costs
-  nothing measurable on cold builds (362 s vs the 368 s pre-CAS baseline).
-- **Virtual artifacts (behind a flag) do not change these numbers, and
-  that is the honest result.** The next step after a CAS is to stop
-  writing bytes nobody reads: when a cached action's outputs are absent,
-  rush can publish only their value stamps and keep the content
-  CAS-backed, materializing it when something actually opens it. It
-  works — a whole-repo rebuild turns 1,357 cache restores into 1,357
-  virtual hits and leaves 23% less on disk (6.34 GB → 4.88 GB), and a
-  single-target build writes 531 KB instead of 16.4 MB — but on this
-  host skipping 1.4 GB of restores buys no wall-clock time (the machine
-  has 2.5 TB of RAM, so those writes plausibly never reach the device;
-  that is inference, not a measurement). It is groundwork for remote
-  caching, where the same bytes would otherwise cross a network.
+Use the 945-target ledger and report its scope separately from the
+whole-repository tree.
 
-## GPU runtime correctness (H100)
+| Operation | Rush | Bazel without disk cache | Bazel with warm disk cache |
+| --- | ---: | ---: | ---: |
+| Compile the slice | 39 s | 245 s | 42 s |
+| Leave inputs unchanged | 0.35 s | 3.4 s | 3.5 s |
+| Rebuild after one file changes | 23 s | 24 s | 24 s |
 
-Runtime parity was validated on a rented H100 (PCIe): the GPU kernel
-test corpus was cross-compiled for `sm_90a` on the build host by BOTH
-engines, and the binaries executed on the GPU with the repo's own
-FileCheck / expect-crash semantics.
+Apply the same cache-reset requirement to cold rows.
 
-- Corpus: 287 GPU kernel tests (of 763; the remainder are multi-hour,
-  100 GB+ RSS compile outliers — two of them OOM-killed under Bazel
-  itself on a 2.5 TB machine).
-- **Zero runtime divergences: every comparable Bazel-green test (222 of
-  222) also passes when built by rush.** 12 shared failures agree
-  between engines (H100-PCIe environment specifics). Rush's binaries
-  additionally pass 36 tests where Bazel's filecheck wrapper scripts
-  cannot run outside `bazel test` runfiles.
-- Mojo GPU programs built by rush are byte-parity-class artifacts: the
-  earlier H100 receipt showed byte-identical run output over ten
-  alternating Bazel/rush runs.
+![Modular stdlib slice](graphs/bench-stdlib.svg)
+
+## Check output and runtime behavior
+
+The build ledger reports 4,175 accepted targets, including 1,063 Python
+targets. Comparable Mojo library artifacts match byte for byte in 38 of 39
+cases; keep the remaining `builtin_kernels` difference visible.
+
+The selected H100 GPU corpus contains 287 of 763 candidate tests. All 222
+comparable Bazel-passing tests also pass when built by Rush. The record also
+reports 12 shared failures and 36 Rush passes whose Bazel wrappers do not run
+outside their runfiles environment. Recover the full case ledger to reconcile
+every selected and excluded test before claiming complete runtime coverage.
+
+Virtual output materialization reports fewer written bytes but no measured
+wall-time improvement on this host. Do not add a speedup for that feature.
+
+Read the [Modular status](../status/modular.md) for acceptance procedures and
+the [measurement provenance](PROVENANCE.md) for source records. Update plots
+and tables from the same sample set when repeating the comparison.

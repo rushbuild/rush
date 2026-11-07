@@ -1,45 +1,45 @@
-# TensorFlow status
+# Build and test TensorFlow
 
-The source-release baseline `8c6bb55e39de7d78283a3e57b0b89df11ee773ea`
-has not rerun the TensorFlow workload gates. The following are inherited
-published results, preserved with their original scope in the
-[historical TensorFlow report](history/tensorflow.md). They establish prior
-work and reproduction targets; they do not certify this release candidate.
+Use TensorFlow's unmodified upstream sources. Compare the same targets and
+configuration with Bazel, then check artifacts and program behavior. Keep each
+acceptance scope distinct.
 
-## Historical acceptance results
+## Read the acceptance results
 
-| Scope | Published result | What was checked |
+| Scope | Result | Apply this pass condition |
 | --- | --- | --- |
-| TF 2.15 non-GPU `tf_cc_test` corpus | 463/463 | Build and execute the selected C++ test programs; keep three `requires-gpu` targets separate |
-| Previously failing target re-sweep | 98/98 | Individual target builds; a separate `graph_constructor_test` run reported 56/56 runtime tests |
-| Differential correctness cases | 8/8 | Clean/edit/incremental/restore sequences, graph/cache decisions and output digests |
+| TF 2.15 non-GPU C++ test corpus | 463/463 | Build and launch every selected `tf_cc_test`; require successful program exit |
+| Repaired target corpus | 98/98 | Build every named target; record the separate 56/56 `graph_constructor_test` runtime result separately |
+| Differential correctness | 8/8 | Compare clean/edit/incremental/restore graphs, cache decisions and output digests |
 | Compatibility micro-conformance | 16/16 | Match Bazel acceptance and rejection at loading, analysis, compile and link phases |
-| Pinned native Python extensions | 2/2 | Build loadable objects, inspect initializer exports, import and call their smoke APIs |
+| Pinned native Python extensions | 2/2 | Build loadable objects, inspect initializer exports, import and call each smoke API |
 
-These reports cover multiple historical engine candidates and configurations.
-The detailed report identifies candidates where recorded, single-host versus
-two-host coverage, uncompleted gates and known baseline failures. The CPU
-corpus executes programs; building the repaired corpus does not substitute
-for running those programs. Two extension imports do not certify a wheel.
+Keep the three `requires-gpu` targets outside the non-GPU corpus. Count
+executed programs for the CPU runtime gate; count builds for the repaired
+target gate. Certify a Python wheel with a dedicated wheel procedure rather
+than extending the two-extension denominator.
 
-## TensorFlow build performance
+The extension targets are
+`//tensorflow/python/autograph/impl/testing:pybind_for_testing` and
+`//tensorflow/python/platform:_pywrap_tf2`. Inspect their `PyInit_*`
+exports, import with the pinned interpreter and require their API results.
 
-The [warm no-op report](../benchmarks/tensorflow.md) records 30 unchanged
-commands for `//tensorflow/core:framework`, with 18,522 retained dependencies:
-Rush 9.3 ms p50, Bazel 64.2 ms p50, and Bazel with `--watchfs` 54.5 ms p50.
-This measures command latency for one target, not full-tree compile time or
-test execution. It has not been repeated for the source-release baseline.
+## Compare build-command latency
 
-## Re-establish the release baseline
+Run unchanged `//tensorflow/core:framework` commands over the
+18,522-dependency manifest. Across 30 samples, Rush's median is **9.3 ms**,
+Bazel's is **64.2 ms**, and Bazel with `--watchfs` is **54.5 ms**.
+Read the [timing report](../benchmarks/tensorflow.md) for its exact scope.
 
-Freeze the candidate, upstream TensorFlow tree, configuration and toolchains.
-Recover the exact case ledgers and procedures for each acceptance row, then
-rerun them with the corresponding Bazel control. Require the recorded behavior
-for every case and report the evaluated denominator and missing coverage.
-If an old command, harness or ledger is unavailable, record that gap rather
-than constructing a new corpus under the old count.
+## Extend the acceptance scope
 
-Revalidate the historical questions about compiler-discovered headers, Python
-wheel breadth, production Bzlmod resolution and interoperable remote services
-against the current code before opening issues. Preserve both closed-work
-evidence and unresolved findings in the historical report.
+Freeze the candidate, upstream tree, configuration and toolchains. Recover
+the exact case ledgers and run each procedure with its Bazel control.
+Publish evaluated denominators and missing coverage. If a ledger or harness
+is unavailable, identify the gap before claiming its count.
+
+Check compiler-discovered headers, Python wheel breadth, production Bzlmod
+resolution and interoperable remote services against the code and open
+reproducible issues. Use [measurement provenance](../benchmarks/PROVENANCE.md)
+for candidate-specific records, completed checks and release-wide validation
+that remains open.

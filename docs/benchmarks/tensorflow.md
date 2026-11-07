@@ -1,26 +1,31 @@
-# TensorFlow warm no-op command latency
+# Compare TensorFlow warm no-op latency
 
-This historical measurement is imported from the published status revision
-`844d03c2c47f2fd2094ee5592015018238258290`. It has not been rerun for
-source baseline `8c6bb55e39de7d78283a3e57b0b89df11ee773ea`.
+Build `//tensorflow/core:framework`, keep its inputs unchanged, and measure
+the next build command. The measured manifest contains 18,522 dependencies.
+Use the 30-sample median to compare command latency.
 
-![Historical TensorFlow warm no-op latency](graphs/bench-tensorflow-noop.svg)
+| Engine | Median | Samples |
+| --- | ---: | ---: |
+| Rush | **9.3 ms** | 30 |
+| Bazel | 64.2 ms | 30 |
+| Bazel with `--watchfs` | 54.5 ms | 30 |
 
-| Engine | Published p50 | Samples | Scope |
-| --- | ---: | ---: | --- |
-| Rush | 9.3 ms | 30 | Unchanged `//tensorflow/core:framework`; 18,522 retained dependencies |
-| Bazel | 64.2 ms | 30 | Same warm no-op target |
-| Bazel `--watchfs` | 54.5 ms | 30 | Same warm no-op target with filesystem watching |
+![TensorFlow warm no-op command latency](graphs/bench-tensorflow-noop.svg)
 
-These are build-command medians. No source changed and no compilation or test
-runtime is represented. The source report does not supply the complete sample
-series, exact timing-candidate identity or toolchain/host record alongside
-these rows. Recover those records before treating this as a reproducible
-comparison or attributing it to the source-release baseline. Do not infer p99
-or a whole-tree speedup from medians.
+The Bazel-to-Rush median ratios are **6.9x** for default Bazel and **5.9x**
+for Bazel with watchfs in this experiment. No source changes and
+no compilation or test execution enter this timing. Measure full builds,
+incremental compilation and test runtime separately.
 
-For a new report, freeze both engines and the upstream configuration, run the
-same unchanged target with matched environment and cache conditions, retain
-every sample, and confirm no unexpected actions executed. Publish the exact
-command lines, output checks, distribution and scope. Measure cold builds,
-novel edits and populated-cache restores as separate experiments.
+## Reproduce the comparison
+
+Freeze both engines, the TensorFlow tree and configuration. Match the target,
+environment and cache conditions, collect all 30 samples, and verify that
+unchanged commands execute no unexpected actions. Report the distribution
+and output checks. Do not derive p99 from a median.
+
+Recover the complete sample series, exact timing-candidate identity and
+toolchain/host record before claiming an independently reproduced result.
+The [source record](PROVENANCE.md) identifies what is retained and what is
+missing. Read [TensorFlow compatibility](../status/tensorflow.md) for build
+and runtime acceptance scopes.
