@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="images/rush.png" alt="Rush — orange gear-shaped crab in motion" width="320">
+</p>
+
 # Rush
 
 Rush is an experimental build system written in Rust. It reads Bazel-style
