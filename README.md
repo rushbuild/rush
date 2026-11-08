@@ -16,6 +16,9 @@ to evaluate the experimental release.
 
 ## Compare build times
 
+Read [Rush vs Buck2](https://rushbuild.github.io/rush/buck2.html) for the
+architecture, adoption requirements and matched-workload comparison.
+
 | Workload and operation | Rush | Reference | Scope |
 | --- | ---: | ---: | --- |
 | TensorFlow unchanged command | **9.3 ms** | Bazel 64.2 ms; watchfs 54.5 ms | 30-sample p50; `//tensorflow/core:framework`; 18,522 dependencies |

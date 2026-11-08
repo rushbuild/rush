@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Compare Rush and Buck2: build rules, incremental architecture, caching, adoption and measured local builds.">
+<meta property="og:title" content="Rush vs Buck2">
+<meta property="og:image" content="https://rushbuild.github.io/rush/images/rush.png">
+<link rel="canonical" href="https://rushbuild.github.io/rush/buck2.html">
+<link rel="icon" type="image/png" href="images/rush.png">
+<title>Rush vs Buck2 — rules, reuse and measured builds</title>
+<style>
+:root{color-scheme:dark;--bg:#101719;--panel:#182326;--ink:#f1f2e9;--muted:#adc0bc;--accent:#ffad5a;--line:#344649}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:18px/1.65 system-ui,sans-serif}
+main,nav,footer{max-width:1120px;margin:auto;padding:28px}nav{display:flex;align-items:center;justify-content:space-between;gap:20px;border-bottom:1px solid var(--line)}nav img{width:52px;height:auto;vertical-align:middle}nav a{font-size:15px}a{color:var(--accent);text-underline-offset:5px}
+header{padding:56px 0 42px}h1{font-size:clamp(48px,7vw,84px);line-height:1.05;letter-spacing:-.055em;margin:20px 0 28px}h2{font-size:32px;line-height:1.25;letter-spacing:-.025em}h3{font-size:21px}.lede{font-size:23px;max-width:850px;color:var(--muted)}.eyebrow{font:13px/1.4 ui-monospace,monospace;color:var(--accent);letter-spacing:.14em;text-transform:uppercase}
+section{padding:34px 0;border-top:1px solid var(--line)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:24px}.card h3{margin-top:0}.card p:last-child{margin-bottom:0}.note{color:var(--muted);font-size:16px}.table-wrap{overflow-x:auto;max-width:100%;margin:22px 0}table{border-collapse:collapse;width:100%;min-width:700px;font-size:16px}th,td{text-align:left;vertical-align:top;padding:16px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:500}td:first-child{width:20%;font-weight:650}td{width:40%}code{font-size:.88em}footer{font-size:14px;color:var(--muted);border-top:1px solid var(--line);padding-bottom:40px}
+@media(max-width:720px){.grid{grid-template-columns:1fr}main,nav,footer{padding:20px}header{padding:32px 0}.lede{font-size:20px}nav{flex-wrap:wrap}h2{font-size:28px}}
+</style>
+</head>
+<body>
+<nav aria-label="Main navigation"><a href="index.html"><img src="images/rush.png" width="737" height="748" alt="Rush"> Rush</a><a href="#architecture">Architecture</a><a href="#measurements">Build comparison</a><a href="https://buck2.build/">Buck2 docs ↗</a></nav>
+<main>
+<header><p class="eyebrow">Compare the engines · check the rules · measure the work</p>
+<h1>Rush vs Buck2.</h1>
+<p class="lede">Choose a build-rule ecosystem first. Both engines use Rust,
+Starlark, incremental state and cached outputs. Rush explores Bazel-style
+workspace compatibility and external build-graph replay. Buck2 supplies its
+own rule APIs around a dynamic incremental engine.</p>
+<p>Use this comparison to plan an evaluation. Check compatibility and output
+correctness before using a timing result to choose an engine.</p></header>
+<section id="adoption"><h2>Start with the workspace.</h2>
+<div class="grid"><article class="card"><h3>Evaluate Rush with Bazel-style inputs.</h3>
+<p>Keep <code>BUILD</code> and <code>.bzl</code> inputs where supported. Validate
+the selected rules, configuration and toolchain against Bazel. Treat the
+public release as experimental; a passing target establishes its tested scope.</p>
+<p><a href="docs/status/README.md">Inspect the Rush workload gates →</a></p></article>
+<article class="card"><h3>Evaluate Buck2 with Buck2 rules.</h3>
+<p>Define <code>BUCK</code> targets, cells and toolchains using Buck2's APIs.
+Translate Bazel rules and providers where required. Shared Starlark syntax
+does not make Bazel and Buck2 rule semantics interchangeable.</p>
+<p><a href="https://buck2.build/docs/concepts/build_rule/">Read the Buck2 rule model →</a></p></article></div>
+</section>
+<section id="architecture"><h2>Compare the implementation.</h2>
+<p>Keep shared techniques separate from the differences that affect adoption.
+Use the source and linked documentation to check each claim.</p>
+<div class="table-wrap"><table><caption>Architecture and integration scope</caption><thead><tr><th scope="col">Concern</th><th scope="col">Rush</th><th scope="col">Buck2</th></tr></thead><tbody>
+<tr><td>Language rules</td><td>Implements substantial language-rule behavior in Rust alongside Starlark evaluation. See <a href="https://github.com/rushbuild/rush/blob/main/crates/rush-rules/src/rules_cc.rs">C/C++ rules</a>.</td><td>Keeps language rules in Starlark and the binary language-agnostic. See <a href="https://buck2.build/docs/about/why/">the rule and engine design</a>.</td></tr>
+<tr><td>Incremental computation</td><td>Retains analysis snapshots and action state, validates freshness, and schedules work through separate components. Read <a href="docs/architecture.md">the component map</a>.</td><td>Uses a single dynamic computation graph on DICE, allowing dependencies across analysis and execution. Read <a href="https://buck2.build/docs/about/why/">the incremental design</a>.</td></tr>
+<tr><td>Output reuse</td><td>Uses action identities, content-addressed outputs and materialization policies. Validate the selected path and its invalidation behavior.</td><td>Uses action caching and <a href="https://buck2.build/docs/users/advanced/deferred_materialization/">deferred materialization</a>. Avoiding unnecessary output downloads is a shared technique.</td></tr>
+<tr><td>Remote services</td><td>Contains experimental remote-service code. Do not assume interoperability with a standard remote-execution backend; inspect <a href="https://github.com/rushbuild/rush/blob/main/crates/rush-remote/src/executor.rs">the current protocol</a> and qualify it.</td><td>Supports the <a href="https://buck2.build/docs/users/remote_execution/">Bazel Remote Execution API</a> and documented backend integration.</td></tr>
+<tr><td>Build-integrated tools</td><td>Provides command and profiling interfaces. No equivalent to the full BXL interface is established by this comparison.</td><td>Provides <a href="https://buck2.build/docs/bxl/">BXL</a> for Starlark tools that query, analyze and build through the engine.</td></tr>
+<tr><td>External build graphs</td><td>Explores Make/Kbuild graph capture, snapshot validation and direct action replay. Read <a href="docs/benchmarks/linux.md">the Linux experiment and acceptance limits</a>.</td><td>The reviewed documentation does not establish an equivalent Kbuild capture/replay workflow. Evaluate a port or integration separately.</td></tr>
+</tbody></table></div>
+<p class="note">Read Buck2's <a href="https://buck2.build/docs/concepts/architecture/">architectural model</a> alongside Rush's source. A list of techniques establishes no speed ranking.</p>
+</section>
+<section id="measurements"><p class="eyebrow">Local execution · matched inputs</p><h2>Measure both engines.</h2>
+<p>A matched C++ evaluation is being prepared. No Rush–Buck2 timing result is
+published here yet. Use Rush's Bazel and Make measurements only for their
+named references and workloads.</p>
+<div class="grid"><article class="card"><h3>Hold the work constant.</h3><p>Use the same source bytes, compiler, optimization flags and job limit. Pin both engines and the Buck2 prelude. Check the executable's content-dependent result after every build.</p></article>
+<article class="card"><h3>Separate the build modes.</h3><p>Measure clean compilation, warm unchanged commands, novel source edits and header invalidation separately. Alternate engine order and retain every accepted sample.</p></article></div>
+<p class="note">Keep setup and migration effort outside command timings.
+Report fixture scale, command lines, cache state and missing coverage with
+the results. A synthetic C++ test establishes no TensorFlow, Modular or
+Linux performance result.</p>
+</section>
+<section><h2>Reproduce before choosing.</h2><p><a href="README.md">Build Rush from source</a> and follow <a href="https://buck2.build/docs/getting_started/install/">Buck2's installation guide</a>. Start with a bounded target, verify its outputs and exercise source and header edits. Expand the target set after those checks pass.</p></section>
+</main>
+<footer>Rush · Experimental source release · <a href="index.html">Project overview</a> · <a href="https://github.com/rushbuild/rush">Source</a></footer>
+</body>
+</html>

@@ -95,7 +95,7 @@ GOVERNANCE AND DOCUMENTATION
 M: Luis Chamberlain <mcgrof@do-not-panic.com>
 A: governance
 F: *.md
-F: index.html
+F: *.html
 F: docs/**
 F: maintenance/**
 F: MAINTAINERS

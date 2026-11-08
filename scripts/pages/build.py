@@ -12,6 +12,7 @@ from urllib.parse import quote, urlsplit
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_URL = 'https://github.com/rushbuild/rush/blob/main/'
 ASSETS = ('images/rush.png',)
+PAGES = ('index.html', 'buck2.html')
 
 
 def published_link(match):
@@ -27,7 +28,7 @@ def published_link(match):
         if parsed.fragment:
             destination += '#' + parsed.fragment
         return 'href="' + escape(destination, quote=True) + '"'
-    if parsed.path not in ASSETS:
+    if parsed.path not in ASSETS + PAGES:
         raise ValueError('undeclared page asset: ' + value)
     return match.group(0)
 
@@ -36,19 +37,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=ROOT / '_site')
     args = parser.parse_args()
-    page = re.sub(r'href="([^"]+)"', published_link,
-                  (ROOT / 'index.html').read_text())
-    for asset in ASSETS:
+    for asset in ASSETS + PAGES:
         if not (ROOT / asset).is_file() or (ROOT / asset).is_symlink():
             raise ValueError('missing regular page asset: ' + asset)
+    pages = {
+        name: re.sub(r'href="([^"]+)"', published_link,
+                     (ROOT / name).read_text())
+        for name in PAGES
+    }
     # Refuse an existing destination rather than overwriting a working tree.
     args.output.mkdir(parents=True, exist_ok=False)
-    (args.output / 'index.html').write_text(page)
+    for name, page in pages.items():
+        (args.output / name).write_text(page)
     for asset in ASSETS:
         destination = args.output / asset
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / asset, destination)
-    print('Staged index.html and ' + ', '.join(ASSETS))
+    print('Staged ' + ', '.join(PAGES + ASSETS))
 
 
 if __name__ == '__main__':

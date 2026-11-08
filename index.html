@@ -15,7 +15,7 @@
 :root{color-scheme:dark;--bg:#101719;--panel:#182326;--ink:#f1f2e9;--muted:#adc0bc;--accent:#ffad5a;--line:#344649}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:18px/1.65 system-ui,sans-serif}
 main,nav,footer{max-width:1120px;margin:auto;padding:28px}nav{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}
-a{color:var(--accent);text-underline-offset:5px}nav a{font-size:15px;margin-left:22px}nav strong{letter-spacing:.16em;font-size:23px}
+a{color:var(--accent);text-underline-offset:5px}nav div{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px 18px}nav a{font-size:15px;white-space:nowrap}nav strong{letter-spacing:.16em;font-size:23px}
 .hero{padding:70px 0 65px;display:grid;grid-template-columns:minmax(0,1.8fr) minmax(260px,1fr);gap:44px;align-items:center}.hero-logo{display:block;width:100%;max-width:360px;height:auto;margin:auto}.eyebrow{font:13px/1.4 ui-monospace,monospace;color:var(--accent);letter-spacing:.14em;text-transform:uppercase}
 h1{font-size:clamp(48px,5.6vw,76px);line-height:1.04;letter-spacing:-.055em;margin:24px 0 30px;font-weight:650}h2{font-size:32px;line-height:1.25;letter-spacing:-.025em}h3{font-size:21px}
 .lede{font-size:23px;max-width:710px;color:var(--muted)}.button{display:inline-block;background:var(--accent);color:#162017;padding:12px 22px;border-radius:5px;text-decoration:none;font-weight:650;margin-top:16px}
@@ -23,11 +23,11 @@ h1{font-size:clamp(48px,5.6vw,76px);line-height:1.04;letter-spacing:-.055em;marg
 .results-table{max-width:100%;overflow-x:auto;margin:20px 0}table{width:100%;min-width:600px;border-collapse:collapse;font-size:16px}th,td{text-align:left;padding:14px 16px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500}td strong{color:var(--accent);white-space:nowrap}.kernel-results{margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}
 section{padding:42px 0;border-top:1px solid var(--line)}pre{overflow:auto;background:#0b1113;padding:25px;border:1px solid var(--line);border-radius:7px;font:15px/1.8 ui-monospace,monospace}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:45px}.two>*{min-width:0}.number{color:var(--accent);font:14px ui-monospace,monospace}footer{border-top:1px solid var(--line);color:var(--muted);font-size:14px;padding-bottom:45px}
-@media(max-width:720px){.grid,.two{grid-template-columns:1fr}.hero{grid-template-columns:1fr;padding:36px 0;gap:24px}.hero-art{grid-row:1}.hero-logo{max-width:240px}.lede{font-size:20px}nav a{margin-left:12px}main,nav,footer{padding:20px}}
+@media(max-width:720px){.grid,.two{grid-template-columns:1fr}.hero{grid-template-columns:1fr;padding:36px 0;gap:24px}.hero-art{grid-row:1}.hero-logo{max-width:240px}.lede{font-size:20px}nav{gap:18px}main,nav,footer{padding:20px}}
 </style>
 </head>
 <body>
-<nav aria-label="Main navigation"><strong>RUSH</strong><div><a href="README.md">Get started</a><a href="docs/status/README.md">Status</a><a href="https://github.com/rushbuild/rush">Source ↗</a></div></nav>
+<nav aria-label="Main navigation"><strong>RUSH</strong><div><a href="README.md">Get started</a><a href="buck2.html">Rush vs Buck2</a><a href="docs/status/README.md">Status</a><a href="https://github.com/rushbuild/rush">Source ↗</a></div></nav>
 <main>
 <header class="hero"><div><p class="eyebrow">Rust · incremental builds · experimental source release</p>
 <h1>Build on what<br>you already know.</h1>
@@ -59,6 +59,7 @@ then compare the result with the same targets and toolchains under Bazel.</p>
 </tbody></table></div><p>Read the ratio as <strong>1.27x</strong>, or about <strong>21% less wall time</strong>, within this three-pair experiment. Account for capture and graph preparation separately; the empty-cache Rush diagnostic takes 12:02.92.</p>
 <p class="note">Parts of Lorenzo's work <a href="https://github.com/torvalds/linux/commit/997208ce9f43f01febac956cf9aeffe89945e3c1">have merged into mainline</a>. Keep the measured v1-patched baseline fixed. <a href="docs/benchmarks/linux.md">Check patch status, setup costs and the remaining acceptance gate.</a></p></div>
 <p><a href="docs/status/README.md">Read workload acceptance scopes</a> · <a href="docs/benchmarks/PROVENANCE.md">Inspect measurement provenance</a></p>
+<p><a href="buck2.html">Compare Rush with Buck2 →</a> Read the architecture and adoption differences. Evaluate build speed with matched workloads.</p>
 </section>
 <div class="grid">
 <article class="card"><span class="number">01 / ANALYZE</span><h2>Keep useful work.</h2><p>Retain analysis state and validate its inputs before reusing a build graph.</p></article>
