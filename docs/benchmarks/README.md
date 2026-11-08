@@ -4,6 +4,16 @@ Compare Rush with Bazel for TensorFlow and Modular. Compare Rush's Linux
 replay path with GNU Make separately. Keep the build mode, workload and cache
 state attached to every result.
 
+## Rush against Buck2
+
+Build identical generated C++ sources with each engine's native rules on one
+Linux host with the same eight-CPU budget. At 1,024 headers, Rush takes less
+time for clean builds, unchanged commands and edits. At 18,432 headers, Rush
+takes less time for clean builds; Buck2 takes less time for unchanged commands
+and one-file rebuilds. Read [the five-sample comparison](buck2.md) for timings,
+compiler counts, output checks and scope. Use this synthetic result separately
+from the TensorFlow, Modular and Linux measurements below.
+
 ## TensorFlow against Bazel
 
 Measure unchanged command latency for `//tensorflow/core:framework`, with
