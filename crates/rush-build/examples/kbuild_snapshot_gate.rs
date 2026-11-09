@@ -8,7 +8,7 @@ use rush_action::external_action_key::{ExternalCredentialState, ExternalSignalSt
 use rush_build::external_analysis_snapshot::ExternalAnalyzerIdentity;
 use rush_build::external_analysis_snapshot::{
     load_if_fresh, persist, ExternalAnalysisKey, ExternalAnalysisSnapshot,
-    ExternalSnapshotAdmission,
+    ExternalInitialInputValue, ExternalSnapshotAdmission,
 };
 #[cfg(unix)]
 use rush_build::external_controller::{
@@ -112,7 +112,8 @@ fn usage() -> ! {
          <transaction.json> <src> <obj>\n\
          or: kbuild_snapshot_gate inspect-snapshot-private <snapshot> <needle>\n\
          or: kbuild_snapshot_gate replay <snapshot> <key.json> <cache>\n\
-         or: kbuild_snapshot_gate replay-commit <snapshot> <key.json> <cache>"
+         or: kbuild_snapshot_gate replay-commit <snapshot> <key.json> <cache>\n\
+         or: kbuild_snapshot_gate replay-clean-commit <snapshot> <key.json> <cache>"
     );
     std::process::exit(2);
 }
@@ -1278,6 +1279,7 @@ async fn replay(
     key_path: &Path,
     cache_root: &Path,
     commit_clean_result: bool,
+    force_clean: bool,
 ) -> Result<ExternalReplayStatus> {
     let diagnostics = std::env::var("RUSH_EXTERNAL_OBSERVATION_STATS").as_deref() == Ok("1");
     let total_started = Instant::now();
@@ -1302,17 +1304,34 @@ async fn replay(
     let cache_elapsed = cache_started.elapsed();
     let output_root = snapshot.key.output_root.clone();
     let clean_started = Instant::now();
-    let clean = continuation
-        .then(|| CleanReplayTree::begin(&output_root))
-        .transpose()?;
+    let clean = begin_replay_tree(&output_root, continuation, force_clean)?;
+    let owned_scratch = snapshot.graph.initial_inputs.iter().any(|input| {
+        input.path.root == "obj"
+            && input.path.path == KBUILD_MANAGED_SCRATCH_DIRECTORY.as_bytes()
+            && matches!(input.value, ExternalInitialInputValue::Directory { mode }
+                if mode == KBUILD_MANAGED_SCRATCH_MODE)
+    });
+    let mut scratch = if clean.is_none() {
+        ManagedReplayScratch::begin(&output_root, owned_scratch)?
+    } else {
+        None
+    };
     let clean_elapsed = clean_started.elapsed();
     let engine_started = Instant::now();
     let replay = ExternalReplayEngine::with_cas(snapshot, cache, ResourceManager::new()?, cas)?;
+    if let Some(scratch) = &mut scratch {
+        scratch.observe_materialization()?;
+    }
     let engine_elapsed = engine_started.elapsed();
     let replay_started = Instant::now();
     let status = replay.replay().await;
     let replay_elapsed = replay_started.elapsed();
     let rollback_started = Instant::now();
+    if matches!(status, Ok(ExternalReplayStatus::Complete { .. })) {
+        if let Some(scratch) = scratch {
+            scratch.finish()?;
+        }
+    }
     if let Some(clean) = clean {
         if commit_clean_result
             && matches!(status, Ok(ExternalReplayStatus::Complete { .. }))
@@ -1336,6 +1355,75 @@ async fn replay(
         );
     }
     status
+}
+
+#[cfg(unix)]
+fn begin_replay_tree(
+    output: &Path,
+    continuation: bool,
+    force_clean: bool,
+) -> Result<Option<CleanReplayTree>> {
+    (continuation || force_clean)
+        .then(|| CleanReplayTree::begin(output))
+        .transpose()
+}
+
+/// Own only a newly materialized, snapshot-declared managed scratch directory.
+/// Pre-existing directories belong to the caller; unexpected shapes or writes
+/// refuse cleanup rather than deleting arbitrary output-tree contents.
+#[cfg(unix)]
+struct ManagedReplayScratch {
+    path: PathBuf,
+    identity: Option<(u64, u64, u32, u32, u32)>,
+}
+
+#[cfg(unix)]
+impl ManagedReplayScratch {
+    fn begin(output: &Path, owned_by_snapshot: bool) -> Result<Option<Self>> {
+        if !owned_by_snapshot {
+            return Ok(None);
+        }
+        let path = output.join(KBUILD_MANAGED_SCRATCH_DIRECTORY);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(None),
+            Ok(_) => anyhow::bail!("pre-existing managed replay scratch is not a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Some(Self { path, identity: None }))
+            }
+            Err(error) => Err(error).context("inspect managed replay scratch"),
+        }
+    }
+
+    fn current_identity(&self) -> Result<(u64, u64, u32, u32, u32)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&self.path)
+            .context("inspect materialized managed replay scratch")?;
+        if !metadata.file_type().is_dir() || metadata.mode() & 0o7777 != KBUILD_MANAGED_SCRATCH_MODE
+        {
+            anyhow::bail!("materialized managed replay scratch has an unexpected shape or mode");
+        }
+        Ok((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+        ))
+    }
+
+    fn observe_materialization(&mut self) -> Result<()> {
+        self.identity = Some(self.current_identity()?);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.identity.is_none() || Some(self.current_identity()?) != self.identity {
+            anyhow::bail!("managed replay scratch identity changed before cleanup");
+        }
+        // rmdir refuses unexpected contents, including files left by a writer.
+        // This is lifecycle cleanup, never a parity exclusion.
+        std::fs::remove_dir(&self.path).context("remove new empty managed replay scratch")
+    }
 }
 
 #[cfg(unix)]
@@ -1798,7 +1886,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     }
-    let commit_clean_result = mode == OsStr::new("replay-commit");
+    let force_clean = mode == OsStr::new("replay-clean-commit");
+    let commit_clean_result = mode == OsStr::new("replay-commit") || force_clean;
     let (snapshot_path, key_path, cache_root) = match mode.to_str() {
         Some("capture") => {
             let capture_path = argument(&mut arguments);
@@ -1840,7 +1929,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("write {}", key_path.display()))?;
             (snapshot_path, key_path, cache_root)
         }
-        Some("replay") | Some("replay-commit") => {
+        Some("replay") | Some("replay-commit") | Some("replay-clean-commit") => {
             let snapshot_path = argument(&mut arguments);
             let key_path = argument(&mut arguments);
             let cache_root = argument(&mut arguments);
@@ -1857,6 +1946,7 @@ async fn main() -> Result<()> {
         &key_path,
         &cache_root,
         commit_clean_result,
+        force_clean,
     )
     .await?;
     let value = match status {
@@ -1974,6 +2064,116 @@ mod tests {
         assert!(error
             .to_string()
             .contains("SOURCE_DATE_EPOCH is not an unsigned integer"));
+    }
+
+    #[test]
+    fn forced_clean_replay_starts_empty_without_analysis_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("obj");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join(".config"), b"seed").unwrap();
+        std::fs::write(output.join("old"), b"old").unwrap();
+        assert!(begin_replay_tree(&output, false, false).unwrap().is_none());
+        let clean = begin_replay_tree(&output, false, true).unwrap().unwrap();
+        assert_eq!(std::fs::read(output.join(".config")).unwrap(), b"seed");
+        assert!(!output.join("old").exists());
+        std::fs::write(output.join("result"), b"new").unwrap();
+        clean.commit().unwrap();
+        assert_eq!(std::fs::read(output.join("result")).unwrap(), b"new");
+        assert!(!output.join("old").exists());
+    }
+
+    #[test]
+    fn forced_clean_replay_error_restores_preexisting_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("obj");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("old"), b"old").unwrap();
+        let clean = begin_replay_tree(&output, false, true).unwrap().unwrap();
+        std::fs::write(
+            output.join(KBUILD_MANAGED_SCRATCH_DIRECTORY),
+            b"unexpected shape",
+        )
+        .unwrap();
+        assert!(clean.commit().is_err());
+        assert_eq!(std::fs::read(output.join("old")).unwrap(), b"old");
+        assert!(!output.join(KBUILD_MANAGED_SCRATCH_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn managed_replay_scratch_cleans_only_new_owned_empty_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path();
+        let path = output.join(KBUILD_MANAGED_SCRATCH_DIRECTORY);
+        assert!(ManagedReplayScratch::begin(output, false)
+            .unwrap()
+            .is_none());
+        let mut scratch = ManagedReplayScratch::begin(output, true).unwrap().unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(KBUILD_MANAGED_SCRATCH_MODE),
+        )
+        .unwrap();
+        scratch.observe_materialization().unwrap();
+        scratch.finish().unwrap();
+        assert!(!path.exists());
+
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("preexisting"), b"owned by caller").unwrap();
+        assert!(ManagedReplayScratch::begin(output, true).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(path.join("preexisting")).unwrap(),
+            b"owned by caller"
+        );
+    }
+
+    #[test]
+    fn managed_replay_scratch_refuses_unexpected_contents_or_replacement() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path();
+        let path = output.join(KBUILD_MANAGED_SCRATCH_DIRECTORY);
+        let mut scratch = ManagedReplayScratch::begin(output, true).unwrap().unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(KBUILD_MANAGED_SCRATCH_MODE),
+        )
+        .unwrap();
+        scratch.observe_materialization().unwrap();
+        std::fs::write(path.join("unexpected"), b"keep").unwrap();
+        assert!(scratch.finish().is_err());
+        assert_eq!(std::fs::read(path.join("unexpected")).unwrap(), b"keep");
+        std::fs::remove_file(path.join("unexpected")).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+
+        let mut scratch = ManagedReplayScratch::begin(output, true).unwrap().unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(KBUILD_MANAGED_SCRATCH_MODE),
+        )
+        .unwrap();
+        scratch.observe_materialization().unwrap();
+        let saved = output.join("saved-scratch");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(KBUILD_MANAGED_SCRATCH_MODE),
+        )
+        .unwrap();
+        assert!(scratch.finish().is_err());
+        assert!(path.is_dir() && saved.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        symlink(&saved, &path).unwrap();
+        assert!(ManagedReplayScratch::begin(output, true).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"keep file").unwrap();
+        assert!(ManagedReplayScratch::begin(output, true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep file");
     }
 
     #[test]
