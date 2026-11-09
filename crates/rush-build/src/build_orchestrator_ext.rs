@@ -2165,7 +2165,9 @@ impl BuildOrchestrator {
 
         // The AnalysisKey we expect both runs to hit (mirrors build_with_dependencies).
         let expected_key = {
-            let semantics = rush_command_core::CommandSemantics::from_process();
+            let semantics = rush_command_core::CommandSemantics::from_process_with_compilation_mode_default(
+                self.output_tree.config().dir_name(),
+            )?;
             let ws_real = std::fs::canonicalize(&self.workspace_root)
                 .unwrap_or_else(|_| self.workspace_root.clone());
             crate::analysis_snapshot::AnalysisKey::new(&semantics, ws_real, target_patterns.clone())
@@ -2317,7 +2319,9 @@ impl BuildOrchestrator {
     /// client's — the correctness premise of [`CommandSemantics`].
     #[allow(clippy::await_holding_lock)]
     pub async fn build_with_dependencies(&self, target_patterns: Vec<String>) -> Result<()> {
-        let semantics = rush_command_core::CommandSemantics::from_process();
+        let semantics = rush_command_core::CommandSemantics::from_process_with_compilation_mode_default(
+            self.output_tree.config().dir_name(),
+        )?;
         self.build_with_dependencies_with_semantics(target_patterns, semantics)
             .await
     }
@@ -2425,12 +2429,19 @@ impl BuildOrchestrator {
         // Generated-repository settings read CUDA/ROCm environment through
         // tracked IO. Run activation only after installing this command's IO,
         // and scope it so those configuration inputs enter the same manifest.
+        let native_configuration = rush_command_core::native_options::NativeConfiguration::from_command_semantics(&semantics)
+            .map_err(anyhow::Error::msg)?;
+        let command_build_config = crate::output_tree::BuildConfig::parse(&native_configuration.compilation_mode)
+            .ok_or_else(|| anyhow!("invalid native compilation mode"))?;
         {
-            let defs = command_configuration_defines(&semantics);
+            let mut defs = command_configuration_defines(&semantics).into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            defs.extend(native_configuration.defines.clone());
+            let defs: Vec<_> = defs.into_iter().collect();
             let scope = self.config_registry_scope();
             self.with_tracked_scope(|| {
                 rush_starlark::config_defines::with_configuration_scope(&scope, || {
-                    rush_starlark::config_defines::begin_command(&defs);
+                    rush_starlark::config_defines::begin_command_with_native_options(&defs, native_configuration.clone());
                 });
             });
         }
@@ -5074,12 +5085,14 @@ impl BuildOrchestrator {
         // the env, so the default CPU toolchain (g++) — and the certified 463 corpus — is
         // unchanged. First step of the GPU ladder: let rush drive hipcc on the W7900.
         let toolchain = {
-            let cxxflags = self.output_tree.config().compiler_flags();
-            let cflags = cxxflags
+            let mut cxxflags = command_build_config.compiler_flags();
+            let mut cflags: Vec<_> = cxxflags
                 .iter()
                 .filter(|flag| !flag.starts_with("-std="))
                 .cloned()
                 .collect();
+            cflags.extend(native_configuration.copts.iter().cloned());
+            cxxflags.extend(native_configuration.copts.iter().cloned());
             let base = Toolchain::default().with_flags(cflags, cxxflags);
             match std::env::var("RUSH_GPU_CXX") {
                 Ok(gpu_cxx) if !gpu_cxx.is_empty() => {
@@ -6575,8 +6588,7 @@ impl BuildOrchestrator {
         if tracked_audit {
             if let Some(io) = self.tracked_io_shared() {
                 let manifest = io.manifest();
-                let semantics = rush_command_core::CommandSemantics::from_process();
-                let staleness = manifest.validate(&semantics).staleness;
+                let staleness = manifest.validate(&command_semantics).staleness;
                 let deps = manifest.deps();
                 let total = deps.len();
                 let mut bzl_content = 0usize;
@@ -20674,6 +20686,165 @@ filegroup(name = "uses_wrong_kind", srcs = select({"@llvm_terminfo//:ordinary_li
             assert!(message.contains(expected), "{target}: {message}");
             assert!(!message.contains("system_cc_library"), "{target}: genuine metadata must never become a library stub: {message}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_api_constructor_mode_is_captured_without_changing_explicit_requests() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"direct_native_mode\")\n")?;
+        write_file(&root.join("BUILD"), r#"
+config_setting(name = "optimized", values = {"compilation_mode": "opt"})
+filegroup(name = "chosen")
+filegroup(name = "root", srcs = select({":optimized": [":chosen"], "//conditions:default": ["//missing:target"]}))
+"#)?;
+        let orchestrator = BuildOrchestrator::with_config(root.to_path_buf(), crate::BuildConfig::Opt);
+        orchestrator.build_with_dependencies(vec!["//:root".into()]).await?;
+        let explicit = semantics_with_define_and_environment(root, "//:root", "native_test", "true", &[
+            (rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV, "[]"),
+        ])?;
+        let error = orchestrator.build_with_dependencies_with_semantics(vec!["//:root".into()], explicit).await
+            .expect_err("an explicit default request must ignore the constructor's opt fallback");
+        assert!(format!("{error:#}").contains("missing"), "{error:#}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_mode_and_copt_reset_change_real_actions_and_executable_values() -> Result<()> {
+        struct RecordingStrategy {
+            actions: Arc<std::sync::Mutex<Vec<rush_action::Action>>>,
+        }
+        #[async_trait::async_trait]
+        impl rush_exec::ExecutionStrategy for RecordingStrategy {
+            async fn execute(&self, action: &rush_action::Action) -> Result<rush_exec::ActionResult> {
+                self.actions.lock().unwrap().push(action.clone());
+                rush_exec::ExecutionStrategy::execute(&rush_exec::LocalStrategy, action).await
+            }
+            fn can_execute(&self, _: &rush_action::Action) -> bool { true }
+            fn name(&self) -> &str { "record-real-native-actions" }
+        }
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"native_compile\")\n")?;
+        write_file(&root.join("BUILD"), "cc_binary(name = \"app\", srcs = [\"main.cc\"])\n")?;
+        write_file(&root.join("main.cc"), r#"#include <stdio.h>
+#ifndef NATIVE_SCOPE
+#define NATIVE_SCOPE 0
+#endif
+#ifdef __OPTIMIZE__
+#define OPTIMIZED 1
+#else
+#define OPTIMIZED 0
+#endif
+int main() { printf("%d/%d\n", NATIVE_SCOPE, OPTIMIZED); return 0; }
+"#)?;
+        let mut orchestrator = BuildOrchestrator::with_config(root.to_path_buf(), crate::BuildConfig::Opt);
+        let executed_actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        orchestrator.action_manager = Arc::new(crate::action_manager::RushActionManager::new(
+            orchestrator.cache.clone(), Arc::new(RecordingStrategy { actions: executed_actions.clone() }),
+            orchestrator.resource_manager.clone(),
+        ));
+        let targets = vec!["//:app".to_string()];
+        let mut compile_action_ids = Vec::new();
+        for (tokens, expected) in [
+            (vec!["--compilation_mode=opt", "--copt=-DNATIVE_SCOPE=7"], "7/1\n"),
+            (vec![], "0/0\n"),
+            (vec!["--compilation-mode=opt", "--copt=-DNATIVE_SCOPE=7"], "7/1\n"),
+            (vec!["--compilation_mode=opt"], "0/1\n"),
+        ] {
+            let encoded = serde_json::to_string(&tokens)?;
+            let semantics = semantics_with_define_and_environment(root, "//:app", "native_test", "true", &[
+                (rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV, encoded.as_str()),
+            ])?;
+            let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
+            executed_actions.lock().unwrap().clear();
+            orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics).await?;
+            let executed = std::mem::take(&mut *executed_actions.lock().unwrap());
+            let compiles: Vec<_> = executed.iter().filter(|action| action.mnemonic == "CppCompile").collect();
+            assert_eq!(compiles.len(), 1, "each changed configuration must execute its one real compile action: {executed:?}");
+            let compile = compiles[0];
+            let cached = orchestrator.cache.get(&compile.id).expect("real compile must publish its actual ActionId");
+            assert_eq!(cached.action_id, compile.id);
+            assert_eq!(cached.exit_code, 0);
+            compile_action_ids.push(compile.id.clone());
+            let snapshot = orchestrator.snapshot_cache.get(&key).expect("native command snapshot");
+            let state = snapshot.retained_execution_state().expect("native command outputs");
+            let outputs = state.artifact_forest.get("//:app").expect("app outputs").flatten();
+            let executable = outputs.iter().find(|artifact| artifact.artifact_type == ArtifactType::Executable)
+                .expect("app executable");
+            let output = std::process::Command::new(&executable.path).current_dir(root).output()?;
+            assert!(output.status.success(), "{:?}", output.status);
+            assert_eq!(String::from_utf8(output.stdout)?, expected);
+            // Preserve the cache entry while removing only this test's object
+            // outputs. The memory-only manager has no CAS, so every request
+            // yields an actual executor ActionId, including the repeated opt
+            // request; a retained-file shortcut cannot hide its identity.
+            for artifact in &compile.outputs {
+                let path = match artifact {
+                    rush_action::Artifact::Source(path) => path,
+                    rush_action::Artifact::Derived { output_path, .. } => output_path,
+                };
+                assert!(path.starts_with(root), "refuse to remove an output outside the task-owned tree: {}", path.display());
+                std::fs::remove_file(path)?;
+            }
+        }
+        assert_ne!(compile_action_ids[0], compile_action_ids[1]);
+        assert_eq!(compile_action_ids[0], compile_action_ids[2]);
+        assert_ne!(compile_action_ids[2], compile_action_ids[3]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_option_defaults_overrides_and_reset_select_the_real_configured_closure() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"native_config\")\n")?;
+        write_file(&root.join("BUILD"), r#"
+config_setting(name = "defaults", values = {
+    "apple_platform_type": "macos", "compilation_mode": "fastbuild",
+    "stamp": "0", "crosstool_top": "@bazel_tools//tools/cpp:toolchain",
+})
+config_setting(name = "changed", values = {
+    "apple_platform_type": "ios", "compilation_mode": "opt", "stamp": "1",
+    "cpu": "aarch64", "copt": "-DNATIVE_SCOPE",
+})
+config_setting(name = "malformed_native", values = {"crosstool_top": "//bad/../pkg:tc"})
+filegroup(name = "uses_bad_native", srcs = select({":malformed_native": [], "//conditions:default": []}))
+filegroup(name = "chosen")
+filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//conditions:default": []}))
+filegroup(name = "root", srcs = select({
+    ":defaults": [":chosen"], ":changed": [":broken_branch"],
+    "//conditions:default": ["//unmatched:missing"],
+}))
+"#)?;
+        write_file(&root.join("broken/BUILD"), "config_setting(name =\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
+        let semantics = |tokens: &[&str]| -> Result<rush_command_core::CommandSemantics> {
+            let encoded = serde_json::to_string(tokens)?;
+            semantics_with_define_and_environment(root, "//:root", "native_test", "true", &[
+                (rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV, encoded.as_str()),
+            ])
+        };
+        for _ in 0..2 {
+            orchestrator.build_with_dependencies_with_semantics(vec!["//:root".into()], semantics(&[])?).await?;
+        }
+        let error = orchestrator.build_with_dependencies_with_semantics(vec!["//:root".into()], semantics(&[
+            "--apple_platform_type=ios", "--compilation_mode=opt", "--stamp",
+            "--cpu=aarch64", "--copt=-DNATIVE_SCOPE",
+        ])?).await.expect_err("the override must select the broken branch");
+        assert!(format!("{error:#}").contains("broken/BUILD"), "{error:#}");
+        orchestrator.build_with_dependencies_with_semantics(vec!["//:root".into()], semantics(&[])?).await?;
+        let malformed_semantics = semantics_with_define_and_environment(root, "//:uses_bad_native", "native_test", "true", &[
+            (rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV, "[]"),
+        ])?;
+        let error = orchestrator.build_with_dependencies_with_semantics(vec!["//:uses_bad_native".into()], malformed_semantics).await
+            .expect_err("an invalid native predicate must fail even when its branch is inactive");
+        assert!(format!("{error:#}").contains("invalid native label option"), "{error:#}");
         Ok(())
     }
 

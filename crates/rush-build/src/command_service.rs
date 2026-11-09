@@ -244,6 +244,13 @@ fn target_patterns_from_argv(argv: &[Bytes]) -> Vec<String> {
         "--define",
         "--output_base",
         "--compilation_mode",
+        "--compilation-mode",
+        "--cpu",
+        "--apple_platform_type",
+        "--crosstool_top",
+        "--copt",
+        "--features",
+        "--strip",
         "-c",
         "--jobs",
         "-j",
@@ -461,6 +468,14 @@ mod tests {
         ];
         let got = target_patterns_from_argv(&argv);
         assert_eq!(got, vec!["//tensorflow/core:framework".to_string()]);
+    }
+
+    #[test]
+    fn native_option_values_are_not_targets() {
+        let argv = ["rush", "build", "--cpu", "aarch64", "--apple_platform_type", "ios",
+            "--crosstool_top", "//tools:custom", "--copt", "-DVALUE", "//app:root"]
+            .map(b).to_vec();
+        assert_eq!(target_patterns_from_argv(&argv), ["//app:root"]);
     }
 
     #[test]

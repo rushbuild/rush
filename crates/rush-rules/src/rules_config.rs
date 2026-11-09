@@ -29,7 +29,7 @@ impl BuildRule for ConfigSettingRule {
             None => Vec::new(),
             Some(Value::Dict(values)) => values
                 .keys()
-                .filter(|key| key.as_str() != "cpu")
+                .filter(|key| !rush_command_core::native_options::supported_native_option(key))
                 .cloned()
                 .collect::<Vec<_>>(),
             Some(_) => anyhow::bail!("values must be a dictionary"),
@@ -64,6 +64,21 @@ impl BuildRule for ConfigSettingRule {
                     _ => None,
                 })
                 .unwrap_or(false);
+        let invalid_native_value = match attrs.get("values") {
+            Some(Value::Dict(values)) => {
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by_key(|(name, _)| *name);
+                entries.into_iter().find_map(|(name, value)| {
+                    if !rush_command_core::native_options::supported_native_option(name) { return None; }
+                    match value {
+                        Value::String(value) => rush_command_core::native_options::NativeConfiguration::default()
+                            .matches(name, value).err(),
+                        _ => Some(format!("native option {name:?} requires a string predicate")),
+                    }
+                })
+            }
+            _ => None,
+        };
         let configuration_error = if !has_predicate {
             Some(
                 "Either values, define_values, flag_values or constraint_values must be specified and non-empty"
@@ -74,6 +89,15 @@ impl BuildRule for ConfigSettingRule {
                 "unsupported native configuration option(s): {}",
                 unsupported_native_options.join(", ")
             ))
+        } else if invalid_native_value.is_some() {
+            invalid_native_value
+        } else if matches!(attrs.get("flag_values"), Some(Value::Dict(values)) if !values.is_empty()) {
+            // The predicate registry can retain typed defaults, but a complete
+            // declared-setting/alias/type resolver is not implemented at this
+            // configured-rule boundary. Preserve the error as metadata so an
+            // unrelated sibling stays lazy; selecting/requesting this condition
+            // must not silently turn an unresolved flag into a false predicate.
+            Some("Rush does not yet support non-empty config_setting.flag_values".to_string())
         } else {
             None
         };
@@ -373,6 +397,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_option_validation_accepts_typed_predicates_and_rejects_unknowns() {
+        let parse = |values| ConfigSettingRule.parse_attributes(&HashMap::from([
+            ("name".to_string(), Value::String("native".to_string())),
+            ("values".to_string(), Value::Dict(values)),
+        ])).unwrap();
+        let supported = parse(HashMap::from([
+            ("apple_platform_type".into(), Value::String("ios".into())),
+            ("compilation_mode".into(), Value::String("opt".into())),
+            ("stamp".into(), Value::String("1".into())),
+            ("crosstool_top".into(), Value::String("@bazel_tools//tools/cpp:toolchain".into())),
+            ("copt".into(), Value::String("-DVALUE".into())),
+        ]));
+        assert!(supported.configuration_error().is_none());
+        let invalid = parse(HashMap::from([("apple_platform_type".into(), Value::String("linux".into()))]));
+        assert!(invalid.configuration_error().unwrap().contains("invalid --apple_platform_type"));
+        let unknown = parse(HashMap::from([("unrecognized".into(), Value::String("anything".into()))]));
+        assert!(unknown.configuration_error().unwrap().contains("unsupported native configuration option"));
+        for label in ["//bad/../pkg:tc", "//pkg//sub:tc", "/absolute:tc"] {
+            let malformed = parse(HashMap::from([("crosstool_top".into(), Value::String(label.into()))]));
+            assert!(malformed.configuration_error().unwrap().contains("invalid native label option"));
+        }
+    }
+
+    #[test]
     fn config_setting_retains_constraint_metadata_without_build_edges() {
         let attrs = HashMap::from([
             ("name".to_string(), Value::String("host".to_string())),
@@ -397,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn config_setting_accepts_typed_flag_value_predicates() {
+    fn config_setting_retains_unsupported_flag_value_error_for_configured_scope() {
         let attrs = HashMap::from([
             ("name".to_string(), Value::String("default_mode".to_string())),
             (
@@ -410,6 +458,14 @@ mod tests {
         ]);
         let instance = ConfigSettingRule.parse_attributes(&attrs).unwrap();
 
-        assert!(instance.configuration_error().is_none());
+        assert_eq!(
+            instance.configuration_error(),
+            Some("Rush does not yet support non-empty config_setting.flag_values")
+        );
+        assert!(instance.is_configuration_condition());
+        assert!(
+            instance.dependencies().is_empty(),
+            "unsupported metadata is not an execution edge"
+        );
     }
 }

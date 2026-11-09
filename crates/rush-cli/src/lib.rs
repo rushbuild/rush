@@ -93,6 +93,24 @@ fn publish_effective_visibility_flags(flags: &[String]) {
 struct BazelRcBuildExpansion {
     rc_flags: Vec<String>,
     effective_visibility_flags: Vec<String>,
+    effective_native_flags: Vec<String>,
+}
+
+fn native_flag_at(tokens: &[String], index: usize) -> Result<Option<(String, bool)>> {
+    let token = &tokens[index];
+    if !rush_command_core::native_options::is_native_configuration_flag(token) { return Ok(None); }
+    if token.contains('=') || matches!(token.as_str(), "--stamp" | "--nostamp" | "--collect_code_coverage" | "--nocollect_code_coverage") {
+        return Ok(Some((token.clone(), false)));
+    }
+    let value = tokens.get(index + 1).ok_or_else(|| anyhow!("{token} requires a value"))?;
+    Ok(Some((format!("{token}={value}"), true)))
+}
+
+fn publish_effective_native_flags(flags: &[String]) -> Result<()> {
+    // JSON preserves flag boundaries, including spaces and embedded newlines.
+    std::env::set_var(rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV,
+        serde_json::to_string(flags)?);
+    Ok(())
 }
 
 fn expand_named_bazelrc_config(
@@ -132,6 +150,7 @@ fn expand_bazelrc_tokens(
 ) -> Result<BazelRcBuildExpansion> {
     let mut rc_flags = Vec::new();
     let mut effective_visibility_flags = Vec::new();
+    let mut effective_native_flags = Vec::new();
     let mut index = 0usize;
     while index < tokens.len() {
         let token = &tokens[index];
@@ -157,10 +176,18 @@ fn expand_bazelrc_tokens(
             effective_visibility_flags.extend(
                 expansion.effective_visibility_flags,
             );
+            effective_native_flags.extend(expansion.effective_native_flags);
         } else {
             rc_flags.push(token.clone());
             if is_visibility_compatibility_flag(token) {
                 effective_visibility_flags.push(token.clone());
+            }
+            if let Some((native, consumes_value)) = native_flag_at(tokens, index)? {
+                effective_native_flags.push(native);
+                if consumes_value {
+                    index += 1;
+                    rc_flags.push(tokens[index].clone());
+                }
             }
         }
         index += 1;
@@ -168,6 +195,7 @@ fn expand_bazelrc_tokens(
     Ok(BazelRcBuildExpansion {
         rc_flags,
         effective_visibility_flags,
+        effective_native_flags,
     })
 }
 
@@ -191,6 +219,8 @@ fn expand_bazelrc_build(
     let mut effective_visibility_flags =
         common.effective_visibility_flags;
     effective_visibility_flags.extend(build.effective_visibility_flags);
+    let mut effective_native_flags = common.effective_native_flags;
+    effective_native_flags.extend(build.effective_native_flags);
     let mut index = 0usize;
     while index < cli_tokens.len() {
         let token = &cli_tokens[index];
@@ -215,14 +245,19 @@ fn expand_bazelrc_build(
             effective_visibility_flags.extend(
                 flags.effective_visibility_flags,
             );
+            effective_native_flags.extend(flags.effective_native_flags);
         } else if is_visibility_compatibility_flag(token) {
             effective_visibility_flags.push(token.clone());
+        } else if let Some((native, consumes_value)) = native_flag_at(cli_tokens, index)? {
+            effective_native_flags.push(native);
+            if consumes_value { index += 1; }
         }
         index += 1;
     }
     Ok(BazelRcBuildExpansion {
         rc_flags,
         effective_visibility_flags,
+        effective_native_flags,
     })
 }
 
@@ -272,6 +307,48 @@ fn load_bazelrc_build_expansion(
     Ok(expansion)
 }
 
+/// Read option arity from the same parser schema that accepts the command.
+/// Preserve each separate value as data even when it resembles daemon routing.
+fn build_option_takes_separate_value(command: &clap::Command, token: &[u8]) -> bool {
+    let Ok(token) = std::str::from_utf8(token) else {
+        return false;
+    };
+    let takes_value = |argument: &clap::Arg| {
+        argument.get_action().takes_values() && !argument.is_require_equals_set()
+    };
+    if let Some(name) = token.strip_prefix("--") {
+        if name.contains('=') {
+            return false;
+        }
+        return command.get_arguments().any(|argument| {
+            takes_value(argument)
+                && (argument.get_long() == Some(name)
+                    || argument
+                        .get_all_aliases()
+                        .is_some_and(|aliases| aliases.contains(&name)))
+        });
+    }
+    let Some(shorts) = token.strip_prefix('-') else {
+        return false;
+    };
+    let mut shorts = shorts.chars().peekable();
+    while let Some(name) = shorts.next() {
+        let Some(argument) = command.get_arguments().find(|argument| {
+            argument.get_short() == Some(name)
+                || argument
+                    .get_all_short_aliases()
+                    .is_some_and(|aliases| aliases.contains(&name))
+        }) else {
+            return false;
+        };
+        if takes_value(argument) {
+            // A remaining suffix is an attached value, not another flag.
+            return shorts.peek().is_none();
+        }
+    }
+    false
+}
+
 fn normalized_daemon_build_argv(
     mut argv: Vec<bytes::Bytes>,
 ) -> Vec<bytes::Bytes> {
@@ -284,6 +361,11 @@ fn normalized_daemon_build_argv(
         argv[1] = bytes::Bytes::from_static(b"build");
     }
 
+    let mut parser = <Cli as clap::CommandFactory>::command();
+    parser.build();
+    let build = parser
+        .find_subcommand("build")
+        .expect("the CLI declares the build command");
     let mut normalized = Vec::with_capacity(argv.len());
     let mut index = 0;
     let mut after_terminator = false;
@@ -297,6 +379,14 @@ fn normalized_daemon_build_argv(
                 continue;
             } else if token.starts_with(b"--daemon=") {
                 index += 1;
+                continue;
+            } else if build_option_takes_separate_value(build, token) {
+                normalized.push(token.clone());
+                index += 1;
+                if let Some(value) = argv.get(index) {
+                    normalized.push(value.clone());
+                    index += 1;
+                }
                 continue;
             }
         }
@@ -499,8 +589,48 @@ FLAGS:
         defines: Vec<String>,
 
         /// Compilation mode: fastbuild, opt, or dbg
-        #[arg(long, short = 'c')]
+        #[arg(long = "compilation_mode", visible_alias = "compilation-mode", short = 'c', overrides_with = "compilation_mode")]
         compilation_mode: Option<String>,
+
+        /// Native target CPU option used by declared configuration conditions.
+        #[arg(long = "cpu", overrides_with = "native_cpu")]
+        native_cpu: Option<String>,
+
+        /// Apple platform option (macos, ios, tvos, watchos, visionos, catalyst).
+        #[arg(long = "apple_platform_type", overrides_with = "apple_platform_type")]
+        apple_platform_type: Option<String>,
+
+        /// Native C++ toolchain label used by configuration conditions.
+        #[arg(long = "crosstool_top", overrides_with = "crosstool_top")]
+        crosstool_top: Option<String>,
+
+        /// Additional option passed to C and C++ compilation (repeatable).
+        #[arg(long = "copt", allow_hyphen_values = true)]
+        copts: Vec<String>,
+
+        /// Native stamping option used by declared configuration conditions.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", overrides_with = "stamp")]
+        stamp: Option<String>,
+
+        /// Disable the native stamping option.
+        #[arg(long, overrides_with = "nostamp")]
+        nostamp: bool,
+
+        /// Native coverage configuration option used by declared conditions.
+        #[arg(long = "collect_code_coverage", num_args = 0..=1, require_equals = true, default_missing_value = "true", overrides_with = "collect_code_coverage")]
+        collect_code_coverage: Option<String>,
+
+        /// Disable the native coverage configuration option.
+        #[arg(long = "nocollect_code_coverage", overrides_with = "nocollect_code_coverage")]
+        nocollect_code_coverage: bool,
+
+        /// Native feature option used by declared configuration conditions.
+        #[arg(long, allow_hyphen_values = true)]
+        features: Vec<String>,
+
+        /// Native strip mode: always, never, or sometimes.
+        #[arg(long, overrides_with = "strip")]
+        strip: Option<String>,
 
         /// Number of parallel jobs (default: auto)
         #[arg(long, short = 'j')]
@@ -1369,6 +1499,16 @@ impl Cli {
                 config,
                 defines,
                 compilation_mode,
+                native_cpu: _,
+                apple_platform_type: _,
+                crosstool_top: _,
+                copts: _,
+                stamp: _,
+                nostamp: _,
+                collect_code_coverage: _,
+                nocollect_code_coverage: _,
+                features: _,
+                strip: _,
                 jobs,
                 disk_cache,
                 disk_cache_dir,
@@ -1442,6 +1582,10 @@ impl Cli {
                 publish_effective_visibility_flags(
                     &bazelrc_expansion.effective_visibility_flags,
                 );
+                publish_effective_native_flags(&bazelrc_expansion.effective_native_flags)?;
+                rush_command_core::native_options::NativeConfiguration::from_tokens(
+                    &bazelrc_expansion.effective_native_flags,
+                ).map_err(anyhow::Error::msg)?;
                 let bazelrc_flags = bazelrc_expansion.rc_flags;
 
                 // Bazel `--define KEY=VALUE` build settings. Publish them via
@@ -5047,6 +5191,203 @@ mod bzl_size_estimate_reuse_cli_tests {
             Some("1".into())
         );
         clean_env();
+    }
+}
+
+#[cfg(test)]
+mod native_configuration_cli_tests {
+    use super::*;
+    use rush_build::BazelRcNamedConfig;
+
+    #[test]
+    fn native_cli_accepts_real_option_spellings_and_repetition() {
+        if let Err(error) = Cli::try_parse_from(["rush", "build", "//:root", "--cpu", "k8",
+            "--cpu=aarch64", "--apple_platform_type=macos", "--apple_platform_type=ios",
+            "--crosstool_top", "//tools:custom", "--copt=-DONE", "--copt", "-DTWO",
+            "--stamp", "--nostamp", "-c", "opt", "--compilation-mode=opt", "--compilation_mode=dbg"]) {
+            panic!("native option CLI rejected a supported spelling: {error}");
+        }
+    }
+
+    #[test]
+    fn native_rc_expansion_preserves_nested_and_cli_occurrence_order() {
+        let bazelrc = BazelRc {
+            common_flags: vec!["--apple_platform_type=macos".into(), "--copt=-DCOMMON".into()],
+            build_flags: vec!["--cpu=k8".into(), "--config=outer".into()],
+            configs: HashMap::from([
+                ("outer".into(), BazelRcNamedConfig {
+                    build_flags: vec!["--apple_platform_type=ios".into(), "--config=inner".into()], ..Default::default() }),
+                ("inner".into(), BazelRcNamedConfig {
+                    build_flags: vec!["--copt".into(), "-DINNER=two words".into(), "-c".into(), "opt".into()], ..Default::default() }),
+            ]),
+            test_flags: Vec::new(), run_flags: Vec::new(), startup_flags: Vec::new(),
+        };
+        let cli = ["--apple_platform_type=macos", "--config=outer", "--cpu", "aarch64", "--compilation-mode=dbg", "--", "--apple_platform_type=macos"].map(str::to_string);
+        let expanded = expand_bazelrc_build(&bazelrc, &cli).unwrap();
+        let configuration = rush_command_core::native_options::NativeConfiguration::from_tokens(&expanded.effective_native_flags).unwrap();
+        assert_eq!(configuration.apple_platform_type, "ios");
+        assert_eq!(configuration.cpu, "aarch64");
+        assert_eq!(configuration.compilation_mode, "dbg");
+        assert_eq!(configuration.copts, ["-DCOMMON", "-DINNER=two words", "-DINNER=two words"]);
+        assert!(expanded.effective_visibility_flags.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod daemon_operand_cli_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn normalize(argv: &[&str]) -> Vec<String> {
+        normalized_daemon_build_argv(
+            argv.iter()
+                .map(|value| Bytes::copy_from_slice(value.as_bytes()))
+                .collect(),
+        )
+        .into_iter()
+        .map(|value| std::str::from_utf8(&value).unwrap().to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn daemon_transport_keeps_parser_accepted_routing_shaped_values() {
+        for option in ["--copt", "--features"] {
+            for value in ["--daemon=off", "--daemon", "--daemon=auto"] {
+                let argv = ["rush", "b", option, value, "--daemon", "on", "//:empty"];
+                let before = Cli::try_parse_from(argv).unwrap();
+                let normalized = normalize(&argv);
+                assert_eq!(normalized, ["rush", "build", option, value, "//:empty"]);
+                let after = Cli::try_parse_from(&normalized).unwrap();
+                for cli in [before, after] {
+                    let Some(Commands::Build {
+                        targets,
+                        copts,
+                        features,
+                        ..
+                    }) = cli.command
+                    else {
+                        panic!("expected a build command");
+                    };
+                    assert_eq!(targets, ["//:empty"]);
+                    if option == "--copt" {
+                        assert_eq!(copts, [value]);
+                        assert!(features.is_empty());
+                    } else {
+                        assert_eq!(features, [value]);
+                        assert!(copts.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_transport_distinguishes_joined_values_short_clusters_and_equals_only_options() {
+        for (argv, expected) in [
+            (
+                vec![
+                    "rush",
+                    "build",
+                    "--copt=--daemon=off",
+                    "//:empty",
+                    "--daemon=auto",
+                ],
+                vec!["rush", "build", "--copt=--daemon=off", "//:empty"],
+            ),
+            (
+                vec![
+                    "rush",
+                    "build",
+                    "-vj",
+                    "4",
+                    "--copt",
+                    "--daemon=off",
+                    "--daemon=auto",
+                    "//:empty",
+                ],
+                vec![
+                    "rush",
+                    "build",
+                    "-vj",
+                    "4",
+                    "--copt",
+                    "--daemon=off",
+                    "//:empty",
+                ],
+            ),
+            (
+                vec![
+                    "rush",
+                    "build",
+                    "-vj4",
+                    "--copt",
+                    "--daemon=off",
+                    "--daemon=auto",
+                    "//:empty",
+                ],
+                vec![
+                    "rush",
+                    "build",
+                    "-vj4",
+                    "--copt",
+                    "--daemon=off",
+                    "//:empty",
+                ],
+            ),
+            (
+                vec!["rush", "build", "--stamp", "--daemon=auto", "//:empty"],
+                vec!["rush", "build", "--stamp", "//:empty"],
+            ),
+            (
+                vec![
+                    "rush",
+                    "build",
+                    "--compilation-mode",
+                    "opt",
+                    "--daemon=auto",
+                    "//:empty",
+                ],
+                vec!["rush", "build", "--compilation-mode", "opt", "//:empty"],
+            ),
+            (
+                vec![
+                    "rush",
+                    "build",
+                    "--daemon=auto",
+                    "--",
+                    "--daemon=target-name",
+                ],
+                vec!["rush", "build", "--", "--daemon=target-name"],
+            ),
+        ] {
+            Cli::try_parse_from(&argv).unwrap();
+            let normalized = normalize(&argv);
+            assert_eq!(normalized, expected);
+            Cli::try_parse_from(&normalized).unwrap();
+        }
+    }
+    #[test]
+    fn daemon_transport_preserves_raw_operand_bytes() {
+        let operand = Bytes::from_static(b"--daemon=\xff");
+        let normalized = normalized_daemon_build_argv(vec![
+            Bytes::from_static(b"rush"),
+            Bytes::from_static(b"build"),
+            Bytes::from_static(b"--copt"),
+            operand.clone(),
+            Bytes::from_static(b"--daemon=auto"),
+            Bytes::from_static(b"//:empty"),
+        ]);
+        // Keep transport byte preservation separate from request validation.
+        assert_eq!(
+            normalized,
+            vec![
+                Bytes::from_static(b"rush"),
+                Bytes::from_static(b"build"),
+                Bytes::from_static(b"--copt"),
+                operand,
+                Bytes::from_static(b"//:empty"),
+            ]
+        );
     }
 }
 

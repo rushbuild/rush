@@ -25,6 +25,7 @@ use crate::ast::{CallExpr, Expr, Program, Stmt};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
+use rush_command_core::native_options::NativeConfiguration;
 
 /// Active Bazel `--define` build settings (key → value). Seeded lazily from
 /// the `RUSH_DEFINES` env var (space/comma-separated `k=v` tokens); the
@@ -45,6 +46,9 @@ static ACTIVE_DEFINES: Lazy<RwLock<HashMap<String, HashMap<String, String>>>> = 
 /// and host configuration.
 static ACTIVE_CONFIG_SETTINGS: Lazy<RwLock<HashSet<(String, String)>>> =
     Lazy::new(|| RwLock::new(HashSet::new()));
+
+static NATIVE_CONFIGURATIONS: Lazy<RwLock<HashMap<String, NativeConfiguration>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
 struct CommandConfigurationEnvironment {
@@ -280,12 +284,16 @@ fn config_setting_predicates(
             .iter()
             .map(|(key, value)| ConfigPredicate::Define(key.clone(), value.clone())),
     );
-    predicates.extend(
-        setting
-            .native_values
-            .iter()
-            .map(|(key, value)| ConfigPredicate::Native(key.clone(), value.clone())),
-    );
+    predicates.extend(setting.native_values.iter().map(|(key, value)| {
+        if key == "define" {
+            if let Some((name, value)) = value.split_once('=') {
+                return ConfigPredicate::Define(name.to_string(), value.to_string());
+            }
+        }
+        ConfigPredicate::Native(key.clone(),
+            rush_command_core::native_options::canonical_native_predicate(key, value)
+                .unwrap_or_else(|_| value.clone()))
+    }));
     predicates.extend(setting.constraint_values.iter().map(|label| {
         ConfigPredicate::Constraint(
             resolved_config_reference(scope, label)
@@ -824,7 +832,20 @@ pub fn set_define(key: String, value: String) {
 /// Idempotent. With no defines, declared native-value and platform-constraint
 /// settings can still match the host.
 pub fn begin_command(defines: &[(String, String)]) {
+    begin_command_with_native_options(defines, NativeConfiguration::default());
+}
+
+/// Install the immutable command's native option values together with defines.
+/// Every workspace scope is reset, including options omitted by this command.
+pub fn begin_command_with_native_options(
+    defines: &[(String, String)],
+    mut native_configuration: NativeConfiguration,
+) {
     let scope = configuration_scope();
+    for (key, value) in defines {
+        native_configuration.defines.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    NATIVE_CONFIGURATIONS.write().unwrap().insert(scope.clone(), native_configuration);
     let command_environment = CommandConfigurationEnvironment {
         enable_cuda: configuration_getenv("RUSH_ENABLE_CUDA").as_deref() == Some("1"),
         pycross_python_version: configuration_getenv("RUSH_PY_VERSION")
@@ -929,6 +950,8 @@ pub fn recompute_active_config_settings_public() {
 fn recompute_active_config_settings() {
     let scope = configuration_scope();
     let defs = active_defines_for_scope(&scope);
+    let native_configuration = NATIVE_CONFIGURATIONS.read().unwrap()
+        .get(&scope).cloned().unwrap_or_default();
     let seen = SEEN_CONFIG_SETTINGS.read().unwrap();
     let build_settings = SCOPED_BUILD_SETTING_VALUES.read().unwrap();
     let mut active = ACTIVE_CONFIG_SETTINGS.write().unwrap();
@@ -943,7 +966,7 @@ fn recompute_active_config_settings() {
             .iter()
             .all(|(key, value)| defs.get(key) == Some(value));
         let native_values_match = setting.native_values.iter().all(|(key, wanted)| {
-            native_config_value(key).is_some_and(|actual| actual == wanted)
+            native_configuration.matches(key, wanted).unwrap_or(false)
         });
         let constraints_match = setting.constraint_values.iter().all(|constraint| {
             resolved_config_reference(&scope, constraint)
@@ -978,17 +1001,6 @@ fn recompute_active_config_settings() {
     // recomputation so parsing or deleting an ordinary config_setting cannot
     // erase CUDA conditions activated for the current command.
     activate_generated_repository_settings();
-}
-
-fn native_config_value(key: &str) -> Option<&'static str> {
-    match key {
-        "cpu" if cfg!(target_arch = "x86_64") => Some("k8"),
-        "cpu" if cfg!(target_arch = "aarch64") => Some("aarch64"),
-        "cpu" if cfg!(target_arch = "arm") => Some("arm"),
-        "cpu" if cfg!(target_arch = "powerpc64") => Some("ppc"),
-        "cpu" if cfg!(target_arch = "s390x") => Some("s390x"),
-        _ => None,
-    }
 }
 
 /// True if any define is active (used to bust parse caches that would
@@ -1141,6 +1153,12 @@ pub fn is_active_config_setting(condition: &str) -> bool {
 /// retain their workspace identity and use this form after async or worker
 /// thread boundaries, where a thread-local scope cannot be inherited safely.
 pub fn is_active_config_setting_in_scope(scope: &str, condition: &str) -> bool {
+    // A module can evaluate a select while producing cached exports. Its
+    // captured dependency set must therefore invalidate on native options as
+    // well as defines; the registry's current value alone is not a cache key.
+    if rush_incremental::tracked::current().is_some() {
+        rush_incremental::tracked::config_fingerprint();
+    }
     let explicit_main = condition
         .strip_prefix("@//")
         .or_else(|| condition.strip_prefix("@@//"))
@@ -1715,6 +1733,36 @@ mod tests {
     }
 
     #[test]
+    fn native_options_recompute_per_command_and_remain_workspace_scoped() {
+        let _guard = isolate_config_state();
+        with_configuration_scope("native-option-scope-a", || {
+            begin_command(&[]);
+            for (name, values) in [
+                ("default", HashMap::from([("apple_platform_type".into(), "macos".into()), ("stamp".into(), "0".into())])),
+                ("changed", HashMap::from([("apple_platform_type".into(), "ios".into()), ("copt".into(), "-DSELECTED".into())])),
+            ] {
+                consider_config_setting_predicates(None, "native_cfg", name, &HashMap::new(), &values, &[], &HashMap::new());
+            }
+            assert!(is_active_config_setting("//native_cfg:default"));
+            assert!(!is_active_config_setting("//native_cfg:changed"));
+            let configuration = NativeConfiguration::from_tokens(&["--apple_platform_type=ios".into(), "--copt=-DSELECTED".into()]).unwrap();
+            begin_command_with_native_options(&[], configuration);
+            assert!(!is_active_config_setting("//native_cfg:default"));
+            assert!(is_active_config_setting("//native_cfg:changed"));
+            with_configuration_scope("native-option-scope-b", || {
+                begin_command(&[]);
+                consider_config_setting_predicates(None, "native_cfg", "changed", &HashMap::new(),
+                    &HashMap::from([("apple_platform_type".into(), "ios".into())]), &[], &HashMap::new());
+                assert!(!is_active_config_setting("//native_cfg:changed"));
+            });
+            assert!(is_active_config_setting("//native_cfg:changed"));
+            begin_command(&[]);
+            assert!(is_active_config_setting("//native_cfg:default"));
+            assert!(!is_active_config_setting("//native_cfg:changed"));
+        });
+    }
+
+    #[test]
     fn builtin_default_does_not_activate_configuration_aliases() {
         let _guard = isolate_config_state();
         for (name, package, actual) in [
@@ -2239,7 +2287,7 @@ config_setting(
     }
 
     #[test]
-    fn build_setting_values_are_scoped_but_flag_conditions_fail_closed() {
+    fn typed_build_setting_registry_predicates_are_workspace_scoped() {
         let _guard = isolate_config_state();
         let expected = HashMap::from([("//flags:mode".to_string(), "on".to_string())]);
         let register = |scope: &str, default: &str| {
@@ -2260,8 +2308,12 @@ config_setting(
         };
 
         assert!(!register("workspace-a", "off"));
-        assert!(!register("workspace-b", "on"));
-        assert!(!with_configuration_scope("workspace-b", || {
+        // This is the internal typed registry, not configured-rule admission.
+        // ConfigSettingRule keeps non-empty flag_values unsupported until the
+        // graph validates declared setting kinds/aliases; its scoped errors are
+        // exercised by the configured-closure integration controls.
+        assert!(register("workspace-b", "on"));
+        assert!(with_configuration_scope("workspace-b", || {
             is_active_config_setting("//conditions:enabled")
         }));
         assert!(!with_configuration_scope("workspace-a", || {
@@ -2275,6 +2327,22 @@ config_setting(
         assert_eq!(
             build_setting_value_in_scope("workspace-a", "//flags:mode").as_deref(),
             Some("off")
+        );
+        assert!(!register("workspace-b", "off"));
+        assert!(register("workspace-a", "on"));
+        assert!(!with_configuration_scope("workspace-b", || {
+            is_active_config_setting("//conditions:enabled")
+        }));
+        assert!(with_configuration_scope("workspace-a", || {
+            is_active_config_setting("//conditions:enabled")
+        }));
+        assert_eq!(
+            build_setting_value_in_scope("workspace-b", "//flags:mode").as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            build_setting_value_in_scope("workspace-a", "//flags:mode").as_deref(),
+            Some("on")
         );
     }
 

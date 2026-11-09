@@ -160,6 +160,28 @@ impl CommandSemantics {
     /// is no wire protocol involved) and tolerates a missing cwd (falls back to
     /// an empty working directory rather than aborting the build).
     pub fn from_process() -> Self {
+        let (argv, env, working_directory, workspace_config) = Self::capture_process();
+        Self::from_parts(argv, env, working_directory, workspace_config)
+    }
+
+    /// Capture the legacy embedding API's constructor mode as the lowest
+    /// precedence native option. Explicit client flags remain authoritative.
+    /// This changes only this returned snapshot, never the process environment.
+    pub fn from_process_with_compilation_mode_default(mode: &str) -> Result<Self, CommandError> {
+        let (argv, mut env, working_directory, workspace_config) = Self::capture_process();
+        let key = crate::native_options::EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes();
+        let mut tokens: Vec<String> = if let Some(raw) = env.get(key) {
+            serde_json::from_slice(raw).map_err(|error| CommandError::InvalidRequest(format!("invalid effective native flags: {error}")))?
+        } else {
+            argv.iter().map(|argument| String::from_utf8_lossy(argument).into_owned()).collect()
+        };
+        tokens.insert(0, format!("--compilation_mode={mode}"));
+        env.insert(Bytes::copy_from_slice(key), Bytes::from(serde_json::to_vec(&tokens)
+            .map_err(|error| CommandError::InvalidRequest(format!("invalid native option snapshot: {error}")))?));
+        Ok(Self::from_parts(argv, env, working_directory, workspace_config))
+    }
+
+    fn capture_process() -> (Vec<Bytes>, BTreeMap<Bytes, Bytes>, Bytes, Vec<(Vec<u8>, Vec<u8>)>) {
         // argv[0] is the program name, exactly as `from_run_request` expects.
         let argv: Vec<Bytes> = std::env::args_os()
             .map(|a| Bytes::from(os_string_bytes(&a)))
@@ -195,7 +217,7 @@ impl CommandSemantics {
             .map(read_workspace_config_content)
             .unwrap_or_default();
 
-        Self::from_parts(argv, env, working_directory, workspace_config)
+        (argv, env, working_directory, workspace_config)
     }
 
     /// Shared constructor for [`from_run_request`] and [`from_process`]: given an
@@ -218,10 +240,15 @@ impl CommandSemantics {
         let mut idx = 1usize; // skip argv[0] (program name)
         while idx < argv.len() {
             let tok = &argv[idx];
+            let native_value_flag = std::str::from_utf8(tok).ok().is_some_and(|token| {
+                crate::native_options::is_native_configuration_flag(token)
+                    && !token.contains('=')
+                    && !matches!(token, "--define" | "--stamp" | "--nostamp" | "--collect_code_coverage" | "--nocollect_code_coverage")
+            });
             // Worker selection and backend identity change executable results.
             // Retain space-form values in the same fingerprint as KEY=VALUE.
             if [b"--remote-executor".as_slice(), b"--remote-instance", b"--remote-platform"]
-                .contains(&tok.as_ref()) {
+                .contains(&tok.as_ref()) || native_value_flag {
                 if let Some(value) = argv.get(idx + 1) {
                     let mut canonical = tok.to_vec();
                     canonical.push(b'='); canonical.extend_from_slice(value);
