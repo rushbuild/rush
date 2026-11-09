@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-const PROOF_SUFFIX: &str = ".rush-workspace-inputs-v3.json";
+const PROOF_SUFFIX: &str = ".rush-workspace-inputs-v4.json";
 
 #[derive(Debug)]
 pub struct WorkspaceRepositoryFetchContext {
@@ -27,6 +27,8 @@ pub struct WorkspaceRepositoryFetchContext {
     executable: PathBuf,
     consistency_inputs: Vec<(Vec<u8>, Option<SourceStat>)>,
     pending_definition: std::sync::Mutex<Option<DefinitionSnapshot>>,
+    required_module: Option<String>,
+    pending_authority: std::sync::Mutex<SourceAuthority>,
 }
 
 impl WorkspaceRepositoryFetchContext {
@@ -38,6 +40,31 @@ impl WorkspaceRepositoryFetchContext {
         }
         Ok(())
     }
+    /// Restrict this invocation to an exact .bzl source consumer. Graph-target
+    /// fetches do not set this purpose and cannot reuse closure-only authority.
+    pub fn for_required_module(mut self, repository: &str, label: &str) -> Result<Self> {
+        self.required_module = Some(canonical_required_module_label(repository, label)?);
+        Ok(self)
+    }
+
+    /// A successful declaration query already executed every WORKSPACE load.
+    /// Admit only the requested canonical label and the exact file identity
+    /// actually consumed in that stable, authoritative loadfiles closure.
+    pub fn required_module_source_is_materialized(
+        &self, workspace: &Path, output_base: &Path, repository: &str,
+    ) -> Result<bool> {
+        let Some(required) = &self.required_module else { return Ok(false); };
+        let definition = self.pending_definition.lock()
+            .map_err(|_| anyhow::anyhow!("repository definition lock poisoned"))?;
+        let Some(definition) = definition.as_ref() else { return Ok(false); };
+        if !required_module_matches(definition, workspace, output_base, repository, required)? {
+            return Ok(false);
+        }
+        *self.pending_authority.lock()
+            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))? = SourceAuthority::LoadedWorkspaceClosure;
+        Ok(true)
+    }
+
     /// Native local_repository roots (including installed tool sources) are
     /// already materialized when Bazel's definition query resolves their source
     /// closure. Admit only the authoritative declared path, never a name-based
@@ -69,7 +96,12 @@ impl WorkspaceRepositoryFetchContext {
         }
         let source = output_base.join("external").join(repository);
         match std::fs::canonicalize(source) {
-            Ok(actual) => Ok(path_identity(&actual)? == *canonical_root),
+            Ok(actual) if path_identity(&actual)? == *canonical_root => {
+                *self.pending_authority.lock()
+                    .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))? = SourceAuthority::NativeLocal;
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
@@ -82,7 +114,17 @@ struct InvocationProof {
     version: u32,
     context_sha256: String,
     marker_sha256: String,
+    authority: SourceAuthority,
     definition: DefinitionSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum SourceAuthority {
+    FetchedRepository,
+    NativeLocal,
+    /// Only exact modules in this proof's authoritative loaded closure are
+    /// admitted; this authority cannot skip a graph-target materialization.
+    LoadedWorkspaceClosure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +173,9 @@ struct DefinitionInput {
 struct DefinitionSnapshot {
     declaration_sha256: String,
     inputs: Vec<DefinitionInput>,
+    /// Actual .bzl consumers reported by loadfiles(), excluding buildfiles()'s
+    /// synthetic package BUILD labels. Each owner, path and file value is exact.
+    loaded_modules: Vec<DefinitionInput>,
     profile: RepositoryProfile,
 }
 
@@ -145,13 +190,82 @@ impl DefinitionSnapshot {
     fn same_values(&self, other: &Self) -> bool {
         self.profile == other.profile
             && self.declaration_sha256 == other.declaration_sha256
-            && self.inputs.len() == other.inputs.len()
-            && self.inputs.iter().zip(&other.inputs).all(|(left, right)| {
-                left.label == right.label
-                    && left.canonical_path == right.canonical_path
-                    && left.sha256 == right.sha256
-            })
+            && definition_input_values_equal(&self.inputs, &other.inputs)
+            && definition_input_values_equal(&self.loaded_modules, &other.loaded_modules)
     }
+}
+
+fn definition_input_values_equal(left: &[DefinitionInput], right: &[DefinitionInput]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(left, right)| {
+        left.label == right.label
+            && left.canonical_path == right.canonical_path
+            && left.sha256 == right.sha256
+    })
+}
+
+fn canonical_required_module_label(repository: &str, label: &str) -> Result<String> {
+    if repository.is_empty() || matches!(repository, "." | "..")
+        || repository.bytes().any(|byte| !byte.is_ascii_alphanumeric() && !b"._-+~".contains(&byte))
+    {
+        bail!("required module repository is not a valid path component");
+    }
+    let canonical = label.strip_prefix("@@").map(|rest| format!("@{rest}"))
+        .unwrap_or_else(|| label.to_owned());
+    let prefix = format!("@{repository}//");
+    let relative = canonical.strip_prefix(&prefix)
+        .context("required module label is outside its declared repository")?;
+    let (package, target) = relative.split_once(':')
+        .context("required module needs an exact package:target label")?;
+    if target.is_empty() || package.contains(':') || target.contains(':')
+        || canonical.bytes().any(|byte| matches!(byte, 0 | b'\n' | b'\r'))
+        || Path::new(package).components().chain(Path::new(target).components())
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("required module is not a package-relative source label");
+    }
+    Ok(canonical)
+}
+
+fn required_module_matches(
+    definition: &DefinitionSnapshot, workspace: &Path, output_base: &Path,
+    repository: &str, label: &str,
+) -> Result<bool> {
+    let required = canonical_required_module_label(repository, label)?;
+    let Some(loaded) = definition.loaded_modules.iter().find(|input|
+        canonical_required_module_label(repository, &input.label).is_ok_and(|actual| actual == required))
+    else { return Ok(false); };
+    // Membership is label/owner-sensitive; identical bytes in another repo do
+    // not authorize this module. The canonical path and stat must also match.
+    let current = match definition_inputs(workspace, output_base, &[required]) {
+        Ok(mut inputs) => inputs.pop().context("required module input omitted")?,
+        Err(error) if error.chain().filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(|error| error.kind() == std::io::ErrorKind::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(loaded.canonical_path == current.canonical_path && loaded.stat == current.stat
+        && loaded.sha256 == current.sha256
+        && definition.inputs.iter().any(|input| input == loaded))
+}
+
+fn loaded_module_labels(output: &str) -> Result<Vec<String>> {
+    let mut labels = output.lines().filter(|line| !line.is_empty())
+        .map(str::to_owned).collect::<Vec<_>>();
+    if labels.iter().any(|label| !label.contains(":") || !(label.starts_with("//") || label.starts_with('@'))) {
+        bail!("Bazel loadfiles query returned an unsupported module label");
+    }
+    labels.sort();
+    labels.dedup();
+    Ok(labels)
+}
+
+fn query_loaded_module_labels(
+    context: &WorkspaceRepositoryFetchContext,
+    workspace: &Path,
+    output_base: &Path,
+    repository: &str,
+) -> Result<Vec<String>> {
+    loaded_module_labels(&query_definition_output(context, workspace, output_base,
+        repository, "label", format!("loadfiles(//external:{repository})"))?)
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -371,6 +485,8 @@ pub fn prepare_workspace_repository_fetch(
         executable,
         consistency_inputs,
         pending_definition: std::sync::Mutex::new(None),
+        required_module: None,
+        pending_authority: std::sync::Mutex::new(SourceAuthority::FetchedRepository),
     })
 }
 
@@ -687,7 +803,9 @@ fn capture_definition(
         repository,
         true,
     )?)?;
+    let module_labels = query_loaded_module_labels(context, workspace, output_base, repository)?;
     let before = definition_inputs(workspace, output_base, &labels)?;
+    let modules_before = definition_inputs(workspace, output_base, &module_labels)?;
     let declaration = query_definition(context, workspace, output_base, repository, false)?;
     let metadata = query_definition_output(
         context,
@@ -704,13 +822,18 @@ fn capture_definition(
         repository,
         true,
     )?)?;
+    let after_module_labels = query_loaded_module_labels(context, workspace, output_base, repository)?;
     let after = definition_inputs(workspace, output_base, &after_labels)?;
-    if labels != after_labels || before != after {
+    let modules_after = definition_inputs(workspace, output_base, &after_module_labels)?;
+    if labels != after_labels || before != after
+        || module_labels != after_module_labels || modules_before != modules_after
+    {
         bail!("WORKSPACE definition closure changed during repository declaration query");
     }
     Ok(DefinitionSnapshot {
         declaration_sha256: digest(&serde_json::to_vec(&(&declaration, &metadata))?),
         inputs: after,
+        loaded_modules: modules_after,
         profile: repository_profile(&metadata, workspace, repository)?,
     })
 }
@@ -875,8 +998,22 @@ fn cached_inputs_are_current(
         Ok(proof) => proof,
         Err(_) => return Ok(false),
     };
-    if proof_value.version != 3 || proof_value.context_sha256 != context.fingerprint {
+    if proof_value.version != 4 || proof_value.context_sha256 != context.fingerprint {
         return Ok(false);
+    }
+    match &proof_value.authority {
+        SourceAuthority::FetchedRepository => {},
+        SourceAuthority::NativeLocal => {
+            if !matches!(&proof_value.definition.profile, RepositoryProfile::NativeLocal { .. }) {
+                bail!("native-local source authority has no native-local declaration");
+            }
+        }
+        SourceAuthority::LoadedWorkspaceClosure => {
+            let Some(required) = &context.required_module else { return Ok(false); };
+            if !required_module_matches(&proof_value.definition, workspace, output_base, repository, required)? {
+                return Ok(false);
+            }
+        }
     }
     let labels: Vec<_> = proof_value
         .definition
@@ -899,6 +1036,8 @@ fn cached_inputs_are_current(
     let observed = DefinitionSnapshot {
         declaration_sha256: proof_value.definition.declaration_sha256.clone(),
         inputs: observed_inputs,
+        loaded_modules: definition_inputs(workspace, output_base,
+            &proof_value.definition.loaded_modules.iter().map(|input| input.label.clone()).collect::<Vec<_>>())?,
         profile: proof_value.definition.profile.clone(),
     };
     if !proof_value.definition.same_values(&observed) {
@@ -941,6 +1080,9 @@ fn verify_definition_bracket(
         .map(|input| input.label.as_str())
         .collect();
     let mut differences = Vec::new();
+    if before.loaded_modules != after.loaded_modules {
+        differences.push("actual loaded-module labels, file values or identities changed".to_string());
+    }
     if before.declaration_sha256 != after.declaration_sha256 {
         differences.push(format!(
             "declaration output {} -> {}",
@@ -987,9 +1129,11 @@ fn verify_definition_bracket(
     bail!("WORKSPACE repository definition changed during materialization; source was not admitted: {}", differences.join("; "));
 }
 
-/// Call only after successful genuine Bazel materialization under `context`,
-/// or after verifying a native local root against its authoritative declaration. The native
-/// downloader and an existing marker cannot create this invocation authority.
+/// Call only after successful genuine Bazel materialization, a verified native
+/// local root, or an exact source module already consumed by the successful
+/// WORKSPACE definition query under `context`. All three retain the same full
+/// definition/stat/context/marker bracket. Closure-only authority cannot admit
+/// graph-target fetches; existing markers never create authority on their own.
 pub fn record_workspace_repository_fetch(
     workspace: &Path,
     output_base: &Path,
@@ -1043,9 +1187,11 @@ fn publish_workspace_fetch(
         }
     }
     let payload = serde_json::to_vec(&InvocationProof {
-        version: 3,
+        version: 4,
         context_sha256: context.fingerprint.clone(),
         marker_sha256: marker_sha256.clone(),
+        authority: context.pending_authority.lock()
+            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))?.clone(),
         definition,
     })?;
     // This sidecar lives beside Bazel's own marker, outside archive contents.
@@ -1088,6 +1234,8 @@ mod tests {
             executable: PathBuf::from("unused-fixture-tool"),
             consistency_inputs: Vec::new(),
             pending_definition: std::sync::Mutex::new(None),
+            required_module: None,
+            pending_authority: std::sync::Mutex::new(SourceAuthority::FetchedRepository),
         }
     }
 
@@ -1095,6 +1243,7 @@ mod tests {
         DefinitionSnapshot {
             declaration_sha256: digest(b"unit fixture declaration, no Bazel execution claim"),
             inputs: Vec::new(),
+            loaded_modules: Vec::new(),
             profile: RepositoryProfile::RepositoryRule,
         }
     }
@@ -1130,6 +1279,81 @@ mod tests {
         // a unit fixture, not a claim that the test executed a repository rule.
         std::fs::write(&marker, format!("{}\nSTARLARK_SEMANTICS -1438583352\nARCH: {}\nFILE://patches:fix.patch {}\nENV:TF_SYSTEM_LIBS \\0\n{suffix}", "a".repeat(64), std::env::consts::ARCH, digest(b"genuine patch bytes\n"))).unwrap();
         marker
+    }
+
+    #[test]
+    fn required_module_authority_requires_actual_owner_label_and_file_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        marker(temp.path(), &output, "");
+        let source = output.join("external/source");
+        let other = output.join("external/other");
+        std::fs::create_dir_all(&other).unwrap();
+        for root in [&source, &other] {
+            std::fs::create_dir_all(root.join("defs/subdir")).unwrap();
+            std::fs::write(root.join("defs/subdir/child.bzl"), b"VALUE = 42\n").unwrap();
+        }
+        let label = "@source//defs:subdir/child.bzl";
+        let context = context().for_required_module("source", label).unwrap();
+        let definition = tracked::test_scope(temp.path(), || {
+            let own = definition_inputs(temp.path(), &output, &[label.into()]).unwrap();
+            let other = definition_inputs(temp.path(), &output, &["@other//defs:subdir/child.bzl".into()]).unwrap();
+            let mut definition = fixture_definition();
+            definition.inputs = own.clone();
+            *context.pending_definition.lock().unwrap() = Some(definition.clone());
+            assert!(!context.required_module_source_is_materialized(temp.path(), &output, "source").unwrap(), "a file on disk is not a loadfiles consumer");
+            definition.inputs.extend(other.clone());
+            definition.loaded_modules = other;
+            *context.pending_definition.lock().unwrap() = Some(definition.clone());
+            assert!(!context.required_module_source_is_materialized(temp.path(), &output, "source").unwrap(), "identical bytes owned by another repository do not qualify");
+            definition.loaded_modules = own;
+            *context.pending_definition.lock().unwrap() = Some(definition.clone());
+            assert!(context.required_module_source_is_materialized(temp.path(), &output, "source").unwrap());
+            assert_eq!(*context.pending_authority.lock().unwrap(), SourceAuthority::LoadedWorkspaceClosure);
+            publish_workspace_fetch(temp.path(), &output, "source", &context, definition.clone()).unwrap();
+            assert!(cached_inputs_are_current(temp.path(), &output, "source", &context).unwrap());
+            assert!(!cached_inputs_are_current(temp.path(), &output, "source", &self::context()).unwrap(), "graph purpose must run genuine fetch");
+            definition
+        });
+        // Refresh must not accept a replaced inode merely because bytes match.
+        let replacement = source.join("replacement.bzl");
+        std::fs::write(&replacement, b"VALUE = 42\n").unwrap();
+        std::fs::rename(replacement, source.join("defs/subdir/child.bzl")).unwrap();
+        tracked::test_scope(temp.path(), || {
+            assert!(!required_module_matches(&definition, temp.path(), &output, "source", label).unwrap());
+            assert!(!cached_inputs_are_current(temp.path(), &output, "source", &context).unwrap());
+        });
+        std::fs::write(source.join("defs/subdir/child.bzl"), b"VALUE = 43\n").unwrap();
+        tracked::test_scope(temp.path(), || {
+            assert!(!required_module_matches(&definition, temp.path(), &output, "source", label).unwrap());
+        });
+        assert!(self::context().for_required_module("source", "@other//defs:subdir/child.bzl").is_err());
+        assert!(self::context().for_required_module("source", "@source//defs/subdir/child.bzl").is_err());
+    }
+
+    #[test]
+    fn actual_loaded_closure_changes_and_failed_queries_never_publish_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        marker(temp.path(), &output, "");
+        let context = context().for_required_module("source", "@source//:defs.bzl").unwrap();
+        tracked::test_scope(temp.path(), || {
+            let error = inputs_are_current_with_definition_loader(temp.path(), &output, "source", &context,
+                || bail!("actual module query failed")).unwrap_err();
+            assert!(error.to_string().contains("actual module query failed"));
+            assert!(context.pending_definition.lock().unwrap().is_none());
+            assert!(!context.required_module_source_is_materialized(temp.path(), &output, "source").unwrap());
+            let (_, proof) = repository_paths(&output, "source").unwrap();
+            assert!(!proof.exists());
+            let mut before = fixture_definition();
+            std::fs::write(temp.path().join("defs.bzl"), b"VALUE = 42\n").unwrap();
+            before.inputs = definition_inputs(temp.path(), &output, &["//:defs.bzl".into()]).unwrap();
+            before.loaded_modules = before.inputs.clone();
+            let mut no_module_load = before.clone();
+            no_module_load.loaded_modules.clear();
+            assert!(!before.same_values(&no_module_load));
+            assert!(verify_definition_bracket(&before, &no_module_load).is_err());
+        });
     }
 
     #[test]
@@ -1389,6 +1613,7 @@ mod tests {
             tracked::test_scope(temp.path(), || DefinitionSnapshot {
                 declaration_sha256: digest(declaration),
                 inputs: definition_inputs(temp.path(), &output, &["//:defs.bzl".into()]).unwrap(),
+                loaded_modules: definition_inputs(temp.path(), &output, &["//:defs.bzl".into()]).unwrap(),
                 profile: RepositoryProfile::RepositoryRule,
             })
         };

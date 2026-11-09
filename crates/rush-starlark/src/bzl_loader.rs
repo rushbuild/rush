@@ -7830,22 +7830,27 @@ impl BzlLoader {
     }
 
     /// A Starlark load reads a source file, which need not be exported as a
-    /// target. Materialize its owning package, then resolve/read the actual
-    /// module through normal source checks without changing upstream BUILD.
+    /// target. Reuse a proved actual WORKSPACE module load, or fall back to
+    /// genuine package materialization and normal source checks. This purpose
+    /// cannot authorize a graph-target fetch or change upstream BUILD.
     pub fn fetch_declared_workspace_repository_for_module(workspace_root: &Path, repo_name: &str, requested: &str) -> Result<Option<PathBuf>> {
         let goal = Self::workspace_module_package_goal(repo_name, requested)?;
-        Self::fetch_declared_workspace_repository_for_label(workspace_root, repo_name, Some(&goal))
+        Self::fetch_declared_workspace_repository_with_purpose(workspace_root, repo_name, Some(&goal), Some(requested))
     }
 
     /// Materialize the requested repository package with non-forcing fetch.
     /// A known requested .bzl/file/rule label avoids loading unrelated packages.
     pub fn fetch_declared_workspace_repository_for_label(workspace_root: &Path, repo_name: &str, requested_label: Option<&str>) -> Result<Option<PathBuf>> {
+        Self::fetch_declared_workspace_repository_with_purpose(workspace_root, repo_name, requested_label, None)
+    }
+
+    fn fetch_declared_workspace_repository_with_purpose(workspace_root: &Path, repo_name: &str, requested_label: Option<&str>, required_module: Option<&str>) -> Result<Option<PathBuf>> {
         if repo_name.is_empty() || repo_name == "." || repo_name == ".."
             || repo_name.bytes().any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.' | b'+' | b'~'))
         {
             anyhow::bail!("declared repository name is not a single valid path component");
         }
-        Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, false, true, requested_label)
+        Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, false, true, requested_label, required_module)
     }
 
     fn admit_registered_workspace_repository(&self, repo_name: &str, path: &Path) -> Result<PathBuf> {
@@ -7877,7 +7882,7 @@ impl BzlLoader {
         repo_name: &str,
         canonical: bool,
     ) -> Result<Option<PathBuf>> {
-        Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, canonical, false, None)
+        Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, canonical, false, None, None)
     }
 
     fn fetch_repo_via_bazel_with_policy(
@@ -7886,6 +7891,7 @@ impl BzlLoader {
         canonical: bool,
         declared_workspace: bool,
         requested_label: Option<&str>,
+        required_module: Option<&str>,
     ) -> Result<Option<PathBuf>> {
         let bzlmod_only = workspace_root.join("MODULE.bazel").exists()
             && !workspace_root.join("WORKSPACE").exists()
@@ -8028,12 +8034,24 @@ impl BzlLoader {
             None
         } else {
             let context = crate::fetch_strategy::prepare_workspace_repository_fetch(workspace_root, &bazel_binary)?;
+            let context = match required_module {
+                Some(module) => context.for_required_module(repo_name, module)?,
+                None => context,
+            };
             if crate::fetch_strategy::workspace_repository_inputs_are_current(
                 workspace_root, &output_base, repo_name, &context,
             )? {
                 return Ok(Some(output_base.join("external").join(repo_name)));
             }
             if context.native_local_source_is_materialized(&output_base, repo_name)? {
+                crate::fetch_strategy::record_workspace_repository_fetch(workspace_root, &output_base, repo_name, &context)?;
+                return Ok(Some(output_base.join("external").join(repo_name)));
+            }
+            if context.required_module_source_is_materialized(workspace_root, &output_base, repo_name)? {
+                // The successful WORKSPACE declaration query is the genuine
+                // consumer of this exact source module. Preserve its original
+                // package:target; do not load an unrelated package BUILD merely
+                // to fetch a source that Bazel has already loaded successfully.
                 crate::fetch_strategy::record_workspace_repository_fetch(workspace_root, &output_base, repo_name, &context)?;
                 return Ok(Some(output_base.join("external").join(repo_name)));
             }

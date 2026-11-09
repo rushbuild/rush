@@ -303,3 +303,98 @@ http_archive(name="nested_first_fetch", urls=[{url:?}], sha256={sha:?}, strip_pr
     server.abort();
     let _ = server.await;
 }
+
+/// A WORKSPACE load is already a genuine consumer of its exact .bzl file. It
+/// does not authorize unrelated graph targets or every other file in the repo.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires explicitly configured RUSH_BAZEL_PATH pointing to Bazel 6.5.0"]
+async fn workspace_loaded_module_admits_exact_source_without_loading_broken_root_build() {
+    let binary = PathBuf::from(std::env::var_os("RUSH_BAZEL_PATH").expect("set exact Bazel 6.5.0"));
+    assert!(binary.is_absolute());
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "bazel 6.5.0");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let cache = rush_build::cache_paths::workspace_cache_root(root);
+    assert!(cache.starts_with(root));
+    let _shutdown = BazelShutdown {
+        binary, output: cache.join("bazel_output_base"), workspace: root.to_path_buf(),
+    };
+    std::fs::write(root.join("BUILD"), "").unwrap();
+    std::fs::write(root.join("rules.bzl"), r#"
+def _impl(ctx):
+    ctx.file("defs.bzl", "VALUE = 42\n")
+    ctx.file("unloaded.bzl", "VALUE = 42\n")
+    ctx.file("nested/BUILD", "")
+    ctx.file("nested/subdir/child.bzl", "VALUE = 43\n")
+    ctx.file("BUILD.bazel", 'load("@undefined_docs//:defs.bzl", "docs")\ndocs(name = "broken")\n')
+source_repository = repository_rule(implementation = _impl)
+"#).unwrap();
+    let workspace = r#"workspace(name = "loaded_module_control")
+load("//:rules.bzl", "source_repository")
+source_repository(name = "source_fixture")
+source_repository(name = "other_fixture")
+load("@source_fixture//:defs.bzl", "VALUE")
+load("@source_fixture//nested:subdir/child.bzl", CHILD = "VALUE")
+"#;
+    std::fs::write(root.join("WORKSPACE"), workspace).unwrap();
+    let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
+    let io = orchestrator.install_fresh_tracked_io_for_test();
+    let source = tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
+        let source = rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_module(
+            root, "source_fixture", "@source_fixture//:defs.bzl",
+        ).unwrap().unwrap();
+        let mut loader = rush_starlark::BzlLoader::new(root.to_path_buf());
+        let values = loader.load_bzl("@source_fixture//:defs.bzl", &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(values["VALUE"], rush_starlark::Value::Int(42));
+        source
+    }));
+    assert!(std::fs::read_to_string(source.join("BUILD.bazel")).unwrap().contains("@undefined_docs"));
+    let proof_path = cache.join("bazel_output_base/external/@source_fixture.rush-workspace-inputs-v4.json");
+    let proof_bytes = std::fs::read(&proof_path).unwrap();
+    let proof: serde_json::Value = serde_json::from_slice(&proof_bytes).unwrap();
+    assert_eq!(proof["version"], 4);
+    assert_eq!(proof["authority"], "LoadedWorkspaceClosure");
+    assert!(proof["definition"]["loaded_modules"].as_array().unwrap().iter()
+        .any(|module| module["label"] == "@source_fixture//:defs.bzl"));
+    // A second exact module in the frozen closure reuses this same authority,
+    // retaining package:target even when target includes a subdirectory.
+    let io = orchestrator.install_fresh_tracked_io_for_test();
+    tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
+        let mut loader = rush_starlark::BzlLoader::new(root.to_path_buf());
+        let values = loader.load_bzl("@source_fixture//nested:subdir/child.bzl", &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(values["VALUE"], rush_starlark::Value::Int(43));
+    }));
+    assert_eq!(std::fs::read(&proof_path).unwrap(), proof_bytes);
+    // The graph route must perform its actual target fetch and fail on the
+    // broken BUILD even though a source-only invocation proof already exists.
+    let io = orchestrator.install_fresh_tracked_io_for_test();
+    let error = tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
+        rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_label(
+            root, "source_fixture", Some("@source_fixture//:all"),
+        ).unwrap_err()
+    }));
+    assert!(format!("{error:#}").contains("fetch @source_fixture//:all"));
+    assert_eq!(std::fs::read(&proof_path).unwrap(), proof_bytes, "a failed fetch cannot publish authority");
+    for (repo, module) in [
+        ("source_fixture", "@source_fixture//:unloaded.bzl"),
+        ("other_fixture", "@other_fixture//:defs.bzl"),
+    ] {
+        let io = orchestrator.install_fresh_tracked_io_for_test();
+        let error = tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
+            rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_module(root, repo, module).unwrap_err()
+        }));
+        assert!(format!("{error:#}").contains("fetch "), "{module}: {error:#}");
+    }
+    // A failing module query must invalidate the old closure without using its
+    // still-present marker/source as success evidence.
+    std::fs::write(root.join("WORKSPACE"), format!("{workspace}load(\"@source_fixture//:missing.bzl\", \"MISSING\")\n")).unwrap();
+    let io = orchestrator.install_fresh_tracked_io_for_test();
+    let error = tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
+        rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_module(root, "source_fixture", "@source_fixture//:defs.bzl").unwrap_err()
+    }));
+    assert!(format!("{error:#}").contains("repository declaration query"));
+    assert_eq!(std::fs::read(&proof_path).unwrap(), proof_bytes);
+    assert_eq!(std::fs::read_to_string(source.join("defs.bzl")).unwrap(), "VALUE = 42\n");
+}
