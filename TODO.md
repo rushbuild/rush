@@ -11,6 +11,7 @@ before implementation. All remain open until their evidence is recorded.
 | P0 | Run the Chores supervised pilot | One real repair plus denied, stale, missing-test and interrupted cases; patch and evidence retained |
 | P0 | Qualify provider/account and GitHub adapters | Both clients use explicit routes; quota exhaustion pauses; writes enforce reviewed head/target and reconcile receipts |
 | P1 | Add PR polling and bounded dispatch | Deduplication, exclusive claims, budgets, auth loss and restart tests; human adopts schedule |
+| P1 | Preflight Linux capture credentials | Reject unsupported credential states before tracing; qualify the same mapped-namespace profile from Make/capture through assembly/replay, preserving full groups, capabilities and output checks |
 | P1 | Extract Kbuild receipt/provenance modules | One private-module move with unchanged snapshot encoding and rejection tests |
 | P1 | Extract orchestration phases | Preserve graph publication and freshness; affected command/no-op tests pass |
 | P1 | Extend remote-execution qualification | Qualify a second backend, TLS and nonempty instances; add recovery/cancellation and declared dynamic dependencies; resolve the retained HIP runtime failure before claiming GPU parity |

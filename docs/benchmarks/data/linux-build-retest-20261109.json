@@ -1,0 +1,473 @@
+{
+  "schema": "rush.linux-build-check.v1",
+  "date": "2026-11-09",
+  "capture_profile": "login credentials for Make/capture/derivation; single-ID user namespace for assembly/replay",
+  "scope_status": "both snapshot assemblies refused captured group credentials; replay not run",
+  "rush_source_commit": "f9d97fe8d2c7540f28da7a88657c21c4b9b5879f",
+  "rush_engine_commit": "b059a257874270dbb17ebebeb2bee6f3546688c3",
+  "gate_example": "kbuild_snapshot_gate",
+  "gate_sha256": "67d84ddfefdca958442937dc9d205cb43cdbb01f8031d263dfb0f833d2c4395d",
+  "gate_build_command": [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "rush-build",
+    "--example",
+    "kbuild_snapshot_gate",
+    "-j8"
+  ],
+  "kernel_commit": "35568770debb5fab088d5d6c2b6a535ad6e8cb4d",
+  "kernel_tree": "116df9506075825b4f676ff33443a8f3acbc6e3e",
+  "kernel_public_base": "28924df2a08f440c73991b83028032c901de2ae4",
+  "public_series_verification": {
+    "public_series": "20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org",
+    "base": "28924df2a08f440c73991b83028032c901de2ae4",
+    "measured_tip": "35568770debb5fab088d5d6c2b6a535ad6e8cb4d",
+    "patch_count": 23,
+    "stable_patch_ids_equal": true,
+    "public_mbox_sha256": "f6d1f2b19ef0b7083f4589ff8022cc83cfe2a73401399dc58c48e85295c6055d",
+    "stable_patch_ids": [
+      "0109e6c90edb0328e5d74f48de444182aa4c14d4",
+      "f3740f9cb6528455e1f3425e5f836641148d1840",
+      "8314e18a90416904c7e88e32fd8264135ab70248",
+      "7272feaba3418892c43966b0150fc244b4c1c1e7",
+      "6b2ee4f2beb5604383163362421b6bda6ea448e0",
+      "88ba86e99496160ade7b8d95bd83c110b0eb090e",
+      "ac46ad2868e42a1a3db420e584edd1ece61a1da5",
+      "126fdec25a931eb9ec0aac9889586578b04a7a67",
+      "276cfe9acba771f797aa6683e914076fee677a07",
+      "a7e5db87ed68572fbfe3d30a2770da8be8dea97e",
+      "90ebf8380596facacd2f0d8f545c1bf254c5a2f6",
+      "6a4746e939b3bf329bc250ddcff98926cfc32d77",
+      "ab65470181ec156ac2fa18c2a4efc227cf441036",
+      "a259116799b56618779a17fc238d2a9c61a2e195",
+      "cc3b143e4218a36fcb75dfa3562f1a3eca8fe582",
+      "2c6ff3de126b3063f2f0755aa0f6f60b7d898fe4",
+      "c8c40f24a58579c8809dabb4515f66952734ca0d",
+      "fb714279c60e02b4195306be198f2948c41c72e7",
+      "835f45f17d5be4e41c6a7812ddd28a590c851d8d",
+      "2ae16651aba6543c57a747fee6e24f54549e8451",
+      "760ca3bbd973beb25ea05c314514dd75b93d4895",
+      "b4fb2f3cb3f31704cd18495823b48e5f263ce64c",
+      "a18c1c123f78a5a17eaf1a337536d2b15fcaa9cd"
+    ],
+    "verbatim_patch_ids_equal": true,
+    "verbatim_patch_ids": [
+      "4dda41e04fd504e445f520836b75d479e7bb8efe",
+      "f1ba7432b12e010c6afb50893050746d13f940ca",
+      "96f0a605f1cdf9c8057421df47b1178b7a939979",
+      "a434f2bb62b2decf35c7e073ded2ead0cb5082a6",
+      "a14a366565f07b93be7cc009a94c79c2234c9584",
+      "8dc037eddab1b70964344971c94375c428be4431",
+      "87dcf8f458298345c4e6028a1e9cb6286464b246",
+      "5a4a8476853a0e99a079e7dc9db2486bc2737923",
+      "0008a9fd9600045cba08177b2f47b306c382c3c3",
+      "a1a5b1d27f39b8b357c27932b296fc1ce4c071f5",
+      "62624989a1fab5c83abda2fc71d9852690043166",
+      "38de8b5504a398af1ab451708699d7a1ca52d0a1",
+      "72c697e268951f93e885af4b005bb05a6b645e6b",
+      "d87cd780ef5cbd425e3a2295d5639eb3c9d4e76d",
+      "f386b0916c18f08b440576e1abb8f29e1ea216ee",
+      "4d4e5b79e6b80ffd103ed04c43e53091f05edd93",
+      "8749d092a27d058b1796ebed3373324b3c223689",
+      "5e0bbe35582e08b06d346e68a3f57b54466c49ff",
+      "3b3764a551a46baa9bb4190cda0431f94129945a",
+      "6bb38f072a16de37f34a479760dc721d5c9487d9",
+      "46be7ab737a2637d9ffeb9aeb0d6447324c7a680",
+      "e418be442c051f2fc7bf0097d40cbf0eb1bae5b6",
+      "250e25c8bd0eb5399a7f86fdb3bb47a885966fa5"
+    ]
+  },
+  "source_layout": "git archive exported source without .git metadata; archive digest binds the retained original, while recreated commits must match the source tree",
+  "kernel_archive_sha256": "f9b92086648ba2f49ff3513416958f4fe5a3cc29ac39a0b8b0e51c46edfe2ae3",
+  "seed_file": "linux-seed-20261109.config",
+  "seed_sha256": "5e0134db8e9bb259ee5133a177f7feed45a11eec67c808adcf0454f1aeb9cfc5",
+  "configuration": "Copy the supplied seed into an isolated O= root; run make olddefconfig outside timing with that host toolchain. Require identical normalized bytes between Make and capture within each host.",
+  "file_creation_mask": "0077",
+  "time_tool_sha256": "6a1994aecdf6bbabe1f220965f5b5c3c5845d04d93afaeed6368b9edac1d9a0a",
+  "timing": "GNU time -v elapsed field, 0.01-second resolution. Setup and single-build diagnostics; no before/after engine performance ratio.",
+  "path_templates": {
+    "SOURCE": "pristine archived kernel source",
+    "GATE": "verified release example executable",
+    "RUN": "new isolated phase root"
+  },
+  "comparison_limits": "Independent host snapshots bind local VFS/tool identities. Make and capture use different O= paths. Compare each replay to its captured Make output, not the separate Make control tree. Keep host toolchains/configurations separate. No exclusive host reservation or full mixed-memory stability qualification.",
+  "replay_definition": "Require nonzero analysis barriers for internal clean-output swapping. Assembly does not populate CAS. First replay with absent cache is an execution diagnostic; only subsequent complete, parity-checked replays can measure populated-cache clean-output replay.",
+  "excluded_attempts": "An initial control refused before Make because GNU time was absent. Supply a verified task-local executable and use a fresh root; retain the prerequisite failure separately.",
+  "hosts": [
+    {
+      "host_label": "Host C",
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "make_jobs": 8,
+      "versions": {
+        "make": "GNU Make 4.4.1",
+        "gcc": "gcc (Debian 16.2.0-3) 16.2.0",
+        "ar": "GNU ar (GNU Binutils for Debian) 2.47",
+        "ld": "GNU ld (GNU Binutils for Debian) 2.47"
+      },
+      "compression_tools": {
+        "gzip": {
+          "sha256": "9cf7b607252713c39d39c0efc16db1732d4099a555b26dfae68a1544841daef9",
+          "version": "gzip 1.14"
+        },
+        "pigz": {
+          "available": false
+        }
+      },
+      "tool_sha256": {
+        "ar": "ac2b6d5f269e2105f9192b701c3f221829905dd69eac1d539190f92e2b83520d",
+        "gcc": "d85726de39dccd87c573ee63d467caee8e69f56cc2edea710f02d1ba5e0ae477",
+        "ld": "1724aff6c56e26d18176986b42d22e51c0b7c7d9c1540c4f4af0a51bfdee9159",
+        "make": "b5441a23f8354840947d2e9dac7f29c8a42e08cab32c0a93b8a7e9fb9f13103e"
+      },
+      "environment_template": {
+        "HOME": "$RUN/home",
+        "KBUILD_BUILD_HOST": "builder",
+        "KBUILD_BUILD_TIMESTAMP": "@1790154919",
+        "KBUILD_BUILD_USER": "builder",
+        "KBUILD_BUILD_VERSION": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "SOURCE_DATE_EPOCH": "1790154919",
+        "TZ": "UTC"
+      },
+      "normalized_config_sha256": "2b3aa42f486b1b378601154b8a4d50e3952fb6415b65d7ac83e08ce834505ad3",
+      "replay_cache_absent_before_assembly_completed": true,
+      "phases": [
+        {
+          "phase": "make",
+          "status": "passed",
+          "timed_argv_template": [
+            "/usr/bin/make",
+            "-s",
+            "-C",
+            "$SOURCE",
+            "-j8",
+            "O=$RUN/make/obj",
+            "all"
+          ],
+          "returncode": 0,
+          "timeout_seconds": 1800,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 667.3,
+            "system_seconds": 41.06,
+            "max_rss_kib": 1029360,
+            "wall_seconds": 96.23
+          },
+          "persistent_entries": 12397,
+          "gate_result": {}
+        },
+        {
+          "phase": "capture",
+          "status": "passed",
+          "timed_argv_template": [
+            "$GATE",
+            "managed-observe-process",
+            "$RUN/capture/state",
+            "$RUN/capture/controller-cache",
+            "$RUN/capture/private/stream.bin",
+            "$RUN/capture/private/summary.json",
+            "$RUN/capture/private/transaction.json",
+            "$SOURCE",
+            "$RUN/capture/obj",
+            "$RUN/normalized.config",
+            "all",
+            "34359738368",
+            "100000000",
+            "1000000",
+            "67108864",
+            "/usr/bin/make",
+            "-s",
+            "-C",
+            "$SOURCE",
+            "-j8",
+            "O=$RUN/capture/obj",
+            "all"
+          ],
+          "returncode": 0,
+          "timeout_seconds": 7200,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 1457.07,
+            "system_seconds": 502.3,
+            "max_rss_kib": 1029152,
+            "wall_seconds": 1275.7
+          },
+          "persistent_entries": 12397,
+          "gate_result": {
+            "decision": "SNAPSHOT_MISSING",
+            "outcome": "capture_uncertified",
+            "reason": "managed Kbuild observation completed without namespace provenance or uncaptured-writer exclusion"
+          }
+        },
+        {
+          "phase": "derive",
+          "status": "passed",
+          "timed_argv_template": [
+            "$GATE",
+            "derive-graph",
+            "$RUN/capture/private/summary.json",
+            "$RUN/derive/private/graph.json",
+            "$RUN/derive/private/envelope.json",
+            "$RUN/capture/obj",
+            "all"
+          ],
+          "returncode": 0,
+          "timeout_seconds": 7200,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 162.14,
+            "system_seconds": 78.3,
+            "max_rss_kib": 10778328,
+            "wall_seconds": 241.12
+          },
+          "gate_result": {
+            "graph_actions": 5684,
+            "mutation_paths": 19387,
+            "process_lifecycles": 35851,
+            "stream_records": 30537465
+          }
+        },
+        {
+          "phase": "assemble",
+          "status": "failed",
+          "timed_argv_template": [
+            "/usr/bin/unshare",
+            "--user",
+            "--map-current-user",
+            "$GATE",
+            "assemble-managed-graph",
+            "$RUN/derive/private/envelope.json",
+            "$RUN/capture/private/transaction.json",
+            "$SOURCE",
+            "$RUN/capture/obj",
+            "$RUN/assemble/private/snapshot.bin",
+            "$RUN/assemble/private/key.json"
+          ],
+          "returncode": 1,
+          "timeout_seconds": 7200,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 1985.2,
+            "system_seconds": 213.82,
+            "max_rss_kib": 4863224,
+            "wall_seconds": 2199.22
+          },
+          "gate_result": {},
+          "failure": {
+            "category": "unsupported_captured_group_credentials",
+            "reason": "Kbuild mandatory action credentials are not isolatable: local isolation cannot preserve distinct group identities."
+          }
+        },
+        {
+          "phase": "replay",
+          "status": "not_run",
+          "reason": "Snapshot assembly has not passed; no replay timing is available."
+        }
+      ]
+    },
+    {
+      "host_label": "Host D",
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "make_jobs": 8,
+      "versions": {
+        "make": "GNU Make 4.4.1",
+        "gcc": "gcc (Debian 15.3.0-2) 15.3.0",
+        "ar": "GNU ar (GNU Binutils for Debian) 2.47",
+        "ld": "GNU ld (GNU Binutils for Debian) 2.47"
+      },
+      "compression_tools": {
+        "gzip": {
+          "sha256": "9cf7b607252713c39d39c0efc16db1732d4099a555b26dfae68a1544841daef9",
+          "version": "gzip 1.14"
+        },
+        "pigz": {
+          "available": false
+        }
+      },
+      "tool_sha256": {
+        "ar": "9362baf27fa8d031982fbadfad93763341ab353e0a331615c065159a7100168f",
+        "gcc": "6af941599045237c267fafdc9e41ff8ed2031d94da7809943c21b0ae758400d4",
+        "ld": "2a1b7757aed136b266f6f53cdf88718a7dd8b1b329b8394751a99ac2f27ea970",
+        "make": "b5441a23f8354840947d2e9dac7f29c8a42e08cab32c0a93b8a7e9fb9f13103e"
+      },
+      "environment_template": {
+        "HOME": "$RUN/home",
+        "KBUILD_BUILD_HOST": "builder",
+        "KBUILD_BUILD_TIMESTAMP": "@1790154919",
+        "KBUILD_BUILD_USER": "builder",
+        "KBUILD_BUILD_VERSION": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "SOURCE_DATE_EPOCH": "1790154919",
+        "TZ": "UTC"
+      },
+      "normalized_config_sha256": "2c2f6ab27b11711d2cc5233724c355bd0344bb91f1b68e1e647fcc4da3631941",
+      "replay_cache_absent_before_assembly_completed": true,
+      "phases": [
+        {
+          "phase": "make",
+          "status": "passed",
+          "timed_argv_template": [
+            "/usr/bin/make",
+            "-s",
+            "-C",
+            "$SOURCE",
+            "-j8",
+            "O=$RUN/make/obj",
+            "all"
+          ],
+          "returncode": 0,
+          "timeout_seconds": 1800,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 684.11,
+            "system_seconds": 80.03,
+            "max_rss_kib": 1021092,
+            "wall_seconds": 103.65
+          },
+          "persistent_entries": 12395,
+          "gate_result": {}
+        },
+        {
+          "phase": "capture",
+          "status": "passed",
+          "timed_argv_template": [
+            "$GATE",
+            "managed-observe-process",
+            "$RUN/capture/state",
+            "$RUN/capture/controller-cache",
+            "$RUN/capture/private/stream.bin",
+            "$RUN/capture/private/summary.json",
+            "$RUN/capture/private/transaction.json",
+            "$SOURCE",
+            "$RUN/capture/obj",
+            "$RUN/normalized.config",
+            "all",
+            "34359738368",
+            "100000000",
+            "1000000",
+            "67108864",
+            "/usr/bin/make",
+            "-s",
+            "-C",
+            "$SOURCE",
+            "-j8",
+            "O=$RUN/capture/obj",
+            "all"
+          ],
+          "returncode": 0,
+          "timeout_seconds": 7200,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 1518.96,
+            "system_seconds": 597.22,
+            "max_rss_kib": 1021756,
+            "wall_seconds": 1357.68
+          },
+          "persistent_entries": 12395,
+          "gate_result": {
+            "decision": "SNAPSHOT_MISSING",
+            "outcome": "capture_uncertified",
+            "reason": "managed Kbuild observation completed without namespace provenance or uncaptured-writer exclusion"
+          }
+        },
+        {
+          "phase": "derive",
+          "status": "passed",
+          "timed_argv_template": [
+            "$GATE",
+            "derive-graph",
+            "$RUN/capture/private/summary.json",
+            "$RUN/derive/private/graph.json",
+            "$RUN/derive/private/envelope.json",
+            "$RUN/capture/obj",
+            "all"
+          ],
+          "returncode": 0,
+          "timeout_seconds": 1800,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 168.12,
+            "system_seconds": 84.7,
+            "max_rss_kib": 10758896,
+            "wall_seconds": 252.98
+          },
+          "gate_result": {
+            "graph_actions": 5684,
+            "mutation_paths": 19383,
+            "process_lifecycles": 35849,
+            "stream_records": 30508675
+          }
+        },
+        {
+          "phase": "assemble",
+          "status": "failed",
+          "timed_argv_template": [
+            "/usr/bin/unshare",
+            "--user",
+            "--map-current-user",
+            "$GATE",
+            "assemble-managed-graph",
+            "$RUN/derive/private/envelope.json",
+            "$RUN/capture/private/transaction.json",
+            "$SOURCE",
+            "$RUN/capture/obj",
+            "$RUN/assemble/private/snapshot.bin",
+            "$RUN/assemble/private/key.json"
+          ],
+          "returncode": 1,
+          "timeout_seconds": 7200,
+          "timed_out": false,
+          "interrupted": false,
+          "resource_timing": {
+            "user_seconds": 2060.77,
+            "system_seconds": 238.03,
+            "max_rss_kib": 4854340,
+            "wall_seconds": 2300.08
+          },
+          "gate_result": {},
+          "failure": {
+            "category": "unsupported_captured_group_credentials",
+            "reason": "Kbuild mandatory action credentials are not isolatable: local isolation cannot preserve distinct group identities."
+          }
+        },
+        {
+          "phase": "replay",
+          "status": "not_run",
+          "reason": "Snapshot assembly has not passed; no replay timing is available."
+        }
+      ]
+    }
+  ]
+}
