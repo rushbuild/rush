@@ -351,10 +351,10 @@ load("@source_fixture//nested:subdir/child.bzl", CHILD = "VALUE")
         source
     }));
     assert!(std::fs::read_to_string(source.join("BUILD.bazel")).unwrap().contains("@undefined_docs"));
-    let proof_path = cache.join("bazel_output_base/external/@source_fixture.rush-workspace-inputs-v4.json");
+    let proof_path = cache.join("bazel_output_base/external/@source_fixture.rush-workspace-inputs-v5.json");
     let proof_bytes = std::fs::read(&proof_path).unwrap();
     let proof: serde_json::Value = serde_json::from_slice(&proof_bytes).unwrap();
-    assert_eq!(proof["version"], 4);
+    assert_eq!(proof["version"], 5);
     assert_eq!(proof["authority"], "LoadedWorkspaceClosure");
     assert!(proof["definition"]["loaded_modules"].as_array().unwrap().iter()
         .any(|module| module["label"] == "@source_fixture//:defs.bzl"));
@@ -385,7 +385,7 @@ load("@source_fixture//nested:subdir/child.bzl", CHILD = "VALUE")
         let error = tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
             rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_module(root, repo, module).unwrap_err()
         }));
-        assert!(format!("{error:#}").contains("fetch "), "{module}: {error:#}");
+        assert!(format!("{error:#}").contains("materialize declaring package for exact module"), "{module}: {error:#}");
     }
     // A failing module query must invalidate the old closure without using its
     // still-present marker/source as success evidence.
@@ -536,4 +536,94 @@ source_repository = repository_rule(implementation = _impl, environ = ["IMPLICIT
     let error = orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &target).await.unwrap_err();
     assert!(format!("{error:#}").contains("declared WORKSPACE repository fetch cannot use Bzlmod discovery"), "{error:#}");
     assert!(!graph.has_node(&target));
+}
+
+/// Source loading materializes only its declaring package. Ordinary target
+/// fetching retains its full dependency traversal and must still report errors.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires explicitly configured RUSH_BAZEL_PATH pointing to Bazel 6.5.0"]
+async fn required_modules_materialize_without_unrelated_target_closures_and_reuse_a_b_a() {
+    use std::os::unix::fs::MetadataExt;
+    let binary = PathBuf::from(std::env::var_os("RUSH_BAZEL_PATH").expect("set exact Bazel 6.5.0"));
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "bazel 6.5.0");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let cache = rush_build::cache_paths::workspace_cache_root(root);
+    assert!(cache.starts_with(root));
+    let _shutdown = BazelShutdown { binary, output: cache.join("bazel_output_base"), workspace: root.to_owned() };
+    let rules = |value| format!(r#"
+def _impl(ctx):
+    ctx.file("setup.bzl", "SETUP = 17\n")
+    ctx.file("protobuf.bzl", "VALUE = {value}\n")
+    ctx.file("defs/BUILD", "")
+    ctx.file("defs/subdir/child.bzl", "VALUE = {}\n")
+    ctx.file("BUILD.bazel", 'load(":protobuf.bzl", "VALUE")\nfilegroup(name="unrelated", srcs=["@undefined_optional_java//:absent"])\n')
+source_repository = repository_rule(implementation = _impl)
+"#, value + 1);
+    std::fs::write(root.join("rules.bzl"), rules(42)).unwrap();
+    std::fs::write(root.join("BUILD"), "fail(\"unrelated main BUILD must remain unloaded\")\n").unwrap();
+    std::fs::write(root.join("WORKSPACE"), r#"workspace(name="module_source_control")
+load("//:rules.bzl", "source_repository")
+source_repository(name="module_source")
+load("@module_source//:setup.bzl", "SETUP")
+"#).unwrap();
+    let orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+    let io = orchestrator.install_fresh_tracked_io_for_test();
+    let first_label = "@module_source//:protobuf.bzl";
+    let second_label = "@module_source//defs:subdir/child.bzl";
+    let identity = |path: &std::path::Path| {
+        let stat = std::fs::metadata(path).unwrap();
+        (stat.dev(), stat.ino(), stat.mode(), stat.len(), stat.mtime(), stat.mtime_nsec(), stat.ctime(), stat.ctime_nsec())
+    };
+    let source = cache.join("bazel_output_base/external/module_source");
+    tokio::task::block_in_place(|| rush_incremental::tracked::scope(io.clone(), || {
+        let mut loader = rush_starlark::BzlLoader::new(root.to_owned());
+        let first = loader.load_bzl(first_label, &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(first["VALUE"], rush_starlark::Value::Int(42));
+        let proof_for = |label: &str| {
+            std::fs::read_dir(cache.join("bazel_output_base/external")).unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.file_name().unwrap().to_string_lossy().contains(".rush-workspace-module-v5-")
+                    && serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+                        ["authority"]["MaterializedModule"]["module"]["label"] == label)
+                .expect("exact module source proof")
+        };
+        let first_proof = proof_for(first_label);
+        let first_proof_bytes = std::fs::read(&first_proof).unwrap();
+        let first_proof_identity = identity(&first_proof);
+        let first_source_identity = identity(&source.join("protobuf.bzl"));
+        let second = loader.load_bzl(second_label, &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(second["VALUE"], rush_starlark::Value::Int(43));
+        let again = loader.load_bzl(first_label, &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(again["VALUE"], rush_starlark::Value::Int(42));
+        assert_ne!(first_proof, proof_for(second_label));
+        assert_eq!(std::fs::read(&first_proof).unwrap(), first_proof_bytes);
+        assert_eq!(identity(&first_proof), first_proof_identity);
+        assert_eq!(identity(&source.join("protobuf.bzl")), first_source_identity);
+        assert!(!source.join("defs/subdir/BUILD").exists());
+        assert!(matches!(io.validate_manifest(&io.manifest()).staleness, Staleness::Fresh),
+            "source and proof dependencies must remain coherent across A/B/A");
+    }));
+    let fresh = orchestrator.install_fresh_tracked_io_for_test();
+    tokio::task::block_in_place(|| rush_incremental::tracked::scope(fresh, || {
+        let error = rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_label(
+            root, "module_source", Some("@module_source//:unrelated"),
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("fetch @module_source//:unrelated"), "{error:#}");
+        assert!(rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_module(
+            root, "module_source", "@module_source//:missing.bzl",
+        ).is_err());
+    }));
+    // A real repository-rule implementation change invalidates the old exact
+    // module proof and materializes the new source through the same query.
+    std::fs::write(root.join("rules.bzl"), rules(44)).unwrap();
+    let fresh = orchestrator.install_fresh_tracked_io_for_test();
+    tokio::task::block_in_place(|| rush_incremental::tracked::scope(fresh, || {
+        let mut loader = rush_starlark::BzlLoader::new(root.to_owned());
+        let values = loader.load_bzl(first_label, &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(values["VALUE"], rush_starlark::Value::Int(44));
+    }));
 }

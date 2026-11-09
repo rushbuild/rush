@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-const PROOF_SUFFIX: &str = ".rush-workspace-inputs-v4.json";
+const PROOF_SUFFIX: &str = ".rush-workspace-inputs-v5.json";
 
 #[derive(Debug)]
 pub struct WorkspaceRepositoryFetchContext {
@@ -63,6 +63,38 @@ impl WorkspaceRepositoryFetchContext {
         *self.pending_authority.lock()
             .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))? = SourceAuthority::LoadedWorkspaceClosure;
         Ok(true)
+    }
+
+    /// Materialize the declaring package with a genuine nontransitive query.
+    /// This loads BUILD but never fetches its target dependency graph. The exact
+    /// source need not be exported or loaded by BUILD; it is bound separately.
+    pub fn materialize_required_module_source(
+        &self, workspace: &Path, output_base: &Path, repository: &str,
+    ) -> Result<()> {
+        let required = self.required_module.as_ref()
+            .context("module materialization requires an exact source purpose")?;
+        let canonical = canonical_required_module_label(repository, required)?;
+        let relative = canonical.strip_prefix(&format!("@{repository}//"))
+            .context("materialized module owner changed")?;
+        let (package, _) = relative.split_once(':').context("module needs package:target")?;
+        let goal = format!("@{repository}//{package}:all");
+        query_definition_output(self, workspace, output_base, repository,
+            "label", format!("loadfiles({goal:?})"))
+            .with_context(|| format!("materialize declaring package for exact module {canonical}"))?;
+        self.bind_materialized_required_module(workspace, output_base, repository)
+    }
+
+    /// Bind only after this context's successful genuine package query. This
+    /// does not claim that Bazel evaluated the requested source as a module.
+    fn bind_materialized_required_module(
+        &self, workspace: &Path, output_base: &Path, repository: &str,
+    ) -> Result<()> {
+        let required = self.required_module.as_ref()
+            .context("module materialization requires an exact source purpose")?;
+        let module = materialized_module_input(workspace, output_base, repository, required)?;
+        *self.pending_authority.lock()
+            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))? = SourceAuthority::MaterializedModule { module };
+        Ok(())
     }
 
     /// Native local_repository roots (including installed tool sources) are
@@ -125,6 +157,9 @@ enum SourceAuthority {
     /// Only exact modules in this proof's authoritative loaded closure are
     /// admitted; this authority cannot skip a graph-target materialization.
     LoadedWorkspaceClosure,
+    /// A successful nontransitive package query materialized this exact
+    /// source. It conveys no target-graph or other-module authority.
+    MaterializedModule { module: DefinitionInput },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,7 +251,10 @@ fn canonical_required_module_label(repository: &str, label: &str) -> Result<Stri
         .context("required module label is outside its declared repository")?;
     let (package, target) = relative.split_once(':')
         .context("required module needs an exact package:target label")?;
-    if target.is_empty() || package.contains(':') || target.contains(':')
+    let valid_segments = |path: &str| path.split('/').all(|segment|
+        !segment.is_empty() && segment != "." && segment != ".." && !segment.contains('\\'));
+    if target.is_empty() || (!package.is_empty() && !valid_segments(package)) || !valid_segments(target)
+        || package.contains(':') || target.contains(':')
         || canonical.bytes().any(|byte| matches!(byte, 0 | b'\n' | b'\r'))
         || Path::new(package).components().chain(Path::new(target).components())
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -224,6 +262,49 @@ fn canonical_required_module_label(repository: &str, label: &str) -> Result<Stri
         bail!("required module is not a package-relative source label");
     }
     Ok(canonical)
+}
+
+fn module_package_exists(directory: &Path) -> Result<bool> {
+    for name in ["BUILD.bazel", "BUILD"] {
+        let path = directory.join(name);
+        if tracked::exists(&path) {
+            // Package lookup does not evaluate BUILD. Reading its actual bytes
+            // rejects directories/dangling links and tracks the ownership input.
+            tracked::read_file(&path).with_context(|| format!("read module package declaration {}", path.display()))?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn materialized_module_input(
+    workspace: &Path, output_base: &Path, repository: &str, label: &str,
+) -> Result<DefinitionInput> {
+    let required = canonical_required_module_label(repository, label)?;
+    let relative = required.strip_prefix(&format!("@{repository}//"))
+        .context("materialized module owner changed")?;
+    let (package, target) = relative.split_once(':').context("module needs package:target")?;
+    let package_root = output_base.join("external").join(repository).join(package);
+    if !module_package_exists(&package_root)? {
+        bail!("materialized module has no declaring package: {required}");
+    }
+    let mut directory = package_root;
+    let mut components = Path::new(target).components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() { break; }
+        directory.push(component.as_os_str());
+        if module_package_exists(&directory)? {
+            bail!("materialized module label crosses a package boundary: {required}");
+        }
+    }
+    definition_inputs(workspace, output_base, &[required])?.pop()
+        .context("materialized module input omitted")
+}
+
+fn module_proof_path(output_base: &Path, repository: &str, label: &str) -> Result<PathBuf> {
+    let canonical = canonical_required_module_label(repository, label)?;
+    let (_, general) = repository_paths(output_base, repository)?;
+    Ok(general.with_file_name(format!("@{repository}.rush-workspace-module-v5-{}.json", digest(canonical.as_bytes()))))
 }
 
 fn required_module_matches(
@@ -970,7 +1051,25 @@ fn cached_inputs_are_current(
     repository: &str,
     context: &WorkspaceRepositoryFetchContext,
 ) -> Result<bool> {
-    let (marker_path, proof) = repository_paths(output_base, repository)?;
+    let (_, general) = repository_paths(output_base, repository)?;
+    if cached_proof_is_current(workspace, output_base, repository, context, &general)? {
+        return Ok(true);
+    }
+    if let Some(required) = &context.required_module {
+        let proof = module_proof_path(output_base, repository, required)?;
+        return cached_proof_is_current(workspace, output_base, repository, context, &proof);
+    }
+    Ok(false)
+}
+
+fn cached_proof_is_current(
+    workspace: &Path,
+    output_base: &Path,
+    repository: &str,
+    context: &WorkspaceRepositoryFetchContext,
+    proof: &Path,
+) -> Result<bool> {
+    let (marker_path, _) = repository_paths(output_base, repository)?;
     let materialized = output_base.join("external").join(repository);
     match std::fs::symlink_metadata(&materialized) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1001,7 +1100,7 @@ fn cached_inputs_are_current(
         Ok(proof) => proof,
         Err(_) => return Ok(false),
     };
-    if proof_value.version != 4 || proof_value.context_sha256 != context.fingerprint {
+    if proof_value.version != 5 || proof_value.context_sha256 != context.fingerprint {
         return Ok(false);
     }
     match &proof_value.authority {
@@ -1016,6 +1115,19 @@ fn cached_inputs_are_current(
             if !required_module_matches(&proof_value.definition, workspace, output_base, repository, required)? {
                 return Ok(false);
             }
+        }
+        SourceAuthority::MaterializedModule { module } => {
+            let Some(required) = &context.required_module else { return Ok(false); };
+            if canonical_required_module_label(repository, required)? != module.label {
+                return Ok(false);
+            }
+            let current = match materialized_module_input(workspace, output_base, repository, required) {
+                Ok(current) => current,
+                Err(error) if error.chain().filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|error| error.kind() == std::io::ErrorKind::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if current != *module { return Ok(false); }
         }
     }
     let labels: Vec<_> = proof_value
@@ -1133,8 +1245,10 @@ fn verify_definition_bracket(
 }
 
 /// Call only after successful genuine Bazel materialization, a verified native
-/// local root, or an exact source module already consumed by the successful
-/// WORKSPACE definition query under `context`. All three retain the same full
+/// local root, an exact source module already consumed by the successful
+/// WORKSPACE definition query, or an exact module bound after a successful
+/// nontransitive declaring-package query.
+/// All retain the same full
 /// definition/stat/context/marker bracket. Closure-only authority cannot admit
 /// graph-target fetches; existing markers never create authority on their own.
 pub fn record_workspace_repository_fetch(
@@ -1180,7 +1294,19 @@ fn publish_workspace_fetch(
     if !inputs_current {
         bail!("Bazel repository inputs changed during materialization; source was not admitted");
     }
-    let (_, proof) = repository_paths(output_base, repository)?;
+    let authority = context.pending_authority.lock()
+        .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))?.clone();
+    if let SourceAuthority::MaterializedModule { module } = &authority {
+        let required = context.required_module.as_ref().context("module source proof lost its exact purpose")?;
+        if module.label != canonical_required_module_label(repository, required)?
+            || *module != materialized_module_input(workspace, output_base, repository, required)? {
+            bail!("required module identity changed during materialization; source was not admitted");
+        }
+    }
+    let proof = match &authority {
+        SourceAuthority::MaterializedModule { module } => module_proof_path(output_base, repository, &module.label)?,
+        _ => repository_paths(output_base, repository)?.1,
+    };
     if let Ok(metadata) = std::fs::symlink_metadata(&proof) {
         if !metadata.file_type().is_file() {
             bail!(
@@ -1190,11 +1316,10 @@ fn publish_workspace_fetch(
         }
     }
     let payload = serde_json::to_vec(&InvocationProof {
-        version: 4,
+        version: 5,
         context_sha256: context.fingerprint.clone(),
         marker_sha256: marker_sha256.clone(),
-        authority: context.pending_authority.lock()
-            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))?.clone(),
+        authority,
         definition,
     })?;
     // This sidecar lives beside Bazel's own marker, outside archive contents.
@@ -1271,6 +1396,25 @@ mod tests {
         publish_workspace_fetch(workspace, output, repo, context, fixture_definition())
     }
 
+    fn assert_v4_general_proof_is_not_reused(
+        workspace: &Path, output: &Path, context: &WorkspaceRepositoryFetchContext,
+    ) {
+        let (_, proof) = repository_paths(output, "source").unwrap();
+        let current = std::fs::read(&proof).unwrap();
+        let mut legacy: InvocationProof = serde_json::from_slice(&current).unwrap();
+        assert_eq!(legacy.version, 5);
+        legacy.version = 4;
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let legacy_path = proof.with_file_name("@source.rush-workspace-inputs-v4.json");
+        std::fs::write(&legacy_path, &legacy_bytes).unwrap();
+        std::fs::remove_file(&proof).unwrap();
+        assert!(!cached_inputs_are_current(workspace, output, "source", context).unwrap());
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+        publish_workspace_fetch(workspace, output, "source", context, legacy.definition).unwrap();
+        assert_eq!(std::fs::read(&proof).unwrap(), current);
+        assert!(cached_inputs_are_current(workspace, output, "source", context).unwrap());
+    }
+
     fn marker(workspace: &Path, output: &Path, suffix: &str) -> PathBuf {
         let patch = workspace.join("patches/fix.patch");
         std::fs::create_dir_all(patch.parent().unwrap()).unwrap();
@@ -1282,6 +1426,85 @@ mod tests {
         // a unit fixture, not a claim that the test executed a repository rule.
         std::fs::write(&marker, format!("{}\nSTARLARK_SEMANTICS -1438583352\nARCH: {}\nFILE://patches:fix.patch {}\nENV:TF_SYSTEM_LIBS \\0\n{suffix}", "a".repeat(64), std::env::consts::ARCH, digest(b"genuine patch bytes\n"))).unwrap();
         marker
+    }
+
+    #[test]
+    fn materialized_module_proofs_are_exact_separate_and_do_not_authorize_graphs() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        marker(temp.path(), &output, "");
+        let source = output.join("external/source");
+        std::fs::create_dir_all(source.join("defs/subdir")).unwrap();
+        std::fs::write(source.join("BUILD.bazel"), b"fail(\"not evaluated by this unit fixture\")\n").unwrap();
+        std::fs::write(source.join("defs/BUILD"), b"").unwrap();
+        std::fs::write(source.join("first.bzl"), b"VALUE = 42\n").unwrap();
+        std::fs::write(source.join("defs/subdir/second.bzl"), b"VALUE = 43\n").unwrap();
+        let first_label = "@source//:first.bzl";
+        let second_label = "@source//defs:subdir/second.bzl";
+        let first = context().for_required_module("source", first_label).unwrap();
+        let second = context().for_required_module("source", second_label).unwrap();
+        // Unit-only direct binding models the result after successful genuine
+        // materialization. The ignored integration test runs actual Bazel.
+        tracked::test_scope(temp.path(), || {
+            first.bind_materialized_required_module(temp.path(), &output, "source").unwrap();
+            record_workspace_repository_fetch(temp.path(), &output, "source", &first).unwrap();
+            let first_proof = module_proof_path(&output, "source", first_label).unwrap();
+            let first_bytes = std::fs::read(&first_proof).unwrap();
+            let first_stat = source_stat(&first_proof).unwrap();
+            let (_, general) = repository_paths(&output, "source").unwrap();
+            assert!(!general.exists(), "one module cannot publish graph authority");
+            assert!(!cached_inputs_are_current(temp.path(), &output, "source", &context()).unwrap());
+            assert!(!cached_inputs_are_current(temp.path(), &output, "source", &second).unwrap());
+            second.bind_materialized_required_module(temp.path(), &output, "source").unwrap();
+            record_workspace_repository_fetch(temp.path(), &output, "source", &second).unwrap();
+            assert_ne!(first_proof, module_proof_path(&output, "source", second_label).unwrap());
+            assert_eq!(std::fs::read(&first_proof).unwrap(), first_bytes);
+            assert_eq!(source_stat(&first_proof).unwrap(), first_stat);
+            assert!(cached_inputs_are_current(temp.path(), &output, "source", &first).unwrap());
+            assert!(cached_inputs_are_current(temp.path(), &output, "source", &second).unwrap());
+            assert!(cached_inputs_are_current(temp.path(), &output, "source", &first).unwrap());
+            let io = tracked::current_required();
+            assert!(matches!(io.validate_manifest(&io.manifest()).staleness, Staleness::Fresh),
+                "A/B/A must not overwrite an already recorded proof dependency");
+        });
+        tracked::test_scope(temp.path(), || {
+            std::fs::write(source.join("first.bzl"), b"VALUE = 44\n").unwrap();
+            assert!(!cached_inputs_are_current(temp.path(), &output, "source", &first).unwrap());
+            assert!(record_workspace_repository_fetch(temp.path(), &output, "source", &first).is_err(),
+                "publication must recheck the bound module identity");
+        });
+        tracked::test_scope(temp.path(), || {
+            let proof = module_proof_path(&output, "source", second_label).unwrap();
+            let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&proof).unwrap()).unwrap();
+            old["version"] = 4.into();
+            std::fs::write(&proof, serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(!cached_inputs_are_current(temp.path(), &output, "source", &second).unwrap(),
+                "old receipt schemas never acquire new module authority");
+            assert!(module_proof_path(&output, "other", second_label).is_err());
+        });
+    }
+
+    #[test]
+    fn materialized_module_sources_require_their_exact_declaring_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        let source = output.join("external/source");
+        std::fs::create_dir_all(source.join("defs/subdir")).unwrap();
+        std::fs::write(source.join("defs/subdir/child.bzl"), b"VALUE = 42\n").unwrap();
+        let label = "@source//defs:subdir/child.bzl";
+        tracked::test_scope(temp.path(), || {
+            assert!(materialized_module_input(temp.path(), &output, "source", label).is_err());
+        });
+        std::fs::write(source.join("defs/BUILD"), b"").unwrap();
+        tracked::test_scope(temp.path(), || {
+            assert_eq!(materialized_module_input(temp.path(), &output, "source", label).unwrap().label, label);
+        });
+        std::fs::write(source.join("defs/subdir/BUILD.bazel"), b"").unwrap();
+        tracked::test_scope(temp.path(), || {
+            let error = materialized_module_input(temp.path(), &output, "source", label).unwrap_err();
+            assert!(error.to_string().contains("crosses a package boundary"));
+            assert!(materialized_module_input(temp.path(), &output, "source", "@source//defs:missing.bzl").is_err());
+        });
     }
 
     #[test]
@@ -1332,6 +1555,9 @@ mod tests {
         });
         assert!(self::context().for_required_module("source", "@other//defs:subdir/child.bzl").is_err());
         assert!(self::context().for_required_module("source", "@source//defs/subdir/child.bzl").is_err());
+        for label in ["@source//defs//subdir:child.bzl", "@source//defs:subdir/./child.bzl", "@source//defs:subdir//child.bzl", "@source//defs:subdir\\child.bzl"] {
+            assert!(self::context().for_required_module("source", label).is_err(), "{label}");
+        }
     }
 
     #[test]
@@ -1376,6 +1602,7 @@ mod tests {
         });
         tracked::test_scope(temp.path(), || {
             record_workspace_repository_fetch(temp.path(), &output, "source", &context).unwrap();
+            assert_v4_general_proof_is_not_reused(temp.path(), &output, &context);
         });
         tracked::test_scope(temp.path(), || {
             assert!(workspace_repository_inputs_are_current(
@@ -1688,6 +1915,9 @@ mod tests {
             publish_workspace_fetch(temp.path(), &output, "source", &context, definition.clone())
                 .unwrap();
             assert!(cached_inputs_are_current(temp.path(), &output, "source", &context).unwrap());
+            assert_v4_general_proof_is_not_reused(temp.path(), &output, &context);
+            assert_eq!(std::fs::read_link(output.join("external/source")).unwrap(), actual,
+                "native-local migration preserves its logical Bazel-owned symlink");
         });
         let other = temp.path().join("different-source");
         std::fs::create_dir(&other).unwrap();

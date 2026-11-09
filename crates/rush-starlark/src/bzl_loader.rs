@@ -7931,21 +7931,22 @@ impl BzlLoader {
         Self::fetch_declared_workspace_repository_for_label(workspace_root, repo_name, None)
     }
 
-    fn workspace_module_package_goal(repo_name: &str, requested: &str) -> Result<String> {
+    fn workspace_module_source_goal(repo_name: &str, requested: &str) -> Result<String> {
         let relative = requested.strip_prefix(&format!("@{}//", repo_name)).ok_or_else(|| anyhow!("requested module is outside its repository"))?;
         let (package, target) = relative.split_once(':').ok_or_else(|| anyhow!("requested module requires package:target syntax"))?;
         if target.is_empty() || Path::new(package).components().chain(Path::new(target).components()).any(|component| !matches!(component, std::path::Component::Normal(_))) {
             anyhow::bail!("requested module is not a package-relative source label");
         }
-        Ok(format!("@{}//{}:all", repo_name, package))
+        Ok(requested.to_string())
     }
 
     /// A Starlark load reads a source file, which need not be exported as a
-    /// target. Reuse a proved actual WORKSPACE module load, or fall back to
-    /// genuine package materialization and normal source checks. This purpose
+    /// target. Reuse a proved actual WORKSPACE module load, or materialize its
+    /// declared package with a genuine nontransitive query and bind this exact
+    /// file. This purpose
     /// cannot authorize a graph-target fetch or change upstream BUILD.
     pub fn fetch_declared_workspace_repository_for_module(workspace_root: &Path, repo_name: &str, requested: &str) -> Result<Option<PathBuf>> {
-        let goal = Self::workspace_module_package_goal(repo_name, requested)?;
+        let goal = Self::workspace_module_source_goal(repo_name, requested)?;
         Self::fetch_declared_workspace_repository_with_purpose(workspace_root, repo_name, Some(&goal), Some(requested))
     }
 
@@ -8176,6 +8177,15 @@ impl BzlLoader {
             }
             Some(context)
         };
+        if required_module.is_some() {
+            let context = workspace_fetch_context.as_ref()
+                .context("required WORKSPACE module has no genuine analyzer context")?;
+            context.materialize_required_module_source(workspace_root, &output_base, repo_name)?;
+            crate::fetch_strategy::record_workspace_repository_fetch(
+                workspace_root, &output_base, repo_name, context,
+            )?;
+            return Ok(Some(output_base.join("external").join(repo_name)));
+        }
         // Bzlmod-only workspaces do not necessarily support the legacy
         // `sync` command, and their apparent repository names do not match
         // the canonical directories under output_base/external. Preserve the
@@ -10073,10 +10083,10 @@ mod tests {
 
     #[test]
     fn module_materialization_goal_preserves_package_for_nested_unexported_source() {
-        assert_eq!(BzlLoader::workspace_module_package_goal("repo", "@repo//defs:subdir/child.bzl").unwrap(), "@repo//defs:all");
-        assert_eq!(BzlLoader::workspace_module_package_goal("repo", "@repo//:py_version.bzl").unwrap(), "@repo//:all");
-        assert!(BzlLoader::workspace_module_package_goal("repo", "@other//defs:child.bzl").is_err());
-        assert!(BzlLoader::workspace_module_package_goal("repo", "@repo//defs:../child.bzl").is_err());
+        assert_eq!(BzlLoader::workspace_module_source_goal("repo", "@repo//defs:subdir/child.bzl").unwrap(), "@repo//defs:subdir/child.bzl");
+        assert_eq!(BzlLoader::workspace_module_source_goal("repo", "@repo//:py_version.bzl").unwrap(), "@repo//:py_version.bzl");
+        assert!(BzlLoader::workspace_module_source_goal("repo", "@other//defs:child.bzl").is_err());
+        assert!(BzlLoader::workspace_module_source_goal("repo", "@repo//defs:../child.bzl").is_err());
     }
 
     #[test]
