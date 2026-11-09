@@ -885,7 +885,7 @@ pub(super) fn cat_copy_file_range_runtime_syscall_candidate(
     let arguments = attempt.arguments;
     cat_process
         && attempt.number == libc::SYS_copy_file_range as u64
-        && signed_i32_argument(arguments[0]) == Some(3)
+        && signed_i32_argument(arguments[0]).is_some_and(|descriptor| descriptor >= 3)
         && arguments[1] == 0
         && signed_i32_argument(arguments[2]) == Some(1)
         && arguments[3] == 0
@@ -929,6 +929,13 @@ pub(super) fn supported_cat_copy_file_range_runtime_syscall(
     if !cat_copy_file_range_runtime_syscall_candidate(attempt, cat_process) {
         return false;
     }
+    // A live inherited descriptor (for example, a Make jobserver pipe) can
+    // change the descriptor assigned to cat's source open. Prove that exact
+    // descriptor's file identity and lifetime instead of assuming the first
+    // descriptor after stdin/stdout/stderr is available.
+    let Some(source_descriptor) = signed_i32_argument(arguments[0]) else {
+        return false;
+    };
 
     open_attempts.iter().any(|open| {
         if open.syscall_index >= attempt.syscall_index
@@ -939,7 +946,7 @@ pub(super) fn supported_cat_copy_file_range_runtime_syscall(
             return false;
         }
         let rush_observe::CapturedOpenOutcome::Opened {
-            descriptor: 3,
+            descriptor,
             identity: source_identity,
             mount_id: source_mount_id,
             file_value: Some(source_value @ CapturedMappedFileValue::WholeFile { .. }),
@@ -947,10 +954,13 @@ pub(super) fn supported_cat_copy_file_range_runtime_syscall(
         else {
             return false;
         };
+        if *descriptor != source_descriptor {
+            return false;
+        }
         let source_replaced_before_copy = close_attempts.iter().any(|close| {
             close.syscall_index > open.syscall_index
                 && close.syscall_index < attempt.syscall_index
-                && close.request.descriptor == 3
+                && close.request.descriptor == source_descriptor
                 && matches!(
                     close.outcome,
                     rush_observe::CapturedCloseOutcome::Closed { .. }
@@ -958,7 +968,7 @@ pub(super) fn supported_cat_copy_file_range_runtime_syscall(
         }) || dup2_attempts.iter().any(|duplication| {
             duplication.syscall_index > open.syscall_index
                 && duplication.syscall_index < attempt.syscall_index
-                && duplication.request.target_descriptor == 3
+                && duplication.request.target_descriptor == source_descriptor
                 && matches!(
                     duplication.outcome,
                     rush_observe::CapturedDup2Outcome::Duplicated { .. }
@@ -967,7 +977,7 @@ pub(super) fn supported_cat_copy_file_range_runtime_syscall(
         if source_replaced_before_copy
             || !close_attempts.iter().any(|close| {
                 close.syscall_index > attempt.syscall_index
-                    && close.request.descriptor == 3
+                    && close.request.descriptor == source_descriptor
                     && close.request.identity.as_ref() == Some(source_identity)
                     && close.request.mount_id == Some(*source_mount_id)
                     && matches!(
@@ -1119,7 +1129,7 @@ pub(super) fn supported_kbuild_runtime_syscall(
     analyzer_process: bool,
     rustc_process: bool,
     make_process: bool,
-    xargs_process: bool,
+    _xargs_process: bool,
 ) -> bool {
     use rush_observe::CapturedUnmodeledSyscallOutcome;
 
@@ -1218,13 +1228,8 @@ pub(super) fn supported_kbuild_runtime_syscall(
         return false;
     }
     match attempt.number {
-        number if number == libc::SYS_poll as u64 => {
-            arguments[0] != 0
-                && signed_i32_argument(arguments[2]) == Some(0)
-                && xargs_process
-                && arguments[1] == 5
-                && returned(5, false)
-        }
+        // Poll admission requires the typed descriptor identities and event
+        // masks. Raw argument words cannot prove a readiness-probe profile.
         number if number == libc::SYS_sigaltstack as u64 => {
             rustc_process && (arguments[0] == 0) != (arguments[1] == 0) && returned(0, false)
         }
@@ -3130,164 +3135,244 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn admits_only_fully_witnessed_cat_copy_file_range_attempts() {
-        let value = rush_observe::CapturedMappedFileValue::WholeFile {
-            bytes: 4,
-            digest: [7; 32],
-            mode: 0o100644,
-        };
-        let source = rush_observe::CapturedDescriptorIdentity {
-            target: b"/workspace/obj/input".to_vec(),
-            device: 1,
-            inode: 2,
-            kind: rush_observe::CapturedDescriptorKind::RegularFile,
-        };
-        let destination = rush_observe::CapturedDescriptorIdentity {
-            target: b"/workspace/obj/output".to_vec(),
-            device: 1,
-            inode: 3,
-            kind: rush_observe::CapturedDescriptorKind::RegularFile,
-        };
-        let open = rush_observe::CapturedOpenAttempt {
-            syscall_index: 10,
-            request: rush_observe::CapturedOpenRequest {
-                system_call: rush_observe::CapturedOpenSystemCall::OpenAt,
-                path: b"input".to_vec(),
-                directory: Some(b"/workspace/obj".to_vec()),
-                flags: libc::O_RDONLY as u64,
-                mode: 0,
-                resolve: 0,
-            },
-            outcome: rush_observe::CapturedOpenOutcome::Opened {
-                descriptor: 3,
-                identity: source.clone(),
-                mount_id: 5,
-                file_value: Some(value),
-            },
-        };
-        let source_close = rush_observe::CapturedCloseAttempt {
-            syscall_index: 40,
-            request: rush_observe::CapturedCloseRequest {
-                descriptor: 3,
-                identity: Some(source),
-                mount_id: Some(5),
-            },
-            outcome: rush_observe::CapturedCloseOutcome::Closed {
-                file_value: Some(value),
-            },
-        };
-        let destination_close = rush_observe::CapturedCloseAttempt {
-            syscall_index: 41,
-            request: rush_observe::CapturedCloseRequest {
-                descriptor: 1,
-                identity: Some(destination.clone()),
-                mount_id: Some(5),
-            },
-            outcome: rush_observe::CapturedCloseOutcome::Closed {
-                file_value: Some(value),
-            },
-        };
-        let closes = [source_close.clone(), destination_close.clone()];
-        let copy = rush_observe::CapturedUnmodeledSyscallAttempt {
-            syscall_index: 20,
-            ..unmodeled_attempt(
-                libc::SYS_copy_file_range as u64,
-                [3, 0, 1, 0, 0x7ff0_0000, 0],
-                4,
-                false,
-            )
-        };
-        assert!(supported_cat_copy_file_range_runtime_syscall(
-            &copy,
-            true,
-            std::slice::from_ref(&open),
-            &[],
-            &closes,
-            &[]
-        ));
-        let mut eof = copy.clone();
-        eof.outcome = rush_observe::CapturedUnmodeledSyscallOutcome::Returned {
-            return_value: 0,
-            is_error: false,
-        };
-        assert!(supported_cat_copy_file_range_runtime_syscall(
-            &eof,
-            true,
-            std::slice::from_ref(&open),
-            &[],
-            &closes,
-            &[]
-        ));
-
-        let fallback = rush_observe::CapturedWriteAttempt {
-            syscall_index: 30,
-            request: rush_observe::CapturedWriteRequest {
-                system_call: rush_observe::CapturedWriteSystemCall::Write,
-                descriptor: 1,
-                identity: Some(destination),
-                mount_id: Some(5),
-                uses_descriptor_offset: true,
-                offset: Some(0),
-                requested_bytes: 4,
-                append: true,
-            },
-            outcome: rush_observe::CapturedWriteOutcome::Wrote {
+        for source_descriptor in [3, 5, 17] {
+            let value = rush_observe::CapturedMappedFileValue::WholeFile {
                 bytes: 4,
                 digest: [7; 32],
-            },
-        };
-        let mut append_probe = copy.clone();
-        append_probe.outcome = rush_observe::CapturedUnmodeledSyscallOutcome::Returned {
-            return_value: -libc::EBADF as i64,
-            is_error: true,
-        };
-        assert!(supported_cat_copy_file_range_runtime_syscall(
-            &append_probe,
-            true,
-            std::slice::from_ref(&open),
-            std::slice::from_ref(&fallback),
-            &closes,
-            &[]
-        ));
-        assert!(!supported_cat_copy_file_range_runtime_syscall(
-            &append_probe,
-            true,
-            std::slice::from_ref(&open),
-            &[],
-            &closes,
-            &[]
-        ));
-        assert!(!supported_cat_copy_file_range_runtime_syscall(
-            &copy,
-            false,
-            std::slice::from_ref(&open),
-            &[],
-            &closes,
-            &[]
-        ));
-        let mut concatenated_destination = destination_close;
-        concatenated_destination.outcome = rush_observe::CapturedCloseOutcome::Closed {
-            file_value: Some(rush_observe::CapturedMappedFileValue::WholeFile {
-                bytes: 9,
-                digest: [8; 32],
                 mode: 0o100644,
-            }),
-        };
-        assert!(supported_cat_copy_file_range_runtime_syscall(
-            &copy,
-            true,
-            std::slice::from_ref(&open),
-            &[],
-            &[source_close.clone(), concatenated_destination],
-            &[]
-        ));
-        assert!(!supported_cat_copy_file_range_runtime_syscall(
-            &copy,
-            true,
-            std::slice::from_ref(&open),
-            &[],
-            std::slice::from_ref(&source_close),
-            &[]
-        ));
+            };
+            let source = rush_observe::CapturedDescriptorIdentity {
+                target: b"/workspace/obj/input".to_vec(),
+                device: 1,
+                inode: 2,
+                kind: rush_observe::CapturedDescriptorKind::RegularFile,
+            };
+            let destination = rush_observe::CapturedDescriptorIdentity {
+                target: b"/workspace/obj/output".to_vec(),
+                device: 1,
+                inode: 3,
+                kind: rush_observe::CapturedDescriptorKind::RegularFile,
+            };
+            let open = rush_observe::CapturedOpenAttempt {
+                syscall_index: 10,
+                request: rush_observe::CapturedOpenRequest {
+                    system_call: rush_observe::CapturedOpenSystemCall::OpenAt,
+                    path: b"input".to_vec(),
+                    directory: Some(b"/workspace/obj".to_vec()),
+                    flags: libc::O_RDONLY as u64,
+                    mode: 0,
+                    resolve: 0,
+                },
+                outcome: rush_observe::CapturedOpenOutcome::Opened {
+                    descriptor: source_descriptor,
+                    identity: source.clone(),
+                    mount_id: 5,
+                    file_value: Some(value),
+                },
+            };
+            let source_close = rush_observe::CapturedCloseAttempt {
+                syscall_index: 40,
+                request: rush_observe::CapturedCloseRequest {
+                    descriptor: source_descriptor,
+                    identity: Some(source),
+                    mount_id: Some(5),
+                },
+                outcome: rush_observe::CapturedCloseOutcome::Closed {
+                    file_value: Some(value),
+                },
+            };
+            let destination_close = rush_observe::CapturedCloseAttempt {
+                syscall_index: 41,
+                request: rush_observe::CapturedCloseRequest {
+                    descriptor: 1,
+                    identity: Some(destination.clone()),
+                    mount_id: Some(5),
+                },
+                outcome: rush_observe::CapturedCloseOutcome::Closed {
+                    file_value: Some(value),
+                },
+            };
+            let closes = [source_close.clone(), destination_close.clone()];
+            let copy = rush_observe::CapturedUnmodeledSyscallAttempt {
+                syscall_index: 20,
+                ..unmodeled_attempt(
+                    libc::SYS_copy_file_range as u64,
+                    [source_descriptor as u64, 0, 1, 0, 0x7ff0_0000, 0],
+                    4,
+                    false,
+                )
+            };
+            assert!(supported_cat_copy_file_range_runtime_syscall(
+                &copy,
+                true,
+                std::slice::from_ref(&open),
+                &[],
+                &closes,
+                &[]
+            ));
+            let mut eof = copy.clone();
+            eof.outcome = rush_observe::CapturedUnmodeledSyscallOutcome::Returned {
+                return_value: 0,
+                is_error: false,
+            };
+            assert!(supported_cat_copy_file_range_runtime_syscall(
+                &eof,
+                true,
+                std::slice::from_ref(&open),
+                &[],
+                &closes,
+                &[]
+            ));
+
+            let fallback = rush_observe::CapturedWriteAttempt {
+                syscall_index: 30,
+                request: rush_observe::CapturedWriteRequest {
+                    system_call: rush_observe::CapturedWriteSystemCall::Write,
+                    descriptor: 1,
+                    identity: Some(destination),
+                    mount_id: Some(5),
+                    uses_descriptor_offset: true,
+                    offset: Some(0),
+                    requested_bytes: 4,
+                    append: true,
+                },
+                outcome: rush_observe::CapturedWriteOutcome::Wrote {
+                    bytes: 4,
+                    digest: [7; 32],
+                },
+            };
+            let mut append_probe = copy.clone();
+            append_probe.outcome = rush_observe::CapturedUnmodeledSyscallOutcome::Returned {
+                return_value: -libc::EBADF as i64,
+                is_error: true,
+            };
+            assert!(supported_cat_copy_file_range_runtime_syscall(
+                &append_probe,
+                true,
+                std::slice::from_ref(&open),
+                std::slice::from_ref(&fallback),
+                &closes,
+                &[]
+            ));
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &append_probe,
+                true,
+                std::slice::from_ref(&open),
+                &[],
+                &closes,
+                &[]
+            ));
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &copy,
+                false,
+                std::slice::from_ref(&open),
+                &[],
+                &closes,
+                &[]
+            ));
+            let mut concatenated_destination = destination_close;
+            concatenated_destination.outcome = rush_observe::CapturedCloseOutcome::Closed {
+                file_value: Some(rush_observe::CapturedMappedFileValue::WholeFile {
+                    bytes: 9,
+                    digest: [8; 32],
+                    mode: 0o100644,
+                }),
+            };
+            assert!(supported_cat_copy_file_range_runtime_syscall(
+                &copy,
+                true,
+                std::slice::from_ref(&open),
+                &[],
+                &[source_close.clone(), concatenated_destination],
+                &[]
+            ));
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &copy,
+                true,
+                std::slice::from_ref(&open),
+                &[],
+                std::slice::from_ref(&source_close),
+                &[]
+            ));
+            // The source descriptor must match both the witnessed open and close.
+            let mut wrong_descriptor = append_probe.clone();
+            wrong_descriptor.arguments[0] = source_descriptor as u64 + 1;
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &wrong_descriptor,
+                true,
+                std::slice::from_ref(&open),
+                std::slice::from_ref(&fallback),
+                &closes,
+                &[]
+            ));
+            let mut wrong_close = source_close.clone();
+            wrong_close.request.descriptor = source_descriptor + 1;
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &append_probe,
+                true,
+                std::slice::from_ref(&open),
+                std::slice::from_ref(&fallback),
+                &[wrong_close, closes[1].clone()],
+                &[]
+            ));
+            let mut premature_close = source_close.clone();
+            premature_close.syscall_index = 15;
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &append_probe,
+                true,
+                std::slice::from_ref(&open),
+                std::slice::from_ref(&fallback),
+                &[premature_close, source_close.clone(), closes[1].clone()],
+                &[]
+            ));
+            let replacement = rush_observe::CapturedDup2Attempt {
+                syscall_index: 15,
+                request: rush_observe::CapturedDup2Request {
+                    system_call: rush_observe::CapturedDescriptorDuplicationSystemCall::Dup2,
+                    source_descriptor: 18,
+                    source_identity: source_close.request.identity.clone(),
+                    source_mount_id: Some(5),
+                    target_descriptor: source_descriptor,
+                    target_identity: source_close.request.identity.clone(),
+                    target_mount_id: Some(5),
+                },
+                outcome: rush_observe::CapturedDup2Outcome::Duplicated {
+                    descriptor: source_descriptor,
+                    identity: source_close.request.identity.clone().unwrap(),
+                    mount_id: 5,
+                    replaced_file_value: Some(value),
+                },
+            };
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &append_probe,
+                true,
+                std::slice::from_ref(&open),
+                std::slice::from_ref(&fallback),
+                &closes,
+                &[replacement]
+            ));
+            let mut wrong_digest = fallback.clone();
+            wrong_digest.outcome = rush_observe::CapturedWriteOutcome::Wrote {
+                bytes: 4,
+                digest: [9; 32],
+            };
+            assert!(!supported_cat_copy_file_range_runtime_syscall(
+                &append_probe,
+                true,
+                std::slice::from_ref(&open),
+                std::slice::from_ref(&wrong_digest),
+                &closes,
+                &[]
+            ));
+            for descriptor in [0, 1, 2, u64::MAX, 0x1_0000_0005] {
+                let mut invalid_source = append_probe.clone();
+                invalid_source.arguments[0] = descriptor;
+                assert!(!cat_copy_file_range_runtime_syscall_candidate(
+                    &invalid_source,
+                    true
+                ));
+            }
+        }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3401,7 +3486,7 @@ mod tests {
         ));
         let xargs_poll =
             unmodeled_attempt(libc::SYS_poll as u64, [0x1000, 5, 0, 0, 0, 0], 5, false);
-        assert!(supported_kbuild_runtime_syscall(
+        assert!(!supported_kbuild_runtime_syscall(
             &xargs_poll,
             false,
             false,

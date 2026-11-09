@@ -6466,7 +6466,7 @@ fn read_poll_runtime_observation_request(
     if entry.number != libc::SYS_poll as u64
         || std::mem::size_of::<libc::pollfd>() != 8
         || entry.arguments[0] == 0
-        || !matches!(entry.arguments[1], 3 | 4)
+        || !matches!(entry.arguments[1], 3 | 4 | 6)
         || signed_i32_syscall_argument(entry.arguments[2]) != Some(0)
     {
         return Ok(None);
@@ -13832,6 +13832,102 @@ mod tests {
                 .iter()
                 .all(|attempt| attempt.number != libc::SYS_poll as u64)
         }));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn captures_measured_xargs_pipe_jobserver_descriptor_readiness_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg(concat!(
+                "import os\n",
+                // Feed real xargs a completed input pipe so its readiness
+                // result is independent of parent/child scheduling.
+                "r, w = os.pipe()\n",
+                "os.write(w, b'x\\n')\n",
+                "os.close(w)\n",
+                "os.dup2(r, 0)\n",
+                "if r != 0: os.close(r)\n",
+                // Reproduce the authentic Make pipe jobserver's descriptor
+                // identities and readiness, without an LD_PRELOAD shim.
+                "r, w = os.pipe()\n",
+                "assert (r, w) == (3, 4), (r, w)\n",
+                "os.write(w, b'+++++++')\n",
+                "os.set_inheritable(r, True)\n",
+                "os.set_inheritable(w, True)\n",
+                "os.execv('/usr/bin/xargs', ['xargs', '/bin/true'])\n",
+            ))
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(directory.path().join("output")).unwrap())
+            .stderr(std::fs::File::create(directory.path().join("errors")).unwrap());
+        let receipt = capture_process_tree(&mut command).unwrap();
+        assert_syscall_census(&receipt);
+        let process = receipt
+            .processes()
+            .iter()
+            .find(|process| {
+                process
+                    .invocations
+                    .iter()
+                    .any(|invocation| invocation.executable.ends_with(b"/xargs"))
+            })
+            .unwrap();
+        let probes = process
+            .runtime_observation_attempts
+            .iter()
+            .filter(|attempt| {
+                matches!(
+                    attempt.request,
+                    CapturedRuntimeObservationRequest::DescriptorReadiness { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(probes.len(), 1);
+        let CapturedRuntimeObservationRequest::DescriptorReadiness {
+            descriptors,
+            timeout_milliseconds,
+        } = &probes[0].request
+        else {
+            unreachable!()
+        };
+        assert_eq!(*timeout_milliseconds, 0);
+        assert_eq!(descriptors.len(), 6);
+        assert!(descriptors.iter().enumerate().all(|(index, descriptor)| {
+            descriptor.descriptor == index as i32
+                && descriptor.requested_events == libc::POLLIN | libc::POLLOUT
+        }));
+        assert_eq!(descriptors[3].identity, descriptors[4].identity);
+        assert_eq!(descriptors[3].mount_id, descriptors[4].mount_id);
+        let jobserver = descriptors[3].identity.as_ref().unwrap();
+        assert_eq!(jobserver.kind, CapturedDescriptorKind::Fifo);
+        assert_eq!(
+            jobserver.target,
+            format!("pipe:[{}]", jobserver.inode).as_bytes()
+        );
+        assert_ne!(descriptors[0].identity, descriptors[3].identity);
+        assert_eq!(descriptors[5].identity, None);
+        assert_eq!(descriptors[5].mount_id, None);
+        assert_eq!(
+            probes[0].outcome,
+            CapturedRuntimeObservationOutcome::DescriptorReadiness {
+                ready: 6,
+                returned_events: vec![
+                    libc::POLLIN | libc::POLLHUP,
+                    libc::POLLIN | libc::POLLOUT,
+                    libc::POLLIN | libc::POLLOUT,
+                    libc::POLLIN,
+                    libc::POLLOUT,
+                    libc::POLLNVAL
+                ],
+            }
+        );
+        assert!(process
+            .unmodeled_syscall_attempts
+            .iter()
+            .all(|attempt| { attempt.number != libc::SYS_poll as u64 }));
     }
 
     #[cfg(target_arch = "x86_64")]

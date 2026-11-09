@@ -21047,7 +21047,20 @@ fn kbuild_descriptor_readiness_request_supported(
                 && descriptor.identity.is_some()
                 && valid_identity(descriptor)
         });
-    let xargs_probe = descriptors.len() == 4
+    // The six-descriptor profile is a measured pipe-jobserver probe: both
+    // endpoints must identify the same anonymous pipe, separate from stdin.
+    let pipe_jobserver_pair = descriptors.len() == 6
+        && descriptors[3].identity.as_ref().is_some_and(|pipe| {
+            pipe.kind == CapturedDescriptorKind::Fifo
+                && pipe.inode != 0
+                && pipe.target == format!("pipe:[{}]", pipe.inode).as_bytes()
+                && descriptors[4].identity.as_ref() == Some(pipe)
+                && descriptors[3].mount_id == descriptors[4].mount_id
+                && descriptors[0].identity.as_ref().is_some_and(|input| {
+                    (input.device, input.inode) != (pipe.device, pipe.inode)
+                })
+        });
+    let xargs_probe = matches!(descriptors.len(), 4 | 6)
         && descriptors.iter().enumerate().all(|(index, descriptor)| {
             descriptor.descriptor == index as i32
                 && descriptor.requested_events == libc::POLLIN | libc::POLLOUT
@@ -21059,7 +21072,8 @@ fn kbuild_descriptor_readiness_request_supported(
                             || (identity.kind == CapturedDescriptorKind::CharacterDevice
                                 && identity.target == b"/dev/null")
                     }
-                    (3, None) => true,
+                    (3 | 4, Some(_)) if pipe_jobserver_pair => true,
+                    (index, None) if index == descriptors.len() - 1 => true,
                     _ => false,
                 }
         });
@@ -21090,6 +21104,18 @@ fn kbuild_descriptor_readiness_supported(
                         libc::POLLIN | libc::POLLHUP,
                         libc::POLLIN | libc::POLLOUT,
                         libc::POLLIN | libc::POLLOUT,
+                        libc::POLLNVAL,
+                    ]
+        }
+        6 => {
+            ready == 6
+                && returned_events
+                    == [
+                        libc::POLLIN | libc::POLLHUP,
+                        libc::POLLIN | libc::POLLOUT,
+                        libc::POLLIN | libc::POLLOUT,
+                        libc::POLLIN,
+                        libc::POLLOUT,
                         libc::POLLNVAL,
                     ]
         }
@@ -31747,6 +31773,107 @@ mod tests {
             attempt: &attempt,
         };
         assert!(kbuild_record_outcome(&event, classified.1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requires_measured_xargs_pipe_jobserver_poll_shape() {
+        let accepts = kbuild_descriptor_readiness_supported;
+
+        let identity = |target: &[u8], inode, kind| CapturedDescriptorIdentity {
+            target: target.to_vec(),
+            device: 1,
+            inode,
+            kind,
+        };
+        let descriptors = vec![
+            CapturedPollDescriptor {
+                descriptor: 0,
+                identity: Some(identity(b"pipe:[11]", 11, CapturedDescriptorKind::Fifo)),
+                mount_id: Some(2),
+                requested_events: libc::POLLIN | libc::POLLOUT,
+            },
+            CapturedPollDescriptor {
+                descriptor: 1,
+                identity: Some(identity(b"output", 12, CapturedDescriptorKind::RegularFile)),
+                mount_id: Some(3),
+                requested_events: libc::POLLIN | libc::POLLOUT,
+            },
+            CapturedPollDescriptor {
+                descriptor: 2,
+                identity: Some(identity(b"errors", 13, CapturedDescriptorKind::RegularFile)),
+                mount_id: Some(3),
+                requested_events: libc::POLLIN | libc::POLLOUT,
+            },
+            CapturedPollDescriptor {
+                descriptor: 3,
+                identity: Some(identity(b"pipe:[14]", 14, CapturedDescriptorKind::Fifo)),
+                mount_id: Some(2),
+                requested_events: libc::POLLIN | libc::POLLOUT,
+            },
+            CapturedPollDescriptor {
+                descriptor: 4,
+                identity: Some(identity(b"pipe:[14]", 14, CapturedDescriptorKind::Fifo)),
+                mount_id: Some(2),
+                requested_events: libc::POLLIN | libc::POLLOUT,
+            },
+            CapturedPollDescriptor {
+                descriptor: 5,
+                identity: None,
+                mount_id: None,
+                requested_events: libc::POLLIN | libc::POLLOUT,
+            },
+        ];
+        let events = [
+            libc::POLLIN | libc::POLLHUP,
+            libc::POLLIN | libc::POLLOUT,
+            libc::POLLIN | libc::POLLOUT,
+            libc::POLLIN,
+            libc::POLLOUT,
+            libc::POLLNVAL,
+        ];
+        assert!(accepts(&descriptors, 0, 6, &events));
+        assert!(!accepts(&descriptors, 1, 6, &events));
+        assert!(!accepts(&descriptors, 0, 5, &events));
+        assert!(!accepts(&descriptors[..5], 0, 5, &events[..5]));
+        assert!(!accepts(&descriptors, 0, 6, &events[..5]));
+        for index in 0..6 {
+            let mut changed = descriptors.clone();
+            changed[index].descriptor += 1;
+            assert!(!accepts(&changed, 0, 6, &events));
+            let mut changed = descriptors.clone();
+            changed[index].requested_events = libc::POLLIN;
+            assert!(!accepts(&changed, 0, 6, &events));
+            let mut changed_events = events;
+            changed_events[index] = 0;
+            assert!(!accepts(&descriptors, 0, 6, &changed_events));
+        }
+        let mut changed = descriptors.clone();
+        changed[4].identity.as_mut().unwrap().inode += 1;
+        assert!(!accepts(&changed, 0, 6, &events));
+        let mut changed = descriptors.clone();
+        changed[4].mount_id = Some(9);
+        assert!(!accepts(&changed, 0, 6, &events));
+        let mut changed = descriptors.clone();
+        for descriptor in &mut changed[3..5] {
+            descriptor.identity.as_mut().unwrap().target = b"named-fifo".to_vec();
+        }
+        assert!(!accepts(&changed, 0, 6, &events));
+        let mut changed = descriptors.clone();
+        for descriptor in &mut changed[3..5] {
+            descriptor.identity.as_mut().unwrap().kind = CapturedDescriptorKind::RegularFile;
+        }
+        assert!(!accepts(&changed, 0, 6, &events));
+        let mut changed = descriptors.clone();
+        changed[0].identity = changed[3].identity.clone();
+        assert!(!accepts(&changed, 0, 6, &events));
+        let mut changed = descriptors.clone();
+        changed[5].identity = changed[3].identity.clone();
+        changed[5].mount_id = Some(2);
+        assert!(!accepts(&changed, 0, 6, &events));
+        let mut reversed = events;
+        reversed.swap(3, 4);
+        assert!(!accepts(&descriptors, 0, 6, &reversed));
     }
 
     #[cfg(unix)]
