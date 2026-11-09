@@ -155,8 +155,12 @@ pub struct RuntimeDirectoryObservation {
 pub struct ObservedActionExecutionResult {
     /// Standard local action execution result.
     pub execution: ActionExecutionResult,
-    /// Complete directory enumerations observed across the process tree.
+    /// Raw per-getdents directory witnesses across the process tree.
     pub directory_observations: Vec<RuntimeDirectoryObservation>,
+    /// Independently proved private open-to-EOF enumerations. A failure never
+    /// replaces or reinterprets the legacy raw observations above. Callers that
+    /// opt into this profile must reject it, rather than fall back to raw pages.
+    pub complete_directory_enumerations: std::result::Result<Vec<RuntimeDirectoryObservation>, String>,
 }
 
 fn resource_trace_path() -> Option<PathBuf> {
@@ -549,6 +553,32 @@ impl LocalActionRunner for DefaultLocalActionRunner {
                 CapturedProcessOutcome::Exited(code) => code,
                 CapturedProcessOutcome::Signaled(_) => -1,
             };
+            let complete_directory_enumerations = (|| -> Result<Vec<RuntimeDirectoryObservation>> {
+                let normalized = capture.normalize_complete_directory_enumerations()?;
+                let covered_pages = normalized.complete.iter().try_fold(0u64, |total, enumeration| {
+                    total.checked_add(u64::try_from(enumeration.pages.len())
+                        .context("runtime directory page count does not fit u64")?)
+                        .context("runtime directory page count overflow")
+                })?;
+                if !normalized.unproved.is_empty()
+                    || normalized.raw_attempts != normalized.raw_complete_attempts
+                    || covered_pages != normalized.raw_attempts
+                {
+                    anyhow::bail!(
+                        "runtime private directory enumeration proof covers {} of {} raw pages with {} unproved attempts",
+                        covered_pages, normalized.raw_attempts, normalized.unproved.len()
+                    );
+                }
+                normalized.complete.into_iter().map(|enumeration| {
+                    let CapturedDirectoryValue::Complete { members, .. } = enumeration.directory_value else {
+                        anyhow::bail!("runtime private directory enumeration lacks a complete value");
+                    };
+                    Ok(RuntimeDirectoryObservation {
+                        path: PathBuf::from(OsString::from_vec(enumeration.identity.target)),
+                        members,
+                    })
+                }).collect()
+            })().map_err(|error| format!("{error:#}"));
             let directory_observations = capture
                 .receipt
                 .processes()
@@ -579,6 +609,7 @@ impl LocalActionRunner for DefaultLocalActionRunner {
                     peak_rss_kb: 0,
                 },
                 directory_observations,
+                complete_directory_enumerations,
             })
         }
     }
@@ -1473,6 +1504,31 @@ mod tests {
         let result = DefaultLocalActionRunner.execute(request).await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout_tail, b"captured-shell");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn observed_runner_retains_raw_pages_and_proves_complete_private_enumeration() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("enumerated");
+        std::fs::create_dir(&directory).unwrap();
+        let mut members = Vec::new();
+        for index in 0..32 {
+            let name = format!("member-{index:02}");
+            std::fs::write(directory.join(&name), b"value").unwrap();
+            members.push(name.into_bytes());
+        }
+        let mut request = req(104, "ExternalDirectoryTest");
+        request.command.executable = PathBuf::from("/bin/ls");
+        request.command.argv = vec!["-a".into(), directory.to_str().unwrap().into()];
+        let result = DefaultLocalActionRunner.execute_observed(request).await.unwrap();
+        assert_eq!(result.execution.exit_code, 0);
+        assert!(result.directory_observations.len() >= 2, "raw positive and EOF pages must survive");
+        assert!(result.directory_observations.iter().all(|value|
+            value.path == directory && value.members == members));
+        assert_eq!(result.complete_directory_enumerations.unwrap(), vec![RuntimeDirectoryObservation {
+            path: directory, members,
+        }]);
     }
 
     #[cfg(target_os = "linux")]

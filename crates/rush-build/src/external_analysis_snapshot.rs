@@ -25,7 +25,7 @@ use std::time::Instant;
 pub const EXTERNAL_ANALYSIS_SNAPSHOT_SCHEMA: &str = "org.rushbuild.external-analysis-snapshot";
 
 /// Current external analysis snapshot layout.
-pub const EXTERNAL_ANALYSIS_SNAPSHOT_VERSION: u32 = 14;
+pub const EXTERNAL_ANALYSIS_SNAPSHOT_VERSION: u32 = 15;
 
 /// Reserved execution-property key for a fail-closed must-execute policy.
 pub(crate) const MANDATORY_EXECUTION_PROPERTY: &str = "rush.mandatory-execution";
@@ -36,6 +36,30 @@ pub(crate) const PROCFS_CLEAN_ENTRY_CACHEABLE_EXECUTION: &str =
     "procfs-content-keyed-clean-entry-v3";
 pub(crate) const RUNTIME_DIRECTORY_CHECKPOINT_PREFIX: &str =
     "rush.runtime-directory-checkpoint.v1.";
+/// Explicit keyed contract for private open-to-EOF directory enumeration.
+pub(crate) const RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY: &str =
+    "rush.runtime-directory-observation-profile";
+pub(crate) const COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE: &str =
+    "complete-private-enumeration-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeDirectoryObservationProfile {
+    /// No opt-in property: preserve exact legacy per-getdents occurrence checks.
+    RawPages,
+    /// Every raw page must belong to a proved private open-to-EOF lifecycle.
+    CompletePrivateEnumerations,
+}
+
+pub(crate) fn runtime_directory_observation_profile(
+    properties: &BTreeMap<String, String>,
+) -> Result<RuntimeDirectoryObservationProfile> {
+    match properties.get(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY).map(String::as_str) {
+        None => Ok(RuntimeDirectoryObservationProfile::RawPages),
+        Some(COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE) =>
+            Ok(RuntimeDirectoryObservationProfile::CompletePrivateEnumerations),
+        Some(profile) => anyhow::bail!("unsupported runtime directory observation profile {profile:?}"),
+    }
+}
 
 const GNU_MAKE_JOBSERVER_ENVIRONMENTS: [&[u8]; 2] = [b"MAKEFLAGS", b"MFLAGS"];
 const GNU_MAKE_JOBSERVER_AUTH_OPTION: &[u8] = b"--jobserver-auth=";
@@ -120,6 +144,24 @@ pub(crate) fn runtime_directory_checkpoints(
         checkpoints.push(checkpoint);
     }
     Ok(checkpoints)
+}
+
+fn complete_directory_checkpoint_shapes_are_uniform(
+    graph: &ExternalActionGraph,
+    checkpoints: &[ExternalRuntimeDirectoryCheckpoint],
+) -> Result<bool> {
+    let mut shapes = BTreeMap::new();
+    for checkpoint in checkpoints {
+        // Use the replay resolver and PathBuf equality verbatim: raw rooted
+        // keys can alias through ./, separators, or overlapping root values.
+        // No filesystem canonicalization is performed by either side.
+        let resolved = crate::external_replay::resolve_path(graph, &checkpoint.path)?;
+        let shape = (&checkpoint.members, &checkpoint.before_actions, &checkpoint.after_actions);
+        if shapes.insert(resolved, shape).is_some_and(|previous| previous != shape) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_runtime_directory_checkpoint(
@@ -459,6 +501,9 @@ impl ExternalAnalysisSnapshot {
             anyhow::bail!("unsupported external analysis schema {:?}", self.schema);
         }
         if self.version != EXTERNAL_ANALYSIS_SNAPSHOT_VERSION {
+            if self.version == 14 {
+                anyhow::bail!("unsupported external analysis version 14; reassemble retained capture with this Rush binary");
+            }
             anyhow::bail!("unsupported external analysis version {}", self.version);
         }
         if self.key.rush_compat_fingerprint != daemon_compat_fingerprint() {
@@ -759,6 +804,28 @@ fn validate_graph(graph: &ExternalActionGraph) -> Result<()> {
         }
         let runtime_directory_checkpoints =
             runtime_directory_checkpoints(&action.execution_properties)?;
+        let directory_profile = runtime_directory_observation_profile(&action.execution_properties)?;
+        if directory_profile == RuntimeDirectoryObservationProfile::CompletePrivateEnumerations
+            && (runtime_directory_checkpoints.is_empty()
+                || action.execution_properties.get(MANDATORY_EXECUTION_PROPERTY)
+                    .map(String::as_str) != Some(PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION))
+        {
+            anyhow::bail!(
+                "action {:?} requires nonempty complete-enumeration checkpoints and uncacheable mandatory execution",
+                action.logical_id
+            );
+        }
+        if directory_profile == RuntimeDirectoryObservationProfile::CompletePrivateEnumerations {
+            // A normalized receipt orders lifetimes by process/open index,
+            // which is not global inter-process time. This profile admits only
+            // uniform per-path contracts; do not infer changing epochs from it.
+            if !complete_directory_checkpoint_shapes_are_uniform(graph, &runtime_directory_checkpoints)? {
+                anyhow::bail!(
+                    "action {:?} has nonuniform per-path complete-enumeration checkpoints; temporal epochs require the legacy raw profile",
+                    action.logical_id
+                );
+            }
+        }
         if let Some(policy) = action
             .execution_properties
             .get("rush.kbuild.directory-materialization")
@@ -1753,6 +1820,176 @@ mod tests {
         match load_if_fresh(&destination, &snapshot.key, &semantics(temp.path())) {
             ExternalSnapshotAdmission::Hit(loaded) => assert_eq!(loaded, snapshot),
             admission => panic!("unexpected admission: {}", admission.decision().as_str()),
+        }
+    }
+
+    #[test]
+    fn complete_directory_profile_is_explicit_keyed_and_versioned() {
+        use crate::external_action_identity::{external_action_key_from_values, ExternalExecutableWitness};
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let mut snapshot = snapshot(temp.path(), &analysis_input);
+        let action = &mut snapshot.graph.actions[0];
+        action.cacheable = false;
+        action.local_only = true;
+        action.execution_properties.insert(MANDATORY_EXECUTION_PROPERTY.into(),
+            PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.into());
+        let (name, value) = encode_runtime_directory_checkpoint(0, &rooted("obj", "generated"), &[b"member".to_vec()]).unwrap();
+        action.execution_properties.insert(name, value);
+        assert_eq!(runtime_directory_observation_profile(&action.execution_properties).unwrap(),
+            RuntimeDirectoryObservationProfile::RawPages);
+        let executables = action.commands.iter().map(|command| ExternalExecutableWitness {
+            path: command.executable.clone(),
+            value: ExternalInputValue::File { digest: [8; 32], executable: true },
+        }).collect::<Vec<_>>();
+        let inputs = action.normal_inputs.iter().map(|input| ExternalInputKey {
+            path: input.path.clone(),
+            value: ExternalInputValue::File { digest: [9; 32], executable: false },
+        }).collect::<Vec<_>>();
+        let raw_key = external_action_key_from_values(action, &executables, &inputs).unwrap().compute_id().unwrap();
+        action.execution_properties.insert(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY.into(),
+            COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE.into());
+        let complete_key = external_action_key_from_values(action, &executables, &inputs).unwrap().compute_id().unwrap();
+        assert_ne!(raw_key, complete_key);
+        assert_eq!(runtime_directory_observation_profile(&action.execution_properties).unwrap(),
+            RuntimeDirectoryObservationProfile::CompletePrivateEnumerations);
+        assert_eq!(snapshot.version, 15); // A version-14 reader must reject this new contract.
+        snapshot.validate_structure().unwrap();
+        let destination = temp.path().join("snapshot.bin");
+        persist(&destination, &snapshot).unwrap();
+        match load_if_fresh(&destination, &snapshot.key, &semantics(temp.path())) {
+            ExternalSnapshotAdmission::Hit(loaded) => assert_eq!(loaded, snapshot),
+            admission => panic!("unexpected admission: {}", admission.decision().as_str()),
+        }
+        let mut old_raw = snapshot.clone();
+        old_raw.version = 14;
+        old_raw.graph.actions[0].execution_properties.remove(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY);
+        let error = old_raw.validate_structure().unwrap_err().to_string();
+        assert!(error.contains("unsupported external analysis version 14"));
+        assert!(error.contains("reassemble retained capture"));
+    }
+
+    #[test]
+    fn complete_directory_profile_rejects_unknown_empty_and_cacheable_contracts() {
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let mut snapshot = snapshot(temp.path(), &analysis_input);
+        let action = &mut snapshot.graph.actions[0];
+        action.execution_properties.insert(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY.into(), "unknown".into());
+        assert!(snapshot.validate_structure().unwrap_err().to_string().contains("unsupported runtime directory observation profile"));
+        let action = &mut snapshot.graph.actions[0];
+        action.execution_properties.insert(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY.into(),
+            COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE.into());
+        action.execution_properties.insert(MANDATORY_EXECUTION_PROPERTY.into(),
+            PROCFS_CLEAN_ENTRY_CACHEABLE_EXECUTION.into());
+        action.local_only = true;
+        let (name, value) = encode_runtime_directory_checkpoint(0, &rooted("obj", "generated"), &[]).unwrap();
+        action.execution_properties.insert(name.clone(), value);
+        assert!(snapshot.validate_structure().unwrap_err().to_string().contains("uncacheable mandatory execution"));
+        let action = &mut snapshot.graph.actions[0];
+        action.cacheable = false;
+        action.execution_properties.insert(MANDATORY_EXECUTION_PROPERTY.into(),
+            PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.into());
+        action.execution_properties.remove(&name);
+        assert!(snapshot.validate_structure().unwrap_err().to_string().contains("nonempty complete-enumeration checkpoints"));
+    }
+
+    #[test]
+    fn complete_directory_profile_requires_uniform_per_path_value_and_order_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let mut snapshot = snapshot(temp.path(), &analysis_input);
+        let action = &mut snapshot.graph.actions[0];
+        action.cacheable = false;
+        action.local_only = true;
+        action.execution_properties.insert(MANDATORY_EXECUTION_PROPERTY.into(),
+            PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.into());
+        action.execution_properties.insert(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY.into(),
+            COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE.into());
+        let path = rooted("obj", "generated");
+        let members = vec![b"member".to_vec()];
+        for index in 0..2 {
+            let (name, value) = encode_ordered_runtime_directory_checkpoint(index, &path, &members,
+                index as u64, &[], &[]).unwrap();
+            action.execution_properties.insert(name, value);
+        }
+        snapshot.validate_structure().unwrap();
+        for (changed_members, before, after) in [
+            (vec![b"different".to_vec()], vec![], vec![]),
+            (members.clone(), vec!["predecessor".to_string()], vec![]),
+            (members.clone(), vec![], vec!["successor".to_string()]),
+        ] {
+            let mut changed = snapshot.clone();
+            let (name, value) = encode_ordered_runtime_directory_checkpoint(1, &path,
+                &changed_members, 1, &before, &after).unwrap();
+            changed.graph.actions[0].execution_properties.insert(name, value);
+            assert!(changed.validate_structure().unwrap_err().to_string()
+                .contains("nonuniform per-path complete-enumeration checkpoints"));
+        }
+        // The new invariant must not reject legacy raw epoch contracts.
+        let action = &mut snapshot.graph.actions[0];
+        action.execution_properties.remove(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY);
+        let (name, value) = encode_ordered_runtime_directory_checkpoint(1, &path,
+            &[b"different".to_vec()], 1, &[], &[]).unwrap();
+        action.execution_properties.insert(name, value);
+        snapshot.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn complete_directory_profile_groups_runtime_path_aliases_without_widening_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let mut snapshot = snapshot(temp.path(), &analysis_input);
+        let action = &mut snapshot.graph.actions[0];
+        action.cacheable = false;
+        action.local_only = true;
+        action.execution_properties.insert(MANDATORY_EXECUTION_PROPERTY.into(),
+            PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.into());
+        action.execution_properties.insert(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY.into(),
+            COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE.into());
+        for (left, right) in [
+            ("generated", "./generated"),
+            ("generated/child", "generated//child"),
+            ("generated/child", "generated/./child"),
+        ] {
+            let mut changed = snapshot.clone();
+            for (index, path) in [left, right].into_iter().enumerate() {
+                let (name, value) = encode_runtime_directory_checkpoint(index,
+                    &rooted("obj", path), &[format!("member-{index}").into_bytes()]).unwrap();
+                changed.graph.actions[0].execution_properties.insert(name, value);
+            }
+            assert!(changed.validate_structure().unwrap_err().to_string()
+                .contains("nonuniform per-path complete-enumeration checkpoints"));
+            changed.graph.actions[0].execution_properties.remove(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY);
+            changed.validate_structure().unwrap(); // Legacy raw spelling policy is unchanged.
+        }
+        // Exact '.' remains a valid root checkpoint, including equal aliases.
+        for (index, path) in [".", "./"].into_iter().enumerate() {
+            let (name, value) = encode_runtime_directory_checkpoint(index, &rooted("obj", path), &[]).unwrap();
+            snapshot.graph.actions[0].execution_properties.insert(name, value);
+        }
+        snapshot.validate_structure().unwrap();
+        // Generic resolver tests cover equal/overlapping roots too. Persisted
+        // directory checkpoints still separately require the obj root; this
+        // grouping helper does not authorize another root name.
+        for (left, alias_root) in [
+            (".", snapshot.key.output_root.clone()),
+            ("generated", snapshot.key.output_root.join("generated")),
+        ] {
+            let mut graph = snapshot.graph.clone();
+            graph.roots.insert("alias".into(), alias_root);
+            let checkpoint = |path, member: &[u8]| ExternalRuntimeDirectoryCheckpoint {
+                path, members: vec![member.to_vec()], observation_ordinal: 0,
+                before_actions: vec![], after_actions: vec![],
+            };
+            let checkpoints = [checkpoint(rooted("obj", left), b"early"),
+                checkpoint(rooted("alias", "."), b"late")];
+            assert!(!complete_directory_checkpoint_shapes_are_uniform(&graph, &checkpoints).unwrap());
+            assert!(validate_runtime_directory_checkpoint(&checkpoints[1]).is_err());
         }
     }
 

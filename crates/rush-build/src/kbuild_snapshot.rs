@@ -813,6 +813,9 @@ struct KbuildMandatoryActionExecutionContract {
 struct KbuildMandatoryActionEligibilityContracts {
     seal: KbuildMandatoryActionEligibilitySeal,
     actions: Vec<KbuildMandatoryActionExecutionContract>,
+    directory_enumerations: BTreeMap<u64, Vec<rush_observe::CompleteDirectoryEnumeration>>,
+    directory_unproved_actions: BTreeSet<u64>,
+    directory_page_ordinals: BTreeMap<(CapturedProcessId, u64), u64>,
 }
 
 #[cfg(unix)]
@@ -13439,6 +13442,13 @@ fn kbuild_mandatory_action_eligibility(
             actions: action_seals,
         },
         actions: contracts,
+        directory_enumerations: BTreeMap::new(),
+        directory_unproved_actions: BTreeSet::new(),
+        directory_page_ordinals: observations.iter().filter_map(|observation| {
+            (observation.class == KbuildInputObservationClass::Directory)
+                .then_some(observation.syscall_index.map(|index| ((observation.process, index), observation.ordinal)))
+                .flatten()
+        }).collect(),
     })
 }
 
@@ -16099,6 +16109,271 @@ fn kbuild_replay_action_inputs(
     Ok((declarations, values))
 }
 
+/// Return one group per closed lifetime only when every checkpoint page is
+/// covered exactly once. This groups by typed FD lifetime, never by value.
+#[cfg(unix)]
+fn kbuild_complete_directory_page_groups(
+    checkpoint_ordinals: &BTreeMap<u64, usize>,
+    page_ordinals: &BTreeMap<(CapturedProcessId, u64), u64>,
+    proofs: &[&rush_observe::CompleteDirectoryEnumeration],
+) -> Option<Vec<(usize, Vec<usize>)>> {
+    let mut covered = BTreeSet::new();
+    let mut groups = Vec::new();
+    for (proof_index, proof) in proofs.iter().enumerate() {
+        if proof.pages.is_empty() {
+            return None;
+        }
+        let mut group = Vec::new();
+        for page in &proof.pages {
+            let ordinal = page_ordinals.get(&(page.process, page.syscall_index))?;
+            let index = *checkpoint_ordinals.get(ordinal)?;
+            if !covered.insert(index) {
+                return None;
+            }
+            group.push(index);
+        }
+        groups.push((proof_index, group));
+    }
+    if covered.len() != checkpoint_ordinals.len() {
+        return None;
+    }
+    groups.sort_by_key(|(_, group)| *group.first().expect("nonempty group"));
+    Some(groups)
+}
+
+#[cfg(all(test, unix))]
+mod complete_directory_page_tests {
+    use super::*;
+
+    fn proof(indices: &[u64]) -> rush_observe::CompleteDirectoryEnumeration {
+        rush_observe::CompleteDirectoryEnumeration {
+            process: 1,
+            descriptor: 3,
+            open_syscall_index: indices[0] - 1,
+            close_syscall_index: indices[indices.len() - 1] + 1,
+            pages: indices
+                .iter()
+                .map(|index| rush_observe::DirectoryEnumerationPage {
+                    process: 1,
+                    syscall_index: *index,
+                    path: b"/obj".to_vec(),
+                })
+                .collect(),
+            identity: rush_observe::CapturedDescriptorIdentity {
+                target: b"/obj".to_vec(),
+                device: 1,
+                inode: 2,
+                kind: rush_observe::CapturedDescriptorKind::Directory,
+            },
+            mount_id: 1,
+            directory_value: rush_observe::CapturedDirectoryValue::Complete {
+                entries: 2,
+                digest: [1; 32],
+                members: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn complete_lifetimes_replace_pages_only_with_an_exact_bijection() {
+        for indices in [vec![1, 2], vec![1, 2, 3, 4]] {
+            let proof = proof(&indices);
+            let page_ordinals = indices
+                .iter()
+                .enumerate()
+                .map(|(index, syscall)| ((1, *syscall), 10 + index as u64))
+                .collect();
+            let checkpoints = indices
+                .iter()
+                .enumerate()
+                .map(|(index, _)| (10 + index as u64, index))
+                .collect();
+            assert_eq!(
+                kbuild_complete_directory_page_groups(&checkpoints, &page_ordinals, &[&proof]),
+                Some(vec![(0, (0..indices.len()).collect())])
+            );
+            let mut missing = page_ordinals.clone();
+            missing.remove(&(1, indices[0]));
+            assert!(
+                kbuild_complete_directory_page_groups(&checkpoints, &missing, &[&proof]).is_none()
+            );
+            assert!(kbuild_complete_directory_page_groups(
+                &checkpoints,
+                &page_ordinals,
+                &[&proof, &proof]
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn identical_directory_values_preserve_distinct_completed_lifetimes() {
+        let first = proof(&[1, 2]);
+        let second = proof(&[5, 6]);
+        let page_ordinals =
+            BTreeMap::from([((1, 1), 10), ((1, 2), 11), ((1, 5), 12), ((1, 6), 13)]);
+        let checkpoints = BTreeMap::from([(10, 0), (11, 1), (12, 2), (13, 3)]);
+        assert_eq!(
+            kbuild_complete_directory_page_groups(&checkpoints, &page_ordinals, &[&first, &second]),
+            Some(vec![(0, vec![0, 1]), (1, vec![2, 3])])
+        );
+        assert!(
+            kbuild_complete_directory_page_groups(&checkpoints, &page_ordinals, &[&first])
+                .is_none()
+        );
+    }
+}
+
+#[cfg(unix)]
+fn kbuild_use_complete_directory_enumerations(
+    actions: &mut [ExternalAction],
+    captured_action_ids: &[Option<String>],
+    mandatory: &KbuildMandatoryActionEligibilityContracts,
+) -> Result<()> {
+    use crate::external_analysis_snapshot::{
+        runtime_directory_checkpoints, COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE,
+        RUNTIME_DIRECTORY_CHECKPOINT_PREFIX, RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY,
+    };
+    let replay_indices = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| (action.logical_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for contract in &mandatory.actions {
+        if contract.directory_checkpoints.is_empty()
+            || mandatory
+                .directory_unproved_actions
+                .contains(&contract.action_index)
+        {
+            continue;
+        }
+        let Some(proofs) = mandatory.directory_enumerations.get(&contract.action_index) else {
+            continue;
+        };
+        let relevant_paths = contract
+            .directory_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.anchor.path.clone())
+            .collect::<BTreeSet<_>>();
+        let proofs = proofs
+            .iter()
+            .filter(|proof| relevant_paths.contains(&bytes_path(&proof.identity.target)))
+            .collect::<Vec<_>>();
+        let ordinals = contract
+            .directory_checkpoints
+            .iter()
+            .enumerate()
+            .map(|(index, checkpoint)| (checkpoint.observation_ordinal, index))
+            .collect::<BTreeMap<_, _>>();
+        if ordinals.len() != contract.directory_checkpoints.len() {
+            anyhow::bail!("Kbuild runtime pages repeat an observation ordinal");
+        }
+        let Some(groups) = kbuild_complete_directory_page_groups(
+            &ordinals,
+            &mandatory.directory_page_ordinals,
+            &proofs,
+        ) else {
+            continue;
+        };
+        let logical_id =
+            kbuild_captured_replay_action_id(captured_action_ids, contract.action_index)?;
+        let action_index = *replay_indices
+            .get(logical_id)
+            .context("Kbuild completed directory observer lost its replay action")?;
+        let action = &mut actions[action_index];
+        if action
+            .execution_properties
+            .get(MANDATORY_EXECUTION_PROPERTY)
+            .map(String::as_str)
+            != Some(PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION)
+        {
+            continue;
+        }
+        let raw = runtime_directory_checkpoints(&action.execution_properties)?;
+        if raw.len() != contract.directory_checkpoints.len()
+            || !raw
+                .iter()
+                .zip(&contract.directory_checkpoints)
+                .all(|(actual, captured)| {
+                    actual.observation_ordinal == captured.observation_ordinal
+                        && actual.path == obj_path(captured.path.path.clone())
+                })
+        {
+            anyhow::bail!("Kbuild complete directory checkpoint identity changed during assembly");
+        }
+        let mut uniform = BTreeMap::new();
+        let mut eligible = true;
+        for checkpoint in &raw {
+            let shape = (
+                &checkpoint.members,
+                &checkpoint.before_actions,
+                &checkpoint.after_actions,
+            );
+            if uniform
+                .insert(checkpoint.path.clone(), shape)
+                .is_some_and(|previous| previous != shape)
+            {
+                eligible = false;
+            }
+        }
+        for (proof_index, group) in &groups {
+            let proof = proofs[*proof_index];
+            let rush_observe::CapturedDirectoryValue::Complete {
+                entries,
+                digest,
+                members,
+            } = &proof.directory_value
+            else {
+                anyhow::bail!("Kbuild closed directory proof lost its complete witness")
+            };
+            for index in group {
+                let captured = &contract.directory_checkpoints[*index];
+                let anchor = &captured.anchor;
+                let expected_value = KbuildObservedInputValue::Directory {
+                    entries: *entries,
+                    digest: *digest,
+                    listing_digest: captured_directory_listing_digest(members)?,
+                };
+                if anchor.process != proof.process
+                    || anchor.descriptor != proof.descriptor
+                    || anchor.open_syscall_index != proof.open_syscall_index
+                    || anchor.path != bytes_path(&proof.identity.target)
+                    || captured.object
+                        != kbuild_descriptor_input_object(&proof.identity, Some(proof.mount_id))?
+                    || captured.value != expected_value
+                    || captured.members != *members
+                {
+                    eligible = false;
+                }
+            }
+        }
+        if !eligible {
+            continue;
+        }
+        let mut replacement = Vec::new();
+        for (_, group) in &groups {
+            let checkpoint = &raw[group[0]];
+            replacement.push(encode_ordered_runtime_directory_checkpoint(
+                replacement.len(),
+                &checkpoint.path,
+                &checkpoint.members,
+                checkpoint.observation_ordinal,
+                &checkpoint.before_actions,
+                &checkpoint.after_actions,
+            )?);
+        }
+        action
+            .execution_properties
+            .retain(|key, _| !key.starts_with(RUNTIME_DIRECTORY_CHECKPOINT_PREFIX));
+        action.execution_properties.extend(replacement);
+        action.execution_properties.insert(
+            RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY.to_string(),
+            COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE.to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn kbuild_mandatory_action_contracts_by_index<'a>(
     mandatory: &'a KbuildMandatoryActionEligibilityContracts,
@@ -17979,6 +18254,7 @@ fn assemble_kbuild_snapshot(
         dependencies.sort();
         dependencies.dedup();
     }
+    kbuild_use_complete_directory_enumerations(&mut actions, &captured_action_ids, mandatory)?;
     let analysis_barriers = kbuild_analysis_barriers(
         &actions,
         &captured_action_ids,
@@ -19132,6 +19408,7 @@ struct KbuildProcessOwnershipMatcher {
     action_file_creation_masks: BTreeMap<u64, u32>,
     process_credentials: BTreeMap<CapturedProcessId, CapturedCredentialState>,
     action_credentials: BTreeMap<u64, ExternalCredentialState>,
+    directory_enumeration_normalizer: rush_observe::DirectoryEnumerationNormalizer,
 }
 
 #[cfg(unix)]
@@ -19327,6 +19604,7 @@ impl KbuildProcessOwnershipMatcher {
             pending_kallsyms_ls_xattrs: Vec::new(),
             input_values: Vec::new(),
             directory_members: BTreeMap::new(),
+            directory_enumeration_normalizer: rush_observe::DirectoryEnumerationNormalizer::default(),
             directory_descriptors: BTreeMap::new(),
             directory_anchors: BTreeMap::new(),
             procfs_directory_descriptors: BTreeMap::new(),
@@ -20335,7 +20613,7 @@ impl KbuildProcessOwnershipMatcher {
     }
 
     fn finish(
-        self,
+        mut self,
         graph_digest: [u8; 32],
         stream: rush_observe::ProcessCaptureStreamSeal,
         coverage: KbuildGraphCaptureCoverage,
@@ -20824,7 +21102,7 @@ impl KbuildProcessOwnershipMatcher {
             &final_output_values,
             &self.output_root,
         )?;
-        let mandatory_action_eligibility = procfs_mandatory_execution
+        let mut mandatory_action_eligibility = procfs_mandatory_execution
             .as_ref()
             .map(|policy| {
                 let source_root = external_input_source_root
@@ -20846,6 +21124,19 @@ impl KbuildProcessOwnershipMatcher {
                 )
             })
             .transpose()?;
+        if let Some(mandatory) = &mut mandatory_action_eligibility {
+            let normalization = std::mem::take(&mut self.directory_enumeration_normalizer).finish()?;
+            for page in normalization.unproved {
+                if let Some(KbuildProcessOwner::Action(action)) = self.process_owners.get(&page.process) {
+                    mandatory.directory_unproved_actions.insert(*action);
+                }
+            }
+            for proof in normalization.complete {
+                if let Some(KbuildProcessOwner::Action(action)) = self.process_owners.get(&proof.process) {
+                    mandatory.directory_enumerations.entry(*action).or_default().push(proof);
+                }
+            }
+        }
         let external_input_manifests = external_input_source_root
             .map(|source_root| {
                 let (captured, references) = kbuild_external_input_manifest_seal(
@@ -22077,6 +22368,7 @@ fn kbuild_witnessed_seek_end_input(
 #[cfg(unix)]
 impl ProcessCaptureStreamVisitor for KbuildProcessOwnershipMatcher {
     fn visit(&mut self, event: ProcessCaptureStreamEvent<'_>) -> Result<()> {
+        self.directory_enumeration_normalizer.observe(&event)?;
         let stream_ordinal = self.stream_ordinal;
         self.stream_ordinal = self
             .stream_ordinal

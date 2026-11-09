@@ -10,6 +10,13 @@
 mod linux;
 #[cfg(unix)]
 mod stream;
+#[cfg(unix)]
+mod directory_enumeration;
+#[cfg(unix)]
+pub use directory_enumeration::{
+    normalize_complete_directory_enumerations, CompleteDirectoryEnumeration,
+    DirectoryEnumerationNormalization, DirectoryEnumerationNormalizer, DirectoryEnumerationPage,
+};
 
 #[cfg(target_os = "linux")]
 pub use linux::{

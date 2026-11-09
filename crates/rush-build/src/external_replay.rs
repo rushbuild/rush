@@ -8,7 +8,8 @@
 use crate::action_manager::{ActionCachePolicy, BeforeOutputMutation, RushActionManager};
 use crate::external_action_identity::{external_action_key_from_values, ExternalExecutableWitness};
 use crate::external_analysis_snapshot::{
-    runtime_directory_checkpoints, ExternalAction, ExternalActionGraph, ExternalAnalysisSnapshot,
+    runtime_directory_checkpoints, runtime_directory_observation_profile,
+    RuntimeDirectoryObservationProfile, ExternalAction, ExternalActionGraph, ExternalAnalysisSnapshot,
     ExternalEmptyOutputInput, ExternalInitialInputValue, ExternalInputKind,
 };
 use anyhow::{Context, Result};
@@ -24,6 +25,7 @@ use rush_action::{Action, ActionId, ActionResult, Artifact, Command};
 use rush_cache::ActionCache;
 use rush_exec::local_action_runner::{
     DefaultLocalActionRunner, ExecutionRequest, LocalActionRunner, RuntimeDirectoryObservation,
+    ObservedActionExecutionResult,
 };
 use rush_exec::local_isolation::{LocalDescriptorTopology, LocalExecutionIsolation};
 use rush_exec::ExecutionStrategy;
@@ -73,6 +75,7 @@ struct ResolvedExternalAction {
     outputs: Vec<(PathBuf, ExternalOutputKind, u32)>,
     input_preconditions: Vec<ResolvedExternalInputPrecondition>,
     runtime_directory_checkpoints: Vec<ResolvedRuntimeDirectoryCheckpoint>,
+    directory_observation_profile: RuntimeDirectoryObservationProfile,
     direct_runtime_directory_opening: Option<RuntimeDirectoryObservation>,
     resource_class: ResourceClass,
     isolation: Option<LocalExecutionIsolation>,
@@ -682,6 +685,7 @@ impl ExecutionStrategy for ExternalExecutionStrategy {
         let direct_runtime_checkpoints = direct_runtime_directory_checkpoint_validation(
             &resolved.runtime_directory_checkpoints,
             &resolved.outputs,
+            resolved.directory_observation_profile,
         );
 
         for precondition in &resolved.input_preconditions {
@@ -748,8 +752,11 @@ impl ExecutionStrategy for ExternalExecutionStrategy {
                 self.runner.execute(request).await
             } else {
                 let observed = self.runner.execute_observed(request).await?;
-                runtime_directory_observations.extend(observed.directory_observations);
-                Ok(observed.execution)
+                let (execution, directory_observations) = select_runtime_directory_observations(
+                    resolved.directory_observation_profile, observed,
+                )?;
+                runtime_directory_observations.extend(directory_observations);
+                Ok(execution)
             }
             .with_context(|| {
                 format!(
@@ -1088,6 +1095,7 @@ impl ExternalReplayEngine {
                             direct_runtime_directory_checkpoint_validation(
                                 &resolved.runtime_directory_checkpoints,
                                 &resolved.outputs,
+                                resolved.directory_observation_profile,
                             );
                         if direct_runtime_checkpoints {
                             resolved.direct_runtime_directory_opening = Some(
@@ -1524,6 +1532,7 @@ impl ExternalReplayEngine {
             outputs: resolved_outputs,
             input_preconditions,
             runtime_directory_checkpoints,
+            directory_observation_profile: runtime_directory_observation_profile(&external.execution_properties)?,
             direct_runtime_directory_opening: None,
             resource_class: map_resource_class(external.resource),
             isolation,
@@ -1665,7 +1674,9 @@ fn direct_runtime_directory_opening_stages(
     for (index, action) in graph.actions.iter().enumerate() {
         let checkpoints = resolve_runtime_directory_checkpoints(graph, action)?;
         let outputs = resolve_external_outputs(graph, action)?;
-        if !direct_runtime_directory_checkpoint_validation(&checkpoints, &outputs) {
+        if !direct_runtime_directory_checkpoint_validation(
+            &checkpoints, &outputs, runtime_directory_observation_profile(&action.execution_properties)?,
+        ) {
             continue;
         }
         let action_stage = *action_stages
@@ -1768,8 +1779,10 @@ fn resolve_runtime_directory_checkpoints(
 fn direct_runtime_directory_checkpoint_validation(
     checkpoints: &[ResolvedRuntimeDirectoryCheckpoint],
     outputs: &[(PathBuf, ExternalOutputKind, u32)],
+    profile: RuntimeDirectoryObservationProfile,
 ) -> bool {
-    checkpoints.len() == 2
+    profile == RuntimeDirectoryObservationProfile::RawPages
+        && checkpoints.len() == 2
         && checkpoints[0].path == checkpoints[1].path
         && checkpoints[0].members == checkpoints[1].members
         && outputs
@@ -1792,6 +1805,21 @@ fn observe_runtime_directory(path: &Path) -> Result<RuntimeDirectoryObservation>
         path: path.to_path_buf(),
         members,
     })
+}
+
+/// Select the persisted contract explicitly. Complete-profile proof failures
+/// cannot be admitted by the legacy per-page path or a before/after shortcut.
+fn select_runtime_directory_observations(
+    profile: RuntimeDirectoryObservationProfile,
+    observed: ObservedActionExecutionResult,
+) -> Result<(rush_exec::local_action_runner::ActionExecutionResult, Vec<RuntimeDirectoryObservation>)> {
+    let observations = match profile {
+        RuntimeDirectoryObservationProfile::RawPages => observed.directory_observations,
+        RuntimeDirectoryObservationProfile::CompletePrivateEnumerations => observed
+            .complete_directory_enumerations
+            .map_err(|reason| anyhow::anyhow!("runtime complete directory enumeration proof failed: {reason}"))?,
+    };
+    Ok((observed.execution, observations))
 }
 
 fn validate_runtime_directory_observations(
@@ -2988,6 +3016,63 @@ mod tests {
                 peak_rss_kb: 0,
             })
         }
+    }
+
+    #[test]
+    fn complete_directory_profile_requires_proof_and_preserves_enumeration_occurrences() {
+        let path = PathBuf::from("/tmp/generated");
+        let members = vec![b"member".to_vec()];
+        let observation = RuntimeDirectoryObservation { path: path.clone(), members: members.clone() };
+        let expected = [ResolvedRuntimeDirectoryCheckpoint {
+            path: path.clone(), members, observation_ordinal: 1,
+            before_actions: Vec::new(), after_actions: Vec::new(),
+        }];
+        let observed = |proof| ObservedActionExecutionResult {
+            execution: ActionExecutionResult {
+                declared_action_id: DeclaredActionId(0), exit_code: 0,
+                stdout_tail: Vec::new(), stderr_tail: Vec::new(),
+                duration: Duration::ZERO, peak_rss_kb: 0,
+            },
+            // Four raw pages can prove one enumeration. The proof helper, not
+            // this selector, establishes the private lifetime/full-entry cover.
+            directory_observations: vec![observation.clone(); 4],
+            complete_directory_enumerations: proof,
+        };
+        let (_, raw) = select_runtime_directory_observations(
+            RuntimeDirectoryObservationProfile::RawPages, observed(Err("unsupported private lifecycle".into())),
+        ).unwrap();
+        assert_eq!(raw.len(), 4);
+        assert!(validate_runtime_directory_observations(&expected, &raw).is_err());
+        let error = select_runtime_directory_observations(
+            RuntimeDirectoryObservationProfile::CompletePrivateEnumerations,
+            observed(Err("unproved page".into())),
+        ).unwrap_err();
+        assert!(error.to_string().contains("unproved page"));
+        let (_, complete) = select_runtime_directory_observations(
+            RuntimeDirectoryObservationProfile::CompletePrivateEnumerations,
+            observed(Ok(vec![observation.clone()])),
+        ).unwrap();
+        validate_runtime_directory_observations(&expected, &complete).unwrap();
+        // Two independently completed opens remain two occurrences; equality
+        // of their values cannot turn them into a single enumeration.
+        assert!(validate_runtime_directory_observations(&expected,
+            &[observation.clone(), observation.clone()]).is_err());
+        assert!(validate_runtime_directory_observations(&expected, &[]).is_err());
+        assert!(validate_runtime_directory_observations(&expected, &[RuntimeDirectoryObservation {
+            path, members: vec![b"changed".to_vec()],
+        }]).is_err());
+    }
+
+    #[test]
+    fn complete_directory_profile_never_uses_direct_before_after_shortcut() {
+        let path = PathBuf::from("/tmp/generated");
+        let checkpoint = ResolvedRuntimeDirectoryCheckpoint {
+            path, members: vec![b"member".to_vec()], observation_ordinal: 0,
+            before_actions: Vec::new(), after_actions: Vec::new(),
+        };
+        let checkpoints = [checkpoint.clone(), checkpoint];
+        assert!(direct_runtime_directory_checkpoint_validation(&checkpoints, &[], RuntimeDirectoryObservationProfile::RawPages));
+        assert!(!direct_runtime_directory_checkpoint_validation(&checkpoints, &[], RuntimeDirectoryObservationProfile::CompletePrivateEnumerations));
     }
 
     #[test]

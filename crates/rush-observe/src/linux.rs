@@ -1178,6 +1178,67 @@ pub struct ProcessCaptureOutput {
     pub stdout_tail: Vec<u8>,
     /// Bounded tail of the root command's standard error.
     pub stderr_tail: Vec<u8>,
+    // Not serialized, clonable, or constructible by receipt consumers. The
+    // binding also detects replacement through the public receipt field.
+    initial_exec_origin: BoundInitialExecOrigin,
+}
+
+struct InitialExecBoundary {
+    root: CapturedProcessId,
+}
+
+struct BoundInitialExecOrigin {
+    root: CapturedProcessId,
+    receipt_digest: [u8; 32],
+}
+
+fn live_origin_receipt_digest(receipt: &ProcessCaptureReceipt) -> Result<[u8; 32]> {
+    struct DigestWriter(blake3::Hasher);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(blake3::Hasher::new());
+    writer.0.update(b"rush.live-initial-exec-origin.v1\0");
+    bincode::serialize_into(&mut writer, receipt)
+        .context("bind live initial-exec origin to its complete receipt")?;
+    Ok(*writer.0.finalize().as_bytes())
+}
+
+impl InitialExecBoundary {
+    fn bind(self, receipt: &ProcessCaptureReceipt) -> Result<BoundInitialExecOrigin> {
+        if receipt.root() != self.root {
+            anyhow::bail!("live initial-exec origin does not match capture root");
+        }
+        Ok(BoundInitialExecOrigin {
+            root: self.root,
+            receipt_digest: live_origin_receipt_digest(receipt)?,
+        })
+    }
+}
+
+impl ProcessCaptureOutput {
+    /// Prove complete directory lifetimes using this capture's verified initial
+    /// exec boundary. Standalone receipts have no such live-origin authority.
+    /// Replacing or modifying the public receipt invalidates that authority.
+    pub fn normalize_complete_directory_enumerations(
+        &self,
+    ) -> Result<crate::DirectoryEnumerationNormalization> {
+        if self.receipt.root() != self.initial_exec_origin.root
+            || live_origin_receipt_digest(&self.receipt)? != self.initial_exec_origin.receipt_digest
+        {
+            anyhow::bail!("live initial-exec origin no longer matches its capture receipt");
+        }
+        crate::directory_enumeration::normalize_live_capture_directory_enumerations(
+            &self.receipt,
+            self.initial_exec_origin.root,
+        )
+    }
 }
 
 /// Run `command` under ptrace while draining both output streams concurrently.
@@ -1219,7 +1280,7 @@ fn capture_process_tree_output(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut drains = None;
     let mut sink = ReceiptBuilder::default();
-    let root = capture_process_tree_events_with_spawn(
+    let (root, initial_exec_boundary) = capture_process_tree_events_with_spawn(
         command,
         &mut sink,
         |child| {
@@ -1247,10 +1308,13 @@ fn capture_process_tree_output(
     let stderr_tail = stderr_drain
         .join()
         .map_err(|_| anyhow::anyhow!("observed process stderr drain panicked"))??;
+    let receipt = sink.finish(root)?;
+    let initial_exec_origin = initial_exec_boundary.bind(&receipt)?;
     Ok(ProcessCaptureOutput {
-        receipt: sink.finish(root)?,
+        receipt,
         stdout_tail,
         stderr_tail,
+        initial_exec_origin,
     })
 }
 
@@ -1283,6 +1347,7 @@ pub(crate) fn capture_process_tree_events(
     sink: &mut impl ProcessCaptureSink,
 ) -> Result<CapturedProcessId> {
     capture_process_tree_events_with_spawn(command, sink, |_| Ok(()), false)
+        .map(|(root, _initial_exec_boundary)| root)
 }
 
 fn capture_process_tree_events_with_spawn(
@@ -1290,7 +1355,7 @@ fn capture_process_tree_events_with_spawn(
     sink: &mut impl ProcessCaptureSink,
     on_spawn: impl FnOnce(&mut Child) -> Result<()>,
     trace_prepared: bool,
-) -> Result<CapturedProcessId> {
+) -> Result<(CapturedProcessId, InitialExecBoundary)> {
     TRACEE_ROOT_CACHE.with(|cache| cache.borrow_mut().clear());
     if !trace_prepared {
         install_process_tree_capture(command);
@@ -1308,6 +1373,9 @@ fn capture_process_tree_events_with_spawn(
     prepare_root_for_interrupts(root_pid)?;
 
     let root_id = 1;
+    // Successful exec unshares the descriptor table. This evidence is minted
+    // only after observing the kernel's initial post-exec SIGTRAP above.
+    let initial_exec_boundary = InitialExecBoundary { root: root_id };
     let mut next_id = root_id + 1;
     let mut mapped_file_witnesses = MappedFileWitnessCache::new();
     let root_invocation =
@@ -3086,7 +3154,7 @@ fn capture_process_tree_events_with_spawn(
     if !early_newborn_stops.is_empty() {
         anyhow::bail!("process capture ended with unannounced traced children");
     }
-    Ok(root_id)
+    Ok((root_id, initial_exec_boundary))
 }
 
 fn finish_process(
@@ -18708,6 +18776,59 @@ mod tests {
                 delivery.signal == libc::SIGTERM as u32
                     && delivery.source == CapturedSignalSource::TracedProcess { process: 1 }
             }));
+    }
+
+    #[test]
+    fn live_initial_exec_origin_proves_root_but_not_standalone_or_changed_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::write(directory.path().join(name), name).unwrap();
+        }
+        // Shell globbing enumerates in the initial process, without a later
+        // exec or child-creation event from which to infer a private table.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' *")
+            .env_clear()
+            .current_dir(directory.path());
+        let mut output = capture_process_tree_with_output(&mut command, 1024).unwrap();
+        let root = output.receipt.root();
+        let root_process = output
+            .receipt
+            .processes()
+            .iter()
+            .find(|process| process.id == root)
+            .unwrap();
+        assert!(root_process.exec_attempts.is_empty());
+        assert!(root_process.process_creation_attempts.is_empty());
+        let proof = output.normalize_complete_directory_enumerations().unwrap();
+        assert_eq!(proof.complete.len(), 1);
+        assert!(proof.unproved.is_empty());
+        assert!(proof.raw_attempts >= 2);
+        assert_eq!(proof.raw_complete_attempts, proof.raw_attempts);
+        assert_eq!(proof.complete[0].process, root);
+        assert_eq!(proof.complete[0].pages.len() as u64, proof.raw_attempts);
+
+        // Serializing the same receipt cannot serialize the live authority.
+        let standalone: ProcessCaptureReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&output.receipt).unwrap()).unwrap();
+        let unseeded = crate::normalize_complete_directory_enumerations(&standalone).unwrap();
+        assert!(unseeded.complete.is_empty());
+        assert_eq!(unseeded.unproved.len() as u64, proof.raw_attempts);
+
+        let original = output.receipt.clone();
+        output.receipt.processes[0].invocations[0].argv[0].push(b'x');
+        output.receipt.validate_complete().unwrap();
+        let error = output
+            .normalize_complete_directory_enumerations()
+            .unwrap_err();
+        assert!(error.to_string().contains("no longer matches"));
+        output.receipt = original;
+        assert_eq!(
+            output.normalize_complete_directory_enumerations().unwrap(),
+            proof
+        );
     }
 
     #[test]
