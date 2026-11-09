@@ -350,6 +350,75 @@ fn tracked_canonicalize_records_symlink_hops_and_matches_std() {
     );
 }
 
+#[test]
+fn refresh_filesystem_observations_sees_created_repository_and_keeps_negative_evidence() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let sem = empty_semantics();
+    let io: crate::tracked::SharedTrackedIo =
+        Arc::new(RealTrackedIo::new(sem.clone(), dir.path()));
+    let external = dir.path().join("output/external");
+    let module = external.join("source/defs.bzl");
+    crate::tracked::scope(io.clone(), || {
+        assert_eq!(crate::tracked::canonicalize(&module).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound);
+        let before = io.manifest();
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, b"VALUE = 41\n").unwrap();
+        // Reproduce the memoized-absence failure before the producer boundary.
+        assert!(crate::tracked::canonicalize(&module).is_err());
+        crate::tracked::refresh_filesystem_observations();
+        assert_eq!(crate::tracked::canonicalize(&module).unwrap(),
+            fs::canonicalize(&module).unwrap());
+        assert_eq!(crate::tracked::read_file(&module).unwrap().as_ref(), b"VALUE = 41\n");
+        let after = io.manifest();
+        for dep in before.deps() { assert!(after.deps().contains(dep)); }
+        assert!(matches!(after.validate_staleness(&sem), Staleness::Stale { .. }));
+        assert!(after.deps().iter().any(|dep| matches!(dep,
+            Dependency::FileExistence { path, exists: true, .. } if path == &external)));
+    });
+    let next: crate::tracked::SharedTrackedIo =
+        Arc::new(RealTrackedIo::new(sem.clone(), dir.path()));
+    crate::tracked::scope(next.clone(), || {
+        crate::tracked::canonicalize(&module).unwrap();
+        crate::tracked::read_file(&module).unwrap();
+    });
+    assert_eq!(next.manifest().validate_staleness(&sem), Staleness::Fresh);
+}
+
+#[test]
+#[cfg(unix)]
+fn refresh_filesystem_observations_does_not_reuse_a_replaced_symlink() {
+    use std::os::unix::fs::symlink;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let sem = empty_semantics();
+    let io: crate::tracked::SharedTrackedIo =
+        Arc::new(RealTrackedIo::new(sem.clone(), dir.path()));
+    for name in ["first", "second", "third"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+        fs::write(dir.path().join(name).join("defs.bzl"), name).unwrap();
+    }
+    let link = dir.path().join("source");
+    symlink("first", &link).unwrap();
+    crate::tracked::scope(io.clone(), || {
+        let module = link.join("defs.bzl");
+        assert!(crate::tracked::canonicalize(&module).unwrap().ends_with("first/defs.bzl"));
+        let before = io.manifest();
+        fs::remove_file(&link).unwrap();
+        symlink("second", &link).unwrap();
+        crate::tracked::refresh_filesystem_observations();
+        assert!(crate::tracked::canonicalize(&module).unwrap().ends_with("second/defs.bzl"));
+        // Live mode remains in force for subsequent producer mutations.
+        fs::remove_file(&link).unwrap();
+        symlink("third", &link).unwrap();
+        assert!(crate::tracked::canonicalize(&module).unwrap().ends_with("third/defs.bzl"));
+        let after = io.manifest();
+        for dep in before.deps() { assert!(after.deps().contains(dep)); }
+        assert!(matches!(after.validate_staleness(&sem), Staleness::Stale { .. }));
+    });
+}
+
 /// 7. Change a recorded env var (two different CommandSemantics) → Stale (Env).
 #[test]
 fn changed_env_var_is_stale() {

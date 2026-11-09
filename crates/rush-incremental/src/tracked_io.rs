@@ -151,6 +151,14 @@ pub trait TrackedIo {
     /// the raw [`CommandSemantics`] through the analysis interface.
     fn validate_manifest(&self, manifest: &DependencyManifest) -> Validated;
 
+    /// Resume live filesystem observations after an analysis-owned producer.
+    ///
+    /// Keep all recorded dependencies, including earlier negative results.
+    /// Implementations with command-local filesystem memos must stop serving
+    /// them after this boundary; a producer may have created or replaced paths.
+    /// Implementations that always read the filesystem need no extra work.
+    fn refresh_filesystem_observations(&self) {}
+
     /// Return a successful canonicalization cached for this analysis command.
     ///
     /// Implementations without a command-local cache may return `None`.
@@ -198,6 +206,9 @@ pub struct RealTrackedIo {
     canonicalized: Mutex<HashMap<PathBuf, PathBuf>>,
     /// Path existence and kind observations made during this command.
     existence_observations: Mutex<HashMap<PathBuf, (bool, Option<FileKind>)>>,
+    /// Once analysis materializes inputs, filesystem values can evolve within
+    /// this command. Disable memos until the next immutable command snapshot.
+    live_filesystem: std::sync::atomic::AtomicBool,
 }
 
 impl RealTrackedIo {
@@ -216,6 +227,7 @@ impl RealTrackedIo {
             recorded: Mutex::new(Vec::new()),
             canonicalized: Mutex::new(HashMap::new()),
             existence_observations: Mutex::new(HashMap::new()),
+            live_filesystem: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -256,8 +268,10 @@ impl RealTrackedIo {
                 Ok(observations) => observations,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if let Some(observation) = observations.get(np) {
-                return *observation;
+            if !self.live_filesystem.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(observation) = observations.get(np) {
+                    return *observation;
+                }
             }
         }
 
@@ -275,7 +289,11 @@ impl RealTrackedIo {
             Ok(observations) => observations,
             Err(poisoned) => poisoned.into_inner(),
         };
-        observations.insert(np.to_path_buf(), observation);
+        // A refresh racing this read leaves no reusable old observation.
+        // Recorded evidence remains append-only in either ordering.
+        if !self.live_filesystem.load(std::sync::atomic::Ordering::Acquire) {
+            observations.insert(np.to_path_buf(), observation);
+        }
         observation
     }
 
@@ -342,7 +360,20 @@ pub(crate) fn classify(meta: &fs::Metadata) -> Option<FileKind> {
 }
 
 impl TrackedIo for RealTrackedIo {
+    fn refresh_filesystem_observations(&self) {
+        // Publish live mode first so in-flight memo writers cannot repopulate
+        // a cache that later reads might use. Never discard recorded evidence.
+        self.live_filesystem.store(true, std::sync::atomic::Ordering::Release);
+        self.existence_observations.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        self.canonicalized.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+    }
+
     fn canonicalize_cache_get(&self, path: &Path) -> Option<PathBuf> {
+        if self.live_filesystem.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
         let cache = match self.canonicalized.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
@@ -355,7 +386,9 @@ impl TrackedIo for RealTrackedIo {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         };
-        cache.insert(path, resolved);
+        if !self.live_filesystem.load(std::sync::atomic::Ordering::Acquire) {
+            cache.insert(path, resolved);
+        }
     }
 
     fn read_file(&self, path: &Path) -> std::io::Result<Bytes> {

@@ -181,6 +181,15 @@ pub fn metadata_kind(path: &Path) -> Option<crate::FileKind> {
     current_required().metadata_kind(path)
 }
 
+/// Resume live filesystem reads after a tool materializes analysis inputs.
+///
+/// Earlier observations remain dependencies and may make this command's
+/// manifest stale. This only prevents command-local memos from hiding newly
+/// created paths or symlink replacements; it never grants reuse authority.
+pub fn refresh_filesystem_observations() {
+    current_required().refresh_filesystem_observations();
+}
+
 /// Probe a path's full stat metadata through the current analysis IO. See
 /// [`TrackedIo::metadata_full`].
 pub fn metadata_full(path: &Path) -> bool {

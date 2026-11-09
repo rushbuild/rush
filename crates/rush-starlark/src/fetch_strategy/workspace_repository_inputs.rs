@@ -574,6 +574,9 @@ fn query_definition_output(
     format: &str,
     expression: String,
 ) -> Result<String> {
+    // Even a definition query can materialize external repositories. Earlier
+    // path probes must remain evidence without hiding the resulting paths.
+    tracked::refresh_filesystem_observations();
     let mut command = Command::new(&context.executable);
     context.apply(&mut command)?;
     command
