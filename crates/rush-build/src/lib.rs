@@ -10020,6 +10020,86 @@ mod cc_binary_linkshared_compat_tests {
 mod package_declaration_catalog_tests {
     use super::*;
 
+    // TensorFlow v2.17.0 tensorflow/core/framework/registration/BUILD uses
+    // these generator and consumer attributes. Loads and unrelated tests
+    // are omitted so this exercises Rush's native macro and parser directly.
+    // Source SHA256: 3ef1fc225fd8d20ac05a80723d7f54e4fa24ce85d4234bc0283273467d1aae14.
+    const REGISTRATION_OPTIONS_BUILD: &str = r#"
+tf_gen_options_header(
+    name = "gen_registration_options",
+    build_settings = {
+        "//tensorflow:enable_registration_v2": "REGISTRATION_V2",
+    },
+    output_header = "options.h",
+    template = "options.h.tpl",
+)
+
+cc_library(
+    name = "registration",
+    hdrs = ["options.h", "registration.h"],
+)
+"#;
+
+    fn parse_registration_options_build(
+        extra_rule: &str,
+    ) -> (tempfile::TempDir, Arc<rush_parse::BuildFile>) {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("tensorflow/core/framework/registration");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(root.path().join("WORKSPACE"), "").unwrap();
+        let build_path = package.join("BUILD");
+        std::fs::write(
+            &build_path,
+            format!("{REGISTRATION_OPTIONS_BUILD}\n{extra_rule}\n"),
+        ).unwrap();
+        let parsed = rush_incremental::tracked::test_scope(root.path(), || {
+            rush_parse::parse_build_file_with_loader(
+                &build_path,
+                rush_starlark::BzlLoader::new(root.path().to_path_buf()),
+            )
+            .unwrap()
+        });
+        (root, parsed)
+    }
+
+    #[test]
+    fn registration_macro_output_resolves_to_generator_without_an_explicit_alias() {
+        let (_root, build_file) = parse_registration_options_build("");
+        assert_eq!(build_file.rules.len(), 2);
+        assert!(!build_file.rules.iter().any(|rule| rule.name == "options.h"));
+        let generator = build_file.rules.iter()
+            .find(|rule| rule.name == "gen_registration_options")
+            .unwrap();
+        assert_eq!(generator.rule_type, "tf_gen_options_header");
+        assert_eq!(
+            BuildOrchestrator::symbolic_declared_outputs(generator).unwrap(),
+            vec!["options.h"]
+        );
+        let catalog = BuildOrchestrator::package_declaration_catalog(
+            &build_file,
+            None,
+            "tensorflow/core/framework/registration",
+        ).unwrap();
+        assert_eq!(
+            catalog.producer_for("options.h"),
+            Some("gen_registration_options")
+        );
+        assert_eq!(catalog.producer_for("registration"), Some("registration"));
+    }
+
+    #[test]
+    fn registration_macro_output_still_rejects_an_explicit_target_alias() {
+        let (_root, build_file) = parse_registration_options_build(
+            "alias(name = \"options.h\", actual = \":registration\")",
+        );
+        let error = BuildOrchestrator::package_declaration_catalog(
+            &build_file,
+            None,
+            "tensorflow/core/framework/registration",
+        ).expect_err("a declared output must not replace an explicit rule target");
+        assert!(error.to_string().contains("conflicts with target"), "{error}");
+    }
+
     fn rule(name: &str, rule_type: &str, attributes: HashMap<String, Value>) -> rush_parse::Rule {
         rush_parse::Rule {
             name: name.to_string(),

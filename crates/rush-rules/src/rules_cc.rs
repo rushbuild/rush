@@ -1424,13 +1424,11 @@ impl RuleInstance for CcLibraryInstance {
         //
         // Additionally, a bare-filename entry in `hdrs` (no `:`/`//`/`@`
         // prefix) is also treated as an implicit `:<name>` dep in the same
-        // package. Bazel's Skylark rule for cc_library resolves such
-        // entries to sibling rules with that target name, which is how
-        // generated headers like `options.h` (produced by
-        // tf_gen_options_header as a sibling target with an alias of that
-        // name) end up wired into dependents. If no such sibling exists,
-        // rush's missing-dep path falls through to the on-disk
-        // source-file check, so plain local headers still work.
+        // package. Resolve these file labels through the package catalog
+        // so generated headers like `options.h` pull their declaring
+        // tf_gen_options_header producer into the dependency graph. If no
+        // generated-file or rule target exists, the missing-dep path uses
+        // the on-disk source-file check, so plain local headers still work.
         let mut out: Vec<String> = self.deps.clone();
         // `data` labels are dependencies too: Bazel builds them and stages
         // their outputs into runfiles. Register them so they're built and
@@ -1453,7 +1451,7 @@ impl RuleInstance for CcLibraryInstance {
             // scan to include srcs that end with `.inc`/`.h`/`.def` so that
             // generated files referenced by name (e.g. gentbl_cc_library
             // outputs like `"passes/foo.h.inc"`) pull in the sibling
-            // genrule via the aliases our macro expanders emit. Without
+            // generator through the package output catalog. Without
             // this, the gentbl target is parsed but never built, and the
             // consumer's `#include` fails against an empty genfiles dir.
             let looks_like_header = h.ends_with(".h")

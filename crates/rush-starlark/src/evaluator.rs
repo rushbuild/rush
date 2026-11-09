@@ -1605,58 +1605,11 @@ fn expand_gentbl_cc_library(
     // Route to rush's native GentblCcLibraryRule instead of whatever
     // Starlark version is loaded. The Starlark version invokes
     // `mlir-tblgen` via a Bazel tool action rush can't execute directly.
-    let mut rule_calls = vec![RuleCall {
+    Ok(vec![RuleCall {
         rule_type: "gentbl_cc_library".to_string(),
         args: Vec::new(),
         kwargs: kwargs.clone(),
-    }];
-
-    // Consumers `hdrs = ["<file>.inc"]` cause rush's cc_library dep-chase to
-    // look up `:<file>.inc` as a sibling target. Emit an alias per output
-    // file in `tbl_outs` pointing back to the gentbl rule so that lookup
-    // resolves (same pattern as expand_tf_gen_options_header, flatbuffer).
-    // Without this, the lookup falls through to empty SystemCcLibrary and
-    // the .inc include fails at compile time.
-    let name = match kwargs.get("name") {
-        Some(Value::String(s)) => s.clone(),
-        _ => return Ok(rule_calls),
-    };
-    let visibility = kwargs
-        .get("visibility")
-        .cloned()
-        .unwrap_or(Value::List(vec![Value::String(
-            "//visibility:public".to_string(),
-        )]));
-
-    if let Some(Value::List(outs_list)) = kwargs.get("tbl_outs") {
-        for entry in outs_list {
-            // Each entry is (args_list, output_file). We only need the
-            // output path — second element.
-            let out_file = match entry {
-                Value::List(items) if items.len() >= 2 => {
-                    if let Value::String(s) = &items[1] {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            let Some(out_file) = out_file else { continue };
-
-            let mut alias_kwargs = HashMap::new();
-            alias_kwargs.insert("name".to_string(), Value::String(out_file));
-            alias_kwargs.insert("actual".to_string(), Value::String(format!(":{}", name)));
-            alias_kwargs.insert("visibility".to_string(), visibility.clone());
-            rule_calls.push(RuleCall {
-                rule_type: "alias".to_string(),
-                args: Vec::new(),
-                kwargs: alias_kwargs,
-            });
-        }
-    }
-
-    Ok(rule_calls)
+    }])
 }
 
 /// #36: map a `tf_gen_op_wrapper(s)_cc` `api_def_srcs` list to the trailing
@@ -1699,9 +1652,8 @@ fn compute_api_def_arg(api_def_srcs: &[String], target: &str) -> Result<String> 
 ///   * `genrule` `<n>_genrule` running the tool to write
 ///     `ops/<n>.{h,cc,_internal.h,_internal.cc}`; cmd uses `set -- $(OUTS)` so
 ///     we don't depend on `$(location)` of genrule OUTPUTS (only `$(location)`
-///     of the tool, which rush does substitute),
-///   * an `alias` per generated file → the genrule so cc_library `:<file>`
-///     lookups resolve (same pattern as gentbl/flatbuffer expanders).
+///     of the tool, which rush does substitute).
+/// Generated-file labels resolve through the package output catalog.
 /// Then one public `cc_library` <name> bundling every op's `.cc`/`.h` and one
 /// `<name>_internal` for the `_internal.*` files, both alwayslink=1 with the
 /// macro's default cc/core deps. api_def_srcs are not yet handled (functional_ops
@@ -1841,28 +1793,13 @@ fn expand_tf_gen_op_wrappers_cc(
             kwargs: gen_kwargs,
         });
 
-        // (3) per-output aliases so `:<generated file>` lookups resolve.
-        for f in &outs {
-            let mut a = HashMap::new();
-            a.insert("name".to_string(), Value::String(f.clone()));
-            a.insert("actual".to_string(), Value::String(format!(":{}_genrule", n)));
-            if let Some(v) = &visibility {
-                a.insert("visibility".to_string(), v.clone());
-            }
-            rule_calls.push(RuleCall {
-                rule_type: "alias".to_string(),
-                args: Vec::new(),
-                kwargs: a,
-            });
-        }
-
         subsrcs.push(format!("{}.cc", out));
         subhdrs.push(format!("{}.h", out));
         internalsrcs.push(format!("{}_internal.cc", out));
         internalhdrs.push(format!("{}_internal.h", out));
     }
 
-    // (4) public cc_library bundling all generated srcs/hdrs.
+    // (3) public cc_library bundling all generated srcs/hdrs.
     let genrule_dep_labels: Vec<Value> = op_lib_names
         .iter()
         .map(|n| Value::String(format!(":{}_genrule", n)))
@@ -1892,7 +1829,7 @@ fn expand_tf_gen_op_wrappers_cc(
         kwargs: lib,
     });
 
-    // (5) internal cc_library.
+    // (4) internal cc_library.
     let mut ilib = HashMap::new();
     ilib.insert("name".to_string(), Value::String(format!("{}_internal", name)));
     ilib.insert(
@@ -1946,8 +1883,8 @@ fn expand_tf_gen_op_wrappers_cc(
 /// replicate that here for one op lib:
 ///   * `tf_cc_binary` tool `<out_ops_file>_gen_cc` linking op_gen + the op libs,
 ///   * `genrule` `<name>_genrule` (4 outs: .h/.cc/_internal.h/_internal.cc) whose
-///     cmd uses `$(OUTS)` for outputs and `$(location :tool)` for the binary,
-///   * an `alias` per generated file → the genrule so `:<file>` lookups resolve.
+///     cmd uses `$(OUTS)` for outputs and `$(location :tool)` for the binary.
+/// Generated-file labels resolve through the package output catalog.
 /// Unlike the plural macro, the singular emits NO bundling cc_library — a separate
 /// hand-written cc_library consumes the generated `.cc`/`.h` (e.g. tf2xla/cc:xla_ops).
 /// api_def_srcs is deferred (same as the plural expander): the singular TF callers
@@ -2060,25 +1997,6 @@ fn expand_tf_gen_op_wrapper_cc(
         kwargs: gen_kwargs,
     });
 
-    // (3) per-output aliases so `:<generated file>` lookups (from the separate
-    // hand-written consuming cc_library) resolve to the genrule.
-    for f in &outs {
-        let mut a = HashMap::new();
-        a.insert("name".to_string(), Value::String(f.clone()));
-        a.insert(
-            "actual".to_string(),
-            Value::String(format!(":{}_genrule", name)),
-        );
-        if let Some(v) = &visibility {
-            a.insert("visibility".to_string(), v.clone());
-        }
-        rule_calls.push(RuleCall {
-            rule_type: "alias".to_string(),
-            args: Vec::new(),
-            kwargs: a,
-        });
-    }
-
     Ok(rule_calls)
 }
 
@@ -2094,10 +2012,8 @@ fn expand_flatbuffer_cc_library(
     //   tree,
     //   cc_library `{name}` with hdrs pointing at the generated files
     //   (includes = ["."]) and a dep on `:{name}_srcs` so the genrule is
-    //   forced to execute before the cc_library is consumed,
-    //   aliases from each `{out_prefix}{basename}_generated.h` → the genrule
-    //   so cc_library implicit `:<file>` lookups resolve (matches the
-    //   tf_gen_options_header pattern).
+    //   forced to execute before the cc_library is consumed.
+    // Generated-file labels resolve through the package output catalog.
     //
     // `@flatbuffers//:flatc` is stubbed in rush so `$(location)`
     // resolution for the flatc binary doesn't work. Instead we rely on
@@ -2274,23 +2190,6 @@ fn expand_flatbuffer_cc_library(
         kwargs: cc_lib_kwargs,
     });
 
-    // Aliases so cc_library implicit `:<file>` deps on each generated header
-    // resolve to the genrule producing it.
-    for header in &output_headers {
-        let mut alias_kwargs = HashMap::new();
-        alias_kwargs.insert("name".to_string(), Value::String(header.clone()));
-        alias_kwargs.insert(
-            "actual".to_string(),
-            Value::String(format!(":{}_srcs", name)),
-        );
-        alias_kwargs.insert("visibility".to_string(), visibility.clone());
-        rule_calls.push(RuleCall {
-            rule_type: "alias".to_string(),
-            args: Vec::new(),
-            kwargs: alias_kwargs,
-        });
-    }
-
     // filegroup `{name}_includes` mirrors the Starlark macro's filegroup
     // output so callers that pass it as `includes = [other_lib:_includes]`
     // continue to resolve.
@@ -2322,46 +2221,13 @@ fn expand_tf_gen_options_header(
     // .tpl into a concrete options.h with every TF_OPTION_<X>() macro set
     // to false. TF's Starlark version invokes a code-generator tool rush
     // doesn't build.
-    let gen = RuleCall {
+    // The generated-file label belongs to this rule's declared output. The
+    // package catalog resolves filename dependencies to the producer.
+    Ok(vec![RuleCall {
         rule_type: "tf_gen_options_header".to_string(),
         args: Vec::new(),
         kwargs: kwargs.clone(),
-    };
-
-    // Also emit an alias named `<output_header>` bound to the generator.
-    // TF cc_library rules reference the generated header by plain filename
-    // in `hdrs = [...]`; with the alias in the same package, rush's dep
-    // chase can resolve it instead of falling through to a missing-file
-    // source node.
-    let base_name = match kwargs.get("name") {
-        Some(Value::String(s)) => s.clone(),
-        _ => return Ok(vec![gen]),
-    };
-    let output_header = match kwargs.get("output_header") {
-        Some(Value::String(s)) => s.clone(),
-        _ => return Ok(vec![gen]),
-    };
-    let mut alias_kwargs = HashMap::new();
-    alias_kwargs.insert("name".to_string(), Value::String(output_header));
-    alias_kwargs.insert(
-        "actual".to_string(),
-        Value::String(format!(":{}", base_name)),
-    );
-    alias_kwargs.insert(
-        "visibility".to_string(),
-        kwargs
-            .get("visibility")
-            .cloned()
-            .unwrap_or(Value::List(vec![Value::String(
-                "//visibility:public".to_string(),
-            )])),
-    );
-    let alias = RuleCall {
-        rule_type: "alias".to_string(),
-        args: Vec::new(),
-        kwargs: alias_kwargs,
-    };
-    Ok(vec![gen, alias])
+    }])
 }
 
 fn expand_tf_cc_tests(
@@ -7739,8 +7605,8 @@ impl Evaluator {
                 // rush. Its flatbuffer_cc_library Starlark impl calls
                 // native.genrule with a $(location @flatbuffers//:flatc) tool
                 // rush can't resolve. Route to our native expander which
-                // hardcodes /usr/bin/flatc and emits genrule + cc_library +
-                // per-output aliases.
+                // invokes flatc and emits the genrule, cc_library and
+                // includes filegroup.
                 "flatbuffer_cc_library",
                 // TF's tf_gen_op_wrappers_cc macro builds a per-op codegen
                 // tf_cc_binary + a genrule that runs it to emit ops/<n>.{h,cc}

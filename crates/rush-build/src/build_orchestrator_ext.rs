@@ -3845,6 +3845,9 @@ impl BuildOrchestrator {
             {
                 continue;
             }
+            // Requested roots may name a generated file rather than its
+            // producing rule. Resolve the root before reachability is built.
+            Self::try_resolve_generated_output_alias(&label, &mut graph)?;
         }
 
         eprintln!("\n✅ Created {} nodes in dependency graph\n", graph.len());
@@ -4799,7 +4802,12 @@ impl BuildOrchestrator {
                             &format!("pkg={} nodes={}", missing_label.package, graph.len()),
                         );
 
-                        if graph.has_node(&missing_label) {
+                        if graph.has_node(&missing_label)
+                            || Self::try_resolve_generated_output_alias(
+                                &missing_label,
+                                &mut graph,
+                            )?
+                        {
                             build_files_seen.insert(package_key, ());
                             total_build_files_loaded += 1;
                             let added_count =
@@ -9848,6 +9856,11 @@ impl BuildOrchestrator {
     ) -> Result<usize> {
         let mut registered = 0usize;
         let mut boundary_cache = HashMap::new();
+        let declarations = Self::package_declaration_catalog(
+            build_file,
+            context_workspace,
+            context_package,
+        )?;
         let mut target_names: Vec<_> = Self::package_source_file_target_names(
             build_file,
             context_workspace,
@@ -9857,6 +9870,13 @@ impl BuildOrchestrator {
         .collect();
         target_names.sort();
         for target_name in target_names {
+            // A declared generated-file label belongs to its producer even
+            // if a stale file with that name exists in the source package.
+            if declarations.producer_for(&target_name)
+                .is_some_and(|producer| producer != target_name.as_str())
+            {
+                continue;
+            }
             let label = Label {
                 workspace: context_workspace.map(ToOwned::to_owned),
                 package: context_package.to_string(),
@@ -20324,6 +20344,166 @@ filegroup(
                 "//q:root".to_string(),
             ])
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registration_generated_output_loads_fresh_producer_before_source_fallback() -> Result<()> {
+        assert_registration_generated_output_producer(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registration_generated_output_can_be_requested_as_a_root() -> Result<()> {
+        assert_registration_generated_output_producer(true).await
+    }
+
+    async fn assert_registration_generated_output_producer(direct_root: bool) -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        for stale_source in [false, true] {
+            let temp = TempDir::new()?;
+            let workspace_root = temp.path();
+            write_file(&workspace_root.join("WORKSPACE"), "")?;
+            write_file(
+                &workspace_root.join("registration/BUILD"),
+                r#"
+tf_gen_options_header(
+    name = "gen_registration_options",
+    build_settings = {
+        "//tensorflow:enable_registration_v2": "REGISTRATION_V2",
+    },
+    output_header = "options.h",
+    template = "options.h.tpl",
+    visibility = ["//visibility:public"],
+)
+cc_library(name = "registration", hdrs = ["options.h"])
+"#,
+            )?;
+            write_file(
+                &workspace_root.join("registration/options.h.tpl"),
+                "#define_option REGISTRATION_V2\n",
+            )?;
+            let source_header = workspace_root.join("registration/options.h");
+            if stale_source {
+                write_file(&source_header, "stale source must not shadow the producer\n")?;
+            }
+            write_file(
+                &workspace_root.join("consumer/BUILD"),
+                "filegroup(name = \"root\", srcs = [\"//registration:options.h\"])\n",
+            )?;
+
+            let orchestrator = BuildOrchestrator::with_workspace(workspace_root.to_path_buf());
+            let root = if direct_root {
+                "//registration:options.h"
+            } else {
+                "//consumer:root"
+            };
+            orchestrator.build_with_dependencies(vec![root.to_string()]).await?;
+
+            let generated_header = cache_paths::workspace_output_root(workspace_root)
+                .join("genfiles/registration/options.h");
+            assert_eq!(
+                std::fs::read_to_string(&generated_header)?,
+                "#define TF_OPTION_REGISTRATION_V2() false\n",
+                "the producer must render the header (stale_source={stale_source}, direct_root={direct_root})",
+            );
+            if stale_source {
+                assert_eq!(
+                    std::fs::read_to_string(&source_header)?,
+                    "stale source must not shadow the producer\n",
+                );
+            } else {
+                assert!(!source_header.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_output_macros_configure_declaring_producers_without_output_named_rules() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        for (source, producer, output) in [
+            // TensorFlow v2.17.0 stablehlo/BUILD bridge_passes_inc_gen.
+            // Source SHA256: 417fdd0fba72034dfdf8585e6228bd88d14fe01f9f66bc66750a129e80e2ea10.
+            (
+                r#"gentbl_cc_library(
+    name = "bridge_passes_inc_gen",
+    tbl_outs = [(["-gen-pass-decls", "-name=Bridge"], "passes/bridge/passes.h.inc")],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "passes/bridge/passes.td",
+    deps = ["@llvm-project//mlir:PassBaseTdFiles"],
+)"#,
+                "bridge_passes_inc_gen",
+                "passes/bridge/passes.h.inc",
+            ),
+            (
+                r#"flatbuffer_cc_library(name = "schema", srcs = ["schema.fbs"], out_prefix = "nested/")"#,
+                "schema_srcs",
+                "nested/schema_generated.h",
+            ),
+            (
+                r#"tf_gen_op_wrapper_cc(name = "xla_ops_gen", out_ops_file = "ops/xla_ops", deps = [], op_gen = "//tools:op_gen")"#,
+                "xla_ops_gen_genrule",
+                "ops/xla_ops.h",
+            ),
+            (
+                r#"tf_gen_op_wrappers_cc(name = "generated_ops", op_lib_names = ["math_ops"], deps = [], pkg = "//ops", op_gen = "//tools:op_gen")"#,
+                "math_ops_genrule",
+                "ops/math_ops.h",
+            ),
+        ] {
+            let temp = TempDir::new()?;
+            let root = temp.path().to_path_buf();
+            rush_incremental::tracked::test_scope(&root, || -> Result<()> {
+                write_file(&root.join("WORKSPACE"), "")?;
+                let build_path = root.join("p/BUILD");
+                let explicit_alias = format!("alias(name = \"kept_alias\", actual = \":{producer}\")");
+                write_file(&build_path, &format!("{source}\n{explicit_alias}\n"))?;
+                let orchestrator = BuildOrchestrator::with_workspace(root.clone());
+                let parsed = orchestrator.with_tracked_scope(|| {
+                    orchestrator.parse_build_file_cached(&build_path, Some(&root))
+                })?;
+                assert_eq!(
+                    parsed.rules.iter().filter(|rule| rule.rule_type == "alias")
+                        .map(|rule| rule.name.as_str()).collect::<Vec<_>>(),
+                    vec!["kept_alias"],
+                );
+                let catalog = BuildOrchestrator::package_declaration_catalog(&parsed, None, "p")?;
+                assert_eq!(catalog.producer_for(output), Some(producer));
+                let instances = orchestrator.with_tracked_scope(|| {
+                    orchestrator.instantiate_build_file_for_repository_targets(
+                        &build_path, Some(&root), None, &HashSet::from([output.to_string()]),
+                    )
+                })?;
+                assert!(instances.iter().any(|instance| instance.target_name() == producer));
+                assert!(!instances.iter().any(|instance| instance.target_name() == output));
+                let mut graph = DependencyGraph::new();
+                for instance in instances {
+                    let label = Label::parse(
+                        &format!("//p:{}", instance.target_name()), None, None,
+                    )?;
+                    graph.add_node(label, instance)?;
+                }
+                let label = Label::parse(&format!("//p:{output}"), None, None)?;
+                assert!(BuildOrchestrator::try_resolve_generated_output_alias(&label, &mut graph)?);
+                assert_eq!(
+                    graph.get(&label).unwrap().rule_instance.dependencies(),
+                    vec![format!("//p:{producer}")],
+                );
+
+                let collision_path = root.join("collision/BUILD");
+                write_file(
+                    &collision_path,
+                    &format!("{source}\nalias(name = \"{output}\", actual = \":{producer}\")\n"),
+                )?;
+                let error = orchestrator.with_tracked_scope(|| {
+                    orchestrator.instantiate_build_file_for_repository_targets(
+                        &collision_path, Some(&root), None, &HashSet::from([output.to_string()]),
+                    )
+                }).err().expect("a genuine output/rule collision must remain invalid");
+                assert!(format!("{error:#}").contains("conflicts with target"), "{error:#}");
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 
