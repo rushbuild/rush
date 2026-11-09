@@ -29,6 +29,7 @@ pub use crate::core::CoreService;
 pub use crate::error::CommandError;
 pub use crate::semantics::{
     populate_workspace_config, BuildDefine, CommandSemantics, RunRequestExt,
+    CONFIG_FINGERPRINT_EXCLUDED_ENV,
 };
 pub use crate::service::{CommandService, RunEventStream};
 

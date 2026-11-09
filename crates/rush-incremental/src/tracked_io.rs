@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 
-use rush_command_core::CommandSemantics;
+use rush_command_core::{CommandSemantics, CONFIG_FINGERPRINT_EXCLUDED_ENV};
 
 use crate::dependency::{content_digest, dir_listing_digest, Dependency, FileKind};
 use crate::manifest::{DependencyManifest, Validated};
@@ -61,6 +61,22 @@ pub trait TrackedIo {
     /// `std::env`). Records [`Dependency::Env`].
     fn getenv(&self, name: &[u8]) -> Option<Bytes>;
 
+    /// Snapshot the captured client environment for a child process. The pairs
+    /// contain raw name/value bytes in deterministic name order. Records
+    /// [`Dependency::ConfigFingerprint`] and [`Dependency::Env`] for every key
+    /// excluded from that fingerprint, including absent keys, because every
+    /// captured variable can affect the child. This never reads the daemon's
+    /// process environment.
+    ///
+    /// Implementations without a captured command environment must fail rather
+    /// than silently inherit process state.
+    fn command_environment(&self) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TrackedIo does not provide a captured command environment",
+        ))
+    }
+
     /// Read a build option through the per-command semantics. Records
     /// [`Dependency::Opt`].
     fn get_option(&self, key: &str) -> Option<String>;
@@ -68,8 +84,9 @@ pub trait TrackedIo {
     /// Consume the *whole* per-command configuration fingerprint. Records
     /// [`Dependency::ConfigFingerprint`] so that any change to the configuration
     /// (env / flags / defines / output base) invalidates conservatively. This is
-    /// the only sanctioned way for analysis to depend on the configuration as a
-    /// whole — there is no accessor returning the raw [`CommandSemantics`].
+    /// the dependency used when analysis consumes the configuration as a whole
+    /// or forwards its captured environment via [`Self::command_environment`].
+    /// There is no accessor returning the raw [`CommandSemantics`].
     fn config_fingerprint(&self) -> [u8; 32];
 
     /// Run a subprocess probe (pkg-config / nm / which / bazel / …), record its
@@ -474,6 +491,16 @@ impl TrackedIo for RealTrackedIo {
             value: value.clone(),
         });
         value
+    }
+
+    fn command_environment(&self) -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.config_fingerprint();
+        for name in CONFIG_FINGERPRINT_EXCLUDED_ENV {
+            let _ = self.getenv(name);
+        }
+        Ok(self.semantics.env().iter()
+            .map(|(name, value)| (name.to_vec(), value.to_vec()))
+            .collect())
     }
 
     fn config_fingerprint(&self) -> [u8; 32] {

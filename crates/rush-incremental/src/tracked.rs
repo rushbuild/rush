@@ -341,6 +341,12 @@ pub fn getenv(name: &[u8]) -> Option<Bytes> {
     current_required().getenv(name)
 }
 
+/// Return the captured client environment through the current analysis IO. See
+/// [`TrackedIo::command_environment`]. No process-environment fallback is used.
+pub fn command_environment() -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    current_required().command_environment()
+}
+
 /// Read an environment variable as UTF-8 through the current analysis IO,
 /// recording the same `Env` dependency as [`getenv`]. Returns `None` if the
 /// variable is unset *or* its value is not valid UTF-8 — mirroring

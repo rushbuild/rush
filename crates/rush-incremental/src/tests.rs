@@ -542,6 +542,144 @@ fn config_fingerprint_is_tracked_and_invalidates() {
     );
 }
 
+#[test]
+fn command_environment_snapshots_are_immutable_and_tracked() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sem_a = semantics(&[
+        (b"Z", b"old"),
+        (b"A", b"first"),
+        (b"RAW_\xff", b"value_\xfe"),
+        (b"Z", b"client-a"),
+    ], &[]);
+    let sem_b = semantics(&[(b"Z", b"client-b"), (b"A", b"first")], &[]);
+    let sem_default = empty_semantics();
+    let io_a = Arc::new(RealTrackedIo::new(sem_a.clone(), dir.path()));
+    let io_b = Arc::new(RealTrackedIo::new(sem_b.clone(), dir.path()));
+    let io_default = Arc::new(RealTrackedIo::new(sem_default.clone(), dir.path()));
+    let expected_a = vec![
+        (b"A".to_vec(), b"first".to_vec()),
+        (b"RAW_\xff".to_vec(), b"value_\xfe".to_vec()),
+        (b"Z".to_vec(), b"client-a".to_vec()),
+    ];
+    crate::tracked::scope(io_a.clone(), || {
+        let mut returned = crate::tracked::command_environment().unwrap();
+        assert_eq!(returned, expected_a);
+        returned[0].1.clear();
+        crate::tracked::scope(io_b.clone(), || {
+            assert_eq!(crate::tracked::command_environment().unwrap(), vec![
+                (b"A".to_vec(), b"first".to_vec()),
+                (b"Z".to_vec(), b"client-b".to_vec()),
+            ]);
+        });
+        assert_eq!(crate::tracked::command_environment().unwrap(), expected_a);
+        crate::tracked::scope(io_default.clone(), || {
+            assert!(crate::tracked::command_environment().unwrap().is_empty());
+        });
+        assert_eq!(crate::tracked::command_environment().unwrap(), expected_a);
+    });
+    assert!(crate::tracked::current().is_none());
+    for (io, sem) in [(&io_a, &sem_a), (&io_b, &sem_b), (&io_default, &sem_default)] {
+        let manifest = io.manifest();
+        let mut expected = vec![Dependency::ConfigFingerprint {
+            digest: *sem.config_fingerprint(),
+        }];
+        expected.extend(rush_command_core::CONFIG_FINGERPRINT_EXCLUDED_ENV.iter()
+            .map(|name| Dependency::Env { name: name.to_vec(), value: None }));
+        assert_eq!(manifest.deps(), crate::DependencyManifest::from_deps(expected).deps());
+        assert_eq!(manifest.validate_staleness(sem), Staleness::Fresh);
+    }
+    let manifest_a = io_a.manifest();
+    for changed in [&sem_b, &sem_default] {
+        assert_stale_is(
+            &manifest_a.validate_staleness(changed),
+            |dep| matches!(dep, Dependency::ConfigFingerprint { .. }),
+            "captured command environment changed",
+        );
+    }
+    assert_stale_is(
+        &io_b.manifest().validate_staleness(&sem_default),
+        |dep| matches!(dep, Dependency::ConfigFingerprint { .. }),
+        "omitted client environment resets to empty",
+    );
+}
+
+#[test]
+fn command_environment_tracks_fingerprint_excluded_keys_including_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in rush_command_core::CONFIG_FINGERPRINT_EXCLUDED_ENV {
+        let requests = [
+            semantics(&[(b"ORDINARY", b"stable")], &[]),
+            semantics(&[(b"ORDINARY", b"stable"), (name, b"first")], &[]),
+            semantics(&[(b"ORDINARY", b"stable"), (name, b"second")], &[]),
+        ];
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(request.config_fingerprint(), requests[0].config_fingerprint());
+            let io = RealTrackedIo::new(request.clone(), dir.path());
+            let environment = io.command_environment().unwrap();
+            assert_eq!(environment, request.env().iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec())).collect::<Vec<_>>());
+            let mut expected = vec![Dependency::ConfigFingerprint {
+                digest: *request.config_fingerprint(),
+            }];
+            expected.extend(rush_command_core::CONFIG_FINGERPRINT_EXCLUDED_ENV.iter()
+                .map(|key| Dependency::Env {
+                    name: key.to_vec(),
+                    value: request.getenv(key).map(<[u8]>::to_vec),
+                }));
+            let manifest = io.manifest();
+            assert_eq!(manifest.deps(), crate::DependencyManifest::from_deps(expected).deps());
+            for (other_index, other) in requests.iter().enumerate() {
+                if index == other_index {
+                    assert_eq!(manifest.validate_staleness(other), Staleness::Fresh);
+                } else {
+                    assert_stale_is(
+                        &manifest.validate_staleness(other),
+                        |dep| matches!(dep, Dependency::Env { name: key, .. } if key.as_slice() == *name),
+                        "diagnostic environment presence or value changed",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn command_environment_default_is_unsupported() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use crate::{DependencyManifest, FileKind, ProcessProbeResult, Validated};
+
+    // Leave command_environment unimplemented, as existing IO test doubles do.
+    // No other accessor may be called to invent a fallback environment.
+    struct NoCommandEnvironment;
+    impl TrackedIo for NoCommandEnvironment {
+        fn read_file(&self, _: &Path) -> std::io::Result<Bytes> { unreachable!() }
+        fn read_to_string(&self, _: &Path) -> std::io::Result<String> { unreachable!() }
+        fn exists(&self, _: &Path) -> bool { unreachable!() }
+        fn metadata_kind(&self, _: &Path) -> Option<FileKind> { unreachable!() }
+        fn metadata_full(&self, _: &Path) -> bool { unreachable!() }
+        fn read_link(&self, _: &Path) -> Option<PathBuf> { unreachable!() }
+        fn read_dir_names(&self, _: &Path) -> std::io::Result<Vec<OsString>> { unreachable!() }
+        fn getenv(&self, _: &[u8]) -> Option<Bytes> { unreachable!() }
+        fn get_option(&self, _: &str) -> Option<String> { unreachable!() }
+        fn config_fingerprint(&self) -> [u8; 32] { unreachable!() }
+        fn probe_process(&self, _: &Path, _: &[Vec<u8>], _: &[Vec<u8>], _: &Path)
+            -> std::io::Result<ProcessProbeResult> { unreachable!() }
+        fn probe_process_stdout(&self, _: &Path, _: &[Vec<u8>], _: &[Vec<u8>], _: &Path)
+            -> std::io::Result<ProcessProbeResult> { unreachable!() }
+        fn manifest(&self) -> DependencyManifest { unreachable!() }
+        fn mark(&self) -> usize { unreachable!() }
+        fn captured_since(&self, _: usize) -> Vec<Dependency> { unreachable!() }
+        fn record_deps(&self, _: &[Dependency]) { unreachable!() }
+        fn validate_manifest(&self, _: &DependencyManifest) -> Validated { unreachable!() }
+    }
+    let io: crate::tracked::SharedTrackedIo = std::sync::Arc::new(NoCommandEnvironment);
+    let error = crate::tracked::scope(io, crate::tracked::command_environment).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+}
+
 /// Fix 4a: chmod on a recorded file changes its metadata → Stale (FileMetadata),
 /// even though the content is byte-identical.
 #[test]

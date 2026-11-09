@@ -34,6 +34,17 @@ use crate::error::CommandError;
 /// this crate can never collide with an unrelated blake3 hash of the same bytes.
 const FINGERPRINT_DOMAIN: &[u8] = b"rush.command.v1/config-fingerprint/1\n";
 
+/// Diagnostic environment keys deliberately excluded from the configuration
+/// fingerprint. Consumers forwarding the full captured environment must track
+/// these keys separately, including absence, since the fingerprint does not
+/// validate their values.
+pub const CONFIG_FINGERPRINT_EXCLUDED_ENV: &[&[u8]] = &[
+    b"RUSH_ACTION_TIMING",
+    b"RUSH_ACTION_TRACE",
+    b"RUSH_PROFILE_PHASES",
+    b"RUSH_REUSE_TIMING",
+];
+
 /// A parsed `--define KEY=VALUE` build define.
 ///
 /// Defines are part of the analysis-affecting configuration, so they participate
@@ -460,13 +471,7 @@ fn compute_config_fingerprint(
 }
 
 fn is_diagnostic_env(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"RUSH_ACTION_TIMING"
-            | b"RUSH_ACTION_TRACE"
-            | b"RUSH_PROFILE_PHASES"
-            | b"RUSH_REUSE_TIMING"
-    )
+    CONFIG_FINGERPRINT_EXCLUDED_ENV.contains(&name)
 }
 
 /// Read the workspace-root `.bazelrc`, `WORKSPACE`/`WORKSPACE.bazel`, and
