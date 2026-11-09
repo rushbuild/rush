@@ -43,14 +43,16 @@ multi-target records.
 ### Compare the Linux kernel with GNU Make
 
 Require snapshot assembly and exact output parity before comparing Rush
-replay with Make. In the November 9 eight-CPU check, Make, observation and
-graph derivation complete on both hosts. Rush refuses snapshot assembly
-because it cannot isolate the captured group credentials; replay is not run.
-A fresh namespace-profile retry is in progress. Read the
-[Linux report](docs/benchmarks/linux.md) for commands, the exact seed,
-[Lorenzo Stoakes's v1 baseline patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/),
-and the separate 32-job replay experiment. Assign no fresh Linux speed ratio
-to failed snapshot assembly.
+replay with Make. Fresh eight-CPU checks complete ordinary Make controls.
+Login-profile assembly refuses group credentials. A mapped-namespace profile
+completes capture and graph derivation on both hosts, then refuses an
+unenforceable `init/` directory checkpoint. One capture also refuses a changed
+directory identity; its unchanged-profile repeat reaches the same checkpoint.
+No replay runs and no fresh Linux speed ratio qualifies.
+
+Read the [Linux report](docs/benchmarks/linux.md) for every attempt, commands,
+the exact seed, [Lorenzo Stoakes's v1 baseline patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/)
+and the separate 32-job replay experiment.
 
 ## Build and try it
 

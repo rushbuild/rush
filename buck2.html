@@ -86,6 +86,7 @@ Read the report's native command differences and unqualified mixed-memory
 configuration. The output sum checks bounded behavior; it establishes no
 byte-identical artifacts. A synthetic C++ test establishes no TensorFlow,
 Modular, Linux, optimized-build or remote-execution performance result.</p>
+<p>Read the separate November 9 <a href="docs/benchmarks/tensorflow.md">TensorFlow</a>, <a href="docs/benchmarks/modular.md">Modular</a> and <a href="docs/benchmarks/linux.md">Linux</a> checks. Those experiments compare Rush revisions with Bazel and Make as references. Inspect their build failures, package-specific medians and snapshot acceptance before extending the synthetic comparison.</p>
 </section>
 <section id="incremental"><p class="eyebrow">Incremental work</p><h2>Build the changed closure.</h2>
 <p>Retain the analyzed graph and reusable header layout. For one-file edits,

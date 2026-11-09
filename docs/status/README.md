@@ -8,7 +8,7 @@ target, configuration, toolchain and cache scope.
 | --- | --- | --- |
 | TensorFlow | [Build and runtime gates](tensorflow.md) | Current TF 2.17 rule-loading failure on both hosts; separate TF 2.15 runtime and import records |
 | Modular | [Build and artifact coverage](modular.md) | Current CPU package: 96/96 compiler/output checks; separate multi-target and runtime records |
-| Linux kernel | [Replay against GNU Make](../benchmarks/linux.md) | Make/capture/derivation pass both; assembly refuses group credentials; mapped-profile retry in progress |
+| Linux kernel | [Replay against GNU Make](../benchmarks/linux.md) | Make controls pass; login group refusal and mapped directory-witness/checkpoint refusals; replay not run |
 | Remote execution | [REAPI and worker checks](../benchmarks/remote-execution.md) | File actions and native C++ in both host directions; CUDA readback; HIP failure retained |
 | Performance | [Compare build modes](../benchmarks/README.md) | Keep compile, restore, novel edit, repeated edit and no-op separate |
 

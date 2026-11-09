@@ -50,11 +50,12 @@ pins and cache limitations.
 
 ## Linux against GNU Make
 
-Run the pinned seeded x86-64 build with eight CPUs and Make jobs. Ordinary
-Make, managed observation and graph derivation complete on both hosts.
-Snapshot assembly refuses captured group credentials on both; no replay runs.
-Assign no fresh speed ratio. Evaluate a new mapped-namespace capture profile
-separately; that retry is in progress.
+Run the pinned seeded x86-64 build with eight CPUs and Make jobs. Make
+controls complete. Login-profile snapshot assembly refuses group credentials.
+Mapped-namespace captures derive 5,684 actions on both hosts, then refuse an
+unenforceable analyzer directory checkpoint. Retain the changed-directory
+capture refusal and its unchanged-profile repeat as separate attempts.
+No replay runs and no fresh Linux speed ratio qualifies.
 
 Read the [Linux report](linux.md) for every phase, exact source/seed/toolchain
 inputs and the separate 32-job, three-pair populated-cache replay record.

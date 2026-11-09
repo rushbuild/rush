@@ -64,7 +64,11 @@ managed observation and derivation complete; assembly refuses group
 credentials and no replay runs. Retain the exact seed, source recipe,
 ordered public-patch verification, tool versions/hashes and host-specific
 normalized configurations. Use GNU time's elapsed field for setup diagnostics.
-A fresh mapped-namespace profile is in progress and remains separate.
+The separate [mapped-profile data](data/linux-mapped-retest-20261109.json)
+retains all three attempts: a directory-witness capture refusal and two
+completed captures/derivations whose assemblies refuse an unenforceable
+`init/` checkpoint. None produces a snapshot or replay. Keep failure timings
+as diagnostics and assign no current Linux speed ratio.
 
 The [public Linux record](https://github.com/rushbuild/rush-status/blob/26e6a51ee374c5cea6f86d33c7edf3e20923dabc/status/linux.md)
 supplies all three timing pairs, kernel identity, parity counts, preparation
