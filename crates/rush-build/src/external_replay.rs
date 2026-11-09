@@ -5,7 +5,7 @@
 //! [`RushActionManager`] so local execution, admission, action caching, output
 //! certification, and CAS restoration remain shared with native Rush builds.
 
-use crate::action_manager::{ActionCachePolicy, RushActionManager};
+use crate::action_manager::{ActionCachePolicy, BeforeOutputMutation, RushActionManager};
 use crate::external_action_identity::{external_action_key_from_values, ExternalExecutableWitness};
 use crate::external_analysis_snapshot::{
     runtime_directory_checkpoints, ExternalAction, ExternalActionGraph, ExternalAnalysisSnapshot,
@@ -34,7 +34,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const OUTPUT_TAIL_LIMIT: usize = 1024 * 1024;
@@ -235,19 +235,16 @@ impl ExternalObservationSession {
         self.generated.fence()
     }
 
-    /// Close the observation window around one action.
+    /// Close the generated observation window before a legitimate mutation.
     ///
-    /// A pure cache hit must not mutate either watcher domain. Once an action
-    /// may have changed the output tree, discard every generated value and its
-    /// watcher before continuing with direct `obj` observation. Stable inputs
-    /// remain fenced, so this never turns a source/host race into a cache hit.
-    fn finish_action(&mut self, may_have_mutated_output_tree: bool) -> Result<()> {
-        if may_have_mutated_output_tree {
-            self.generated.disable();
-            self.stable.fence()
-        } else {
-            self.fence()
-        }
+    /// Fence both domains first: an earlier foreign write cannot be excused by
+    /// a later scheduled writer. Discard generated memo values before writing,
+    /// so concurrently completing cache hits cannot reject the producer's own
+    /// writes or reuse its pre-mutation values. Stable inputs stay fenced.
+    fn before_output_mutation(&mut self) -> Result<()> {
+        self.fence()?;
+        self.generated.disable();
+        Ok(())
     }
 
     fn observe(
@@ -293,6 +290,12 @@ impl ExternalObservationSession {
             );
         }
     }
+}
+
+fn lock_observations(
+    observations: &Mutex<ExternalObservationSession>,
+) -> Result<MutexGuard<'_, ExternalObservationSession>> {
+    observations.lock().map_err(|_| anyhow::anyhow!("external observations are poisoned"))
 }
 
 impl ExternalObservationMemo {
@@ -811,6 +814,10 @@ pub struct ExternalReplayEngine {
     manager: Arc<RushActionManager>,
     kconfig_values: BTreeMap<String, Vec<u8>>,
     empty_output_inputs: BTreeMap<ExternalPathKey, ExternalEmptyOutputInput>,
+    #[cfg(test)]
+    completion_observer: Option<Arc<dyn Fn(&str, bool) + Send + Sync>>,
+    #[cfg(test)]
+    before_manager_observer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl ExternalReplayEngine {
@@ -867,6 +874,10 @@ impl ExternalReplayEngine {
             manager,
             kconfig_values,
             empty_output_inputs,
+            #[cfg(test)]
+            completion_observer: None,
+            #[cfg(test)]
+            before_manager_observer: None,
         })
     }
 
@@ -894,6 +905,10 @@ impl ExternalReplayEngine {
             manager,
             kconfig_values,
             empty_output_inputs,
+            #[cfg(test)]
+            completion_observer: None,
+            #[cfg(test)]
+            before_manager_observer: None,
         })
     }
 
@@ -904,7 +919,11 @@ impl ExternalReplayEngine {
         let diagnostics = std::env::var("RUSH_EXTERNAL_OBSERVATION_STATS").as_deref() == Ok("1");
         let replay_started = Instant::now();
         let order = requested_topological_order(&self.snapshot.graph)?;
-        let mut observations = ExternalObservationSession::new(&self.snapshot.graph);
+        let observations = Arc::new(Mutex::new(ExternalObservationSession::new(&self.snapshot.graph)));
+        let before_output_mutation: Arc<BeforeOutputMutation> = {
+            let observations = observations.clone();
+            Arc::new(move || lock_observations(&observations)?.before_output_mutation())
+        };
         let action_stages = analysis_action_stages(&self.snapshot.graph);
         let mut next_barrier = 0usize;
         let mut cache_hits = 0usize;
@@ -942,8 +961,12 @@ impl ExternalReplayEngine {
             let stage_action_count = pending.len();
             let mut launches = 0usize;
             while next_barrier < stage {
-                if !self.analysis_barrier_matches(next_barrier, &mut observations) {
-                    observations.report_if_enabled();
+                let matched = {
+                    let mut observations = lock_observations(&observations)?;
+                    self.analysis_barrier_matches(next_barrier, &mut observations)
+                };
+                if !matched {
+                    lock_observations(&observations)?.report_if_enabled();
                     return Ok(ExternalReplayStatus::AnalysisMismatch {
                         barrier_index: next_barrier,
                         cache_hits,
@@ -1050,20 +1073,17 @@ impl ExternalReplayEngine {
                         let index = *index;
                         let action_started = Instant::now();
                         let external = &self.snapshot.graph.actions[index];
-                        observations.fence().with_context(|| {
-                            format!(
-                                "validate inputs before external action {:?}",
-                                external.logical_id
-                            )
-                        })?;
-                        let (action, mut resolved) =
-                            self.prepare_action(external, &mut observations)?;
-                        observations.fence().with_context(|| {
-                            format!(
-                                "validate inputs prepared for external action {:?}",
-                                external.logical_id
-                            )
-                        })?;
+                        let (action, mut resolved) = {
+                            let mut observations = lock_observations(&observations)?;
+                            observations.fence().with_context(|| {
+                                format!("validate inputs before external action {:?}", external.logical_id)
+                            })?;
+                            let prepared = self.prepare_action(external, &mut observations)?;
+                            observations.fence().with_context(|| {
+                                format!("validate inputs prepared for external action {:?}", external.logical_id)
+                            })?;
+                            prepared
+                        };
                         let direct_runtime_checkpoints =
                             direct_runtime_directory_checkpoint_validation(
                                 &resolved.runtime_directory_checkpoints,
@@ -1102,8 +1122,6 @@ impl ExternalReplayEngine {
                                 .context("external replay has no output root")?,
                             resolved.file_creation_mask,
                         )?;
-                        let outputs_present_before =
-                            resolved_outputs.iter().all(|(path, _, _)| path.exists());
                         let direct_runtime_directory_expectations = direct_runtime_checkpoints
                             .then(|| {
                                 (
@@ -1118,16 +1136,22 @@ impl ExternalReplayEngine {
                         let policy = cache_policy(external);
                         let manager = self.manager.clone();
                         let logical_id = external.logical_id.clone();
+                        let before_output_mutation = before_output_mutation.clone();
+                        #[cfg(test)]
+                        let before_manager_observer = self.before_manager_observer.clone();
                         running.spawn(async move {
+                            #[cfg(test)]
+                            if let Some(observer) = &before_manager_observer {
+                                observer(&logical_id);
+                            }
                             let result = manager
-                                .execute_with_cache_policy(action, policy)
+                                .execute_canonical_external_action(action, policy, before_output_mutation)
                                 .await
                                 .with_context(|| format!("replay external action {logical_id:?}"));
                             (
                                 index,
                                 resolved_outputs,
                                 missing_output_parents,
-                                outputs_present_before,
                                 direct_runtime_directory_expectations,
                                 action_started,
                                 result,
@@ -1151,7 +1175,6 @@ impl ExternalReplayEngine {
                     index,
                     resolved_outputs,
                     missing_output_parents,
-                    outputs_present_before,
                     direct_runtime_directory_expectations,
                     action_started,
                     result,
@@ -1187,30 +1210,23 @@ impl ExternalReplayEngine {
                         String::from_utf8_lossy(&result.stderr)
                     );
                 }
-                let repaired_output_mode = normalize_and_validate_outputs(&resolved_outputs)
+                normalize_and_validate_outputs_observed(&resolved_outputs, Some(before_output_mutation.as_ref()))
                     .with_context(|| {
                         format!(
                             "normalize outputs after external action {:?}",
                             external.logical_id
                         )
                     })?;
-                let repaired_parent_mode = if result.cached {
-                    normalize_cached_output_parents(&missing_output_parents).with_context(|| {
+                if result.cached {
+                    normalize_cached_output_parents_observed(&missing_output_parents, Some(before_output_mutation.as_ref())).with_context(|| {
                         format!(
                             "normalize cached output parents after external action {:?}",
                             external.logical_id
                         )
-                    })?
-                } else {
-                    false
-                };
-                observations
-                    .finish_action(
-                        !result.cached
-                            || !outputs_present_before
-                            || repaired_output_mode
-                            || repaired_parent_mode,
-                    )
+                    })?;
+                }
+                lock_observations(&observations)?
+                    .fence()
                     .with_context(|| {
                         format!(
                             "validate inputs after external action {:?}",
@@ -1237,6 +1253,10 @@ impl ExternalReplayEngine {
                     );
                 }
                 completed.insert(external.logical_id.clone());
+                #[cfg(test)]
+                if let Some(observer) = &self.completion_observer {
+                    observer(&external.logical_id, result.cached);
+                }
             }
             if diagnostics {
                 eprintln!(
@@ -1246,8 +1266,12 @@ impl ExternalReplayEngine {
             }
         }
         while next_barrier < self.snapshot.graph.analysis_barriers.len() {
-            if !self.analysis_barrier_matches(next_barrier, &mut observations) {
-                observations.report_if_enabled();
+            let matched = {
+                let mut observations = lock_observations(&observations)?;
+                self.analysis_barrier_matches(next_barrier, &mut observations)
+            };
+            if !matched {
+                lock_observations(&observations)?.report_if_enabled();
                 return Ok(ExternalReplayStatus::AnalysisMismatch {
                     barrier_index: next_barrier,
                     cache_hits,
@@ -1257,7 +1281,7 @@ impl ExternalReplayEngine {
             next_barrier += 1;
         }
 
-        observations.report_if_enabled();
+        lock_observations(&observations)?.report_if_enabled();
         if diagnostics {
             eprintln!(
                 "external replay scheduler: actions={} elapsed_us={}",
@@ -2571,6 +2595,13 @@ fn materialize_captured_kconfig(path: &Path, captured: &[u8]) -> Result<Vec<u8>>
 pub(crate) fn normalize_and_validate_outputs(
     outputs: &[(PathBuf, ExternalOutputKind, u32)],
 ) -> Result<bool> {
+    normalize_and_validate_outputs_observed(outputs, None)
+}
+
+fn normalize_and_validate_outputs_observed(
+    outputs: &[(PathBuf, ExternalOutputKind, u32)],
+    before_output_mutation: Option<&BeforeOutputMutation>,
+) -> Result<bool> {
     let mut repaired_mode = false;
     for (path, kind, mode) in outputs {
         let metadata = std::fs::symlink_metadata(path)
@@ -2588,6 +2619,11 @@ pub(crate) fn normalize_and_validate_outputs(
         }
         let actual_mode = permission_mode(&metadata);
         if actual_mode != *mode {
+            if *kind != ExternalOutputKind::Symlink {
+                if let Some(before) = before_output_mutation {
+                    before()?;
+                }
+            }
             set_output_mode(path, *kind, *mode)?;
             repaired_mode = true;
         }
@@ -2654,6 +2690,13 @@ fn missing_output_parents(
 }
 
 fn normalize_cached_output_parents(parents: &[(PathBuf, u32)]) -> Result<bool> {
+    normalize_cached_output_parents_observed(parents, None)
+}
+
+fn normalize_cached_output_parents_observed(
+    parents: &[(PathBuf, u32)],
+    before_output_mutation: Option<&BeforeOutputMutation>,
+) -> Result<bool> {
     let mut repaired = false;
     for (path, mode) in parents {
         let metadata = std::fs::symlink_metadata(path)
@@ -2662,6 +2705,9 @@ fn normalize_cached_output_parents(parents: &[(PathBuf, u32)]) -> Result<bool> {
             anyhow::bail!("cached output parent is not a directory: {}", path.display());
         }
         if permission_mode(&metadata) != *mode {
+            if let Some(before) = before_output_mutation {
+                before()?;
+            }
             set_output_mode(path, ExternalOutputKind::Tree, *mode)?;
             repaired = true;
         }
@@ -2745,6 +2791,54 @@ mod tests {
             (after.ctime(), after.ctime_nsec()),
             "an already-correct output must not receive chmod"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_and_parent_mode_repairs_fence_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        std::fs::write(&output, b"value\n").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let outputs = [(output.clone(), ExternalOutputKind::File, 0o600)];
+        let refused: Arc<BeforeOutputMutation> = Arc::new(|| anyhow::bail!("input fence rejected"));
+        assert!(normalize_and_validate_outputs_observed(&outputs, Some(refused.as_ref())).is_err());
+        assert_eq!(permission_mode(&std::fs::metadata(&output).unwrap()), 0o640);
+
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let before: Arc<BeforeOutputMutation> = {
+            let output = output.clone();
+            let callbacks = callbacks.clone();
+            Arc::new(move || {
+                assert_eq!(permission_mode(&std::fs::metadata(&output)?), 0o640);
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        assert!(normalize_and_validate_outputs_observed(&outputs, Some(before.as_ref())).unwrap());
+        assert!(!normalize_and_validate_outputs_observed(&outputs, Some(before.as_ref())).unwrap());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+
+        let parent = temp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let parents = [(parent.clone(), 0o700)];
+        assert!(normalize_cached_output_parents_observed(&parents, Some(refused.as_ref())).is_err());
+        assert_eq!(permission_mode(&std::fs::metadata(&parent).unwrap()), 0o750);
+        let before: Arc<BeforeOutputMutation> = {
+            let callbacks = callbacks.clone();
+            Arc::new(move || {
+                assert_eq!(permission_mode(&std::fs::metadata(&parent)?), 0o750);
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        assert!(normalize_cached_output_parents_observed(&parents, Some(before.as_ref())).unwrap());
+        assert!(!normalize_cached_output_parents_observed(&parents, Some(before.as_ref())).unwrap());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(unix)]
@@ -2836,41 +2930,33 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingRunner {
-        calls: Mutex<Vec<String>>,
-        argv0s: Mutex<Vec<Option<String>>>,
-        signal_states: Mutex<Vec<Option<ExternalSignalState>>>,
-        file_creation_masks: Mutex<Vec<Option<u32>>>,
-        credentials: Mutex<Vec<Option<ExternalCredentialState>>>,
-        stdin_null: Mutex<Vec<bool>>,
-        isolations: Mutex<Vec<Option<LocalExecutionIsolation>>>,
+        // One atomic record binds every request field to its action label.
+        // Independent ready actions may enter the runner in either order.
+        requests: Mutex<Vec<(String, ExecutionRequest)>>,
+    }
+
+    impl RecordingRunner {
+        fn calls(&self) -> Vec<String> {
+            self.requests.lock().unwrap().iter().map(|(label, _)| label.clone()).collect()
+        }
+
+        fn requests(&self) -> Vec<(String, ExecutionRequest)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn assert_producers_precede_link(calls: &[String]) {
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2], "link");
+        assert_eq!(calls[..2].iter().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["a", "b"]));
     }
 
     #[async_trait]
     impl LocalActionRunner for RecordingRunner {
         async fn execute(&self, request: ExecutionRequest) -> Result<ActionExecutionResult> {
             let label = request.command.argv[0].clone();
-            self.calls.lock().unwrap().push(label.clone());
-            self.argv0s
-                .lock()
-                .unwrap()
-                .push(request.command.argv0.clone());
-            self.signal_states
-                .lock()
-                .unwrap()
-                .push(request.signal_state);
-            self.file_creation_masks
-                .lock()
-                .unwrap()
-                .push(request.file_creation_mask);
-            self.credentials
-                .lock()
-                .unwrap()
-                .push(request.credentials.clone());
-            self.stdin_null.lock().unwrap().push(request.stdin_null);
-            self.isolations
-                .lock()
-                .unwrap()
-                .push(request.isolation.clone());
+            self.requests.lock().unwrap().push((label.clone(), request.clone()));
             let started = Instant::now();
             match label.as_str() {
                 "a" | "b" => {
@@ -3203,8 +3289,8 @@ mod tests {
         let first = session
             .observe(graph, &generated.path, generated.kind)
             .unwrap();
+        session.before_output_mutation().unwrap();
         std::fs::write(&generated_path, b"second\n").unwrap();
-        session.finish_action(true).unwrap();
         let second = session
             .observe(graph, &generated.path, generated.kind)
             .unwrap();
@@ -3213,6 +3299,23 @@ mod tests {
         assert_eq!(session.requests, 2);
         assert_eq!(session.reused, 0);
         assert!(session.generated.watcher.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn planned_output_mutation_does_not_excuse_an_earlier_foreign_generated_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = snapshot(temp.path());
+        let graph = &snapshot.graph;
+        let generated = &graph.actions[2].normal_inputs[0];
+        let path = resolve_path(graph, &generated.path).unwrap();
+        std::fs::write(&path, b"before\n").unwrap();
+        let mut session = ExternalObservationSession::new(graph);
+        session.observe(graph, &generated.path, generated.kind).unwrap();
+        std::fs::write(&path, b"foreign\n").unwrap();
+        let error = session.before_output_mutation().unwrap_err().to_string();
+        assert!(error.contains("generated external input changed"), "{error}");
+        assert!(session.generated.watcher.is_some(), "a failed fence must not disable the guard");
     }
 
     #[cfg(target_os = "linux")]
@@ -3227,7 +3330,7 @@ mod tests {
         session.observe(graph, &source.path, source.kind).unwrap();
         std::fs::write(graph.roots["src"].join("a.in"), b"changed\n").unwrap();
 
-        let error = session.finish_action(true).unwrap_err().to_string();
+        let error = session.before_output_mutation().unwrap_err().to_string();
         assert!(error.contains("external leaf input changed"));
     }
 
@@ -3641,7 +3744,7 @@ mod tests {
             counts(replay(snapshot, &temp.path().join("cache"), runner.clone()).await),
             (0, 3)
         );
-        assert_eq!(*runner.calls.lock().unwrap(), ["a", "b", "link"]);
+        assert_eq!(runner.calls(), ["a", "b", "link"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3667,7 +3770,7 @@ mod tests {
             }
             status => panic!("unexpected replay status: {status:?}"),
         }
-        assert_eq!(*runner.calls.lock().unwrap(), ["a"]);
+        assert_eq!(runner.calls(), ["a"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3681,48 +3784,33 @@ mod tests {
             counts(replay(primary.clone(), &cache_root, runner.clone()).await),
             (0, 3)
         );
-        assert_eq!(
-            *runner.signal_states.lock().unwrap(),
-            [
-                Some(ExternalSignalState {
-                    blocked: 1_u64 << (10 - 1),
-                    ignored: 0,
-                }),
-                Some(ExternalSignalState {
-                    blocked: 0,
-                    ignored: 1_u64 << (12 - 1),
-                }),
-                Some(ExternalSignalState::default()),
-            ]
-        );
-        assert_eq!(
-            *runner.file_creation_masks.lock().unwrap(),
-            [Some(0o077), Some(0o027), Some(0o022)]
-        );
-        assert_eq!(*runner.stdin_null.lock().unwrap(), [true, true, true]);
-        assert_eq!(*runner.isolations.lock().unwrap(), [None, None, None]);
-        assert_eq!(
-            *runner.argv0s.lock().unwrap(),
-            [
-                Some("captured-a".to_string()),
-                Some("captured-b".to_string()),
-                Some("captured-link".to_string()),
-            ]
-        );
-        assert_eq!(
-            *runner.credentials.lock().unwrap(),
-            [
-                Some(ExternalCredentialState {
-                    supplementary_groups: vec![10],
-                    ..ExternalCredentialState::default()
-                }),
-                Some(ExternalCredentialState {
-                    supplementary_groups: vec![20],
-                    ..ExternalCredentialState::default()
-                }),
-                Some(ExternalCredentialState::default()),
-            ]
-        );
+        assert_producers_precede_link(&runner.calls());
+        let recorded = runner.requests();
+        assert_eq!(recorded.len(), 3);
+        for (label, request) in recorded {
+            let expected = primary.graph.actions.iter().find(|action| action.logical_id == label).unwrap();
+            assert_eq!(request.signal_state, Some(expected.signal_state), "{label}");
+            assert_eq!(request.file_creation_mask, Some(expected.file_creation_mask), "{label}");
+            assert_eq!(request.credentials.as_ref(), Some(&expected.credentials), "{label}");
+            let argv0 = format!("captured-{label}");
+            assert_eq!(request.command.argv0.as_deref(), Some(argv0.as_str()), "{label}");
+            assert_eq!(request.command.executable, primary.key.workspace_root.join("tool"), "{label}");
+            assert_eq!(request.command.argv, expected.commands[0].argv.iter()
+                .map(|argument| resolve_argument(&primary.graph, argument).unwrap()).collect::<Vec<_>>(), "{label}");
+            assert_eq!(request.command.working_dir.as_ref(), Some(&primary.key.output_root), "{label}");
+            assert!(request.command.env.is_empty(), "{label}");
+            assert_eq!(request.command.env_policy, ActionEnvPolicy::ExplicitOnly, "{label}");
+            assert_eq!(request.mnemonic, expected.mnemonic, "{label}");
+            assert_eq!(request.resource_class, Some(map_resource_class(expected.resource)), "{label}");
+            assert_eq!(request.declared_action_id, DeclaredActionId(0), "{label}");
+            assert_eq!(request.owner_target, TargetId(0), "{label}");
+            assert!(request.declared_inputs.is_empty() && request.declared_outputs.is_empty(), "{label}");
+            assert_eq!(request.timeout, None, "{label}");
+            assert_eq!(request.log_command_index, Some(0), "{label}");
+            assert!(!request.remove_stale_archive_before_execute, "{label}");
+            assert!(request.terminate_process_group_on_drop && request.stdin_null, "{label}");
+            assert_eq!(request.isolation, None, "{label}");
+        }
         for output in ["a.o", "b.o", "final"] {
             assert_eq!(
                 permission_mode(&std::fs::metadata(primary.key.output_root.join(output)).unwrap()),
@@ -3795,7 +3883,129 @@ mod tests {
             counts(replay(primary, &cache_root, runner.clone()).await),
             (2, 1)
         );
-        assert_eq!(runner.calls.lock().unwrap().len(), 6);
+        assert_eq!(runner.calls().len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controller_owned_seed_can_be_replaced_by_its_output_producer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut primary = snapshot(temp.path());
+        primary.graph.initial_inputs.push(ExternalInitialInput {
+            path: rooted("obj", "a.o"),
+            value: ExternalInitialInputValue::File { bytes: b"seed\n".to_vec(), mode: 0o640 },
+        });
+        let cache_root = temp.path().join("cache");
+        let runner = Arc::new(RecordingRunner::default());
+        let engine = ExternalReplayEngine::with_runner_and_cas(
+            primary.clone(), disk_cache(&cache_root), ResourceManager::new().unwrap(),
+            runner.clone(), Arc::new(CasStore::new(&cache_root).unwrap()),
+        ).unwrap();
+        assert_eq!(std::fs::read(primary.key.output_root.join("a.o")).unwrap(), b"seed\n");
+        assert_eq!(counts(engine.replay().await.unwrap()), (0, 3));
+        assert_eq!(std::fs::read(primary.key.output_root.join("final")).unwrap(), b"a1\nb1\n");
+        // A restart must preserve the produced value rather than reseeding it.
+        assert_eq!(counts(replay(primary, &cache_root, runner).await), (3, 0));
+    }
+
+    struct ParkAfterPublishingRunner {
+        recording: RecordingRunner,
+        published: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        published_gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    #[async_trait]
+    impl LocalActionRunner for ParkAfterPublishingRunner {
+        async fn execute(&self, request: ExecutionRequest) -> Result<ActionExecutionResult> {
+            let park = request.command.argv[0] == "a";
+            let result = self.recording.execute(request).await?;
+            if park {
+                *self.published_gate.0.lock().unwrap() = true;
+                self.published_gate.1.notify_all();
+                self.published.notify_one();
+                self.release.notified().await;
+            }
+            Ok(result)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_sibling_completes_while_dirty_producer_is_still_running() {
+        assert_cached_sibling_with_parked_producer(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_sibling_completes_while_uncacheable_producer_is_still_running() {
+        assert_cached_sibling_with_parked_producer(true).await;
+    }
+
+    async fn assert_cached_sibling_with_parked_producer(uncacheable: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut primary = snapshot(temp.path());
+        if uncacheable {
+            let action = &mut primary.graph.actions[0];
+            action.cacheable = false;
+            action.sandbox = true;
+            action.credentials = ExternalCredentialState::default();
+            action.execution_properties.insert(
+                crate::external_analysis_snapshot::MANDATORY_EXECUTION_PROPERTY.to_string(),
+                crate::external_analysis_snapshot::PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.to_string(),
+            );
+        }
+        let cache_root = temp.path().join("cache");
+        assert_eq!(counts(replay(primary.clone(), &cache_root, Arc::new(RecordingRunner::default())).await), (0, 3));
+        if !uncacheable {
+            std::fs::write(primary.key.workspace_root.join("a.in"), b"a2\n").unwrap();
+        }
+        let runner = Arc::new(ParkAfterPublishingRunner {
+            recording: RecordingRunner::default(),
+            published: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            published_gate: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+        });
+        let cached_sibling = Arc::new(tokio::sync::Notify::new());
+        let mut engine = ExternalReplayEngine::with_runner_and_cas(
+            primary.clone(), disk_cache(&cache_root), ResourceManager::new().unwrap(),
+            runner.clone(), Arc::new(CasStore::new(&cache_root).unwrap()),
+        ).unwrap();
+        engine.before_manager_observer = Some({
+            let gate = runner.published_gate.clone();
+            Arc::new(move |logical_id| {
+                if logical_id == "b" {
+                    // Force b's cache-hit validation to occur after a wrote
+                    // a.o, while a is parked before returning its result.
+                    let (published, _) = gate.1.wait_timeout_while(
+                        gate.0.lock().unwrap(), Duration::from_secs(10), |published| !*published,
+                    ).unwrap();
+                    assert!(*published, "producer did not publish before cached sibling");
+                }
+            })
+        });
+        engine.completion_observer = Some({
+            let cached_sibling = cached_sibling.clone();
+            Arc::new(move |logical_id, cached| {
+                if logical_id == "b" && cached {
+                    cached_sibling.notify_one();
+                }
+            })
+        });
+        let replay_task = tokio::spawn(async move { engine.replay().await });
+        tokio::time::timeout(Duration::from_secs(10), runner.published.notified()).await.unwrap();
+        // The producer has already written a.o but cannot complete. Require
+        // the actual cached-sibling completion fence to pass in this window.
+        tokio::time::timeout(Duration::from_secs(10), cached_sibling.notified()).await.unwrap();
+        assert!(!replay_task.is_finished());
+        runner.release.notify_one();
+        let result = replay_task.await.unwrap().unwrap();
+        assert_eq!(counts(result), if uncacheable { (2, 1) } else { (1, 2) });
+        assert_eq!(std::fs::read(primary.key.output_root.join("final")).unwrap(),
+            if uncacheable { &b"a1\nb1\n"[..] } else { &b"a2\nb1\n"[..] });
+        let expected_calls = if uncacheable {
+            vec!["a".to_string()]
+        } else {
+            vec!["a".to_string(), "link".to_string()]
+        };
+        assert_eq!(runner.recording.calls(), expected_calls);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3823,20 +4033,16 @@ mod tests {
             counts(replay(primary, &cache_root, runner.clone()).await),
             (2, 1)
         );
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            ["a", "b", "link", "a"]
-        );
-        let isolations = runner.isolations.lock().unwrap();
-        assert_eq!(isolations.len(), 4);
-        for (index, isolation) in isolations.iter().enumerate() {
-            if index == 0 || index == 3 {
-                assert_eq!(
-                    isolation.as_ref().unwrap().writable_roots(),
-                    [output_root.as_path()]
-                );
+        let calls = runner.calls();
+        assert_producers_precede_link(&calls[..3]);
+        assert_eq!(calls[3..], ["a"]);
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 4);
+        for (label, request) in requests {
+            if label == "a" {
+                assert_eq!(request.isolation.as_ref().unwrap().writable_roots(), [output_root.as_path()]);
             } else {
-                assert!(isolation.is_none());
+                assert!(request.isolation.is_none(), "{label}");
             }
         }
 
@@ -3970,6 +4176,6 @@ mod tests {
         .unwrap();
         let error = engine.replay().await.unwrap_err().to_string();
         assert!(error.contains("replay external action \"a\""));
-        assert_eq!(runner.calls.lock().unwrap().len(), 3);
+        assert_eq!(runner.calls().len(), 3);
     }
 }

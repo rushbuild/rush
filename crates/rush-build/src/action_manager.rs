@@ -7,6 +7,10 @@ use rush_resource::{ResourceManager, ResourceRequest, TaskType};
 use rush_rules::context::ActionManager;
 use std::sync::Arc;
 
+/// A synchronous fence invoked immediately before an action may write files.
+/// Retained cache hits do not cross this boundary.
+pub(crate) type BeforeOutputMutation = dyn Fn() -> Result<()> + Send + Sync;
+
 /// Action manager implementation that handles caching and execution.
 ///
 /// Phase 5.C.4 commit 7: now acquires `ResourceManager` permits
@@ -165,19 +169,29 @@ impl RushActionManager {
     fn restore_outputs_from_cas(
         &self,
         result: &rush_exec::ActionResult,
-    ) -> bool {
+        before_output_mutation: Option<&BeforeOutputMutation>,
+        invalidate_virtual_outputs: bool,
+    ) -> Result<bool> {
         let Some(cas) = self.cas.as_deref() else {
-            return false;
+            return Ok(false);
         };
         if result.output_records.is_empty() {
-            return false;
+            return Ok(false);
+        }
+        if let Some(before) = before_output_mutation {
+            before()?;
+        }
+        if invalidate_virtual_outputs {
+            rush_action::virtual_artifacts::unregister(
+                &result.output_records.iter().map(|record| record.path.clone()).collect::<Vec<_>>(),
+            );
         }
         for record in &result.output_records {
             if crate::virtual_materializer::materialize_record(cas, record).is_err() {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Phase 4 virtual-hit gate: a cache hit whose outputs are ALL absent may
@@ -365,16 +379,37 @@ impl RushActionManager {
         action: Action,
         policy: ActionCachePolicy,
     ) -> Result<ActionResult> {
-        self.execute_impl(action, policy).await
+        self.execute_impl(action, policy, true, None).await
+    }
+
+    /// Execute with a replay-owned input fence at actual mutation boundaries.
+    /// The callback is scoped to this invocation, never installed globally on
+    /// the manager shared by other replays. It must not hold a lock over await.
+    /// Captured commands and their external action identities are exact: native
+    /// compiler overrides and generated-source sharding must not rewrite them.
+    /// Inputs and outputs are filesystem values, never native virtual-artifact
+    /// placeholders. Producers or verified CAS restoration materialize outputs;
+    /// this path does not implicitly JIT-materialize a different input value.
+    pub(crate) async fn execute_canonical_external_action(
+        &self,
+        action: Action,
+        policy: ActionCachePolicy,
+        before_output_mutation: Arc<BeforeOutputMutation>,
+    ) -> Result<ActionResult> {
+        self.execute_impl(action, policy, false, Some(before_output_mutation.as_ref())).await
     }
 
     async fn execute_impl(
         &self,
         mut action: Action,
         policy: ActionCachePolicy,
+        prepare_native_command: bool,
+        before_output_mutation: Option<&BeforeOutputMutation>,
     ) -> Result<ActionResult> {
         let action_t0 = std::time::Instant::now();
-        crate::generated_cc_sharding::prepare(&mut action)?;
+        if prepare_native_command {
+            crate::generated_cc_sharding::prepare(&mut action)?;
+        }
         // Cache lookup. The cache stores ActionResults keyed by
         // action.id (blake3 of inputs+command+env). If we get a hit we
         // STILL need to confirm the declared output files actually
@@ -395,7 +430,7 @@ impl RushActionManager {
             // bytes touch disk unless a
             // consumer actually needs them (JIT / pre-build / top-level
             // materialization in virtual_materializer).
-            if !outputs_present && self.try_virtual_hit(&action, &result) {
+            if prepare_native_command && !outputs_present && self.try_virtual_hit(&action, &result) {
                 result.cached = true;
                 trace_action_outcome(&action, "HIT-VIRTUAL");
                 if crate::action_timing::enabled() {
@@ -413,7 +448,7 @@ impl RushActionManager {
             // CAS can rebuild them from cached bytes instead of paying the
             // action again. Restoration verifies every blob digest; any
             // doubt falls through to re-execution.
-            if !outputs_present && self.restore_outputs_from_cas(&result) {
+            if !outputs_present && self.restore_outputs_from_cas(&result, before_output_mutation, !prepare_native_command)? {
                 outputs_present = Self::action_outputs_exist(&action);
                 if outputs_present {
                     trace_action_outcome(&action, "HIT-CAS-RESTORE");
@@ -444,7 +479,8 @@ impl RushActionManager {
 
         let lookup_elapsed = lookup_t0.elapsed();
 
-        if !policy.must_execute()
+        if prepare_native_command
+            && !policy.must_execute()
             && matches!(action.mnemonic.as_str(), "CppArchive" | "CcArchive")
             && Self::action_outputs_exist(&action)
             && crate::thin_archive::can_reuse_cc_archive_command(
@@ -488,7 +524,7 @@ impl RushActionManager {
         // virtual-hit, so re-producing it is not schedulable this
         // build (the CAS quarantines corrupt blobs, so the NEXT build
         // misses and re-executes).
-        if rush_action::virtual_artifacts::enabled() {
+        if prepare_native_command && rush_action::virtual_artifacts::enabled() {
             for input in &action.inputs {
                 let path = match input {
                     rush_action::Artifact::Source(p) => p,
@@ -519,9 +555,21 @@ impl RushActionManager {
         let resource_handle = self.resource_manager.acquire(resource_request).await?;
         let resource_wait = permit_t0.elapsed();
 
-        // Execute
+        // Fence after resource admission, immediately before execution. Keeping
+        // the fence active while queued detects earlier foreign input writes.
         let execution_timer = crate::action_timing::ExecutionTimer::start_if_enabled();
-        let result = self.strategy.execute(&action).await;
+        let result = match before_output_mutation.map(|before| before()).transpose() {
+            Ok(_) => {
+                // Invalidate only output metadata: a later native sweep must
+                // not resurrect a previous virtual value after this writer.
+                // Canonical inputs remain exact filesystem values.
+                if !prepare_native_command {
+                    rush_action::virtual_artifacts::unregister(&Self::output_paths(&action));
+                }
+                self.strategy.execute(&action).await
+            }
+            Err(error) => Err(error),
+        };
         let execution = execution_timer.map(|timer| timer.finish());
 
         // Release permit before returning, regardless of outcome.
@@ -606,7 +654,7 @@ impl RushActionManager {
 #[async_trait]
 impl ActionManager for RushActionManager {
     async fn execute(&self, action: Action) -> Result<ActionResult> {
-        self.execute_impl(action, ActionCachePolicy::CACHEABLE)
+        self.execute_impl(action, ActionCachePolicy::CACHEABLE, true, None)
             .await
     }
 }
@@ -765,6 +813,159 @@ mod output_value_tests {
             env: HashMap::new(),
             mnemonic: "CppCompile".to_string(),
         }
+    }
+
+    struct ExactCommandStrategy {
+        expected: Action,
+        calls: AtomicUsize,
+        expect_missing_input: bool,
+    }
+
+    #[async_trait]
+    impl ExecutionStrategy for ExactCommandStrategy {
+        async fn execute(&self, action: &Action) -> Result<ActionResult> {
+            assert_eq!(action.id, self.expected.id);
+            assert_eq!(action.command.executable, self.expected.command.executable);
+            assert_eq!(action.command.args, self.expected.command.args);
+            assert_eq!(action.env, self.expected.env);
+            if self.expect_missing_input {
+                let input = match &action.inputs[0] {
+                    Artifact::Source(path) => path,
+                    Artifact::Derived { output_path, .. } => output_path,
+                };
+                assert!(!input.exists(), "canonical execution must not JIT-materialize an input");
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            CountingStrategy { calls: AtomicUsize::new(0) }.execute(action).await
+        }
+        fn can_execute(&self, _: &Action) -> bool { true }
+        fn name(&self) -> &str { "exact-external-command" }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn canonical_external_commands_skip_native_sharding_and_fence_actual_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("rush-out/genfiles/tensorflow/cc/ops/math_ops.cc");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, r#"#include "ops.h"
+namespace tensorflow {
+namespace ops {
+Foo::Foo() {}
+Bar::Bar() {}
+Baz::Baz() {}
+Qux::Qux() {}
+A::A() {}
+B::B() {}
+C::C() {}
+D::D() {}
+}  // namespace ops
+}  // namespace tensorflow
+"#).unwrap();
+        let mut native = compile_action(&dir.path().join("native.o"), &source, None);
+        let native_id = native.id.clone();
+        assert!(crate::generated_cc_sharding::prepare(&mut native).unwrap());
+        assert_ne!(native.id, native_id, "the fixture must trigger native preparation");
+
+        let output = dir.path().join("exact.o");
+        let action = compile_action(&output, &source, None);
+        let strategy = Arc::new(ExactCommandStrategy { expected: action.clone(), calls: AtomicUsize::new(0), expect_missing_input: false });
+        let cache = Arc::new(ActionCache::new());
+        let cas = Arc::new(rush_cache::cas::CasStore::new(dir.path()).unwrap());
+        let stale_output_record = if rush_action::virtual_artifacts::enabled() {
+            let stale_path = dir.path().join("stale-native-output");
+            std::fs::write(&stale_path, b"obsolete native bytes\n").unwrap();
+            let mut record = cas.record_output_durable(&stale_path).unwrap();
+            record.path = output.clone();
+            rush_action::virtual_artifacts::register(std::slice::from_ref(&record));
+            Some(record)
+        } else {
+            None
+        };
+        let manager = RushActionManager::new_with_cas(cache, strategy.clone(), ResourceManager::new().unwrap(), Some(cas.clone()));
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let before: Arc<BeforeOutputMutation> = {
+            let mutations = mutations.clone();
+            Arc::new(move || { mutations.fetch_add(1, Ordering::SeqCst); Ok(()) })
+        };
+        let first = manager.execute_canonical_external_action(action.clone(), ActionCachePolicy::CACHEABLE, before.clone()).await.unwrap();
+        assert!(!first.cached);
+        assert_eq!(first.action_id, action.id);
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+        assert!(!dir.path().join("exact.o.rush-shard0.cc").exists());
+        assert!(!rush_action::virtual_artifacts::is_registered(&output), "execution must invalidate old output metadata");
+        let retained = manager.execute_canonical_external_action(action.clone(), ActionCachePolicy::CACHEABLE, before.clone()).await.unwrap();
+        assert!(retained.cached);
+        assert_eq!(mutations.load(Ordering::SeqCst), 1, "pure retained hits must not disable generated memoization");
+        std::fs::remove_file(&output).unwrap();
+        if let Some(record) = &stale_output_record {
+            rush_action::virtual_artifacts::register(std::slice::from_ref(record));
+        }
+        let restored = manager.execute_canonical_external_action(action.clone(), ActionCachePolicy::CACHEABLE, before.clone()).await.unwrap();
+        assert!(restored.cached);
+        assert_eq!(mutations.load(Ordering::SeqCst), 2);
+        assert_eq!(strategy.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&output).unwrap(), b"result");
+        assert!(!rush_action::virtual_artifacts::is_registered(&output));
+
+        // Corrupted CAS bytes cannot turn a missing output into a cache hit.
+        let digest = first.output_records[0].content_digest.unwrap().to_hex();
+        std::fs::write(dir.path().join("cas").join(&digest[..2]).join(&digest), b"corrupted").unwrap();
+        std::fs::remove_file(&output).unwrap();
+        let recovered = manager.execute_canonical_external_action(action.clone(), ActionCachePolicy::CACHEABLE, before).await.unwrap();
+        assert!(!recovered.cached);
+        assert_eq!(std::fs::read(&output).unwrap(), b"result");
+        assert_eq!(strategy.calls.load(Ordering::SeqCst), 2);
+
+        // A failed fence must prevent both CAS output restoration and execution.
+        std::fs::remove_file(&output).unwrap();
+        if let Some(record) = &stale_output_record {
+            rush_action::virtual_artifacts::register(std::slice::from_ref(record));
+        }
+        let refused: Arc<BeforeOutputMutation> = Arc::new(|| anyhow::bail!("foreign input mutation"));
+        assert!(manager.execute_canonical_external_action(action.clone(), ActionCachePolicy::CACHEABLE, refused.clone()).await.is_err());
+        assert!(manager.execute_canonical_external_action(action.clone(), ActionCachePolicy::UNCACHEABLE, refused).await.is_err());
+        assert!(!output.exists());
+        assert_eq!(strategy.calls.load(Ordering::SeqCst), 2);
+        if stale_output_record.is_some() {
+            assert!(rush_action::virtual_artifacts::is_registered(&output), "a rejected fence must leave output metadata untouched");
+        }
+
+        if rush_action::virtual_artifacts::enabled() {
+            // The subprocess below enables native virtual mode. Even then,
+            // canonical external execution must preserve this missing path.
+            let record = cas.record_output_durable(&source).unwrap();
+            rush_action::virtual_artifacts::register(&[record]);
+            std::fs::remove_file(&source).unwrap();
+            let strategy = Arc::new(ExactCommandStrategy {
+                expected: action.clone(), calls: AtomicUsize::new(0), expect_missing_input: true,
+            });
+            let manager = RushActionManager::new_with_cas(
+                Arc::new(ActionCache::new()), strategy.clone(), ResourceManager::new().unwrap(), Some(cas),
+            );
+            manager.execute_canonical_external_action(action, ActionCachePolicy::UNCACHEABLE, Arc::new(|| Ok(()))).await.unwrap();
+            assert_eq!(strategy.calls.load(Ordering::SeqCst), 1);
+            assert!(!source.exists());
+            assert!(rush_action::virtual_artifacts::is_registered(&source), "canonical execution must preserve input registrations");
+            assert!(!rush_action::virtual_artifacts::is_registered(&output));
+            rush_action::virtual_artifacts::unregister(&[source]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_external_virtual_mode_does_not_virtualize_or_jit() {
+        // Virtual mode and its fallback environment are process-global. Use an
+        // isolated invocation of the exact regression rather than racing the
+        // rest of the unit-test binary's native mode/cache settings.
+        let temp = tempfile::tempdir().unwrap();
+        let status = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args(["--exact", "action_manager::output_value_tests::canonical_external_commands_skip_native_sharding_and_fence_actual_mutations", "--nocapture", "--test-threads=1"])
+            .env("RUSH_VIRTUAL_ARTIFACTS", "1")
+            .env("RUSH_USE_SCHEDULER", "0")
+            .env(rush_cache::roots::CACHE_ROOT_ENV, temp.path())
+            .status().unwrap();
+        assert!(status.success());
     }
 
     #[test]

@@ -2145,11 +2145,9 @@ mod tests {
                 mode: 0o644,
             },
         }];
-        assert!(output_overlap
-            .validate_structure()
-            .unwrap_err()
-            .to_string()
-            .contains("also a declared output"));
+        // Controller-owned seeds may be replaced by the declared producer.
+        // The seed shape/ownership checks still apply; overlap alone is valid.
+        output_overlap.validate_structure().unwrap();
 
         let mut wrong_observation = snapshot(temp.path(), &analysis_input);
         wrong_observation.graph.actions[0]
