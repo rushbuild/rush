@@ -168,6 +168,49 @@ impl RetainedExecutionState {
     }
 }
 
+fn commit_pruned_updates_if_current<R>(
+    slot: &mut Option<RetainedExecutionState>,
+    build_order: &[String],
+    expected_generation: u64,
+    expected_forest: Arc<BuiltArtifactForest>,
+    updates: BuiltArtifactForest,
+    refresh: impl FnOnce(&mut crate::freshness_ledger::FreshnessLedger) -> (Option<u64>, R),
+) -> Option<(R, usize)> {
+    let Some(current) = slot.as_mut() else {
+        return None;
+    };
+    if current.generation != expected_generation
+        || !Arc::ptr_eq(&current.artifact_forest, &expected_forest)
+        || !artifact_forest_covers_keys(build_order, &current.artifact_forest)
+        || updates
+            .keys()
+            .any(|key| !current.artifact_forest.contains_key(key))
+    {
+        *slot = None;
+        return None;
+    }
+    let ledger_refs = Arc::strong_count(&current.ledger);
+    let (baseline, result) = refresh(Arc::make_mut(&mut current.ledger));
+    if current.ledger.is_empty() || baseline.is_none() {
+        *slot = None;
+        return None;
+    }
+    // Release the execution's old forest reference before applying the small
+    // patch. Outstanding readers still force copy-on-write; the common unique
+    // snapshot can replace existing keys without cloning the entire forest.
+    drop(expected_forest);
+    let forest = Arc::make_mut(&mut current.artifact_forest);
+    for (key, value) in updates {
+        *forest.get_mut(&key).expect("replacement key checked above") = value;
+    }
+    current.generation = current
+        .generation
+        .checked_add(1)
+        .expect("retained execution generation overflow");
+    current.watch_baseline_id = baseline.expect("checked above");
+    Some((result, ledger_refs))
+}
+
 fn refresh_state_if_current(
     slot: &mut Option<RetainedExecutionState>,
     expected: &RetainedExecutionState,
@@ -548,11 +591,11 @@ impl AnalysisSnapshot {
     /// caller-owned diagnostics. `Some(0)` is valid conservative retention;
     /// `None` or a revision mismatch clears retention because this execution has
     /// already written outputs relative to the expected generation.
-    pub(crate) fn commit_pruned_execution_state<R>(
+    pub(crate) fn commit_pruned_execution_updates<R>(
         &self,
         expected_generation: u64,
-        expected_artifact_forest: &Arc<BuiltArtifactForest>,
-        artifact_forest: BuiltArtifactForest,
+        expected_artifact_forest: Arc<BuiltArtifactForest>,
+        updates: BuiltArtifactForest,
         refresh_and_baseline: impl FnOnce(
             &mut crate::freshness_ledger::FreshnessLedger,
         ) -> (Option<u64>, R),
@@ -561,33 +604,14 @@ impl AnalysisSnapshot {
             .retained_execution_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !artifact_forest_covers_keys(&self.build_order_keys, &artifact_forest) {
-            *guard = None;
-            return None;
-        }
-        let Some(current) = guard.as_mut() else {
-            *guard = None;
-            return None;
-        };
-        if current.generation != expected_generation
-            || !Arc::ptr_eq(&current.artifact_forest, expected_artifact_forest)
-        {
-            *guard = None;
-            return None;
-        }
-        let ledger_strong_count = Arc::strong_count(&current.ledger);
-        let (watch_baseline_id, result) = refresh_and_baseline(Arc::make_mut(&mut current.ledger));
-        if current.ledger.is_empty() || watch_baseline_id.is_none() {
-            *guard = None;
-            return None;
-        }
-        current.generation = current
-            .generation
-            .checked_add(1)
-            .expect("retained execution generation overflow");
-        current.artifact_forest = Arc::new(artifact_forest);
-        current.watch_baseline_id = watch_baseline_id.expect("checked above");
-        Some((result, ledger_strong_count))
+        commit_pruned_updates_if_current(
+            &mut guard,
+            &self.build_order_keys,
+            expected_generation,
+            expected_artifact_forest,
+            updates,
+            refresh_and_baseline,
+        )
     }
 
     /// Re-validate the snapshot's manifest against a new command's semantics.
@@ -966,6 +990,107 @@ mod tests {
             &[label("//pkg:active"), label("//pkg:inactive")],
             &hydrated
         ));
+    }
+
+    #[test]
+    fn pruned_updates_preserve_inactive_roots_and_avoid_unique_forest_clone() {
+        let order = vec!["//:active".to_string(), "//:inactive".to_string()];
+        let inactive = artifact_root("inactive.a");
+        let forest = Arc::new(HashMap::from([
+            ("//:active".into(), artifact_root("old.a")),
+            ("//:inactive".into(), Arc::clone(&inactive)),
+        ]));
+        let address = Arc::as_ptr(&forest);
+        let capacity = forest.capacity();
+        let key_order = forest.keys().cloned().collect::<Vec<_>>();
+        let mut slot = Some(RetainedExecutionState {
+            generation: 7,
+            ledger: Arc::new(nonempty_ledger("input")),
+            artifact_forest: Arc::clone(&forest),
+            watch_baseline_id: 41,
+        });
+        let replacement = artifact_root("new.a");
+        assert!(commit_pruned_updates_if_current(
+            &mut slot,
+            &order,
+            7,
+            forest,
+            HashMap::from([("//:active".into(), Arc::clone(&replacement))]),
+            |_| (Some(42), ())
+        )
+        .is_some());
+        let current = slot.unwrap();
+        assert_eq!(Arc::as_ptr(&current.artifact_forest), address);
+        assert_eq!(current.artifact_forest.capacity(), capacity);
+        assert_eq!(
+            current.artifact_forest.keys().cloned().collect::<Vec<_>>(),
+            key_order
+        );
+        assert_eq!(current.generation, 8);
+        assert_eq!(current.watch_baseline_id, 42);
+        assert!(Arc::ptr_eq(
+            &current.artifact_forest["//:active"],
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            &current.artifact_forest["//:inactive"],
+            &inactive
+        ));
+    }
+
+    #[test]
+    fn pruned_updates_copy_for_readers_and_reject_invalid_publication() {
+        let order = vec!["//:active".to_string()];
+        let old_root = artifact_root("old.a");
+        let original = RetainedExecutionState {
+            generation: 7,
+            ledger: Arc::new(nonempty_ledger("input")),
+            artifact_forest: Arc::new(HashMap::from([("//:active".into(), Arc::clone(&old_root))])),
+            watch_baseline_id: 41,
+        };
+        let mut slot = Some(original.clone());
+        assert!(commit_pruned_updates_if_current(
+            &mut slot,
+            &order,
+            7,
+            Arc::clone(&original.artifact_forest),
+            HashMap::from([("//:active".into(), artifact_root("new.a"))]),
+            |_| (Some(42), ())
+        )
+        .is_some());
+        assert!(Arc::ptr_eq(
+            &original.artifact_forest["//:active"],
+            &old_root
+        ));
+        assert!(!Arc::ptr_eq(
+            &slot.as_ref().unwrap().artifact_forest,
+            &original.artifact_forest
+        ));
+        for case in 0..4 {
+            let mut slot = Some(original.clone());
+            let key = if case == 0 { "//:unknown" } else { "//:active" };
+            let expected_generation = if case == 1 { 6 } else { 7 };
+            let wrong_order = vec!["//:missing".to_string()];
+            let build_order = if case == 2 { &wrong_order } else { &order };
+            let mut callback_ran = false;
+            let result = commit_pruned_updates_if_current(
+                &mut slot,
+                build_order,
+                expected_generation,
+                Arc::clone(&original.artifact_forest),
+                HashMap::from([(key.into(), artifact_root("bad.a"))]),
+                |_| {
+                    callback_ran = true;
+                    (None, ())
+                },
+            );
+            assert!(result.is_none() && slot.is_none());
+            assert_eq!(callback_ran, case == 3);
+            assert!(Arc::ptr_eq(
+                &original.artifact_forest["//:active"],
+                &old_root
+            ));
+        }
     }
 
     #[test]

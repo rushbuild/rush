@@ -103,6 +103,125 @@ fn resolve_dep_provider<'a>(
     None
 }
 
+type ArtifactRoot = Arc<rush_rules::nested_set::NestedSet<Artifact>>;
+
+trait ArtifactLookup {
+    fn get(&self, key: &str) -> Option<&ArtifactRoot>;
+    fn entries(&self) -> impl Iterator<Item = (&String, &ArtifactRoot)>;
+}
+
+impl ArtifactLookup for HashMap<String, ArtifactRoot> {
+    fn get(&self, key: &str) -> Option<&ArtifactRoot> {
+        HashMap::get(self, key)
+    }
+    fn entries(&self) -> impl Iterator<Item = (&String, &ArtifactRoot)> {
+        self.iter()
+    }
+}
+
+#[derive(Default)]
+struct ExecutionArtifacts<'a> {
+    base: Option<&'a HashMap<String, ArtifactRoot>>,
+    updates: HashMap<String, ArtifactRoot>,
+}
+
+impl ArtifactLookup for ExecutionArtifacts<'_> {
+    fn get(&self, key: &str) -> Option<&ArtifactRoot> {
+        self.updates
+            .get(key)
+            .or_else(|| self.base.and_then(|base| base.get(key)))
+    }
+    fn entries(&self) -> impl Iterator<Item = (&String, &ArtifactRoot)> {
+        // Keep the retained key order for compatibility lookups too: replacing
+        // a value must not promote it ahead of another fuzzy-matching key.
+        self.base
+            .into_iter()
+            .flat_map(|base| base.iter())
+            .map(|(key, value)| (key, self.updates.get(key).unwrap_or(value)))
+            .chain(
+                self.updates
+                    .iter()
+                    .filter(|(key, _)| self.base.map_or(true, |base| !base.contains_key(*key))),
+            )
+    }
+}
+
+impl ExecutionArtifacts<'_> {
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+    fn insert(&mut self, key: String, value: ArtifactRoot) {
+        self.updates.insert(key, value);
+    }
+    fn len(&self) -> usize {
+        self.base.map_or(0, HashMap::len)
+            + self
+                .updates
+                .keys()
+                .filter(|key| self.base.map_or(true, |base| !base.contains_key(*key)))
+                .count()
+    }
+    fn values(&self) -> impl Iterator<Item = &ArtifactRoot> {
+        self.entries().map(|(_, value)| value)
+    }
+    fn into_updates(self) -> HashMap<String, ArtifactRoot> {
+        self.updates
+    }
+}
+
+#[cfg(test)]
+mod execution_artifacts_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_shadows_once_and_preserves_base_and_compatibility_lookup() {
+        let root = |path: &str| {
+            rush_rules::nested_set::NestedSet::new(
+                vec![Artifact {
+                    path: PathBuf::from(path),
+                    artifact_type: ArtifactType::Generated,
+                }],
+                Vec::new(),
+            )
+        };
+        let old = root("old");
+        let untouched = root("untouched");
+        let base = HashMap::from([
+            ("//pkg:active".into(), Arc::clone(&old)),
+            ("@repo//pkg:dep".into(), Arc::clone(&untouched)),
+        ]);
+        let replacement = root("new");
+        let mut view = ExecutionArtifacts {
+            base: Some(&base),
+            updates: HashMap::new(),
+        };
+        view.insert("//pkg:active".into(), Arc::clone(&replacement));
+        assert!(Arc::ptr_eq(view.get("//pkg:active").unwrap(), &replacement));
+        assert!(Arc::ptr_eq(base.get("//pkg:active").unwrap(), &old));
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.entries().count(), 2);
+        assert_eq!(
+            view.entries().map(|(key, _)| key).collect::<Vec<_>>(),
+            base.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            view.entries()
+                .filter(|(key, _)| key.as_str() == "//pkg:active")
+                .count(),
+            1
+        );
+        let expected = resolve_dep_artifacts(&base, "//pkg:dep", "pkg").unwrap();
+        assert!(Arc::ptr_eq(
+            resolve_dep_artifacts(&view, "//pkg:dep", "pkg").unwrap(),
+            expected
+        ));
+        let updates = view.into_updates();
+        assert_eq!(updates.len(), 1);
+        assert!(Arc::ptr_eq(&updates["//pkg:active"], &replacement));
+        assert!(Arc::ptr_eq(&base["@repo//pkg:dep"], &untouched));
+    }
+}
+
 /// #39 link-reachability: resolve a dep's built artifact NestedSet, mirroring
 /// `resolve_dep_provider`'s label matching exactly.
 ///
@@ -124,14 +243,14 @@ fn resolve_dep_provider<'a>(
 /// the cc_test link's `--start-group`, where the single-pass linker resolves
 /// those back-references.
 fn resolve_dep_artifacts<'a>(
-    built_artifacts: &'a HashMap<String, Arc<rush_rules::nested_set::NestedSet<Artifact>>>,
+    built_artifacts: &'a impl ArtifactLookup,
     dep_label: &str,
     consumer_package: &str,
 ) -> Option<&'a Arc<rush_rules::nested_set::NestedSet<Artifact>>> {
     if let Some(a) = built_artifacts.get(dep_label) {
         return Some(a);
     }
-    for (stored, arts) in built_artifacts {
+    for (stored, arts) in built_artifacts.entries() {
         if rush_rules::providers::dep_label_matches(stored, dep_label, consumer_package) {
             return Some(arts);
         }
@@ -6588,8 +6707,8 @@ impl BuildOrchestrator {
     ///
     /// Takes an immutable [`AnalysisSnapshot`] (the PASS-A output: dependency
     /// graph, build order, action registry, analysis providers, toolchain) and
-    /// runs PASS-B execution against fresh per-run maps. The snapshot's
-    /// analysis state is immutable; only a successful execution publishes a
+    /// runs PASS-B against fresh providers and an artifact replacement overlay.
+    /// The snapshot's analysis state is immutable; only a successful execution publishes a
     /// new coherent ledger/artifact/watch generation under interior
     /// mutability. `built_providers` is cloned from immutable
     /// `analysis_providers`, so post-build provider refresh writes into the run
@@ -6728,7 +6847,10 @@ impl BuildOrchestrator {
                     .as_ref()
                     .expect("current prune plan must have retained execution state");
                 let hydrated = (
-                    plan.retained_artifact_forest.as_ref().clone(),
+                    ExecutionArtifacts {
+                        base: Some(plan.retained_artifact_forest.as_ref()),
+                        updates: HashMap::new(),
+                    },
                     Some(Arc::clone(&state.ledger)),
                 );
                 // Do not retain the coherent-state clone: the ledger Arc above
@@ -6738,10 +6860,11 @@ impl BuildOrchestrator {
                 hydrated
             } else {
                 full_execution_expected = current_retained_state.take();
-                (HashMap::new(), None)
+                (ExecutionArtifacts::default(), None)
             };
         debug_assert!(current_retained_state.is_none());
         debug_assert!(prune_plan.is_some() || previous_ledger_for_output_equiv.is_none());
+        let pruned_execution = prune_plan.is_some();
 
         let use_scheduler =
             std::env::var("RUSH_USE_SCHEDULER").as_deref() == Ok("1");
@@ -8250,7 +8373,9 @@ impl BuildOrchestrator {
             if !virtual_materialized.is_empty() {
                 watcher.note_own_write_paths(&virtual_materialized);
             }
-            if let Some(plan) = &prune_plan {
+            if pruned_execution {
+                let artifact_updates = built_artifacts.into_updates();
+                let plan = prune_plan.take().expect("pruned execution has a plan");
                 // Protect the inactive portion of the prior ledger with the
                 // exact watcher baseline pinned by the plan. Only the active
                 // paths are restatted below.
@@ -8280,11 +8405,10 @@ impl BuildOrchestrator {
                         plan.ledger_required_present_paths.clone()
                     };
                 let required_count = required_present_paths.len();
-                let artifact_forest = std::mem::take(&mut built_artifacts);
-                let committed = snapshot.commit_pruned_execution_state(
+                let committed = snapshot.commit_pruned_execution_updates(
                     plan.retained_generation,
-                    &plan.retained_artifact_forest,
-                    artifact_forest,
+                    plan.retained_artifact_forest,
+                    artifact_updates,
                     |ledger| {
                         ledger.refresh_after_pruned_rebuild_in_place(
                             &refresh_paths,
@@ -8404,7 +8528,7 @@ impl BuildOrchestrator {
                 let retained_committed = snapshot.commit_retained_execution_state(
                     full_execution_expected.as_ref(),
                     Arc::clone(&ledger),
-                    std::mem::take(&mut built_artifacts),
+                    built_artifacts.into_updates(),
                     baseline_id,
                 );
 
@@ -8441,7 +8565,7 @@ impl BuildOrchestrator {
             }
         }
 
-        if prune_plan.is_none() {
+        if !pruned_execution {
             let t_prune_index = std::time::Instant::now();
             let _ = get_or_build_pass_b_prune_index(snapshot, &self.workspace_root).await;
             if exec_timing {
@@ -14007,7 +14131,7 @@ fn build_committed_target_artifacts(
     label: &Label,
     node: &DependencyNode,
     artifacts: Vec<Artifact>,
-    built_artifacts: &HashMap<String, Arc<rush_rules::nested_set::NestedSet<Artifact>>>,
+    built_artifacts: &impl ArtifactLookup,
 ) -> Result<Arc<rush_rules::nested_set::NestedSet<Artifact>>> {
     let rule_type = node.rule_instance.rule_type();
     let is_alias = identity_artifact_alias_rule_kind(rule_type);
