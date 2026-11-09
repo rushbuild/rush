@@ -8815,6 +8815,112 @@ mod membership_neutral_action_tests {
             None
         );
     }
+
+    #[test]
+    fn proves_atomic_rename_membership_without_inventing_process_order() {
+        let rename = batch(0, 20, vec![member(6, b"generated.h")]);
+        let creation = batch(
+            1,
+            10,
+            vec![KbuildDirectoryEffectDescriptor {
+                kind_tag: 4,
+                subject: KbuildDirectoryEffectSubject::DirectoryObject,
+            }],
+        );
+        let observation = KbuildProcessEventKey {
+            process: 9,
+            syscall_index: 30,
+            stream_ordinal: 30,
+        };
+        let causality = KbuildProcessCausality::default();
+        assert_eq!(kbuild_process_event_relation(&causality, rename.event, observation).unwrap(), 2);
+
+        // A fresh directory has no initial generated.h; its only insertion
+        // must precede a complete listing which contains that name.
+        assert_eq!(
+            kbuild_directory_batch_relations(
+                &[creation.clone(), rename.clone()],
+                &causality,
+                observation,
+                &[b"generated.h".to_vec()],
+                None,
+            ).unwrap(),
+            vec![0, 0]
+        );
+        assert_eq!(
+            kbuild_projected_directory_batch_relations(
+                &[creation.clone(), rename.clone()],
+                &causality,
+                observation,
+                &[],
+                &BTreeSet::new(),
+            ).unwrap(),
+            vec![0, 1]
+        );
+
+        // An existing directory may already contain the destination. Its
+        // presence cannot order a replacement, but absence with no remover
+        // proves that the rename has yet to happen.
+        assert_eq!(
+            kbuild_unremoved_absent_ambiguous_create_relation(
+                &rename, std::slice::from_ref(&rename), &[]
+            ).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            kbuild_unremoved_absent_ambiguous_create_relation(
+                &rename, std::slice::from_ref(&rename), &[b"generated.h".to_vec()]
+            ).unwrap(),
+            None
+        );
+        for removal_kind in [2, 5] {
+            let removal = batch(1, 25, vec![member(removal_kind, b"generated.h")]);
+            assert_eq!(
+                kbuild_unremoved_absent_ambiguous_create_relation(
+                    &rename, &[rename.clone(), removal.clone()], &[]
+                ).unwrap(),
+                None
+            );
+            assert_eq!(
+                kbuild_fresh_directory_proved_relation(
+                    &rename, &[creation.clone(), rename.clone(), removal], &[]
+                ),
+                None
+            );
+        }
+        let replacement = batch(2, 25, vec![member(6, b"generated.h")]);
+        assert_eq!(
+            kbuild_fresh_directory_proved_relation(
+                &rename, &[creation, rename.clone(), replacement], &[b"generated.h".to_vec()]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn projects_temporary_rename_source_before_proving_persistent_destination() {
+        let creation = batch(1, 10, vec![KbuildDirectoryEffectDescriptor {
+            kind_tag: 4,
+            subject: KbuildDirectoryEffectSubject::DirectoryObject,
+        }]);
+        let rename = batch(0, 20, vec![member(5, b"temporary"), member(6, b"generated.h")]);
+        let observation = KbuildProcessEventKey {
+            process: 9, syscall_index: 30, stream_ordinal: 30,
+        };
+        let batches = [creation, rename];
+        let members = [b"generated.h".to_vec()];
+        let causality = KbuildProcessCausality::default();
+        assert_eq!(
+            kbuild_directory_batch_relations(&batches, &causality, observation, &members, None).unwrap(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            kbuild_projected_directory_batch_relations(
+                &batches, &causality, observation, &members, &BTreeSet::from([b"temporary".to_vec()])
+            ).unwrap(),
+            vec![0, 0]
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -8875,7 +8981,7 @@ fn kbuild_fresh_directory_proved_relation(
         let KbuildDirectoryEffectSubject::Member(member) = &effect.subject else {
             return None;
         };
-        if effect.kind_tag != 0 {
+        if !matches!(effect.kind_tag, 0 | 6) {
             return None;
         }
         let member_effects = batches
@@ -8956,7 +9062,11 @@ fn kbuild_unremoved_absent_ambiguous_create_relation(
         let KbuildDirectoryEffectSubject::Member(member) = &effect.subject else {
             return Ok(None);
         };
-        if effect.kind_tag != 0 || members.binary_search(member).is_ok() {
+        // Each successful operation leaves this name present. In a stable
+        // directory with no removal of that name, an absent listing proves
+        // the operation follows the observation even when sibling processes
+        // have no wait/fork ordering edge.
+        if !matches!(effect.kind_tag, 0 | 6) || members.binary_search(member).is_ok() {
             return Ok(None);
         }
         if batches
@@ -9094,17 +9204,29 @@ fn kbuild_projected_directory_batch_relations(
     members: &[Vec<u8>],
     ignored_members: &BTreeSet<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let mut relations = batches
+    // A rename carries source and destination effects in one syscall batch.
+    // Apply the already-proved transient-name projection to its effects
+    // before testing membership; a discarded temporary source must not hide
+    // the persistent destination's exact listing relation.
+    let projected_batches = batches.iter().map(|batch| KbuildDirectoryEffectBatch {
+        owner: batch.owner,
+        event: batch.event,
+        effects: batch.effects.iter().filter(|effect| match &effect.subject {
+            KbuildDirectoryEffectSubject::DirectoryObject => true,
+            KbuildDirectoryEffectSubject::Member(member) => !ignored_members.contains(member),
+        }).cloned().collect(),
+    }).collect::<Vec<_>>();
+    let mut relations = projected_batches
         .iter()
         .map(|batch| {
             let causal = kbuild_process_event_relation(causality, batch.event, observation)?;
             if causal == 2 {
                 let membership = kbuild_membership_proved_directory_relation(batch, members)?
-                    .or_else(|| kbuild_fresh_directory_proved_relation(batch, batches, members));
+                    .or_else(|| kbuild_fresh_directory_proved_relation(batch, &projected_batches, members));
                 let fenced = if membership.is_none() {
                     kbuild_removal_fenced_ambiguous_create_relation(
                         batch,
-                        batches,
+                        &projected_batches,
                         causality,
                         observation,
                         members,
@@ -9113,7 +9235,7 @@ fn kbuild_projected_directory_batch_relations(
                     None
                 };
                 let unremoved_absent = if membership.is_none() && fenced.is_none() {
-                    kbuild_unremoved_absent_ambiguous_create_relation(batch, batches, members)?
+                    kbuild_unremoved_absent_ambiguous_create_relation(batch, &projected_batches, members)?
                 } else {
                     None
                 };
