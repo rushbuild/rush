@@ -32,14 +32,36 @@ and failed assembly 2,199.22 / 2,300.08 s on C / D. Treat these as setup and
 single-control diagnostics. Require a cheap credential preflight before
 another expensive capture; assembly currently reaches this refusal late.
 
-## Evaluate the mapped-namespace profile separately
+## Read all mapped-namespace attempts
 
 Run every phase, including normalization, the Make control and capture, with
-the outer prefix `unshare --user --map-current-user`. Keep the existing inner
-assembly/replay namespaces and credential checks. Start fresh run roots with
-the same gate, source, seed, tools and CPU budget. The two-host retry is in
-progress. Its preliminary credential predicate passes; actual assembly and
-replay must still establish full credential preservation and output parity.
+the outer prefix `unshare --user --map-current-user`. Retain the existing inner
+assembly/replay namespaces and every consistency check. Use fresh roots with
+the same frozen source, gate, seed, tools and CPU budget.
+
+| Host / attempt | Make control | Capture | Derivation | Assembly | Replay |
+| --- | --- | --- | --- | --- | --- |
+| Host C / 1 | Completes; 96.44 s | Completes | 5,684 actions | Refuses `init/` checkpoint | Not run |
+| Host D / 1 | Completes; 98.88 s | Refuses changed directory identity | Not run | Not run | Not run |
+| Host D / 2 | Completes; 98.90 s | Completes | 5,684 actions | Refuses `init/` checkpoint | Not run |
+
+Keep [all three attempts](data/linux-mapped-retest-20261109.json), including
+the failure and unchanged-profile repeat. Host D's first capture exits 1 at
+491.93 s because an enumerated directory identity changes before witnessing.
+The repeat completes capture and derivation without changing the engine,
+configuration or consistency checks. This repeat establishes no engine fix.
+
+Both completed captures then reach the same assembly refusal: the analyzer's
+`init/` directory checkpoint is not causally enforceable. Its cross-owner
+provenance includes an unresolved mutation. Assembly takes 2,265.55 s on C
+and 2,393.96 s on D before refusing. Both exit 1 without timeout or
+interruption, write no snapshot and start no replay.
+
+The mapped credential predicate passes its preliminary check; full snapshot
+and replay acceptance remain unqualified. Require coherent directory
+witnesses and enforceable analyzer/mutation ordering, then repeat capture,
+assembly and complete output parity before timing replay. Preserve refusal
+of unsafe observations. Assign no Linux speed improvement to these results.
 
 ## Reproduce the pinned source and configuration
 
@@ -65,7 +87,11 @@ differ after recreating commits. All 23 measured patches match the freshly
 fetched public series in order under whitespace-preserving patch IDs. Retain those IDs in the data.
 
 Copy [the exact seed](data/linux-seed-20261109.config) into separate output
-roots and run `make olddefconfig` outside timing. Require seed SHA256
+roots and run `make olddefconfig` outside timing. Copy the normalized result
+to `RUN/normalized.config` and seed the separate Make-control root with it.
+Keep the managed capture output root absent; let capture create and seed it.
+Create the phase metadata directories before their recorded commands.
+Require seed SHA256
 `5e0134db8e9bb259ee5133a177f7feed45a11eec67c808adcf0454f1aeb9cfc5`.
 Its GCC 11 header records the seed's origin; each new build normalizes it
 with its own pinned compiler. Host C uses GCC 16.2.0 and Host D uses GCC
