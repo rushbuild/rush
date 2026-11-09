@@ -151,20 +151,16 @@ pub fn fingerprint_path(path: &Path) -> Result<ArtifactFingerprint> {
     fingerprint_regular_from_digest(path, &digest, executable)
 }
 
-/// The regular-file fingerprint, computed from a content digest the
-/// caller ALREADY has.
-///
-/// Byte-identical to the regular-file branch of [`fingerprint_path`] —
-/// enforced by `fingerprint_from_digest_matches_fingerprint_path` — but
-/// it does not re-read the file. Committing an output used to hash it
-/// twice (once for the digest, once for the fingerprint) plus a third
-/// read to copy it into the CAS; this is the seam that removes the
-/// second pass.
-pub fn fingerprint_regular_from_digest(
-    path: &Path,
+/// Fingerprint bytes already classified as a non-thin regular file. The caller
+/// must validate that classification along with its cached content signature.
+pub(crate) fn fingerprint_known_plain_from_digest(
     digest: &ContentDigest,
     executable: bool,
-) -> Result<ArtifactFingerprint> {
+) -> ArtifactFingerprint {
+    ArtifactFingerprint(*regular_file_hasher(digest, executable).finalize().as_bytes())
+}
+
+fn regular_file_hasher(digest: &ContentDigest, executable: bool) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new();
     hasher.update(FP_DOMAIN);
     hasher.update(b"file\0");
@@ -173,6 +169,19 @@ pub fn fingerprint_regular_from_digest(
     hasher.update(&[executable as u8]);
     #[cfg(not(unix))]
     let _ = executable;
+    hasher
+}
+
+/// The regular-file fingerprint, computed from a content digest the caller has.
+///
+/// Byte-identical to the regular-file branch of [`fingerprint_path`], without
+/// rehashing the file bytes. Thin archives still include their member values.
+pub fn fingerprint_regular_from_digest(
+    path: &Path,
+    digest: &ContentDigest,
+    executable: bool,
+) -> Result<ArtifactFingerprint> {
+    let mut hasher = regular_file_hasher(digest, executable);
 
     // Thin-archive correctness gate: fold in member fingerprints. The
     // archive bytes hold only member PATHS, so identical bytes with a
@@ -628,6 +637,10 @@ mod tests {
             fingerprint_regular_from_digest(&plain, &d, false).unwrap(),
             fingerprint_path(&plain).unwrap()
         );
+        assert_eq!(
+            fingerprint_known_plain_from_digest(&d, false),
+            fingerprint_path(&plain).unwrap()
+        );
         // Executable file — the exec bit is part of the value.
         #[cfg(unix)]
         {
@@ -639,6 +652,10 @@ mod tests {
             let d = content_digest_of_file(&exe).unwrap();
             assert_eq!(
                 fingerprint_regular_from_digest(&exe, &d, true).unwrap(),
+                fingerprint_path(&exe).unwrap()
+            );
+            assert_eq!(
+                fingerprint_known_plain_from_digest(&d, true),
                 fingerprint_path(&exe).unwrap()
             );
         }

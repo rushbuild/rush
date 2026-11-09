@@ -26,6 +26,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// Invalidate legacy action-cache entries produced before ctime-aware source
+// memoization. Those entries may contain outputs keyed by stale source bytes.
+const ACTION_ID_DOMAIN: &[u8] = b"rush.legacy-action-id.v2\0";
+
 /// Content-addressed identifier for an action.
 ///
 /// Actions are uniquely identified by the BLAKE3 hash of their inputs,
@@ -208,8 +212,8 @@ impl Action {
         // targets streamed 267 GB of identical bytes through blake3 and
         // saturated memory bandwidth - measured as clean-target
         // verification stretching from ~20 ms to ~1.3 s. The memo hashes
-        // each distinct file once and revalidates by (mtime_ns, size,
-        // inode) stat on every use, so a changed file is always re-read.
+        // stable files once and revalidates mtime, ctime, device, inode,
+        // size and mode on every use. Restoring mtime cannot hide a write.
         // Thin archives bypass the memo: their key must track member
         // CONTENT, and editing a member does not touch the archive file's
         // metadata.
@@ -228,11 +232,10 @@ impl Action {
             };
             #[cfg(not(unix))]
             let executable = false;
-            let fingerprint = crate::artifact_value::fingerprint_regular_from_digest(
-                path,
+            let fingerprint = crate::artifact_value::fingerprint_known_plain_from_digest(
                 &crate::artifact_value::ContentDigest(digest),
                 executable,
-            )?;
+            );
             hasher.update(b"artifact-fingerprint\0");
             hasher.update(&fingerprint.0);
             return Ok(());
@@ -248,7 +251,8 @@ impl Action {
     /// Returns None for a thin archive so the caller falls through to the
     /// member-tracking path. The signature check runs on every lookup: a
     /// stat costs microseconds against the milliseconds-to-seconds of a
-    /// re-hash, and a file whose mtime, size, or inode moved is re-read.
+    /// re-hash. Modification/change timestamps, size, inode, device and mode
+    /// changes force a re-read, including writes that restore the old mtime.
     /// The signature is captured before reading and confirmed after, so a
     /// write racing the read cannot pin a stale digest to a valid
     /// signature - the entry is simply not stored and the next lookup
@@ -258,7 +262,8 @@ impl Action {
         use std::os::unix::fs::MetadataExt;
         use std::sync::{Mutex, OnceLock};
 
-        type Shard = Mutex<HashMap<PathBuf, ((i64, i64, u64, u64), [u8; 32])>>;
+        type Signature = (i64, i64, u64, u64, i64, i64, u64, u32);
+        type Shard = Mutex<HashMap<PathBuf, (Signature, [u8; 32])>>;
         static SHARDS: OnceLock<Vec<Shard>> = OnceLock::new();
         const N_SHARDS: usize = 16;
         let shards = SHARDS.get_or_init(|| {
@@ -269,7 +274,10 @@ impl Action {
             std::hash::Hash::hash(p, &mut h);
             &shards[(std::hash::Hasher::finish(&h) as usize) % N_SHARDS]
         };
-        let signature = |md: &std::fs::Metadata| (md.mtime(), md.mtime_nsec(), md.len(), md.ino());
+        let signature = |md: &std::fs::Metadata| (
+            md.mtime(), md.mtime_nsec(), md.len(), md.ino(),
+            md.ctime(), md.ctime_nsec(), md.dev(), md.mode(),
+        );
 
         let md = std::fs::metadata(path).map_err(|e| {
             anyhow::anyhow!("Action::compute_id: stat input `{}`: {}", path.display(), e)
@@ -316,23 +324,20 @@ impl Action {
         }
         let digest = *content_hasher.finalize().as_bytes();
 
-        // Store only when the file did not change under the read, and only
-        // when its mtime is comfortably in the past. Kernel file timestamps
-        // tick coarsely (jiffies), so two same-size writes inside one tick
-        // produce identical (mtime_ns, size, inode) signatures and a stored
-        // entry would serve the FIRST write's digest for the second - the
-        // "mtime is not proof" failure two rush-action tests reproduce by
-        // rewriting a file immediately. A file last written >=2 s ago
-        // cannot gain a same-signature sibling: any later write lands at a
-        // far newer mtime and misses the signature check. Recently-written
-        // files are simply hashed again until they age - the memo's
-        // audience is toolchain and source files that sit unchanged.
+        // Confirm the same signature after reading. Wait for both modification
+        // and change timestamps to leave the existing two-second coarse-clock
+        // guard window before storing; fresh writes must not populate a memo
+        // entry that a second write in the same timestamp tick could reuse.
         let old_enough = md
             .modified()
             .ok()
             .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
             .is_some_and(|age| age >= std::time::Duration::from_secs(2));
-        if old_enough {
+        let ctime_ns = i128::from(md.ctime()) * 1_000_000_000 + i128::from(md.ctime_nsec());
+        let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i128).unwrap_or(0);
+        let change_old_enough = now_ns - ctime_ns >= 2_000_000_000;
+        if old_enough && change_old_enough {
             if let Ok(md_after) = std::fs::metadata(path) {
                 if signature(&md_after) == sig {
                     if let Ok(mut guard) = shard(path).lock() {
@@ -465,15 +470,15 @@ impl Action {
 
     /// Compute the content-based ActionId for this action.
     ///
-    /// The ID is the BLAKE3 hash of the serialized action data (inputs,
-    /// command, environment). This ensures that identical actions have
-    /// identical IDs for cache hits.
+    /// The ID is a versioned BLAKE3 hash of the serialized action data
+    /// (inputs, command, environment). Identical actions share cache hits.
     pub fn compute_id(
         inputs: &[Artifact],
         command: &Command,
         env: &HashMap<String, String>,
     ) -> anyhow::Result<ActionId> {
         let mut hasher = blake3::Hasher::new();
+        hasher.update(ACTION_ID_DOMAIN);
 
         // Hash inputs
         for input in inputs {
@@ -532,13 +537,23 @@ impl Action {
 mod tests {
     use super::*;
 
-    /// Prove the memo stores and serves: restoring an identical
-    /// (mtime, size, inode) signature over CHANGED bytes is the one probe
-    /// that a recompute answers differently from a cache hit. Then prove
-    /// every honest invalidation re-reads, that a freshly-written file is
-    /// never stored, and that thin archives bypass the memo.
     #[test]
-    fn memoized_plain_file_digest_hits_invalidates_and_skips_thin() {
+    fn action_id_invalidates_pre_ctime_cache_namespace() {
+        let command = Command {
+            executable: "compiler".into(),
+            args: vec!["input.cc".into()],
+            working_dir: None,
+            execution_info: ExecutionInfo::default(),
+        };
+        let old = blake3::hash(&bincode::serialize(&command).unwrap());
+        let current = Action::compute_id(&[], &command, &HashMap::new()).unwrap();
+        assert_ne!(current.hash(), &old);
+    }
+
+    /// A mature memo entry must still observe same-size writes whose mtime
+    /// was restored. Also cover fresh rewrites and thin-archive transitions.
+    #[test]
+    fn memoized_plain_file_digest_tracks_ctime_and_skips_thin() {
         let dir = std::env::temp_dir().join(format!(
             "rush-action-memo-test-{}",
             std::process::id()
@@ -552,23 +567,23 @@ mod tests {
         };
         let mtime_of = |path: &std::path::Path| std::fs::metadata(path).unwrap().modified().unwrap();
 
-        // Aged file: first lookup stores, and the stored entry is served.
+        // Let both timestamp clocks age so this exercises a stored entry.
         std::fs::write(&f, b"fn main(): pass").unwrap();
         backdate(&f, 10);
         let aged_mtime = mtime_of(&f);
+        std::thread::sleep(std::time::Duration::from_millis(2100));
         let d1 = Action::memoized_plain_file_digest(&f).unwrap().unwrap();
         assert_eq!(d1, *blake3::hash(b"fn main(): pass").as_bytes());
 
-        // Same-size new bytes with the signature RESTORED: only a stored
-        // entry can answer with the old digest. (This shape is exactly what
-        // the 2-second store window makes impossible through real writes -
-        // constructing it by hand is the proof the memo exists.)
+        // An editor/build tool can preserve mtime after replacing file bytes.
+        // ctime must invalidate the old digest even when size/inode are equal.
         std::fs::write(&f, b"fn main(): quit").unwrap();
         let h = std::fs::File::options().write(true).open(&f).unwrap();
         h.set_times(std::fs::FileTimes::new().set_modified(aged_mtime)).unwrap();
         drop(h);
         let d2 = Action::memoized_plain_file_digest(&f).unwrap().unwrap();
-        assert_eq!(d2, d1, "identical signature must be served from the memo");
+        assert_ne!(d2, d1, "restored mtime must not conceal changed bytes");
+        assert_eq!(d2, *blake3::hash(b"fn main(): quit").as_bytes());
 
         // A moved mtime is a changed signature: the new bytes are read.
         backdate(&f, 5);
@@ -598,6 +613,9 @@ mod tests {
         let thin = dir.join("lib.a");
         std::fs::write(&thin, b"!<thin>\n_rest_of_archive").unwrap();
         assert!(Action::memoized_plain_file_digest(&thin).unwrap().is_none());
+        std::fs::write(&f, b"!<thin>\n_rest_of_archive").unwrap();
+        backdate(&f, 10);
+        assert!(Action::memoized_plain_file_digest(&f).unwrap().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
