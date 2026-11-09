@@ -6792,7 +6792,7 @@ impl Evaluator {
                             | "count" | "find" | "rfind" | "index" | "rindex" | "lstrip"
                             | "rstrip" | "partition" | "rpartition" | "removeprefix"
                             | "removesuffix" | "isdigit" | "isalnum" | "isalpha"
-                            | "isspace" | "islower" | "isupper" | "title" => {
+                            | "isspace" | "islower" | "isupper" | "title" | "elems" => {
                                 // Return a bound method
                                 Ok(Value::BoundMethod {
                                     object: Box::new(obj_val),
@@ -8753,6 +8753,24 @@ impl Evaluator {
                 // Call a bound method (e.g., "hello".split(","))
                 match object.as_ref() {
                     Value::String(s) => {
+                        if method == "elems" {
+                            let positional = merge_args(args, args_unpack, self)?;
+                            let named = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                            if !positional.is_empty() || !named.is_empty() {
+                                anyhow::bail!("string.elems() accepts no arguments");
+                            }
+                            // Bazel 6.5 exposes individual source-byte elements.
+                            // Value::String currently stores UTF-8 text, so a
+                            // non-ASCII byte element cannot be represented
+                            // faithfully. Refuse instead of replacing bytes or
+                            // silently iterating Unicode scalar values.
+                            if !s.is_ascii() {
+                                anyhow::bail!("string.elems() does not yet support non-ASCII byte elements with Rush's UTF-8 string representation");
+                            }
+                            return Ok(Value::FrozenList(s.bytes().map(|byte|
+                                Value::String(char::from(byte).to_string())
+                            ).collect()));
+                        }
                         // Evaluate arguments
                         let mut eval_args = Vec::new();
                         for arg in args {

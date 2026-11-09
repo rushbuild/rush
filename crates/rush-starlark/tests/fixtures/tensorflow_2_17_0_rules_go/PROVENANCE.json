@@ -1,0 +1,18 @@
+{
+  "tensorflow_tag": "v2.17.0",
+  "rules_go_tag": "v0.34.0",
+  "archive_url": "https://github.com/bazelbuild/rules_go/releases/download/v0.34.0/rules_go-v0.34.0.zip",
+  "archive_sha256": "16e9fca53ed6bd4ff4ad76facc9b7b651a89db1689a2877d6fd7b82aa824e366",
+  "declaration_url": "https://github.com/tensorflow/tensorflow/blob/v2.17.0/tensorflow/workspace2.bzl",
+  "original_file_url": "https://github.com/bazelbuild/rules_go/blob/v0.34.0/go/private/sdk.bzl",
+  "original_file_sha256": "c1842f508281a58d628480cc388060f930bb8dee670d186e5357947fbe4a749b",
+  "excerpt": {
+    "path": "parse_version.bzl",
+    "start_line": 350,
+    "end_line": 384,
+    "sha256": "0805255c92106c1e55e0f752c0ea83577d71b2d61e7e65c935e0465cabe14768",
+    "transformation": "exact complete _parse_version definition, unchanged bytes; omit following separator blank line"
+  },
+  "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "scope": "Authentic required SDK version parser; no repository or Go toolchain materialization."
+}

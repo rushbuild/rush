@@ -1827,7 +1827,8 @@ fn builtin_hasattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
         Value::String(_) => {
             matches!(
                 attr_name.as_str(),
-                "split"
+                "elems"
+                    | "split"
                     | "strip"
                     | "replace"
                     | "startswith"
@@ -1874,6 +1875,9 @@ fn builtin_getattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
     };
     let default_value = args.get(2).unwrap_or(&Value::None);
 
+    if matches!(obj, Value::String(_)) && attr_name == "elems" {
+        return Ok(Value::BoundMethod { object: Box::new(obj.clone()), method: attr_name.clone() });
+    }
     if let Value::FrozenList(_) = obj {
         if matches!(attr_name.as_str(), "append" | "clear" | "extend" | "index" | "insert" | "pop" | "remove" | "count") {
             return Ok(Value::BoundMethod { object: Box::new(obj.clone()), method: attr_name.clone() });
