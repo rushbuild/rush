@@ -1002,12 +1002,14 @@ fn convert_configurable_value(value: &StarlarkValue) -> Result<Value> {
         StarlarkValue::Int(value) => Ok(Value::Int(*value)),
         StarlarkValue::Bool(value) => Ok(Value::Bool(*value)),
         StarlarkValue::None => Ok(Value::None),
-        StarlarkValue::List(values) | StarlarkValue::Tuple(values) => Ok(Value::List(
+        StarlarkValue::List(values) | StarlarkValue::Tuple(values) | StarlarkValue::FrozenList(values) => Ok(Value::List(
             values
                 .iter()
                 .map(convert_configurable_value)
                 .collect::<Result<Vec<_>>>()?,
         )),
+        StarlarkValue::ImmutableMapping(view) if view.frozen_dictionary().is_some() =>
+            convert_configurable_value(&StarlarkValue::Dict(view.frozen_dictionary().unwrap().clone())),
         StarlarkValue::Dict(values) => Ok(Value::Dict(
             values
                 .iter()
@@ -1064,7 +1066,7 @@ fn convert_value(value: &StarlarkValue) -> Result<Value> {
     match value {
         StarlarkValue::String(s) => Ok(Value::String(s.clone())),
         StarlarkValue::Bool(b) => Ok(Value::Bool(*b)),
-        StarlarkValue::List(items) | StarlarkValue::Tuple(items) => {
+        StarlarkValue::List(items) | StarlarkValue::Tuple(items) | StarlarkValue::FrozenList(items) => {
             let converted: Result<Vec<_>> = items.iter().map(convert_value).collect();
             Ok(Value::List(converted?))
         }
@@ -1111,6 +1113,11 @@ fn convert_value(value: &StarlarkValue) -> Result<Value> {
         StarlarkValue::Namespace(_) | StarlarkValue::WorkspaceNativeNamespace { .. } => {
             Ok(Value::String("<namespace>".to_string()))
         }
+        StarlarkValue::ImmutableMapping(view) => {
+            let entries = view.frozen_dictionary().ok_or_else(||
+                anyhow::anyhow!("Cannot convert opaque native rule metadata to a rule attribute"))?;
+            convert_value(&StarlarkValue::Dict(entries.clone()))
+        }
         StarlarkValue::ModuleExtension(_) => {
             Err(anyhow!("module-extension declarations cannot become legacy rule attributes; delegate extension execution to Bazel"))
         }
@@ -1156,6 +1163,30 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn frozen_attribute_dictionary_has_transparent_legacy_and_configurable_conversion() {
+        let root = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(root.path(), || {
+            let mut evaluator = rush_starlark::Evaluator::new();
+            evaluator.register_workspace_native_namespace();
+            evaluator.eval_program(&rush_starlark::parse(
+                "native.local_repository(name = \"repo\", path = \"dep\", repo_mapping = {\"dep\": \"@owner\"})\nm = native.existing_rule(\"repo\")[\"repo_mapping\"]\n"
+            ).unwrap()).unwrap();
+            let frozen = evaluator.get_var("m").unwrap();
+            let dictionary = StarlarkValue::Dict(HashMap::from([("dep".to_string(), StarlarkValue::String("@owner".to_string()))]));
+            for input in [&frozen, &dictionary] {
+                // The legacy display bridge keeps its bounded dictionary
+                // summary; configured operands retain actual dictionary data.
+                assert!(matches!(convert_value(input).unwrap(), Value::String(value) if value == "{dep: @owner}"));
+                let Value::Dict(entries) = convert_configurable_value(input).unwrap() else {
+                    panic!("configured attribute dictionaries must retain dictionary data");
+                };
+                assert_eq!(entries.len(), 1);
+                assert!(matches!(entries.get("dep"), Some(Value::String(value)) if value == "@owner"));
+            }
+        });
+    }
 
     #[test]
     fn test_convert_string() {

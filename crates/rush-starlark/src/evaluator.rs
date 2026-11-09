@@ -264,6 +264,103 @@ pub struct ModuleExtensionDeclaration {
     pub source_context: Option<String>,
 }
 
+/// Immutable mapping snapshots returned by native rule introspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImmutableMappingKind {
+    RuleView,
+    RulesView,
+    FrozenDict,
+}
+
+#[derive(Debug)]
+pub struct ImmutableMapping {
+    pub(crate) entries: HashMap<String, Value>,
+    pub(crate) kind: ImmutableMappingKind,
+}
+
+impl ImmutableMapping {
+    pub(crate) fn freeze(value: &Value) -> Value {
+        match value {
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
+                Value::Tuple(items.iter().map(Self::freeze).collect())
+            }
+            Value::Dict(entries) => Value::ImmutableMapping(Arc::new(Self {
+                entries: entries
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Self::freeze(value)))
+                    .collect(),
+                kind: ImmutableMappingKind::FrozenDict,
+            })),
+            // Rule metadata contains only values already representable by the
+            // evaluator. Do not synthesize computed defaults or extra attrs.
+            other => other.clone(),
+        }
+    }
+
+    /// Borrow actual immutable dictionary contents for typed attribute conversion.
+    /// Opaque native rule views never qualify as attribute dictionaries.
+    pub fn frozen_dictionary(&self) -> Option<&HashMap<String, Value>> {
+        (self.kind == ImmutableMappingKind::FrozenDict).then_some(&self.entries)
+    }
+
+    // RulesView stores immutable metadata templates, not observable child-view
+    // identities. Bazel constructs a fresh ExistingRuleView on each accessor.
+    pub(crate) fn exposed_value(&self, value: &Value) -> Value {
+        match (self.kind, value) {
+            (ImmutableMappingKind::RulesView, Value::ImmutableMapping(template)) => {
+                debug_assert_eq!(template.kind, ImmutableMappingKind::RuleView);
+                Value::ImmutableMapping(Arc::new(Self {
+                    entries: template.entries.clone(),
+                    kind: ImmutableMappingKind::RuleView,
+                }))
+            }
+            _ => value.clone(),
+        }
+    }
+
+    pub(crate) fn copied_entries(&self) -> HashMap<String, Value> {
+        self.entries
+            .iter()
+            .map(|(key, value)| (key.clone(), self.exposed_value(value)))
+            .collect()
+    }
+
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self.kind {
+            ImmutableMappingKind::FrozenDict => "dict",
+            _ => "Map",
+        }
+    }
+
+    pub(crate) fn key(&self, key: &Value) -> Result<Option<String>> {
+        if self.kind != ImmutableMappingKind::FrozenDict {
+            return Ok(match key {
+                Value::String(key) => Some(key.clone()),
+                _ => None,
+            });
+        }
+        dictionary_key(key).map(Some)
+    }
+
+    pub(crate) fn has_method(&self, method: &str) -> bool {
+        matches!(method, "get" | "keys" | "values" | "items")
+            || self.kind == ImmutableMappingKind::FrozenDict
+                && matches!(
+                    method,
+                    "clear" | "pop" | "popitem" | "setdefault" | "update"
+                )
+    }
+}
+
+// Read-only mapping expansion is distinct from typed dictionary attributes:
+// opaque views support ** expansion, but cannot themselves become attributes.
+fn dictionary_expansion_value(value: Value) -> Value {
+    match value {
+        Value::ImmutableMapping(view) => Value::Dict(view.copied_entries()),
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -272,9 +369,12 @@ pub enum Value {
     Bool(bool),
     None,
     List(Vec<Value>),
+    /// List-valued immutable introspection results; list() makes a mutable copy.
+    FrozenList(Vec<Value>),
     /// Immutable Starlark sequence; distinct from mutable lists.
     Tuple(Vec<Value>),
     Dict(HashMap<String, Value>),
+    ImmutableMapping(Arc<ImmutableMapping>),
     Function {
         params: Vec<(String, Option<Expr>)>, // (name, default_value)
         varargs_param: Option<String>,       // *args parameter
@@ -372,7 +472,10 @@ impl PartialEq for Value {
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::None, Self::None) => true,
             (Self::Tuple(_), Self::Tuple(_)) => tuple_element_equal(self, other),
-            (Self::List(a), Self::List(b)) => a == b,
+            (Self::List(a), Self::List(b))
+            | (Self::FrozenList(a), Self::FrozenList(b))
+            | (Self::List(a), Self::FrozenList(b))
+            | (Self::FrozenList(a), Self::List(b)) => a == b,
             (Self::Dict(a), Self::Dict(b))
             | (Self::Namespace(a), Self::Namespace(b))
             | (Self::Select(a), Self::Select(b)) => a == b,
@@ -404,6 +507,16 @@ impl PartialEq for Value {
             ) => a == b && ar == br,
             (Self::RuleFunction(a), Self::RuleFunction(b))
             | (Self::NativeFunction(a), Self::NativeFunction(b)) => a == b,
+            (Self::ImmutableMapping(a), Self::ImmutableMapping(b)) => {
+                if a.kind == ImmutableMappingKind::FrozenDict && b.kind == a.kind {
+                    a.entries == b.entries
+                } else {
+                    Arc::ptr_eq(a, b)
+                }
+            }
+            (Self::ImmutableMapping(a), Self::Dict(b))
+            | (Self::Dict(b), Self::ImmutableMapping(a)) =>
+                a.kind == ImmutableMappingKind::FrozenDict && a.entries == *b,
             (Self::ModuleExtension(a), Self::ModuleExtension(b)) => Arc::ptr_eq(a, b),
             (
                 Self::Provider {
@@ -731,6 +844,10 @@ fn same_value_representation(left: &Value, right: &Value) -> bool {
             })
     };
     match (left, right) {
+        (Value::ImmutableMapping(left), Value::ImmutableMapping(right)) => Arc::ptr_eq(left, right),
+        (Value::ImmutableMapping(_), Value::Dict(_)) | (Value::Dict(_), Value::ImmutableMapping(_)) => false,
+        (Value::FrozenList(left), Value::FrozenList(right)) => sequence(left, right),
+        (Value::FrozenList(_), Value::List(_)) | (Value::List(_), Value::FrozenList(_)) => false,
         (Value::Tuple(left), Value::Tuple(right)) | (Value::List(left), Value::List(right)) => {
             sequence(left, right)
         }
@@ -844,7 +961,7 @@ impl Value {
             Value::Int(_) => Ok(singleton(ConfigurableKind::Int)),
             Value::Float(_) => Ok(singleton(ConfigurableKind::Float)),
             Value::String(_) => Ok(singleton(ConfigurableKind::String)),
-            Value::List(_) => Ok(singleton(ConfigurableKind::List)),
+            Value::List(_) | Value::FrozenList(_) => Ok(singleton(ConfigurableKind::List)),
             Value::Dict(_) => Ok(singleton(ConfigurableKind::Dict)),
             Value::None => Ok(singleton(ConfigurableKind::None)),
             Value::Bool(_) => Ok(singleton(ConfigurableKind::Bool)),
@@ -867,6 +984,7 @@ impl Value {
             | Value::WorkspaceNativeNamespace { .. }
             | Value::RuleFunction(_)
             | Value::NativeFunction(_)
+            | Value::ImmutableMapping(_)
             | Value::ModuleExtension(_)
             | Value::Provider { .. }
             | Value::ProviderInstance { .. }
@@ -951,8 +1069,9 @@ impl Value {
             Value::Int(0) => false,
             Value::Float(f) if *f == 0.0 => false,
             Value::String(s) if s.is_empty() => false,
-            Value::List(l) | Value::Tuple(l) if l.is_empty() => false,
+            Value::List(l) | Value::Tuple(l) | Value::FrozenList(l) if l.is_empty() => false,
             Value::Dict(d) if d.is_empty() => false,
+            Value::ImmutableMapping(view) if view.entries.is_empty() => false,
             Value::Namespace(m) if m.is_empty() => false,
             _ => true,
         }
@@ -985,7 +1104,7 @@ impl Value {
             Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
             Value::None => "None".to_string(),
             Value::Tuple(_) => starlark_repr(self),
-            Value::List(items) => {
+            Value::List(items) | Value::FrozenList(items) => {
                 let items_str: Vec<_> = items.iter().map(|v| v.to_string()).collect();
                 format!("[{}]", items_str.join(", "))
             }
@@ -1002,6 +1121,12 @@ impl Value {
             Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => "<namespace>".to_string(),
             Value::RuleFunction(name) => format!("<rule:{}>", name),
             Value::NativeFunction(name) => format!("<native:{}>", name),
+            Value::ImmutableMapping(view) => match view.kind {
+                ImmutableMappingKind::RuleView => format!("<native.ExistingRuleView for target '{}'>",
+                    view.entries.get("name").map(Value::to_string).unwrap_or_default()),
+                ImmutableMappingKind::RulesView => "<native.ExistingRulesView object>".to_string(),
+                ImmutableMappingKind::FrozenDict => crate::builtins::starlark_repr(&Value::Dict(view.entries.clone())),
+            },
             Value::ModuleExtension(_) => "<unknown object com.google.devtools.build.lib.bazel.bzlmod.AutoValue_ModuleExtension>".to_string(),
             Value::Provider { name, .. } => format!("<provider:{}>", name),
             Value::ProviderInstance {
@@ -1085,7 +1210,7 @@ impl Value {
         match self {
             Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) => size_of::<Value>(),
             Value::String(s) => size_of::<Value>() + s.capacity(),
-            Value::List(items) | Value::Tuple(items) => {
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                 size_of::<Value>()
                     + items.capacity() * size_of::<Value>()
                     + items
@@ -1134,6 +1259,12 @@ impl Value {
             }
             Value::RuleFunction(name) | Value::NativeFunction(name) => {
                 size_of::<Value>() + name.len()
+            }
+            Value::ImmutableMapping(view) => {
+                if !visited.insert(Arc::as_ptr(view) as usize) { return size_of::<Value>(); }
+                size_of::<Value>() + size_of::<ImmutableMapping>()
+                    + view.entries.capacity() * (size_of::<String>() + size_of::<Value>())
+                    + view.entries.iter().map(|(key,value)| key.capacity() + value.estimate_size_internal(visited)).sum::<usize>()
             }
             Value::ModuleExtension(declaration) => {
                 if !visited.insert(Arc::as_ptr(declaration) as usize) {
@@ -1270,6 +1401,15 @@ impl ValueCensus {
             self.string_bytes += workspace_root.as_os_str().len();
         }
         match v {
+            Value::ImmutableMapping(view) => {
+                if seen_envs.insert(Arc::as_ptr(view) as usize) {
+                    self.dict_entries += view.entries.len();
+                    for (key,value) in &view.entries {
+                        self.string_bytes += key.len();
+                        self.walk_value(value, seen_envs);
+                    }
+                }
+            }
             Value::ModuleExtension(declaration) => {
                 if seen_envs.insert(Arc::as_ptr(declaration) as usize) {
                     self.string_bytes += declaration.doc.len()
@@ -1283,7 +1423,7 @@ impl ValueCensus {
                 }
             }
             Value::String(s) => self.string_bytes += s.len(),
-            Value::List(items) | Value::Tuple(items) => {
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                 self.list_elements += items.len();
                 for i in items {
                     self.walk_value(i, seen_envs);
@@ -1522,6 +1662,16 @@ pub(crate) const BZLMOD_EXT_PROXY: &str = "__bzlmod_module_extension_proxy__";
 /// non-data values (functions, providers) fall back to a string repr.
 fn value_to_json(v: &Value) -> Result<serde_json::Value> {
     Ok(match v {
+        Value::ImmutableMapping(view) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in &view.entries {
+                let Value::String(key) = dictionary_key_value(key) else {
+                    anyhow::bail!("json object keys must be strings");
+                };
+                object.insert(key, value_to_json(value)?);
+            }
+            serde_json::Value::Object(object)
+        }
         Value::ModuleExtension(_) => {
             return Err(anyhow!("module-extension declarations are not JSON data values"));
         }
@@ -1530,7 +1680,7 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value> {
         Value::Int(n) => serde_json::Value::from(*n),
         Value::Float(f) => serde_json::json!(*f),
         Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::List(items) | Value::Tuple(items) => serde_json::Value::Array(
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => serde_json::Value::Array(
             items
                 .iter()
                 .map(value_to_json)
@@ -1652,7 +1802,7 @@ fn exports_files_sources(args: &[Value], kwargs: &HashMap<String, Value>) -> Res
     };
 
     match source_value {
-        Value::List(items) | Value::Tuple(items) => items
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items
             .iter()
             .map(|item| match item {
                 Value::String(s) => Ok(s.clone()),
@@ -1681,7 +1831,7 @@ fn exports_files_visibility(kwargs: &HashMap<String, Value>) -> Result<Vec<Value
         // exports_files(): the source target is public, independent of the
         // package's default_visibility.
         Value::None => Ok(vec![Value::String("//visibility:public".to_string())]),
-        Value::List(specifications) | Value::Tuple(specifications) => {
+        Value::List(specifications) | Value::Tuple(specifications) | Value::FrozenList(specifications) => {
             if specifications
                 .iter()
                 .all(|specification| matches!(specification, Value::String(_)))
@@ -1808,7 +1958,7 @@ fn expand_tf_custom_op_library(
 
     // Extract existing deps or create empty list
     let mut all_deps = match expanded_kwargs.get("deps") {
-        Some(Value::List(deps) | Value::Tuple(deps)) => deps.clone(),
+        Some(Value::List(deps) | Value::Tuple(deps) | Value::FrozenList(deps)) => deps.clone(),
         _ => Vec::new(),
     };
 
@@ -1831,7 +1981,7 @@ fn expand_tf_custom_op_library(
 
     // Extract copts and add -fPIC for shared library
     let mut copts = match expanded_kwargs.get("copts") {
-        Some(Value::List(opts) | Value::Tuple(opts)) => opts.clone(),
+        Some(Value::List(opts) | Value::Tuple(opts) | Value::FrozenList(opts)) => opts.clone(),
         _ => Vec::new(),
     };
 
@@ -1847,7 +1997,7 @@ fn expand_tf_custom_op_library(
 
     // Extract linkopts and add -shared for shared library
     let mut linkopts = match expanded_kwargs.get("linkopts") {
-        Some(Value::List(opts) | Value::Tuple(opts)) => opts.clone(),
+        Some(Value::List(opts) | Value::Tuple(opts) | Value::FrozenList(opts)) => opts.clone(),
         _ => Vec::new(),
     };
 
@@ -1882,12 +2032,12 @@ fn expand_cc_header_only_library(
 
     // Extract existing deps or create empty list
     let mut all_deps = match expanded_kwargs.get("deps") {
-        Some(Value::List(deps) | Value::Tuple(deps)) => deps.clone(),
+        Some(Value::List(deps) | Value::Tuple(deps) | Value::FrozenList(deps)) => deps.clone(),
         _ => Vec::new(),
     };
 
     // Add extra_deps to the deps list (TensorFlow-specific attribute)
-    if let Some(Value::List(extra_deps) | Value::Tuple(extra_deps)) = expanded_kwargs.get("extra_deps") {
+    if let Some(Value::List(extra_deps) | Value::Tuple(extra_deps) | Value::FrozenList(extra_deps)) = expanded_kwargs.get("extra_deps") {
         all_deps.extend(extra_deps.clone());
     }
 
@@ -2036,7 +2186,7 @@ fn expand_tf_gen_op_wrappers_cc(
     };
     let get_list = |k: &str| -> Vec<String> {
         match kwargs.get(k) {
-            Some(Value::List(l) | Value::Tuple(l)) => l
+            Some(Value::List(l) | Value::Tuple(l) | Value::FrozenList(l)) => l
                 .iter()
                 .filter_map(|v| match v {
                     Value::String(s) => Some(s.clone()),
@@ -2267,7 +2417,7 @@ fn expand_tf_gen_op_wrapper_cc(
     };
     let get_list = |k: &str| -> Vec<String> {
         match kwargs.get(k) {
-            Some(Value::List(l) | Value::Tuple(l)) => l
+            Some(Value::List(l) | Value::Tuple(l) | Value::FrozenList(l)) => l
                 .iter()
                 .filter_map(|v| match v {
                     Value::String(s) => Some(s.clone()),
@@ -2393,7 +2543,7 @@ fn expand_flatbuffer_cc_library(
     };
 
     let srcs: Vec<String> = match kwargs.get("srcs") {
-        Some(Value::List(l) | Value::Tuple(l)) => l
+        Some(Value::List(l) | Value::Tuple(l) | Value::FrozenList(l)) => l
             .iter()
             .filter_map(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -2415,7 +2565,7 @@ fn expand_flatbuffer_cc_library(
     };
 
     let flatc_args: Vec<String> = match kwargs.get("flatc_args") {
-        Some(Value::List(l) | Value::Tuple(l)) => l
+        Some(Value::List(l) | Value::Tuple(l) | Value::FrozenList(l)) => l
             .iter()
             .filter_map(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -2627,7 +2777,7 @@ fn expand_tf_gpu_cc_test(
         _ => return Ok(vec![]),
     };
     let tags: Vec<Value> = match kwargs.get("tags") {
-        Some(Value::List(t) | Value::Tuple(t)) => t.clone(),
+        Some(Value::List(t) | Value::Tuple(t) | Value::FrozenList(t)) => t.clone(),
         _ => vec![],
     };
     let has_gpu_tag = tags
@@ -2656,7 +2806,7 @@ fn expand_tf_gpu_cc_test(
     let gpu_name = format!("{}_gpu", name);
     gpu.insert("name".to_string(), Value::String(gpu_name.clone()));
     let mut gdeps = match kwargs.get("deps") {
-        Some(Value::List(d) | Value::Tuple(d)) => d.clone(),
+        Some(Value::List(d) | Value::Tuple(d) | Value::FrozenList(d)) => d.clone(),
         _ => vec![],
     };
     let gpu_runtime = "//tensorflow/core:gpu_runtime".to_string();
@@ -2727,10 +2877,10 @@ fn expand_cc_library_with_android_deps(
     // Combine deps and common_deps, ignoring android_deps
     if let (Some(deps), Some(common_deps)) = (kwargs.get("deps"), kwargs.get("common_deps")) {
         let mut combined_deps = Vec::new();
-        if let Value::List(d) | Value::Tuple(d) = deps {
+        if let Value::List(d) | Value::Tuple(d) | Value::FrozenList(d) = deps {
             combined_deps.extend(d.clone());
         }
-        if let Value::List(cd) | Value::Tuple(cd) = common_deps {
+        if let Value::List(cd) | Value::Tuple(cd) | Value::FrozenList(cd) = common_deps {
             combined_deps.extend(cd.clone());
         }
         new_kwargs.insert("deps".to_string(), Value::List(combined_deps));
@@ -2884,7 +3034,7 @@ fn expand_tf_proto_library(
         }
         let mut impl_protodeps: Vec<Value> =
             vec![Value::String(format!(":{}", gen_owner))];
-        if let Some(Value::List(pds) | Value::Tuple(pds)) = kwargs.get("protodeps") {
+        if let Some(Value::List(pds) | Value::Tuple(pds) | Value::FrozenList(pds)) = kwargs.get("protodeps") {
             for pd in pds {
                 if let Value::String(l) = pd {
                     impl_protodeps.push(Value::String(rewrite_proto_label_to_cc_impl(l)));
@@ -3347,6 +3497,108 @@ impl Evaluator {
             .define(alias.to_string(), Value::RuleFunction(target.to_string()));
     }
 
+    fn existing_label_metadata(&self, value: &Value) -> Value {
+        let label_text = |label: &str| {
+            if let Some(label) = label.strip_prefix("//") {
+                let (package, target) = label
+                    .split_once(':')
+                    .unwrap_or_else(|| (label, label.rsplit('/').next().unwrap_or(label)));
+                if package == self.current_package {
+                    format!(":{target}")
+                } else {
+                    format!("//{package}:{target}")
+                }
+            } else if label.starts_with('@') || label.starts_with(':') {
+                label.to_string()
+            } else {
+                format!(":{label}")
+            }
+        };
+        match value {
+            Value::String(label) => Value::String(label_text(label)),
+            Value::Label {
+                package,
+                name,
+                workspace_name,
+                ..
+            } => {
+                let owner = self
+                    .current_repository
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim_start_matches('@');
+                Value::String(if workspace_name.trim_start_matches('@') == owner {
+                    label_text(&format!("//{package}:{name}"))
+                } else {
+                    format!("@{workspace_name}//{package}:{name}")
+                })
+            }
+            Value::List(values) | Value::Tuple(values) | Value::FrozenList(values) => Value::Tuple(
+                values
+                    .iter()
+                    .map(|value| self.existing_label_metadata(value))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    fn existing_rule_view(&self, rule_call: &RuleCall) -> Value {
+        // Keep the existing plural API's supported defaults in one place.
+        // This is not a claim to implement every native rule's Bazel schema.
+        const DEFAULT_LIST_ATTRS: [&str; 13] = [
+            "srcs",
+            "hdrs",
+            "deps",
+            "data",
+            "args",
+            "copts",
+            "defines",
+            "includes",
+            "linkopts",
+            "additional_linker_inputs",
+            "tags",
+            "features",
+            "visibility",
+        ];
+        let mut entries: HashMap<_, _> = rule_call
+            .kwargs
+            .iter()
+            .filter(|(name, _)| name.chars().next().is_some_and(char::is_alphabetic))
+            .map(|(name, value)| {
+                let value = if matches!(
+                    name.as_str(),
+                    "srcs"
+                        | "hdrs"
+                        | "deps"
+                        | "data"
+                        | "visibility"
+                        | "exports"
+                        | "actual"
+                        | "tools"
+                ) {
+                    self.existing_label_metadata(value)
+                } else {
+                    value.clone()
+                };
+                (name.clone(), ImmutableMapping::freeze(&value))
+            })
+            .collect();
+        for name in DEFAULT_LIST_ATTRS {
+            entries
+                .entry(name.to_string())
+                .or_insert_with(|| Value::Tuple(Vec::new()));
+        }
+        entries.insert(
+            "kind".to_string(),
+            Value::String(rule_call.rule_type.clone()),
+        );
+        Value::ImmutableMapping(Arc::new(ImmutableMapping {
+            entries,
+            kind: ImmutableMappingKind::RuleView,
+        }))
+    }
+
     /// Register a BUILD rule function (e.g., "cc_library", "tf_cc_library")
     pub fn register_rule_function(&mut self, name: String) {
         // Create a placeholder value - we'll intercept calls in eval_call
@@ -3792,7 +4044,7 @@ impl Evaluator {
         let Some(default_visibility) = kwargs.get("default_visibility") else {
             return Ok(());
         };
-        let (Value::List(specifications) | Value::Tuple(specifications)) = default_visibility else {
+        let (Value::List(specifications) | Value::Tuple(specifications) | Value::FrozenList(specifications)) = default_visibility else {
             return Err(anyhow!(
                 "package(default_visibility) must be a list of labels"
             ));
@@ -3967,7 +4219,7 @@ impl Evaluator {
                 .kwargs
                 .get("constraint_values")
                 .map(|value| {
-                    let (Value::List(values) | Value::Tuple(values)) = value else {
+                    let (Value::List(values) | Value::Tuple(values) | Value::FrozenList(values)) = value else {
                         unreachable!("config_setting attributes are validated before activation")
                     };
                     values
@@ -4086,7 +4338,7 @@ impl Evaluator {
             }
 
             if let Some(value) = kwargs.get("constraint_values") {
-                let (Value::List(values) | Value::Tuple(values)) = value else {
+                let (Value::List(values) | Value::Tuple(values) | Value::FrozenList(values)) = value else {
                     return Err(anyhow!(
                         "in call to config_setting(), parameter 'constraint_values' got value of type '{}', want 'sequence'",
                         starlark_type_name(value)?
@@ -4132,7 +4384,7 @@ impl Evaluator {
             let Some(value) = kwargs.get(attribute) else {
                 continue;
             };
-            let (Value::List(values) | Value::Tuple(values)) = value else {
+            let (Value::List(values) | Value::Tuple(values) | Value::FrozenList(values)) = value else {
                 return Err(anyhow!(
                     "in call to package_group(), parameter '{}' got value of type '{}', want 'sequence'",
                     attribute,
@@ -5463,7 +5715,7 @@ impl Evaluator {
                 Ok(())
             }
             BindingPattern::Tuple(patterns) => {
-                let (Value::List(values) | Value::Tuple(values)) = value else {
+                let (Value::List(values) | Value::Tuple(values) | Value::FrozenList(values)) = value else {
                     return Err(anyhow!(
                         "Cannot unpack {:?} into {} bindings",
                         value,
@@ -5553,7 +5805,7 @@ impl Evaluator {
                         map.get_mut(&key)
                             .ok_or_else(|| anyhow!("Key {} not found in dictionary", key))?
                     }
-                    Value::List(items) | Value::Tuple(items) => {
+                    Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                         let position = Self::list_index(index, items.len())?;
                         &mut items[position]
                     }
@@ -5583,6 +5835,7 @@ impl Evaluator {
         let container = Self::descend_lvalue(&mut root_value, &steps)?;
 
         match container {
+            Value::ImmutableMapping(_) | Value::FrozenList(_) => anyhow::bail!("cannot mutate immutable native rule metadata"),
             Value::Dict(map) => {
                 let key = dictionary_key(&index)?;
                 let assigned = if let Some(op) = op {
@@ -5651,7 +5904,7 @@ impl Evaluator {
                                         }
                                         let iterable = self.eval_expression(&call.args[0])?;
                                         match iterable {
-                                            Value::List(items) | Value::Tuple(items) => {
+                                            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                                                 new_list.extend(items);
                                             }
                                             _ => {
@@ -5725,7 +5978,7 @@ impl Evaluator {
                                     }
                                     for unpack in &call.args_unpack {
                                         match self.eval_expression(unpack)? {
-                                            Value::List(items) | Value::Tuple(items) => update_args.extend(items),
+                                            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => update_args.extend(items),
                                             value => {
                                                 return Err(anyhow!(
                                                     "Cannot unpack non-list value in *args: {:?}",
@@ -5741,7 +5994,7 @@ impl Evaluator {
                                     }
 
                                     if let Some(update_val) = update_args.into_iter().next() {
-                                        match update_val {
+                                        match dictionary_expansion_value(update_val) {
                                             Value::Dict(update_dict) => {
                                                 new_dict.extend(update_dict);
                                             }
@@ -5753,14 +6006,37 @@ impl Evaluator {
                                         }
                                     }
 
+                                    let mut keyword_names = HashSet::new();
+                                    let mut immutable_keyword_names = HashSet::new();
                                     for (key, value_expr) in &call.kwargs {
                                         let value = self.eval_expression(value_expr)?;
+                                        keyword_names.insert(key.clone());
                                         new_dict.insert(key.clone(), value);
                                     }
                                     for unpack in &call.kwargs_unpack {
-                                        match self.eval_expression(unpack)? {
+                                        let raw = self.eval_expression(unpack)?;
+                                        let immutable_mapping =
+                                            matches!(&raw, Value::ImmutableMapping(_));
+                                        match dictionary_expansion_value(raw) {
                                             Value::Dict(update_dict) => {
-                                                new_dict.extend(update_dict);
+                                                for (key, value) in update_dict {
+                                                    if immutable_mapping {
+                                                        if !matches!(
+                                                            dictionary_key_value(&key),
+                                                            Value::String(_)
+                                                        ) {
+                                                            anyhow::bail!("keyword argument names must be strings");
+                                                        }
+                                                        if keyword_names.contains(&key) {
+                                                            anyhow::bail!("multiple values for keyword argument '{key}'");
+                                                        }
+                                                        immutable_keyword_names.insert(key.clone());
+                                                    } else if immutable_keyword_names.contains(&key) {
+                                                        anyhow::bail!("multiple values for keyword argument '{key}'");
+                                                    }
+                                                    keyword_names.insert(key.clone());
+                                                    new_dict.insert(key, value);
+                                                }
                                             }
                                             value => {
                                                 return Err(anyhow!(
@@ -5904,6 +6180,9 @@ impl Evaluator {
                     .ok_or_else(|| anyhow!("Undefined variable: {}", target))?
                     .clone();
                 let rhs = self.eval_expression(value)?;
+                if matches!((&current, op), (Value::FrozenList(_), BinOp::Add)) {
+                    anyhow::bail!("cannot mutate frozen list from native rule metadata");
+                }
                 let result = self.apply_binop(&current, *op, &rhs)?;
                 self.env.set(target, result)?;
                 Ok(())
@@ -5965,7 +6244,7 @@ impl Evaluator {
             } => {
                 let iter_val = self.eval_expression(iterable)?;
                 let items = match iter_val {
-                    Value::List(items) | Value::Tuple(items) => items,
+                    Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items,
                     Value::String(s) => {
                         // Strings are iterable in Starlark (yield 1-char strings).
                         s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -5974,6 +6253,7 @@ impl Evaluator {
                     // is a HashMap, so sort keys for determinism (see
                     // builtin_list for the same rationale).
                     Value::Dict(map) => sorted_dictionary_key_values(&map),
+                        Value::ImmutableMapping(view) => sorted_dictionary_key_values(&view.entries),
                     _ => return Err(anyhow!("Cannot iterate over {:?}", iter_val)),
                 };
 
@@ -6344,7 +6624,7 @@ impl Evaluator {
                         }
                         None => {
                             // **dict unpacking
-                            let dict_val = self.eval_expression(val_expr)?;
+                            let dict_val = dictionary_expansion_value(self.eval_expression(val_expr)?);
                             match dict_val {
                                 Value::Dict(other_map) => {
                                     // Merge the dictionary
@@ -6422,7 +6702,7 @@ impl Evaluator {
                 let obj_val = self.eval_expression(object)?;
                 let idx_val = self.eval_expression(index)?;
                 match (obj_val, idx_val) {
-                    (Value::List(items) | Value::Tuple(items), Value::Int(idx)) => {
+                    (Value::List(items) | Value::Tuple(items) | Value::FrozenList(items), Value::Int(idx)) => {
                         let idx = if idx < 0 {
                             (items.len() as i64 + idx) as usize
                         } else {
@@ -6432,6 +6712,10 @@ impl Evaluator {
                             .get(idx)
                             .cloned()
                             .ok_or_else(|| anyhow!("Index out of bounds"))
+                    }
+                    (Value::ImmutableMapping(view), key) => {
+                        let found = view.key(&key)?.and_then(|key| view.entries.get(&key));
+                        found.map(|value| view.exposed_value(value)).ok_or_else(|| anyhow!("key not found in immutable mapping"))
                     }
                     (Value::Dict(map), key) => {
                         let key_str = dictionary_key(&key)?;
@@ -6463,6 +6747,18 @@ impl Evaluator {
                 let obj_val = self.eval_expression(object)?;
 
                 match obj_val {
+                    Value::FrozenList(_) => match attr.as_str() {
+                        "append" | "clear" | "extend" | "index" | "insert" | "pop" | "remove" | "count" =>
+                            Ok(Value::BoundMethod { object: Box::new(obj_val.clone()), method: attr.clone() }),
+                        _ => Err(anyhow!("list has no attribute '{attr}'")),
+                    },
+                    Value::ImmutableMapping(view) => {
+                        if view.has_method(attr) {
+                            Ok(Value::BoundMethod { object: Box::new(Value::ImmutableMapping(view)), method: attr.clone() })
+                        } else {
+                            Err(anyhow!("immutable mapping has no attribute '{attr}'"))
+                        }
+                    }
                     Value::ModuleExtension(_) => Err(anyhow!("module-extension declarations have no attribute '{attr}'")),
                     Value::WorkspaceNativeNamespace { attrs, workspace_root } => {
                         if attr == "bazel_version" {
@@ -6576,7 +6872,7 @@ impl Evaluator {
 
                     // Convert iterable to list
                     let items = match iterable_val {
-                        Value::List(items) | Value::Tuple(items) => items,
+                        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items,
                         Value::String(s) => {
                             // Strings are iterable in Python/Starlark
                             s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -6585,6 +6881,7 @@ impl Evaluator {
                         // Dict is a HashMap, so sort keys for determinism (see
                         // builtin_list for the same rationale).
                         Value::Dict(map) => sorted_dictionary_key_values(&map),
+                        Value::ImmutableMapping(view) => sorted_dictionary_key_values(&view.entries),
                         _ => return Err(anyhow!("Cannot iterate over {:?}", iterable_val)),
                     };
 
@@ -6597,7 +6894,7 @@ impl Evaluator {
                         } else {
                             // Multiple variables: unpack tuple/list
                             let values = match item {
-                                Value::List(ref values) | Value::Tuple(ref values) => values,
+                                Value::List(ref values) | Value::Tuple(ref values) | Value::FrozenList(ref values) => values,
                                 _ => {
                                     return Err(anyhow!(
                                         "Cannot unpack {:?} into {} variables",
@@ -6680,7 +6977,7 @@ impl Evaluator {
 
                     // Convert iterable to list
                     let items = match iterable_val {
-                        Value::List(items) | Value::Tuple(items) => items,
+                        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items,
                         Value::String(s) => {
                             // Strings are iterable in Python/Starlark
                             s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -6689,6 +6986,7 @@ impl Evaluator {
                         // Dict is a HashMap, so sort keys for determinism (see
                         // builtin_list for the same rationale).
                         Value::Dict(map) => sorted_dictionary_key_values(&map),
+                        Value::ImmutableMapping(view) => sorted_dictionary_key_values(&view.entries),
                         _ => return Err(anyhow!("Cannot iterate over {:?}", iterable_val)),
                     };
 
@@ -6701,7 +6999,7 @@ impl Evaluator {
                         } else {
                             // Multiple variables: unpack tuple/list
                             let values = match item {
-                                Value::List(ref values) | Value::Tuple(ref values) => values,
+                                Value::List(ref values) | Value::Tuple(ref values) | Value::FrozenList(ref values) => values,
                                 _ => {
                                     return Err(anyhow!(
                                         "Cannot unpack {:?} into {} variables",
@@ -6823,8 +7121,9 @@ impl Evaluator {
                     return Err(anyhow!("Slice step cannot be zero"));
                 }
 
+                let tuple_slice = matches!(&obj_val, Value::Tuple(_));
                 match obj_val {
-                    Value::Tuple(items) => {
+                    Value::Tuple(items) | Value::FrozenList(items) => {
                         let len = items.len() as i64;
                         let bound = |value: i64| {
                             let value = if value < 0 { value.saturating_add(len) } else { value };
@@ -6839,7 +7138,7 @@ impl Evaluator {
                             let Some(next) = i.checked_add(step_val) else { break };
                             i = next;
                         }
-                        Ok(Value::Tuple(result))
+                        Ok(if tuple_slice { Value::Tuple(result) } else { Value::List(result) })
                     }
                     Value::List(items) => {
                         let len = items.len();
@@ -6993,7 +7292,7 @@ impl Evaluator {
                 }
                 Ok(xs.len().cmp(&ys.len()))
             }
-            (Value::List(xs), Value::List(ys)) => {
+            (Value::List(xs) | Value::FrozenList(xs), Value::List(ys) | Value::FrozenList(ys)) => {
                 for (xi, yi) in xs.iter().zip(ys.iter()) {
                     match self.starlark_order(xi, yi)? {
                         Ordering::Equal => continue,
@@ -7042,7 +7341,7 @@ impl Evaluator {
                 (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
                 (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
                 (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
-                (Value::List(a), Value::List(b)) => {
+                (Value::List(a) | Value::FrozenList(a), Value::List(b) | Value::FrozenList(b)) => {
                     let mut result = a.clone();
                     result.extend(b.clone());
                     Ok(Value::List(result))
@@ -7086,7 +7385,8 @@ impl Evaluator {
                     Ok(Value::Tuple(result))
                 }
                 // List repetition: [1, 2] * 3 = [1, 2, 1, 2, 1, 2]
-                (Value::List(l), Value::Int(n)) | (Value::Int(n), Value::List(l)) => {
+                (Value::List(l) | Value::FrozenList(l), Value::Int(n))
+                | (Value::Int(n), Value::List(l) | Value::FrozenList(l)) => {
                     if *n < 0 {
                         // Negative repetition returns empty list (Python/Starlark behavior)
                         Ok(Value::List(Vec::new()))
@@ -7281,11 +7581,14 @@ impl Evaluator {
             }
             BinOp::In => match right {
                 Value::Tuple(items) => Ok(Value::Bool(items.iter().any(|item| tuple_element_equal(item, left)))),
-                Value::List(items) => Ok(Value::Bool(items.contains(left))),
+                Value::List(items) | Value::FrozenList(items) => Ok(Value::Bool(items.contains(left))),
                 Value::String(s) => {
                     let needle = left.to_string();
                     Ok(Value::Bool(s.contains(&needle)))
                 }
+                Value::ImmutableMapping(view) => Ok(Value::Bool(
+                    view.key(left)?.is_some_and(|key| view.entries.contains_key(&key)),
+                )),
                 Value::Dict(map) => {
                     // Check if key exists in dict
                     let key = dictionary_key(left)?;
@@ -7295,11 +7598,14 @@ impl Evaluator {
             },
             BinOp::NotIn => match right {
                 Value::Tuple(items) => Ok(Value::Bool(!items.iter().any(|item| tuple_element_equal(item, left)))),
-                Value::List(items) => Ok(Value::Bool(!items.contains(left))),
+                Value::List(items) | Value::FrozenList(items) => Ok(Value::Bool(!items.contains(left))),
                 Value::String(s) => {
                     let needle = left.to_string();
                     Ok(Value::Bool(!s.contains(&needle)))
                 }
+                Value::ImmutableMapping(view) => Ok(Value::Bool(
+                    !view.key(left)?.is_some_and(|key| view.entries.contains_key(&key)),
+                )),
                 Value::Dict(map) => {
                     // Check if key does not exist in dict
                     let key = dictionary_key(left)?;
@@ -7345,7 +7651,7 @@ impl Evaluator {
                 for list_expr in unpack {
                     let list_val = evaluator.eval_expression(list_expr)?;
                     match list_val {
-                        Value::List(items) | Value::Tuple(items) => {
+                        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                             merged.extend(items);
                         }
                         Value::Dict(map) => merged.extend(sorted_dictionary_key_values(&map)),
@@ -7367,6 +7673,7 @@ impl Evaluator {
                             evaluator: &mut Self|
          -> Result<HashMap<String, Value>> {
             let mut merged = HashMap::new();
+            let mut mapping_keys = HashSet::new();
 
             // Add regular kwargs
             for (key, val_expr) in base_kwargs {
@@ -7376,10 +7683,21 @@ impl Evaluator {
 
             // Merge unpacked dicts
             for dict_expr in unpack {
-                let dict_val = evaluator.eval_expression(dict_expr)?;
+                let raw = evaluator.eval_expression(dict_expr)?;
+                let immutable_mapping = matches!(&raw, Value::ImmutableMapping(_));
+                let dict_val = dictionary_expansion_value(raw);
                 match dict_val {
                     Value::Dict(dict_map) => {
                         for (k, v) in dict_map {
+                            if immutable_mapping {
+                                if !matches!(dictionary_key_value(&k), Value::String(_)) {
+                                    anyhow::bail!("keyword argument names must be strings");
+                                }
+                                if merged.contains_key(&k) { anyhow::bail!("multiple values for keyword argument '{k}'"); }
+                                mapping_keys.insert(k.clone());
+                            } else if mapping_keys.contains(&k) && merged.contains_key(&k) {
+                                anyhow::bail!("multiple values for keyword argument '{k}'");
+                            }
                             merged.insert(k, v);
                         }
                     }
@@ -7408,7 +7726,7 @@ impl Evaluator {
                 values.push((name.clone(), evaluator.eval_expression(expression)?));
             }
             for expression in unpack {
-                let Value::Dict(items) = evaluator.eval_expression(expression)? else {
+                let Value::Dict(items) = dictionary_expansion_value(evaluator.eval_expression(expression)?) else {
                     return Err(anyhow!("module_extension() **kwargs must be a dict"));
                 };
                 for (key, value) in items {
@@ -7619,7 +7937,12 @@ impl Evaluator {
             if func_value == Some(Value::None) || force_macro_expand {
                 // This is a BUILD rule call - merge arguments first
                 let eval_args = merge_args(args, args_unpack, self)?;
-                let eval_kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                let mut eval_kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                for value in eval_kwargs.values_mut() {
+                    if matches!(value, Value::ImmutableMapping(view) if view.kind == ImmutableMappingKind::FrozenDict) {
+                        *value = dictionary_expansion_value(value.clone());
+                    }
+                }
                 Self::validate_loading_time_rule_attributes(name, &eval_kwargs)?;
 
                 // Check if this is a macro that needs expansion
@@ -7812,11 +8135,26 @@ impl Evaluator {
                 }
 
                 // Process **kwargs unpacking
+                let mut mapping_keys = HashSet::new();
                 for dict_expr in kwargs_unpack {
-                    let dict_val = self.eval_expression(dict_expr)?;
+                    let raw = self.eval_expression(dict_expr)?;
+                    let immutable_mapping = matches!(&raw, Value::ImmutableMapping(_));
+                    let dict_val = dictionary_expansion_value(raw);
                     match dict_val {
                         Value::Dict(dict_map) => {
                             for (key, val) in dict_map {
+                                if immutable_mapping {
+                                    if !matches!(dictionary_key_value(&key), Value::String(_)) {
+                                        anyhow::bail!("keyword argument names must be strings");
+                                    }
+                                    if bound_params.contains(&key) || extra_kwargs.contains_key(&key) {
+                                        anyhow::bail!("multiple values for keyword argument '{key}'");
+                                    }
+                                    mapping_keys.insert(key.clone());
+                                } else if mapping_keys.contains(&key)
+                                    && (bound_params.contains(&key) || extra_kwargs.contains_key(&key)) {
+                                    anyhow::bail!("multiple values for keyword argument '{key}'");
+                                }
                                 // If key matches a named parameter, bind it directly
                                 if param_names.contains(&key.as_str()) {
                                     func_env.define(key.clone(), val);
@@ -7918,6 +8256,11 @@ impl Evaluator {
                 // IMPORTANT: Use merge_args/merge_kwargs to handle **kwargs unpacking
                 let eval_args = merge_args(args, args_unpack, self)?;
                 let mut eval_kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                for value in eval_kwargs.values_mut() {
+                    if matches!(value, Value::ImmutableMapping(view) if view.kind == ImmutableMappingKind::FrozenDict) {
+                        *value = dictionary_expansion_value(value.clone());
+                    }
+                }
                 Self::validate_loading_time_rule_attributes(&rule_type, &eval_kwargs)?;
 
                 // Concrete custom-rule identities are encoded on RuleFunction so
@@ -7977,18 +8320,15 @@ impl Evaluator {
                     return self.builtins.get("Label")
                         .context("Label builtin is unavailable")?(&eval_args, &eval_kwargs);
                 }
-                // This is a native function call (like native.glob, native.existing_rules)
-                // Evaluate arguments
+                // Existing-rule lookup honors ordinary star argument calls;
+                // preserve legacy dispatch behavior for unrelated native APIs.
+                let lookup = matches!(func_name.as_str(), "existing_rule" | "existing_rules");
                 let mut eval_args = Vec::new();
-                for arg in args {
-                    eval_args.push(self.eval_expression(arg)?);
-                }
-
+                if lookup { eval_args = merge_args(args, args_unpack, self)?; }
+                else { for arg in args { eval_args.push(self.eval_expression(arg)?); } }
                 let mut eval_kwargs = HashMap::new();
-                for (key, val_expr) in kwargs {
-                    let val = self.eval_expression(val_expr)?;
-                    eval_kwargs.insert(key.clone(), val);
-                }
+                if lookup { eval_kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?; }
+                else { for (key, expr) in kwargs { eval_kwargs.insert(key.clone(), self.eval_expression(expr)?); } }
 
                 // Handle specific native functions
                 match func_name.as_str() {
@@ -8026,7 +8366,7 @@ impl Evaluator {
                         let mut seen = Vec::new();
                         if let Some(first) = eval_args.first() {
                             let items = match first {
-                                Value::List(items) | Value::Tuple(items) => items.clone(),
+                                Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items.clone(),
                                 Value::Dict(map) => {
                                     sorted_dictionary_key_values(map)
                                 }
@@ -8050,7 +8390,7 @@ impl Evaluator {
                         }
                         let first = &eval_args[0];
                         let list = match first {
-                            Value::List(items) | Value::Tuple(items) => items.clone(),
+                            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items.clone(),
                             Value::String(s) => vec![Value::String(s.clone())],
                             _ => Vec::new(),
                         };
@@ -8082,57 +8422,34 @@ impl Evaluator {
                             Err(anyhow!("glob builtin not found"))
                         }
                     }
+                    "existing_rule" => {
+                        if eval_args.len() != 1 || !eval_kwargs.is_empty() {
+                            anyhow::bail!("native.existing_rule() requires exactly one positional string name");
+                        }
+                        let Value::String(name) = &eval_args[0] else {
+                            anyhow::bail!("native.existing_rule() name must be a string");
+                        };
+                        // Exact current caller-package name, not a label. The
+                        // latest declaration matches the existing plural map.
+                        Ok(self.rule_calls.iter().rev().find(|call| {
+                            call.rule_type != "source_file"
+                                && call.kwargs.get("name") == Some(&Value::String(name.clone()))
+                        }).map(|call| self.existing_rule_view(call)).unwrap_or(Value::None))
+                    }
                     "existing_rules" => {
-                        // Return a dict of currently defined rules. Bazel's
-                        // native.existing_rules() exposes every rule with ALL
-                        // its attributes populated at their defaults — macros
-                        // like TF's tflite_combine_cc_tests index unset
-                        // attributes directly (`r["data"]`, `r["copts"]`, …).
-                        // We only store explicitly-set kwargs, so default the
-                        // common list-valued attributes to an empty list when
-                        // absent (empty list is falsy, matching Bazel's
-                        // observable behavior for an unset list attr).
-                        const DEFAULT_LIST_ATTRS: [&str; 13] = [
-                            "srcs",
-                            "hdrs",
-                            "deps",
-                            "data",
-                            "args",
-                            "copts",
-                            "defines",
-                            "includes",
-                            "linkopts",
-                            "additional_linker_inputs",
-                            "tags",
-                            "features",
-                            "visibility",
-                        ];
-                        let mut rules_dict = HashMap::new();
-                        for rule_call in &self.rule_calls {
-                            let mut rule_info = HashMap::new();
-                            rule_info.insert(
-                                "kind".to_string(),
-                                Value::String(rule_call.rule_type.clone()),
-                            );
-
-                            // Add explicitly-set rule attributes.
-                            for (key, val) in &rule_call.kwargs {
-                                rule_info.insert(key.clone(), val.clone());
-                            }
-
-                            // Backfill common list attrs Bazel always exposes.
-                            for attr in DEFAULT_LIST_ATTRS {
-                                rule_info
-                                    .entry(attr.to_string())
-                                    .or_insert_with(|| Value::List(vec![]));
-                            }
-
-                            // Get the rule name from kwargs if present
-                            if let Some(Value::String(name)) = rule_call.kwargs.get("name") {
-                                rules_dict.insert(name.clone(), Value::Dict(rule_info));
+                        if !eval_args.is_empty() || !eval_kwargs.is_empty() {
+                            anyhow::bail!("native.existing_rules() accepts no arguments");
+                        }
+                        let mut entries = HashMap::new();
+                        for call in &self.rule_calls {
+                            if call.rule_type == "source_file" { continue; }
+                            if let Some(Value::String(name)) = call.kwargs.get("name") {
+                                entries.insert(name.clone(), self.existing_rule_view(call));
                             }
                         }
-                        Ok(Value::Dict(rules_dict))
+                        Ok(Value::ImmutableMapping(Arc::new(ImmutableMapping {
+                            entries, kind: ImmutableMappingKind::RulesView,
+                        })))
                     }
                     "exports_files" => {
                         let visibility = exports_files_visibility(&eval_kwargs)?;
@@ -8231,6 +8548,13 @@ impl Evaluator {
                                 fields.push("bazel_version".to_string());
                                 fields
                             }
+                            Some(Value::ImmutableMapping(view)) => {
+                                let mut methods = vec!["get", "items", "keys", "values"];
+                                if view.kind == ImmutableMappingKind::FrozenDict {
+                                    methods.extend(["clear", "pop", "popitem", "setdefault", "update"]);
+                                }
+                                methods.into_iter().map(str::to_string).collect()
+                            },
                             Some(Value::Dict(map)) => sorted_dictionary_key_values(map)
                                 .into_iter()
                                 .filter_map(|key| match key {
@@ -8343,7 +8667,7 @@ impl Evaluator {
                                 }
                             }
                             for expression in kwargs_unpack {
-                                let Value::Dict(values) = self.eval_expression(expression)? else {
+                                let Value::Dict(values) = dictionary_expansion_value(self.eval_expression(expression)?) else {
                                     return Err(anyhow!(
                                         "Provider {} cannot unpack a non-dict argument", name
                                     ));
@@ -8748,7 +9072,7 @@ impl Evaluator {
                                     return Err(anyhow!("join() requires an argument"));
                                 }
                                 let items = match &eval_args[0] {
-                                    Value::List(items) | Value::Tuple(items) => items,
+                                    Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items,
                                     _ => return Err(anyhow!("join() argument must be a list")),
                                 };
                                 let strings: Result<Vec<String>> = items
@@ -8899,6 +9223,64 @@ impl Evaluator {
                             _ => Err(anyhow!("Unknown string method: {}", method)),
                         }
                     }
+                    Value::FrozenList(items) => {
+                        let arguments = merge_args(args, args_unpack, self)?;
+                        let keywords = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                        if !keywords.is_empty() { anyhow::bail!("list {}() accepts no named arguments", method); }
+                        match method.as_str() {
+                            "count" if arguments.len() == 1 => Ok(Value::Int(items.iter().filter(|item| **item == arguments[0]).count() as i64)),
+                            "index" if !arguments.is_empty() && arguments.len() <= 3 => {
+                                let length = items.len() as i64;
+                                let bound = |value: Option<&Value>, default: i64| -> Result<usize> {
+                                    let index = match value { Some(Value::Int(index)) => *index, None => default,
+                                        _ => anyhow::bail!("list index bounds must be integers") };
+                                    Ok(if index < 0 { (length + index).max(0) } else { index.min(length) } as usize)
+                                };
+                                let start = bound(arguments.get(1),0)?;
+                                let end = bound(arguments.get(2),length)?;
+                                (start..end).find(|index| items[*index] == arguments[0])
+                                    .map(|index| Value::Int(index as i64)).ok_or_else(|| anyhow!("item not found in list"))
+                            }
+                            "count" | "index" => anyhow::bail!("invalid arguments to list {}()", method),
+                            _ => anyhow::bail!("cannot mutate frozen list from native rule metadata"),
+                        }
+                    }
+                    Value::ImmutableMapping(view) => {
+                        let arguments = merge_args(args, args_unpack, self)?;
+                        let keywords = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                        match method.as_str() {
+                            "get" => {
+                                if arguments.is_empty() || arguments.len() > 2
+                                    || keywords.keys().any(|name| name != "default")
+                                    || (arguments.len() == 2 && keywords.contains_key("default"))
+                                {
+                                    anyhow::bail!("immutable mapping get() requires a key and optional default");
+                                }
+                                let default = arguments.get(1).or_else(|| keywords.get("default"))
+                                    .cloned().unwrap_or(Value::None);
+                                Ok(view.key(&arguments[0])?.and_then(|key| view.entries.get(&key))
+                                    .map(|value| view.exposed_value(value)).unwrap_or(default))
+                            }
+                            "keys" | "values" | "items" => {
+                                if !arguments.is_empty() || !keywords.is_empty() {
+                                    anyhow::bail!("immutable mapping {}() accepts no arguments", method);
+                                }
+                                let mut keys: Vec<_> = view.entries.keys().collect();
+                                keys.sort();
+                                let values = keys.into_iter().map(|key| match method.as_str() {
+                                    "keys" => dictionary_key_value(key),
+                                    "values" => view.exposed_value(&view.entries[key]),
+                                    _ => Value::Tuple(vec![dictionary_key_value(key), view.exposed_value(&view.entries[key])]),
+                                }).collect();
+                                Ok(if view.kind == ImmutableMappingKind::FrozenDict {
+                                    Value::List(values)
+                                } else {
+                                    Value::FrozenList(values)
+                                })
+                            }
+                            _ => anyhow::bail!("cannot mutate immutable native rule metadata"),
+                        }
+                    }
                     Value::Dict(map) => {
                         // Execute dict methods
                         // Evaluate arguments first
@@ -8978,7 +9360,10 @@ impl Evaluator {
                                     ));
                                 }
                                 if let Some(update_val) = eval_args.first() {
-                                    if !matches!(update_val, Value::Dict(_)) {
+                                    if !matches!(
+                                        dictionary_expansion_value(update_val.clone()),
+                                        Value::Dict(_)
+                                    ) {
                                         return Err(anyhow!(
                                             "update() argument must be a dict"
                                         ));
@@ -9233,7 +9618,7 @@ mod tests {
                     Some(Value::String(value)) if value == name
                 )
         })?;
-        let (Value::List(specifications) | Value::Tuple(specifications)) = rule.kwargs.get("visibility")? else {
+        let (Value::List(specifications) | Value::Tuple(specifications) | Value::FrozenList(specifications)) = rule.kwargs.get("visibility")? else {
             return None;
         };
         specifications

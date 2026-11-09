@@ -62,12 +62,14 @@ fn starlark_to_configurable_rule_value(value: &StarlarkValue) -> Result<RuleValu
         StarlarkValue::Float(_) => Err(anyhow!(
             "configurable float operands are not supported by the rule bridge"
         )),
-        StarlarkValue::List(items) | StarlarkValue::Tuple(items) => Ok(RuleValue::List(
+        StarlarkValue::List(items) | StarlarkValue::Tuple(items) | StarlarkValue::FrozenList(items) => Ok(RuleValue::List(
             items
                 .iter()
                 .map(starlark_to_configurable_rule_value)
                 .collect::<Result<Vec<_>>>()?,
         )),
+        StarlarkValue::ImmutableMapping(view) if view.frozen_dictionary().is_some() =>
+            starlark_to_configurable_rule_value(&StarlarkValue::Dict(view.frozen_dictionary().unwrap().clone())),
         StarlarkValue::Dict(items) => Ok(RuleValue::Dict(
             items
                 .iter()
@@ -110,7 +112,7 @@ pub fn starlark_to_rule_value(value: &StarlarkValue) -> Result<RuleValue> {
         StarlarkValue::Float(f) => Ok(RuleValue::Int(*f as i64)), // Lossy conversion
         StarlarkValue::Bool(b) => Ok(RuleValue::Bool(*b)),
         StarlarkValue::None => Ok(RuleValue::None),
-        StarlarkValue::List(items) | StarlarkValue::Tuple(items) => {
+        StarlarkValue::List(items) | StarlarkValue::Tuple(items) | StarlarkValue::FrozenList(items) => {
             let converted: Result<Vec<_>> = items.iter().map(starlark_to_rule_value).collect();
             Ok(RuleValue::List(converted?))
         }
@@ -124,6 +126,13 @@ pub fn starlark_to_rule_value(value: &StarlarkValue) -> Result<RuleValue> {
         StarlarkValue::Function { .. } => Err(anyhow!("Cannot convert function to rule attribute")),
         StarlarkValue::Namespace(_) | StarlarkValue::WorkspaceNativeNamespace { .. } => {
             Err(anyhow!("Cannot convert namespace to rule attribute"))
+        }
+        StarlarkValue::ImmutableMapping(view) => {
+            let entries = view.frozen_dictionary().ok_or_else(||
+                anyhow!("Cannot convert opaque native rule metadata to a rule attribute"))?;
+            Ok(RuleValue::Dict(entries.iter().map(|(key, value)|
+                Ok((key.clone(), starlark_to_rule_value(value)?))
+            ).collect::<Result<HashMap<_,_>>>()?))
         }
         StarlarkValue::ModuleExtension(_) => {
             Err(anyhow!("Cannot convert a module-extension declaration to a rule attribute"))
@@ -183,6 +192,18 @@ pub fn rule_call_to_attrs(rule_call: &RuleCall) -> Result<HashMap<String, RuleVa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_attribute_dictionary_has_transparent_typed_and_configurable_conversion() {
+        let dictionary = StarlarkValue::Dict(HashMap::from([
+            ("nested".to_string(), StarlarkValue::Dict(HashMap::from([
+                ("values".to_string(), StarlarkValue::List(vec![StarlarkValue::Int(7)])),
+            ]))),
+        ]));
+        let frozen = crate::evaluator::ImmutableMapping::freeze(&dictionary);
+        assert_eq!(starlark_to_rule_value(&frozen).unwrap(), starlark_to_rule_value(&dictionary).unwrap());
+        assert_eq!(starlark_to_configurable_rule_value(&frozen).unwrap(), starlark_to_configurable_rule_value(&dictionary).unwrap());
+    }
 
     #[test]
     fn test_convert_string() {

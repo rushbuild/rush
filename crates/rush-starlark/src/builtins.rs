@@ -272,8 +272,9 @@ fn builtin_len(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 
     match &args[0] {
         Value::String(s) => Ok(Value::Int(s.len() as i64)),
-        Value::List(items) | Value::Tuple(items) => Ok(Value::Int(items.len() as i64)),
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => Ok(Value::Int(items.len() as i64)),
         Value::Dict(map) => Ok(Value::Int(map.len() as i64)),
+        Value::ImmutableMapping(view) => Ok(Value::Int(view.entries.len() as i64)),
         _ => Err(anyhow!("len() argument must be a sequence")),
     }
 }
@@ -333,7 +334,7 @@ fn builtin_max(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 
     // Handle single list argument
     let items = if args.len() == 1 {
-        if let Value::List(list) | Value::Tuple(list) = &args[0] {
+        if let Value::List(list) | Value::Tuple(list) | Value::FrozenList(list) = &args[0] {
             if list.is_empty() {
                 return Err(anyhow!("max() arg is an empty sequence"));
             }
@@ -372,7 +373,7 @@ fn builtin_min(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 
     // Handle single list argument
     let items = if args.len() == 1 {
-        if let Value::List(list) | Value::Tuple(list) = &args[0] {
+        if let Value::List(list) | Value::Tuple(list) | Value::FrozenList(list) = &args[0] {
             if list.is_empty() {
                 return Err(anyhow!("min() arg is an empty sequence"));
             }
@@ -472,7 +473,7 @@ pub(crate) fn starlark_repr(value: &Value) -> String {
         Value::String(value) => format!("{:?}", value),
         Value::Bool(value) => if *value { "True" } else { "False" }.to_string(),
         Value::None => "None".to_string(),
-        Value::List(values) => format!(
+        Value::List(values) | Value::FrozenList(values) => format!(
             "[{}]",
             values
                 .iter()
@@ -529,13 +530,14 @@ pub(crate) fn starlark_type_name(value: &Value) -> Result<&str> {
         Value::String(_) => Ok("string"),
         Value::Bool(_) => Ok("bool"),
         Value::None => Ok("NoneType"),
-        Value::List(_) => Ok("list"),
+        Value::List(_) | Value::FrozenList(_) => Ok("list"),
         Value::Tuple(_) => Ok("tuple"),
         Value::Dict(_) => Ok("dict"),
         Value::Function { .. } | Value::Lambda { .. } => Ok("function"),
         Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => Ok("namespace"),
         Value::RuleFunction(_) => Ok("rule_function"),
         Value::NativeFunction(_) => Ok("builtin_function_or_method"),
+        Value::ImmutableMapping(view) => Ok(view.type_name()),
         Value::ModuleExtension(_) => Ok("AutoValue_ModuleExtension"),
         Value::Provider { .. } => Ok("provider"),
         Value::ProviderInstance { provider_name, .. } => Ok(provider_name),
@@ -658,8 +660,9 @@ fn builtin_tuple(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
     }
     match args {
         [] => Ok(Value::Tuple(Vec::new())),
-        [Value::List(items) | Value::Tuple(items)] => Ok(Value::Tuple(items.clone())),
+        [Value::List(items) | Value::Tuple(items) | Value::FrozenList(items)] => Ok(Value::Tuple(items.clone())),
         [Value::Dict(map)] => Ok(Value::Tuple(sorted_dictionary_key_values(map))),
+        [Value::ImmutableMapping(view)] => Ok(Value::Tuple(sorted_dictionary_key_values(&view.entries))),
         [value] => Err(anyhow!("tuple() argument must be iterable, got {}", starlark_type_name(value)?)),
         _ => Err(anyhow!("tuple() accepts at most 1 positional argument")),
     }
@@ -675,7 +678,7 @@ fn builtin_list(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     match &args[0] {
-        Value::List(items) | Value::Tuple(items) => Ok(Value::List(items.clone())),
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => Ok(Value::List(items.clone())),
         Value::String(s) => {
             let chars: Vec<Value> = s.chars().map(|c| Value::String(c.to_string())).collect();
             Ok(Value::List(chars))
@@ -690,13 +693,20 @@ fn builtin_list(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
         Value::Dict(map) => {
             Ok(Value::List(sorted_dictionary_key_values(map)))
         }
+        Value::ImmutableMapping(view) => Ok(Value::List(sorted_dictionary_key_values(&view.entries))),
         _ => Err(anyhow!("list() argument must be iterable")),
     }
 }
 
 /// dict(items) - Create a dictionary
-fn builtin_dict(_args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
-    let mut map = HashMap::new();
+fn builtin_dict(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
+    if matches!(args.first(), Some(Value::ImmutableMapping(_))) && args.len() > 1 {
+        return Err(anyhow!("dict() accepts at most one positional argument"));
+    }
+    let mut map = match args {
+        [Value::ImmutableMapping(view)] => view.copied_entries(),
+        _ => HashMap::new(),
+    };
     for (key, value) in kwargs {
         map.insert(key.clone(), value.clone());
     }
@@ -727,7 +737,7 @@ fn extract_glob_patterns(
 ) -> Result<(Vec<String>, Vec<String>)> {
     let patterns: Vec<String> = if !args.is_empty() {
         match &args[0] {
-            Value::List(items) | Value::Tuple(items) => items.iter().map(|v| v.to_string()).collect(),
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items.iter().map(|v| v.to_string()).collect(),
             Value::String(s) => vec![s.clone()],
             _ => {
                 return Err(anyhow!(
@@ -740,7 +750,7 @@ fn extract_glob_patterns(
             .iter()
             .find(|(k, _)| k == "include")
             .and_then(|(_, v)| match v {
-                Value::List(items) | Value::Tuple(items) => Some(items.iter().map(|v| v.to_string()).collect()),
+                Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => Some(items.iter().map(|v| v.to_string()).collect()),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -751,7 +761,7 @@ fn extract_glob_patterns(
         .iter()
         .find(|(k, _)| k == "exclude")
         .and_then(|(_, v)| match v {
-            Value::List(items) | Value::Tuple(items) => Some(items.iter().map(|v| v.to_string()).collect()),
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => Some(items.iter().map(|v| v.to_string()).collect()),
             _ => None,
         })
         .unwrap_or_default();
@@ -1398,7 +1408,7 @@ fn builtin_provider(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value>
 
     // Extract field names from list or dict, or use empty vec if not specified
     let fields = match fields_value {
-        Some(Value::List(items) | Value::Tuple(items)) => {
+        Some(Value::List(items) | Value::Tuple(items) | Value::FrozenList(items)) => {
             // List format: fields = ["foo", "bar"]
             let mut field_names = Vec::new();
             for item in items {
@@ -1581,7 +1591,7 @@ fn builtin_depset(_args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> 
     // Extract 'direct' parameter
     if let Some((_, direct_value)) = kwargs.iter().find(|(k, _)| k == "direct") {
         match direct_value {
-            Value::List(items) | Value::Tuple(items) => {
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                 for item in items {
                     let item_str = item.to_string();
                     if seen.insert(item_str.clone()) {
@@ -1596,11 +1606,11 @@ fn builtin_depset(_args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> 
     // Extract 'transitive' parameter (list of depsets)
     if let Some((_, transitive_value)) = kwargs.iter().find(|(k, _)| k == "transitive") {
         match transitive_value {
-            Value::List(depsets) | Value::Tuple(depsets) => {
+            Value::List(depsets) | Value::Tuple(depsets) | Value::FrozenList(depsets) => {
                 for depset in depsets {
                     // Each depset is just a list in our current implementation
                     match depset {
-                        Value::List(items) | Value::Tuple(items) => {
+                        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => {
                             for item in items {
                                 let item_str = item.to_string();
                                 if seen.insert(item_str.clone()) {
@@ -1801,6 +1811,8 @@ fn builtin_hasattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
     };
 
     let has_attr = match obj {
+        Value::FrozenList(_) => matches!(attr_name.as_str(), "append" | "clear" | "extend" | "index" | "insert" | "pop" | "remove" | "count"),
+        Value::ImmutableMapping(view) => view.has_method(attr_name),
         Value::WorkspaceNativeNamespace { attrs, .. } => {
             attr_name == "bazel_version" || attrs.contains_key(attr_name)
         }
@@ -1862,6 +1874,20 @@ fn builtin_getattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
     };
     let default_value = args.get(2).unwrap_or(&Value::None);
 
+    if let Value::FrozenList(_) = obj {
+        if matches!(attr_name.as_str(), "append" | "clear" | "extend" | "index" | "insert" | "pop" | "remove" | "count") {
+            return Ok(Value::BoundMethod { object: Box::new(obj.clone()), method: attr_name.clone() });
+        }
+    }
+    if let Value::ImmutableMapping(view) = obj {
+        return if view.has_method(attr_name) {
+            Ok(Value::BoundMethod { object: Box::new(obj.clone()), method: attr_name.clone() })
+        } else if let Some(default) = args.get(2) {
+            Ok(default.clone())
+        } else {
+            Err(anyhow!("immutable mapping has no attribute '{attr_name}'"))
+        };
+    }
     if matches!(obj, Value::ModuleExtension(_)) {
         return args.get(2).cloned().ok_or_else(||
             anyhow!("module-extension declarations have no attribute '{attr_name}'"));
@@ -1938,7 +1964,7 @@ fn builtin_module_extension(args: &[Value], kwargs: &[(String, Value)]) -> Resul
     };
     let environ = match arguments.remove("environ") {
         None => Vec::new(),
-        Some(Value::List(values) | Value::Tuple(values)) => values.into_iter().map(|value| match value {
+        Some(Value::List(values) | Value::Tuple(values) | Value::FrozenList(values)) => values.into_iter().map(|value| match value {
             Value::String(value) => Ok(value),
             _ => Err(anyhow!("module_extension() environ must contain strings")),
         }).collect::<Result<Vec<_>>>()?,
@@ -2141,7 +2167,7 @@ fn builtin_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     let items = match &args[0] {
-        Value::List(items) | Value::Tuple(items) => items.clone(),
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items.clone(),
         _ => return Err(anyhow!("sorted() argument must be a list")),
     };
 
@@ -2202,7 +2228,7 @@ fn builtin_enumerate(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
     }
 
     let items = match &args[0] {
-        Value::List(items) | Value::Tuple(items) => items.clone(),
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items.clone(),
         Value::String(value) => value
             .chars()
             .map(|character| Value::String(character.to_string()))
@@ -2256,7 +2282,7 @@ fn builtin_zip(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     let lists: Result<Vec<&Vec<Value>>> = args
         .iter()
         .map(|arg| match arg {
-            Value::List(items) | Value::Tuple(items) => Ok(items),
+            Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => Ok(items),
             _ => Err(anyhow!("zip() arguments must be lists")),
         })
         .collect();
@@ -2293,7 +2319,7 @@ fn builtin_any(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     let items = match &args[0] {
-        Value::List(items) | Value::Tuple(items) => items,
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items,
         _ => return Err(anyhow!("any() argument must be iterable")),
     };
 
@@ -2325,7 +2351,7 @@ fn builtin_all(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     let items = match &args[0] {
-        Value::List(items) | Value::Tuple(items) => items,
+        Value::List(items) | Value::Tuple(items) | Value::FrozenList(items) => items,
         _ => return Err(anyhow!("all() argument must be iterable")),
     };
 

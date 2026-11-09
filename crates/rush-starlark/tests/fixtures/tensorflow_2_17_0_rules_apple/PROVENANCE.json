@@ -1,0 +1,20 @@
+{
+  "tensorflow_tag": "v2.17.0",
+  "rules_apple_release": "2.3.0",
+  "archive_url": "https://github.com/bazelbuild/rules_apple/releases/download/2.3.0/rules_apple.2.3.0.tar.gz",
+  "declaration_url": "https://github.com/tensorflow/tensorflow/blob/v2.17.0/tensorflow/workspace2.bzl",
+  "files": [
+    {
+      "path": "repositories.bzl",
+      "archive_path": "apple/repositories.bzl",
+      "sha256": "b10c533acfeb451a88ead32a19238a74a72dc7361b0ae32bb488f2031c784967"
+    },
+    {
+      "path": "LICENSE",
+      "archive_path": "LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  ],
+  "scope": "Authentic Apple dependency guard source; test supplies a synthetic native HTTP declaration seam, without network/repository materialization.",
+  "archive_sha256": "a6141240657093fa7ccc7ca1ee5a62408dd9996d1bf47bc2369b8b9faefb2698"
+}
