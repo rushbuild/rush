@@ -6264,11 +6264,14 @@ impl BzlLoader {
                     apparent.to_string()
                 }
             };
-            if let Some(path) = self.external_repos.get(&repository) {
-                return Ok(Some((repository, path.value().clone())));
+            let registered = self.external_repos.get(&repository).map(|path| path.value().clone());
+            if let Some(path) = registered {
+                let path = self.admit_registered_workspace_repository(&repository, &path)?;
+                self.external_repos.insert(repository.clone(), path.clone());
+                return Ok(Some((repository, path)));
             }
             Self::push_thread_context(owner_repo_root.to_path_buf(), PathBuf::new());
-            let fetched = self.try_fetch_known_repo(&repository, canonical_label);
+            let fetched = self.try_fetch_known_repo(&repository, canonical_label, None, None);
             Self::pop_thread_context();
             let Some(path) = fetched? else {
                 return Ok(None);
@@ -7155,6 +7158,8 @@ impl BzlLoader {
                 .get(&repo_name)
                 .map(|r| r.value().clone())
         };
+        let legacy_workspace = rush_incremental::tracked::exists(&self.workspace_root.join("WORKSPACE"))
+            || rush_incremental::tracked::exists(&self.workspace_root.join("WORKSPACE.bazel"));
 
         // A non-empty canonical name resolves directly against the shared
         // bazel output base's external tree — Bazel materialized it there
@@ -7183,7 +7188,7 @@ impl BzlLoader {
         let bzlmod_only = self.workspace_root.join("MODULE.bazel").exists()
             && !self.workspace_root.join("WORKSPACE").exists()
             && !self.workspace_root.join("WORKSPACE.bazel").exists();
-        if repo_root_opt.is_none() && !bzlmod_only {
+        if repo_root_opt.is_none() && !bzlmod_only && !legacy_workspace {
             if let Some(stub_path) = create_known_stub_repo(&self.workspace_root, &repo_name)? {
                 debug_log!(
                     "[DEBUG resolve_external_bzl] Created/using known stub for '{}': {}",
@@ -7198,7 +7203,7 @@ impl BzlLoader {
 
         // If repo is warmup-materialized, use it immediately and avoid
         // going through the rest of on-demand resolution.
-        if repo_root_opt.is_none() {
+        if repo_root_opt.is_none() && !legacy_workspace {
             if let Some(path) = crate::fetch_strategy::is_warmed_up(&repo_name) {
                 if path.exists() {
                     debug_log!(
@@ -7236,7 +7241,10 @@ impl BzlLoader {
         // Keep this log after warmup/known-repo fast paths so it does not fire for
         // repos already satisfied by preloaded materialization.
         if repo_root_opt.is_none() {
-            if let Some(fetched) = self.try_fetch_known_repo(&repo_name, is_canonical)? {
+            let requested_module = path_and_file.split_once(':')
+                .map(|(package, filename)| PathBuf::from(package).join(filename))
+                .ok_or_else(|| anyhow!("Invalid .bzl path in external label: {}", bzl_label))?;
+            if let Some(fetched) = self.try_fetch_known_repo(&repo_name, is_canonical, Some(&requested_module), Some(&format!("@{}//{}", repo_name, path_and_file)))? {
                 debug_log!(
                     "[DEBUG resolve_external_bzl] Successfully fetched repo '{}' to {}",
                     repo_name,
@@ -7258,7 +7266,7 @@ impl BzlLoader {
 
         // FIX: Also check the workspace's external/ directory for pre-configured stub repos
         // This handles repos like com_google_googleapis that are stubbed out in external/
-        if repo_root_opt.is_none() {
+        if repo_root_opt.is_none() && !legacy_workspace {
             let external_path = self.workspace_root.join("external").join(&repo_name);
             if external_path.exists() && external_path.is_dir() {
                 debug_log!(
@@ -7270,7 +7278,7 @@ impl BzlLoader {
                 repo_root_opt = Some(external_path);
             }
         }
-        if repo_root_opt.is_none() {
+        if repo_root_opt.is_none() && !legacy_workspace {
             let cache_external = cache_backed_external_repo_dir(&self.workspace_root, &repo_name);
             if cache_external.exists() && cache_external.is_dir() {
                 debug_log!(
@@ -7290,6 +7298,11 @@ impl BzlLoader {
                 repo_name
             )
         })?;
+        let requested_label = format!("@{}//{}", repo_name, path_and_file);
+        let repo_root = self.admit_registered_workspace_repository_for_label(&repo_name, &repo_root, Some(&requested_label))?;
+        if !repo_name.is_empty() {
+            self.external_repos.insert(repo_name.clone(), repo_root.clone());
+        }
 
         debug_log!(
             "[DEBUG resolve_external_bzl] Resolved repo root for '{}': {}",
@@ -7313,7 +7326,7 @@ impl BzlLoader {
             bzl_path.display()
         );
 
-        if !bzl_path.exists() {
+        if !rush_incremental::tracked::exists(&bzl_path) {
             debug_log!(
                 "[ERROR resolve_external_bzl] File does not exist: {}",
                 bzl_path.display()
@@ -7353,6 +7366,8 @@ impl BzlLoader {
         &self,
         repo_name: &str,
         canonical: bool,
+        requested_module: Option<&Path>,
+        requested_label: Option<&str>,
     ) -> Result<Option<PathBuf>> {
         let workspace_root = &self.workspace_root;
         // GUARD AGAINST INFINITE RECURSION: Check if we're already fetching this repo
@@ -7368,6 +7383,22 @@ impl BzlLoader {
                     return Ok(None);
                 }
             }
+        }
+
+        if rush_incremental::tracked::exists(&workspace_root.join("WORKSPACE"))
+            || rush_incremental::tracked::exists(&workspace_root.join("WORKSPACE.bazel"))
+        {
+            // A name-only success bit or an unverified directory is not a
+            // declaration proof. Registered roots are handled by the caller;
+            // unknown WORKSPACE repos go through the genuine rule and shared
+            // FILE/ENV/config freshness admission before any heuristic skips.
+            let _guard = FetchGuard::new(repo_name.to_string());
+            // Preserve the original package/target separator. A filesystem
+            // path loses the distinction in //defs:subdir/child.bzl.
+            return match requested_label {
+                Some(module) => Self::fetch_declared_workspace_repository_for_module(workspace_root, repo_name, module),
+                None => Self::fetch_declared_workspace_repository(workspace_root, repo_name),
+            };
         }
 
         if std::env::var("RUSH_DISABLE_FETCH_DEDUP").ok().as_deref() != Some("1") {
@@ -7527,13 +7558,35 @@ impl BzlLoader {
         }
 
         if let Some(path) = Self::find_third_party_dir(workspace_root, repo_name)? {
-            Self::mark_repo_fetched_for_dedupe(repo_name);
-            return Ok(Some(path));
+            let declared_source = Self::resolve_third_party_source_candidate(
+                &path,
+                requested_module,
+                || {
+                    let _guard = FetchGuard::new(repo_name.to_string());
+                    Self::fetch_declared_workspace_repository(workspace_root, repo_name)
+                },
+            )?;
+            if declared_source.is_some() {
+                Self::mark_repo_fetched_for_dedupe(repo_name);
+            }
+            return Ok(declared_source);
         }
 
         // Create RAII guard to track and auto-cleanup this fetch
         // Guard will automatically remove repo from REPOS_BEING_FETCHED when dropped
         let _guard = FetchGuard::new(repo_name.to_string());
+
+        if rush_incremental::tracked::exists(&workspace_root.join("WORKSPACE"))
+            || rush_incremental::tracked::exists(&workspace_root.join("WORKSPACE.bazel"))
+        {
+            // Repository macros can format URLs and declare patches/overlays.
+            // The abbreviated regex tuples below cannot represent that rule.
+            let fetched = Self::fetch_declared_workspace_repository(workspace_root, repo_name)?;
+            if fetched.is_some() {
+                Self::mark_repo_fetched_for_dedupe(repo_name);
+            }
+            return Ok(fetched);
+        }
 
         // Try WORKSPACE repository rules first (chunked scanning)
         let workspace_path = workspace_root.join("WORKSPACE");
@@ -7795,19 +7848,95 @@ impl BzlLoader {
         Ok(res)
     }
 
+    /// Materialize a declared legacy WORKSPACE repository with its genuine
+    /// repository rule, including patches, overlays and formatted attributes.
+    /// Callers register the resulting Bazel-owned source root. This does not
+    /// interpret a partial http_archive tuple as a complete source definition.
+    pub fn fetch_declared_workspace_repository(workspace_root: &Path, repo_name: &str) -> Result<Option<PathBuf>> {
+        Self::fetch_declared_workspace_repository_for_label(workspace_root, repo_name, None)
+    }
+
+    fn workspace_module_package_goal(repo_name: &str, requested: &str) -> Result<String> {
+        let relative = requested.strip_prefix(&format!("@{}//", repo_name)).ok_or_else(|| anyhow!("requested module is outside its repository"))?;
+        let (package, target) = relative.split_once(':').ok_or_else(|| anyhow!("requested module requires package:target syntax"))?;
+        if target.is_empty() || Path::new(package).components().chain(Path::new(target).components()).any(|component| !matches!(component, std::path::Component::Normal(_))) {
+            anyhow::bail!("requested module is not a package-relative source label");
+        }
+        Ok(format!("@{}//{}:all", repo_name, package))
+    }
+
+    /// A Starlark load reads a source file, which need not be exported as a
+    /// target. Materialize its owning package, then resolve/read the actual
+    /// module through normal source checks without changing upstream BUILD.
+    pub fn fetch_declared_workspace_repository_for_module(workspace_root: &Path, repo_name: &str, requested: &str) -> Result<Option<PathBuf>> {
+        let goal = Self::workspace_module_package_goal(repo_name, requested)?;
+        Self::fetch_declared_workspace_repository_for_label(workspace_root, repo_name, Some(&goal))
+    }
+
+    /// Materialize the requested repository package with non-forcing fetch.
+    /// A known requested .bzl/file/rule label avoids loading unrelated packages.
+    pub fn fetch_declared_workspace_repository_for_label(workspace_root: &Path, repo_name: &str, requested_label: Option<&str>) -> Result<Option<PathBuf>> {
+        if repo_name.is_empty() || repo_name == "." || repo_name == ".."
+            || repo_name.bytes().any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.' | b'+' | b'~'))
+        {
+            anyhow::bail!("declared repository name is not a single valid path component");
+        }
+        Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, false, true, requested_label)
+    }
+
+    fn admit_registered_workspace_repository(&self, repo_name: &str, path: &Path) -> Result<PathBuf> {
+        self.admit_registered_workspace_repository_for_label(repo_name, path, None)
+    }
+
+    fn admit_registered_workspace_repository_for_label(&self, repo_name: &str, path: &Path, requested_label: Option<&str>) -> Result<PathBuf> {
+        let bzlmod_only = self.workspace_root.join("MODULE.bazel").exists()
+            && !self.workspace_root.join("WORKSPACE").exists()
+            && !self.workspace_root.join("WORKSPACE.bazel").exists();
+        if !bzlmod_only && !repo_name.is_empty() {
+            let cache_root = tracked_command_environment("RUSH_WORKSPACE_CACHE_ROOT")?
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.workspace_root.join(".cache").join("rush"));
+            let expected = cache_root.join("bazel_output_base").join("external").join(repo_name);
+            if path == expected {
+                let materialized = match requested_label {
+                    Some(module) => Self::fetch_declared_workspace_repository_for_module(&self.workspace_root, repo_name, module),
+                    None => Self::fetch_declared_workspace_repository(&self.workspace_root, repo_name),
+                }?;
+                return materialized.ok_or_else(|| anyhow!("declared repository @{} has no verified source root", repo_name));
+            }
+        }
+        Ok(path.to_path_buf())
+    }
+
     fn fetch_repo_via_bazel(
         workspace_root: &std::path::Path,
         repo_name: &str,
         canonical: bool,
     ) -> Result<Option<PathBuf>> {
+        Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, canonical, false, None)
+    }
+
+    fn fetch_repo_via_bazel_with_policy(
+        workspace_root: &Path,
+        repo_name: &str,
+        canonical: bool,
+        declared_workspace: bool,
+        requested_label: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
+        let bzlmod_only = workspace_root.join("MODULE.bazel").exists()
+            && !workspace_root.join("WORKSPACE").exists()
+            && !workspace_root.join("WORKSPACE.bazel").exists();
+        if declared_workspace && bzlmod_only {
+            anyhow::bail!("declared WORKSPACE repository fetch cannot use Bzlmod discovery");
+        }
         // Phase 5.C.4 commit 143 (Batch R): if this
         // repo was pre-fetched by the warmup pass,
         // short-circuit. The warmup ran ONE combined
         // / parallel bazel call ahead of analyze, so
         // per-repo invocations are redundant.
-        if let Some(path) =
+        if let Some(path) = bzlmod_only.then(||
             crate::fetch_strategy::is_warmed_up(repo_name)
-        {
+        ).flatten() {
             if path.exists() {
                 eprintln!(
                     "    ⚡ fetch warmed-up: @{} → {}",
@@ -7879,15 +8008,11 @@ impl BzlLoader {
         let _sync_guard = BAZEL_SYNC_SERIALIZE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(path) = crate::fetch_strategy::is_warmed_up(repo_name) {
+        if let Some(path) = bzlmod_only.then(|| crate::fetch_strategy::is_warmed_up(repo_name)).flatten() {
             if path.exists() {
                 return Ok(Some(path));
             }
         }
-
-        let bzlmod_only = workspace_root.join("MODULE.bazel").exists()
-            && !workspace_root.join("WORKSPACE").exists()
-            && !workspace_root.join("WORKSPACE.bazel").exists();
 
         // Phase 5.C.4 commit 134/149: hard-stop on known parser-only repos.
         // These repos are intentionally resolved through stubs or
@@ -7904,7 +8029,7 @@ impl BzlLoader {
             "com_github_grpc_grpc",
             "local_config_remote_execution",
         ];
-        if !bzlmod_only && SKIP_FETCH_REPOS.contains(&repo_name) {
+        if !declared_workspace && !bzlmod_only && SKIP_FETCH_REPOS.contains(&repo_name) {
             let workspace_external = vendored_external_repo_dir(workspace_root, repo_name);
             if workspace_external.exists() {
                 debug_log!(
@@ -7935,6 +8060,21 @@ impl BzlLoader {
                 return Ok(Some(stub_repo));
             }
         }
+        let workspace_fetch_context = if bzlmod_only {
+            None
+        } else {
+            let context = crate::fetch_strategy::prepare_workspace_repository_fetch(workspace_root, &bazel_binary)?;
+            if crate::fetch_strategy::workspace_repository_inputs_are_current(
+                workspace_root, &output_base, repo_name, &context,
+            )? {
+                return Ok(Some(output_base.join("external").join(repo_name)));
+            }
+            if context.native_local_source_is_materialized(&output_base, repo_name)? {
+                crate::fetch_strategy::record_workspace_repository_fetch(workspace_root, &output_base, repo_name, &context)?;
+                return Ok(Some(output_base.join("external").join(repo_name)));
+            }
+            Some(context)
+        };
         // Bzlmod-only workspaces do not necessarily support the legacy
         // `sync` command, and their apparent repository names do not match
         // the canonical directories under output_base/external. Preserve the
@@ -8033,15 +8173,22 @@ impl BzlLoader {
         } else {
             None
         };
+        let workspace_target = requested_label.map(str::to_owned).unwrap_or_else(|| format!("@{}//...", repo_name));
+        if !bzlmod_only && !workspace_target.starts_with(&format!("@{}//", repo_name)) {
+            anyhow::bail!("requested materialization label is outside its declared repository");
+        }
         let fetch_description = if bzlmod_only {
             format!(
                 "fetch --repo=@@{}",
                 bzlmod_canonical_name.as_deref().unwrap_or(repo_name)
             )
         } else {
-            format!("sync --only={}", repo_name)
+            format!("fetch {}", workspace_target)
         };
         let mut fetch_command = StdCommand::new(&bazel_binary);
+        if let Some(context) = &workspace_fetch_context {
+            context.apply(&mut fetch_command)?;
+        }
         fetch_command
             .arg("--output_base")
             .arg(&output_base)
@@ -8054,7 +8201,7 @@ impl BzlLoader {
                     bzlmod_canonical_name.as_deref().unwrap_or(repo_name)
                 ));
         } else {
-            fetch_command.arg("sync").arg("--only").arg(repo_name);
+            fetch_command.arg("fetch").arg(&workspace_target);
         }
         let status = fetch_command.status().map_err(|error| {
             anyhow!(
@@ -8101,6 +8248,11 @@ impl BzlLoader {
                 "Bazel reported success but {} is missing",
                 bazel_repo_path.display()
             ));
+        }
+        if let Some(context) = &workspace_fetch_context {
+            crate::fetch_strategy::record_workspace_repository_fetch(
+                workspace_root, &output_base, repo_name, context,
+            )?;
         }
 
         // Phase 5.C.4 commit 148 (Batch S): write the
@@ -8954,6 +9106,27 @@ impl BzlLoader {
         Ok(repo_dir_opt)
     }
 
+    fn resolve_third_party_source_candidate(
+        candidate: &Path,
+        requested_module: Option<&Path>,
+        fetch_declared: impl FnOnce() -> Result<Option<PathBuf>>,
+    ) -> Result<Option<PathBuf>> {
+        if requested_module.is_some_and(|module| rush_incremental::tracked::exists(&candidate.join(module))) {
+            return Ok(Some(candidate.to_path_buf()));
+        }
+        let declaration = candidate.join("workspace.bzl");
+        if rush_incremental::tracked::exists(&declaration) {
+            // TensorFlow's third_party/<repo> often holds only the archive
+            // declaration and patches, not the repository's source. Record
+            // the decision input and run the real rule instead of publishing
+            // this metadata directory as a fetched external root.
+            rush_incremental::tracked::read_file(&declaration)
+                .with_context(|| format!("read repository declaration {}", declaration.display()))?;
+            return fetch_declared();
+        }
+        Ok(Some(candidate.to_path_buf()))
+    }
+
     fn find_third_party_dir(
         workspace_root: &std::path::Path,
         repo_name: &str,
@@ -9700,6 +9873,97 @@ impl BzlLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn third_party_declaration_metadata_is_not_a_materialized_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let metadata = root.path().join("third_party/pybind11_bazel");
+        let source = root.path().join("materialized/pybind11_bazel");
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let declaration = metadata.join("workspace.bzl");
+        std::fs::write(&declaration, include_bytes!("../tests/fixtures/pybind11_bazel_72cbbf1/workspace.bzl")).unwrap();
+        std::fs::write(metadata.join("BUILD"), "").unwrap();
+        std::fs::write(metadata.join("pybind11_bazel.patch"), include_bytes!("../tests/fixtures/pybind11_bazel_72cbbf1/tensorflow.patch")).unwrap();
+        std::fs::write(source.join("build_defs.bzl"), include_bytes!("../tests/fixtures/pybind11_bazel_72cbbf1/build_defs.bzl")).unwrap();
+        rush_incremental::tracked::test_scope(root.path(), || {
+            let calls = std::cell::Cell::new(0);
+            let selected = BzlLoader::resolve_third_party_source_candidate(
+                &metadata, Some(Path::new("build_defs.bzl")), || {
+                    calls.set(calls.get() + 1);
+                    Ok(Some(source.clone()))
+                },
+            ).unwrap();
+            assert_eq!(selected, Some(source));
+            assert_eq!(calls.get(), 1);
+            assert!(!metadata.join("build_defs.bzl").exists());
+            let manifest = rush_incremental::tracked::current_required().manifest();
+            assert!(manifest.deps().iter().any(|dependency| matches!(dependency,
+                Dependency::FileContent { path, .. } if path == &declaration)));
+            assert!(manifest.deps().iter().any(|dependency| matches!(dependency,
+                Dependency::FileExistence { path, .. } if path == &metadata.join("build_defs.bzl"))));
+        });
+    }
+
+    #[test]
+    fn third_party_discovery_never_substitutes_metadata_for_a_failed_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("third_party/declared_repo");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("workspace.bzl"), "def repo():\n    pass\n").unwrap();
+        std::fs::write(candidate.join("keep-existing"), "unrelated contents").unwrap();
+        rush_incremental::tracked::test_scope(root.path(), || {
+            assert!(BzlLoader::resolve_third_party_source_candidate(
+                &candidate, Some(Path::new("missing.bzl")), || Ok(None),
+            ).unwrap().is_none());
+            let error = BzlLoader::resolve_third_party_source_candidate(
+                &candidate, None, || anyhow::bail!("declared repository fetch failed"),
+            ).unwrap_err();
+            assert!(error.to_string().contains("declared repository fetch failed"));
+            assert_eq!(std::fs::read_to_string(candidate.join("keep-existing")).unwrap(), "unrelated contents");
+            std::fs::write(candidate.join("real.bzl"), "value = 1\n").unwrap();
+            assert_eq!(BzlLoader::resolve_third_party_source_candidate(
+                &candidate, Some(Path::new("real.bzl")), || panic!("existing source must not fetch"),
+            ).unwrap(), Some(candidate));
+        });
+    }
+
+    #[test]
+    fn module_materialization_goal_preserves_package_for_nested_unexported_source() {
+        assert_eq!(BzlLoader::workspace_module_package_goal("repo", "@repo//defs:subdir/child.bzl").unwrap(), "@repo//defs:all");
+        assert_eq!(BzlLoader::workspace_module_package_goal("repo", "@repo//:py_version.bzl").unwrap(), "@repo//:all");
+        assert!(BzlLoader::workspace_module_package_goal("repo", "@other//defs:child.bzl").is_err());
+        assert!(BzlLoader::workspace_module_package_goal("repo", "@repo//defs:../child.bzl").is_err());
+    }
+
+    #[test]
+    fn legacy_workspace_source_discovery_requires_proof_despite_name_and_directory_hints() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = "declared_source_proof_test";
+        std::fs::write(root.path().join("WORKSPACE"), "workspace(name = \"proof_test\")\n").unwrap();
+        let metadata = root.path().join("third_party").join(repository);
+        let unregistered = root.path().join("external").join(repository);
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::create_dir_all(&unregistered).unwrap();
+        std::fs::write(metadata.join("workspace.bzl"), "def repo():\n    pass\n").unwrap();
+        std::fs::write(metadata.join("BUILD"), "").unwrap();
+        std::fs::write(unregistered.join("BUILD"), "").unwrap();
+        std::fs::write(unregistered.join("build_defs.bzl"), include_bytes!("../tests/fixtures/pybind11_bazel_72cbbf1/build_defs.bzl")).unwrap();
+        rush_incremental::tracked::test_scope(root.path(), || {
+            SELF_SINGLETON_FETCHED.lock().unwrap().insert(repository.to_string());
+            let loader = BzlLoader::new(root.path().to_path_buf());
+            // This command scope deliberately has no client Bazel/PATH. The
+            // loader must attempt genuine proof admission and report that
+            // missing prerequisite, never accept a name bit or raw directory.
+            let result = loader.resolve_bzl_path(&format!("@{repository}//:build_defs.bzl"));
+            SELF_SINGLETON_FETCHED.lock().unwrap().remove(repository);
+            let error = result.expect_err("unregistered source hints must not bypass repository-rule admission");
+            assert!(format!("{error:#}").contains("client command supplied neither RUSH_BAZEL_PATH nor PATH"), "{error:#}");
+            assert_eq!(std::fs::read(unregistered.join("build_defs.bzl")).unwrap(),
+                include_bytes!("../tests/fixtures/pybind11_bazel_72cbbf1/build_defs.bzl"));
+            assert!(!metadata.join("build_defs.bzl").exists());
+        });
+    }
 
     fn write_executable(path: &Path) {
         std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();

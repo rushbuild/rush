@@ -3582,7 +3582,7 @@ impl BuildOrchestrator {
                             .record_external_repo_resolution();
                     }
                     if let Some(path) =
-                        self.registered_external_repository_path(ws_name).await
+                        self.registered_external_repository_path(ws_name, &label).await?
                     {
                         path
                     } else {
@@ -4392,7 +4392,7 @@ impl BuildOrchestrator {
                         // Fetch and parse the BUILD file for this dependency
                         let workspace_root = if let Some(ref ws_name) = missing_label.workspace {
                             if let Some(path) =
-                                self.registered_external_repository_path(ws_name).await
+                                self.registered_external_repository_path(ws_name, &missing_label).await?
                             {
                                 path
                             } else {
@@ -11302,6 +11302,30 @@ impl BuildOrchestrator {
         }
 
         Ok(false)
+    }
+
+    /// Materialize the actual WORKSPACE declaration, including repository-rule
+    /// patches and external BUILD overlays. Register only the validated Bazel
+    /// source root; legacy cache directories are neither consumed nor replaced.
+    pub(crate) async fn fetch_workspace_repository_with_bazel(
+        &self,
+        repository: &str,
+        mapping: &HashMap<String, String>,
+        requested: Option<&Label>,
+    ) -> Result<PathBuf> {
+        let requested_label = requested.map(ToString::to_string);
+        let path = self.with_tracked_scope(|| {
+            tokio::task::block_in_place(|| {
+                rush_starlark::BzlLoader::fetch_declared_workspace_repository_for_label(&self.workspace_root, repository, requested_label.as_deref())
+            })
+        })?.ok_or_else(|| anyhow!("WORKSPACE repository @{} was not materialized by its declared repository rule", repository))?;
+        self.external_repo_paths.lock().await.insert(repository.to_string(), path.clone());
+        let mut loader = self.bzl_loader.lock().map_err(|_| anyhow!("BzlLoader lock poisoned while registering declared repository"))?;
+        loader.add_external_repo(repository.to_string(), path.clone());
+        if !mapping.is_empty() {
+            loader.set_command_repo_mapping_for(repository.to_string(), mapping.clone());
+        }
+        Ok(path)
     }
 
     pub(crate) async fn fetch_repo_with_bazel(&self, repo_name: &str) -> Result<bool> {

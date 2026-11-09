@@ -46,7 +46,7 @@ impl WorkspaceLoader {
     pub async fn load(
         &self,
         workspace_file: &Path,
-        fetch_dependencies: bool,
+        _fetch_dependencies: bool,
     ) -> Result<DiscoveredRepositories> {
         eprintln!(
             "📋 Loading WORKSPACE via Starlark: {}",
@@ -89,109 +89,11 @@ impl WorkspaceLoader {
 
         evaluator.register_rule_function("tf_workspace0".to_string());
 
-        // Register callback for immediate fetching of http_archives
-        // This ensures that archives are available for load() statements that appear later in the same file
-        let repo_mgr = self.repository_manager.clone();
-        // Note: bzl_loader was created above. We need to share it with Evaluator AND the callback.
-        // But Evaluator takes Arc<Mutex<BzlLoader>>.
-        // So let's create the Arc<Mutex> once.
+        // Resolve load() on demand through the genuine repository-rule path.
+        // Eagerly fetching every declared archive loads unrelated packages and
+        // is unnecessary for a later module load to materialize its own source.
         let bzl_loader_arc = Arc::new(Mutex::new(bzl_loader));
-        evaluator.set_bzl_loader(bzl_loader_arc.clone());
-
-        let workspace_root = self.workspace_root.clone();
-
-        evaluator.set_rule_call_callback(Arc::new(move |rule_call| {
-            if fetch_dependencies
-                && (rule_call.rule_type == "http_archive"
-                    || rule_call.rule_type == "tf_http_archive")
-            {
-                // Helper to extract string
-                let extract_string = |key: &str| -> Option<String> {
-                    if let Some(Value::String(s)) = rule_call.kwargs.get(key) {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                };
-
-                // Helper to extract string list
-                let extract_string_list = |key: &str| -> Vec<String> {
-                    if let Some(Value::List(items)) = rule_call.kwargs.get(key) {
-                        items
-                            .iter()
-                            .filter_map(|v| {
-                                if let Value::String(s) = v {
-                                    Some(s.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                // Helper to extract string dict
-                let extract_string_dict = |key: &str| -> HashMap<String, String> {
-                    if let Some(Value::Dict(items)) = rule_call.kwargs.get(key) {
-                        items
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                if let Value::String(s) = v {
-                                    Some((k.clone(), s.clone()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        HashMap::new()
-                    }
-                };
-
-                if let Some(name) = extract_string("name") {
-                    let urls = extract_string_list("urls");
-                    let sha256 = extract_string("sha256");
-                    let strip_prefix = extract_string("strip_prefix");
-                    let build_file = extract_string("build_file");
-                    let repo_mapping = extract_string_dict("repo_mapping");
-
-                    let archive = HttpArchive {
-                        name: name.clone(),
-                        urls,
-                        sha256,
-                        strip_prefix,
-                        build_file,
-                        build_file_content: None,
-                        repo_mapping,
-                    };
-
-                    // Fetch immediately using block_in_place
-                    tokio::task::block_in_place(|| {
-                        let handle = tokio::runtime::Handle::current();
-                        handle.block_on(async {
-                            // eprintln!("      Downloading @{} (immediate)...", archive.name);
-                            match repo_mgr.fetch_http_archive(&workspace_root, &archive).await {
-                                Ok(path) => {
-                                    // eprintln!("      ✓ @{} fetched to {}", archive.name, path.display());
-                                    // Register in BzlLoader
-                                    if let Ok(mut loader) = bzl_loader_arc.lock() {
-                                        loader.add_external_repo(archive.name.clone(), path);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "      ❌ Failed to fetch @{} (immediate): {}",
-                                        archive.name, e
-                                    );
-                                }
-                            }
-                        });
-                    });
-                }
-            }
-        }));
+        evaluator.set_bzl_loader(bzl_loader_arc);
 
         // Evaluate the program.
         //
@@ -207,10 +109,8 @@ impl WorkspaceLoader {
         // installed command scope if one is up (nested WORKSPACE under a command),
         // otherwise build one from the process CommandSemantics snapshot — the same
         // real IO `BuildOrchestrator::ensure_tracked_io` constructs, not a fabricated
-        // one. The scope wraps only the synchronous `eval_program`; the http_archive
-        // fetch callback's `block_on` runs on this same thread (block_in_place keeps
-        // the OS thread, so the thread-local scope persists) and does network IO, not
-        // tracked reads.
+        // one. The synchronous eval and genuine repository-rule callback share
+        // this scope, including tracked patch/overlay/configuration inputs.
         let ws_io: rush_incremental::tracked::SharedTrackedIo =
             match rush_incremental::tracked::current() {
                 Some(io) => io,

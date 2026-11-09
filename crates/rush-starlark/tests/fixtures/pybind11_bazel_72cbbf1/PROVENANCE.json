@@ -1,0 +1,31 @@
+{
+  "upstream_commit": "72cbbf1fbc830e487e3012862b7b720001b70672",
+  "tensorflow_tag": "v2.17.0",
+  "archive_sha256_from_tensorflow_declaration": "516c1b3a10d87740d2b7de6f121f8e19dde2c372ecbfe59aef44cd1872c10395",
+  "files": {
+    "upstream_build_defs.bzl": {
+      "url": "https://raw.githubusercontent.com/pybind/pybind11_bazel/72cbbf1fbc830e487e3012862b7b720001b70672/build_defs.bzl",
+      "sha256": "9911c481bbaa76fbcaf4fe58fa8bc9c8bc137d7aa38ec11df183b38e0c4cdc54"
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/pybind/pybind11_bazel/72cbbf1fbc830e487e3012862b7b720001b70672/LICENSE",
+      "sha256": "dc5582c5b17dd8cde271eabf2533e24046e0b3f5c2047c07be6fc41def615213"
+    },
+    "tensorflow.patch": {
+      "url": "https://raw.githubusercontent.com/tensorflow/tensorflow/v2.17.0/third_party/pybind11_bazel/pybind11_bazel.patch",
+      "sha256": "308718467be37b41517b8d18d694068c0eb817efbf962beabf0469cffe21d6cb"
+    },
+    "workspace.bzl": {
+      "url": "https://raw.githubusercontent.com/tensorflow/tensorflow/v2.17.0/third_party/pybind11_bazel/workspace.bzl",
+      "sha256": "4845a93577ebfe65ffb27f35cca124c2f8e0b471fd955c171daf534b9480251b"
+    },
+    "build_defs.bzl": {
+      "derived_from": "upstream_build_defs.bzl + tensorflow.patch; patch --batch --fuzz=0 -p1",
+      "sha256": "66cc3435282276af092320fb17e28547d7614b4d71cd9852ec49fb127e2262e4"
+    },
+    "TENSORFLOW_LICENSE": {
+      "url": "https://raw.githubusercontent.com/tensorflow/tensorflow/v2.17.0/LICENSE",
+      "sha256": "71c6915d04265772a0339bed47276942c678b45cc01534210ebe6984fd1aec65"
+    }
+  }
+}

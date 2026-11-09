@@ -2122,6 +2122,7 @@ impl BuildOrchestrator {
         );
         let discovered = match loader.load(workspace_path, fetch_dependencies).await {
             Ok(d) => d,
+            Err(e) if fetch_dependencies => return Err(e).with_context(|| format!("load WORKSPACE repository declarations from {}", workspace_path.display())),
             Err(e) => {
                 debug_log!(
                     "Warning: Failed to load WORKSPACE file {}: {}",
@@ -2154,30 +2155,8 @@ impl BuildOrchestrator {
                 self.repository_manager
                     .register_http_archive(archive.clone());
 
-                if fetch_dependencies {
-                    eprintln!("      Downloading @{}...", archive.name);
-                    match self
-                        .repository_manager
-                        .fetch_http_archive(&self.workspace_root, archive)
-                        .await
-                    {
-                        Ok(path) => {
-                            eprintln!("      ✓ @{} fetched to {}", archive.name, path.display());
-                            // Register in external_repo_paths
-                            let mut repo_paths = self.external_repo_paths.lock().await;
-                            repo_paths.insert(archive.name.clone(), path.clone());
-                            drop(repo_paths);
-
-                            // Register in BzlLoader
-                            if let Ok(mut loader) = self.bzl_loader.lock() {
-                                loader.add_external_repo(archive.name.clone(), path.clone());
-                            }
-                        }
-                        Err(e) => {
-                            debug_log!("      ❌ Failed to fetch @{}: {}", archive.name, e);
-                        }
-                    }
-                }
+                // Source materialization is demand-driven by actual load() or
+                // selected graph labels, preserving the requested closure.
             }
         }
 
@@ -5097,23 +5076,24 @@ cc_library(
     /// it. Mirror that path into the orchestrator registry so the configured
     /// graph consumes the already-resolved identity instead of trying a second,
     /// context-free fetch.
-    async fn registered_external_repository_path(&self, name: &str) -> Option<PathBuf> {
-        if let Some(path) = self.external_repo_paths.lock().await.get(name).cloned() {
-            return Some(path);
+    async fn registered_external_repository_path(&self, name: &str, requested: &crate::dependency_graph::Label) -> Result<Option<PathBuf>> {
+        let registered = self.external_repo_paths.lock().await.get(name).cloned();
+        let loader_path = self.bzl_loader.lock().ok().and_then(|loader| loader.external_repo_path(name));
+        let candidate = registered.or(loader_path);
+        let declared = self.repository_manager.get_http_archive(name);
+        let bazel_root = cache_paths::workspace_cache_root(&self.workspace_root).join("bazel_output_base");
+        let materialized_workspace_rule = candidate.as_ref().is_some_and(|path| {
+            path.starts_with(&bazel_root) && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("external"))
+        }) && (self.workspace_root.join("WORKSPACE").exists() || self.workspace_root.join("WORKSPACE.bazel").exists());
+        if declared.is_some() || materialized_workspace_rule {
+            let mapping = declared.map(|archive| archive.repo_mapping).unwrap_or_default();
+            return self.fetch_workspace_repository_with_bazel(name, &mapping, Some(requested)).await.map(Some);
         }
-        let loader_path = self
-            .bzl_loader
-            .lock()
-            .ok()
-            .and_then(|loader| loader.external_repo_path(name));
-        if let Some(path) = loader_path {
-            self.external_repo_paths
-                .lock()
-                .await
-                .insert(name.to_string(), path.clone());
-            return Some(path);
+        if let Some(path) = candidate {
+            self.external_repo_paths.lock().await.insert(name.to_string(), path.clone());
+            return Ok(Some(path));
         }
-        None
+        Ok(None)
     }
 
     /// Expand wildcard target patterns into concrete target labels.

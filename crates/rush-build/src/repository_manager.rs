@@ -509,48 +509,20 @@ impl RepositoryManager {
             return Ok(true);
         }
 
-        // Check if this is a registered http_archive
+        // WORKSPACE repository rules can apply patches and owner-qualified
+        // BUILD overlays absent from the parsed HttpArchive tuple. Delegate the
+        // original declaration to Bazel; the native downloader is only a source
+        // primitive for callers such as BCR that retain their own full semantics.
         if let Some(repo_name) = &missing_label.workspace {
             if let Some(archive) = self.get_http_archive(repo_name) {
-                eprintln!("    🌐 Fetching http_archive @{}...", repo_name);
-
-                // Fetch the archive
-                match self
-                    .fetch_http_archive(&orchestrator.workspace_root, &archive)
-                    .await
-                {
-                    Ok(repo_path) => {
-                        eprintln!("    ✅ Fetched @{} to {}", repo_name, repo_path.display());
-
-                        // Register the repo path in the orchestrator
-                        orchestrator
-                            .external_repo_paths
-                            .lock()
-                            .await
-                            .insert(repo_name.clone(), repo_path.clone());
-
-                        // Also update bzl_loader so it can find .bzl files in this repo
-                        if let Ok(mut loader) = orchestrator.bzl_loader.lock() {
-                            loader.add_external_repo(repo_name.clone(), repo_path);
-                            // Register repo mapping if present
-                            if !archive.repo_mapping.is_empty() {
-                                loader.set_command_repo_mapping_for(
-                                    repo_name.clone(),
-                                    archive.repo_mapping.clone(),
-                                );
-                            }
-                        }
-
-                        // Now that the repo is fetched, we can try to find the BUILD file
-                        // and parse the target. But for now, we just return true to indicate
-                        // we did something. The caller should retry parsing.
-                        return Ok(true);
-                    }
-                    Err(e) => {
-                        eprintln!("    ❌ Failed to fetch @{}: {}", repo_name, e);
-                        // Don't return error, let the build fail naturally later
-                    }
-                }
+                orchestrator
+                    .fetch_workspace_repository_with_bazel(
+                        repo_name,
+                        &archive.repo_mapping,
+                        Some(missing_label),
+                    )
+                    .await?;
+                return Ok(true);
             }
         }
 

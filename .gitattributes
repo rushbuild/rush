@@ -1,0 +1,2 @@
+# Preserve the exact upstream patch, including required blank context markers.
+crates/rush-starlark/tests/fixtures/pybind11_bazel_72cbbf1/tensorflow.patch whitespace=-blank-at-eol
