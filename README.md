@@ -29,7 +29,7 @@ current engine on two Linux hosts, using eight CPUs and eight requested jobs.
 | TensorFlow 2.17 framework, fresh build, both hosts | Rule loading fails | Rule loading fails | Build completes |
 
 Use the Modular medians within their ten-sample no-op scope. All 96 Modular
-commands pass compiler-count and package-byte checks. Clean-output and novel
+commands pass compiler-count and package-byte checks. Rush before/after clean-output and novel
 comment-edit differences are small with overlapping ranges; these checks
 establish no broad compilation speedup. TensorFlow executes zero compiler
 calls under both Rush versions because `JavaInfo` fails to load. Assign no
@@ -42,15 +42,15 @@ multi-target records.
 
 ### Compare the Linux kernel with GNU Make
 
-Read the separate three-pair experiment while the new two-host snapshot
-checks run. That retained experiment reports **40.24 s** for populated-cache
-Rush replay versus **50.92 s** for a clean
-Make build at the median of three alternating pairs, with 12,397 persistent
-output entries matched. Both arms use the same tree carrying
-[Lorenzo Stoakes's v1 build-speedup patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/).
-Parts of that work have merged into mainline; keep the measured v1 baseline
-fixed. Read the [Linux report](docs/benchmarks/linux.md) for upstream links,
-setup cost, empty-cache behavior and the remaining acceptance gate.
+Require snapshot assembly and exact output parity before comparing Rush
+replay with Make. In the November 9 eight-CPU check, Make, observation and
+graph derivation complete on both hosts. Rush refuses snapshot assembly
+because it cannot isolate the captured group credentials; replay is not run.
+A fresh namespace-profile retry is in progress. Read the
+[Linux report](docs/benchmarks/linux.md) for commands, the exact seed,
+[Lorenzo Stoakes's v1 baseline patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/),
+and the separate 32-job replay experiment. Assign no fresh Linux speed ratio
+to failed snapshot assembly.
 
 ## Build and try it
 

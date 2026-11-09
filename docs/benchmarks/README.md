@@ -42,7 +42,7 @@ medians use three each. Use eight CPUs and eight requested jobs on both hosts.
 | Host D / novel comment edit | 11.222 s | 11.208 s | 11.310 s |
 
 Read [the complete report and ranges](modular.md), all 96 accepted samples,
-compiler counts, output digests and the reproducible controller. Clean/edit
+compiler counts, output digests and the reproducible controller. Rush before/after clean/edit
 ranges overlap; use the lower no-op medians within this single-package scope.
 Retain compiler/tool caches and analysis metadata in the clean-output profile.
 Keep the separate 4,175-target and 945-target records attached to their original
@@ -50,13 +50,15 @@ pins and cache limitations.
 
 ## Linux against GNU Make
 
-Read the separate three-pair record while fresh two-host snapshot checks run.
-Compare its populated-cache Rush replay into a clean output root with a clean
-Make build of the same Linux tree carrying Lorenzo Stoakes's v1 build-speedup
-patches. Three alternating pairs give **40.24 s for Rush** and **50.92 s for
-Make** at the median, with exact output parity. Treat this as a three-pair
-experiment; the larger acceptance gate remains open. Read the
-[Linux report](linux.md) for setup cost, empty-cache behavior and patch status.
+Run the pinned seeded x86-64 build with eight CPUs and Make jobs. Ordinary
+Make, managed observation and graph derivation complete on both hosts.
+Snapshot assembly refuses captured group credentials on both; no replay runs.
+Assign no fresh speed ratio. Evaluate a new mapped-namespace capture profile
+separately; that retry is in progress.
+
+Read the [Linux report](linux.md) for every phase, exact source/seed/toolchain
+inputs and the separate 32-job, three-pair populated-cache replay record.
+Complete fresh snapshot and parity checks before extending that record.
 
 ## Interpret and reproduce the results
 

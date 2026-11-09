@@ -10,7 +10,7 @@ contracts before counting a runtime pass.
 Run the [two-host CPU stdlib comparison](../benchmarks/modular.md) at source
 `4e87649567`. Both Rush revisions and the pinned Bazel toolchain build the
 single package with matching bytes. All 96 measured commands pass their
-compiler-count/output checks. Current Rush has lower no-op medians; clean
+compiler-count/output checks. Current Rush has lower no-op medians; Rush before/after clean
 and comment-edit ranges overlap. Keep this one-package build result separate
 from the multi-target build and GPU runtime ledgers below.
 

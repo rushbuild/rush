@@ -58,6 +58,14 @@ every built target; recover the case ledger before expanding its denominator.
 
 ## Linux
 
+The [November 9 data](data/linux-build-retest-20261109.json) records two
+complete login-profile attempts through snapshot refusal. Make controls,
+managed observation and derivation complete; assembly refuses group
+credentials and no replay runs. Retain the exact seed, source recipe,
+ordered public-patch verification, tool versions/hashes and host-specific
+normalized configurations. Use GNU time's elapsed field for setup diagnostics.
+A fresh mapped-namespace profile is in progress and remains separate.
+
 The [public Linux record](https://github.com/rushbuild/rush-status/blob/26e6a51ee374c5cea6f86d33c7edf3e20923dabc/status/linux.md)
 supplies all three timing pairs, kernel identity, parity counts, preparation
 costs and incomplete acceptance gates. Keep raw private experiment material
