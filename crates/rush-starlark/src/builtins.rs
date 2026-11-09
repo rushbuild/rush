@@ -42,6 +42,7 @@ pub fn get_builtins() -> HashMap<String, BuiltinFn> {
     builtins.insert("rule".to_string(), builtin_rule);
     builtins.insert("hasattr".to_string(), builtin_hasattr);
     builtins.insert("getattr".to_string(), builtin_getattr);
+    builtins.insert("module_extension".to_string(), builtin_module_extension);
     builtins.insert("repository_rule".to_string(), builtin_repository_rule);
     builtins.insert("exec_group".to_string(), builtin_exec_group);
     builtins.insert("attr".to_string(), builtin_attr);
@@ -535,6 +536,7 @@ pub(crate) fn starlark_type_name(value: &Value) -> Result<&str> {
         Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => Ok("namespace"),
         Value::RuleFunction(_) => Ok("rule_function"),
         Value::NativeFunction(_) => Ok("builtin_function_or_method"),
+        Value::ModuleExtension(_) => Ok("AutoValue_ModuleExtension"),
         Value::Provider { .. } => Ok("provider"),
         Value::ProviderInstance { provider_name, .. } => Ok(provider_name),
         Value::Select(_) | Value::Configurable { .. } => Ok("select"),
@@ -1860,6 +1862,11 @@ fn builtin_getattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
     };
     let default_value = args.get(2).unwrap_or(&Value::None);
 
+    if matches!(obj, Value::ModuleExtension(_)) {
+        return args.get(2).cloned().ok_or_else(||
+            anyhow!("module-extension declarations have no attribute '{attr_name}'"));
+    }
+
     if let Value::WorkspaceNativeNamespace { attrs, workspace_root } = obj {
         return if attr_name == "bazel_version" {
             crate::bzl_loader::workspace_repository_analyzer_version(workspace_root)
@@ -1889,6 +1896,66 @@ fn builtin_getattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
     };
 
     Ok(attr_value.cloned().unwrap_or_else(|| default_value.clone()))
+}
+
+/// Preserve a Bazel 6.5 module-extension declaration without executing it.
+fn builtin_module_extension(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
+    use crate::evaluator::ModuleExtensionDeclaration;
+    if args.len() > 1 {
+        return Err(anyhow!("module_extension() accepts only implementation positionally; remaining arguments are keyword-only"));
+    }
+    let mut arguments = HashMap::new();
+    for (name, value) in kwargs {
+        if !matches!(name.as_str(), "implementation" | "tag_classes" | "doc" | "environ" | "os_dependent" | "arch_dependent") {
+            return Err(anyhow!("module_extension() got unexpected keyword argument '{name}'"));
+        }
+        if arguments.insert(name.as_str(), value.clone()).is_some() {
+            return Err(anyhow!("module_extension() got multiple values for '{name}'"));
+        }
+    }
+    if let Some(implementation) = args.first() {
+        if arguments.insert("implementation", implementation.clone()).is_some() {
+            return Err(anyhow!("module_extension() got multiple values for 'implementation'"));
+        }
+    }
+    let implementation = arguments.remove("implementation")
+        .ok_or_else(|| anyhow!("module_extension() missing required argument 'implementation'"))?;
+    if !matches!(&implementation, Value::Function { .. } | Value::Lambda { .. }
+        | Value::NativeFunction(_) | Value::Provider { .. } | Value::BoundMethod { .. })
+    {
+        return Err(anyhow!("module_extension() implementation must be a supported callable; compatibility rule markers cannot implement extensions"));
+    }
+    let tag_classes = match arguments.remove("tag_classes") {
+        None => HashMap::new(),
+        Some(Value::Dict(values)) if values.is_empty() => values,
+        Some(Value::Dict(_)) => return Err(anyhow!("module_extension() nonempty tag_classes requires genuine tag_class declarations; native tag_class construction is not supported, delegate extension evaluation to Bazel")),
+        Some(_) => return Err(anyhow!("module_extension() tag_classes must be a dict")),
+    };
+    let doc = match arguments.remove("doc") {
+        None => String::new(),
+        Some(Value::String(value)) => value,
+        Some(_) => return Err(anyhow!("module_extension() doc must be a string")),
+    };
+    let environ = match arguments.remove("environ") {
+        None => Vec::new(),
+        Some(Value::List(values) | Value::Tuple(values)) => values.into_iter().map(|value| match value {
+            Value::String(value) => Ok(value),
+            _ => Err(anyhow!("module_extension() environ must contain strings")),
+        }).collect::<Result<Vec<_>>>()?,
+        Some(_) => return Err(anyhow!("module_extension() environ must be a list or tuple of strings")),
+    };
+    let boolean = |value: Option<Value>, name: &str| match value {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(value),
+        Some(_) => Err(anyhow!("module_extension() {name} must be a bool")),
+    };
+    let os_dependent = boolean(arguments.remove("os_dependent"), "os_dependent")?;
+    let arch_dependent = boolean(arguments.remove("arch_dependent"), "arch_dependent")?;
+    let source_context = crate::bzl_loader::BzlLoader::capture_thread_context()
+        .and_then(|context| context.load_stack.last().cloned());
+    Ok(Value::ModuleExtension(std::sync::Arc::new(ModuleExtensionDeclaration {
+        implementation, tag_classes, doc, environ, os_dependent, arch_dependent, source_context,
+    })))
 }
 
 /// repository_rule(implementation, attrs={}, environ=[]) - Define a repository rule

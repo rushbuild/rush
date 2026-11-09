@@ -125,6 +125,9 @@ pub fn starlark_to_rule_value(value: &StarlarkValue) -> Result<RuleValue> {
         StarlarkValue::Namespace(_) | StarlarkValue::WorkspaceNativeNamespace { .. } => {
             Err(anyhow!("Cannot convert namespace to rule attribute"))
         }
+        StarlarkValue::ModuleExtension(_) => {
+            Err(anyhow!("Cannot convert a module-extension declaration to a rule attribute"))
+        }
         StarlarkValue::RuleFunction(name) => Err(anyhow!(
             "Cannot convert rule function '{}' to rule attribute",
             name

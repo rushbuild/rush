@@ -1,0 +1,22 @@
+{
+  "upstream": "bazelbuild/bazel",
+  "revision": "6.5.0",
+  "files": [
+    {
+      "path": "xcode_configure.bzl",
+      "url": "https://raw.githubusercontent.com/bazelbuild/bazel/6.5.0/tools/osx/xcode_configure.bzl",
+      "sha256": "2f3d8daf4b40a99800984c412681ca9cf415fadf167f8ac4643fc4edcfbceacd"
+    },
+    {
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/bazelbuild/bazel/6.5.0/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  ],
+  "constructor_authority": [
+    "https://github.com/bazelbuild/bazel/blob/6.5.0/src/main/java/com/google/devtools/build/lib/starlarkbuildapi/repository/RepositoryModuleApi.java",
+    "https://github.com/bazelbuild/bazel/blob/6.5.0/src/main/java/com/google/devtools/build/lib/bazel/repository/starlark/StarlarkRepositoryModule.java",
+    "https://github.com/bazelbuild/bazel/blob/6.5.0/src/main/java/com/google/devtools/build/lib/bazel/bzlmod/ModuleExtension.java"
+  ],
+  "scope": "Byte-authentic Xcode module declaration load only; no extension execution or Xcode discovery."
+}

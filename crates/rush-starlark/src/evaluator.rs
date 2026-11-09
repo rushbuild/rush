@@ -252,6 +252,19 @@ impl ConfigurableKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModuleExtensionDeclaration {
+    pub implementation: Value,
+    pub tag_classes: HashMap<String, Value>,
+    pub doc: String,
+    pub environ: Vec<String>,
+    pub os_dependent: bool,
+    pub arch_dependent: bool,
+    /// Captured loader context, when available; the AST has no source-line
+    /// spans, so no line number is invented for this declaration.
+    pub source_context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -282,6 +295,9 @@ pub enum Value {
     RuleFunction(String),
     /// Native function marker (for native.glob, native.existing_rules, etc.)
     NativeFunction(String),
+    /// Real module-extension declaration. Construction preserves its callable
+    /// and metadata; this value is not callable and does not execute extensions.
+    ModuleExtension(Arc<ModuleExtensionDeclaration>),
     /// Provider type (created by provider() function)
     Provider {
         name: String,
@@ -388,6 +404,7 @@ impl PartialEq for Value {
             ) => a == b && ar == br,
             (Self::RuleFunction(a), Self::RuleFunction(b))
             | (Self::NativeFunction(a), Self::NativeFunction(b)) => a == b,
+            (Self::ModuleExtension(a), Self::ModuleExtension(b)) => Arc::ptr_eq(a, b),
             (
                 Self::Provider {
                     name: an,
@@ -850,6 +867,7 @@ impl Value {
             | Value::WorkspaceNativeNamespace { .. }
             | Value::RuleFunction(_)
             | Value::NativeFunction(_)
+            | Value::ModuleExtension(_)
             | Value::Provider { .. }
             | Value::ProviderInstance { .. }
             | Value::BoundMethod { .. }
@@ -984,6 +1002,7 @@ impl Value {
             Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => "<namespace>".to_string(),
             Value::RuleFunction(name) => format!("<rule:{}>", name),
             Value::NativeFunction(name) => format!("<native:{}>", name),
+            Value::ModuleExtension(_) => "<unknown object com.google.devtools.build.lib.bazel.bzlmod.AutoValue_ModuleExtension>".to_string(),
             Value::Provider { name, .. } => format!("<provider:{}>", name),
             Value::ProviderInstance {
                 provider_name,
@@ -1116,6 +1135,21 @@ impl Value {
             Value::RuleFunction(name) | Value::NativeFunction(name) => {
                 size_of::<Value>() + name.len()
             }
+            Value::ModuleExtension(declaration) => {
+                if !visited.insert(Arc::as_ptr(declaration) as usize) {
+                    return size_of::<Value>();
+                }
+                size_of::<Value>() + size_of::<ModuleExtensionDeclaration>()
+                    + declaration.implementation.estimate_size_internal(visited)
+                    + declaration.doc.capacity()
+                    + declaration.environ.capacity() * size_of::<String>()
+                    + declaration.environ.iter().map(|name| name.capacity()).sum::<usize>()
+                    + declaration.source_context.as_ref().map_or(0, String::capacity)
+                    + declaration.tag_classes.capacity() * (size_of::<String>() + size_of::<Value>())
+                    + declaration.tag_classes.iter().map(|(name, value)| {
+                        name.capacity() + value.estimate_size_internal(visited)
+                    }).sum::<usize>()
+            }
             Value::Provider { name, fields, init } => {
                 size_of::<Value>()
                     + name.len()
@@ -1236,6 +1270,18 @@ impl ValueCensus {
             self.string_bytes += workspace_root.as_os_str().len();
         }
         match v {
+            Value::ModuleExtension(declaration) => {
+                if seen_envs.insert(Arc::as_ptr(declaration) as usize) {
+                    self.string_bytes += declaration.doc.len()
+                        + declaration.environ.iter().map(String::len).sum::<usize>()
+                        + declaration.source_context.as_ref().map_or(0, String::len);
+                    self.walk_value(&declaration.implementation, seen_envs);
+                    for (name, value) in &declaration.tag_classes {
+                        self.string_bytes += name.len();
+                        self.walk_value(value, seen_envs);
+                    }
+                }
+            }
             Value::String(s) => self.string_bytes += s.len(),
             Value::List(items) | Value::Tuple(items) => {
                 self.list_elements += items.len();
@@ -1320,6 +1366,9 @@ pub struct Environment {
     vars: Arc<std::sync::RwLock<HashMap<String, Value>>>,
     parent: Option<Arc<Environment>>,
     definition_label_context: Option<Arc<DefinitionLabelContext>>,
+    /// Set only for a real .bzl evaluation and inherited by its closures.
+    /// Label() can initialize definition_label_context in BUILD files too.
+    bzl_definition_scope: bool,
 }
 
 /// Retain the module namespace used by Label() inside a Starlark closure.
@@ -1337,6 +1386,7 @@ impl Environment {
             vars: Arc::new(std::sync::RwLock::new(HashMap::new())),
             parent: None,
             definition_label_context: None,
+            bzl_definition_scope: false,
         }
     }
 
@@ -1344,6 +1394,7 @@ impl Environment {
         Self {
             vars: Arc::new(std::sync::RwLock::new(HashMap::new())),
             definition_label_context: parent.definition_label_context.clone(),
+            bzl_definition_scope: parent.bzl_definition_scope,
             parent: Some(parent),
         }
     }
@@ -1447,6 +1498,7 @@ impl PartialEq for Environment {
         Arc::ptr_eq(&self.vars, &other.vars)
             && self.parent == other.parent
             && self.definition_label_context == other.definition_label_context
+            && self.bzl_definition_scope == other.bzl_definition_scope
     }
 }
 
@@ -1470,6 +1522,9 @@ pub(crate) const BZLMOD_EXT_PROXY: &str = "__bzlmod_module_extension_proxy__";
 /// non-data values (functions, providers) fall back to a string repr.
 fn value_to_json(v: &Value) -> Result<serde_json::Value> {
     Ok(match v {
+        Value::ModuleExtension(_) => {
+            return Err(anyhow!("module-extension declarations are not JSON data values"));
+        }
         Value::None => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Int(n) => serde_json::Value::from(*n),
@@ -3198,6 +3253,7 @@ impl Evaluator {
 
     pub(crate) fn set_definition_label_context(&mut self, context: DefinitionLabelContext) {
         self.env.definition_label_context = Some(Arc::new(context));
+        self.env.bzl_definition_scope = true;
     }
 
     fn definition_label_context(&mut self) -> Result<Arc<DefinitionLabelContext>> {
@@ -6236,6 +6292,9 @@ impl Evaluator {
 
                 // Check if it's a builtin function
                 if let Some(builtin) = self.builtins.get(name).copied() {
+                    if name == "module_extension" && !self.env.bzl_definition_scope {
+                        return Err(anyhow!("Undefined variable: module_extension (available only in .bzl definitions)"));
+                    }
                     // For namespace-like builtins (config_common, cc_common, etc.),
                     // call them immediately to get the namespace value.
                     // This allows attribute access like config_common.FeatureFlagInfo.
@@ -6404,6 +6463,7 @@ impl Evaluator {
                 let obj_val = self.eval_expression(object)?;
 
                 match obj_val {
+                    Value::ModuleExtension(_) => Err(anyhow!("module-extension declarations have no attribute '{attr}'")),
                     Value::WorkspaceNativeNamespace { attrs, workspace_root } => {
                         if attr == "bazel_version" {
                             crate::bzl_loader::workspace_repository_analyzer_version(&workspace_root)
@@ -7335,10 +7395,49 @@ impl Evaluator {
             Ok(merged)
         };
 
+        // A new declaration constructor must not inherit the legacy last-wins
+        // kwargs merger. Reject ambiguous arguments for direct and alias calls.
+        let extension_kwargs = |base: &[(String, Expr)], unpack: &[Expr], evaluator: &mut Self|
+            -> Result<Vec<(String, Value)>> {
+            let mut values = Vec::new();
+            let mut names = HashSet::new();
+            for (name, expression) in base {
+                if !names.insert(name.clone()) {
+                    return Err(anyhow!("module_extension() got multiple values for '{name}'"));
+                }
+                values.push((name.clone(), evaluator.eval_expression(expression)?));
+            }
+            for expression in unpack {
+                let Value::Dict(items) = evaluator.eval_expression(expression)? else {
+                    return Err(anyhow!("module_extension() **kwargs must be a dict"));
+                };
+                for (key, value) in items {
+                    let Value::String(name) = dictionary_key_value(&key) else {
+                        return Err(anyhow!("module_extension() keyword names must be strings"));
+                    };
+                    if !names.insert(name.clone()) {
+                        return Err(anyhow!("module_extension() got multiple values for '{name}'"));
+                    }
+                    values.push((name, value));
+                }
+            }
+            Ok(values)
+        };
+
         // Check if this is a function identifier (for built-ins and rule functions)
         if let Expr::Ident(name) = function {
             // Check for built-in functions
-            if let Some(builtin) = self.builtins.get(name).copied() {
+            if let Some(builtin) = self.builtins.get(name).copied().filter(|_| {
+                name != "module_extension" || self.env.get(name).is_none()
+            }) {
+                if name == "module_extension" {
+                    if !self.env.bzl_definition_scope {
+                        return Err(anyhow!("Undefined variable: module_extension (available only in .bzl definitions)"));
+                    }
+                    let args = merge_args(args, args_unpack, self)?;
+                    let kwargs = extension_kwargs(kwargs, kwargs_unpack, self)?;
+                    return builtin(&args, &kwargs);
+                }
                 // Phase 5.C.4 commit 106: bump the
                 // coarse op counter. `glob` is tracked
                 // as its own category so it can be
@@ -7864,6 +7963,12 @@ impl Evaluator {
                 Ok(Value::None)
             }
             Value::NativeFunction(func_name) => {
+                if func_name == "module_extension" {
+                    let args = merge_args(args, args_unpack, self)?;
+                    let kwargs = extension_kwargs(kwargs, kwargs_unpack, self)?;
+                    return self.builtins.get("module_extension")
+                        .context("module_extension constructor is unavailable")?(&args, &kwargs);
+                }
                 if func_name == "Label" {
                     let mut eval_args = merge_args(args, args_unpack, self)?;
                     self.qualify_label_argument(&mut eval_args)?;
@@ -9032,6 +9137,7 @@ impl Evaluator {
 
                 result
             }
+            Value::ModuleExtension(_) => Err(anyhow!("module-extension declarations are not callable; execute extensions through the genuine Bazel repository analyzer")),
             _ => Err(anyhow!("Not a function: {:?}", func_val)),
         }
     }

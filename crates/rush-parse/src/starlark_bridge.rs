@@ -1111,6 +1111,9 @@ fn convert_value(value: &StarlarkValue) -> Result<Value> {
         StarlarkValue::Namespace(_) | StarlarkValue::WorkspaceNativeNamespace { .. } => {
             Ok(Value::String("<namespace>".to_string()))
         }
+        StarlarkValue::ModuleExtension(_) => {
+            Err(anyhow!("module-extension declarations cannot become legacy rule attributes; delegate extension execution to Bazel"))
+        }
         StarlarkValue::RuleFunction(name) => Ok(Value::String(format!("<rule:{}>", name))),
         StarlarkValue::NativeFunction(name) => Ok(Value::String(format!("<native:{}>", name))),
         StarlarkValue::Provider { name, .. } => Ok(Value::String(format!("<provider:{}>", name))),
