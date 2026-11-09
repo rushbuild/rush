@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/bazelbuild/rules_java",
+  "tag": "5.3.5",
+  "commit": "f8786592b079c5e23580a4e91ac865620177d189",
+  "files": {
+    "native.bzl": {
+      "source": "java/private/native.bzl",
+      "url": "https://raw.githubusercontent.com/bazelbuild/rules_java/f8786592b079c5e23580a4e91ac865620177d189/java/private/native.bzl",
+      "sha256": "2a77333abf00329e125993d66bee2b7ab8c46181b64e15f3aff27a75926ddfac"
+    },
+    "defs.bzl": {
+      "source": "java/defs.bzl",
+      "url": "https://raw.githubusercontent.com/bazelbuild/rules_java/f8786592b079c5e23580a4e91ac865620177d189/java/defs.bzl",
+      "sha256": "2791e87e988e79090c0650b55a5a05e1902b551b5634ad9cf0b20b9d93c10337"
+    },
+    "LICENSE": {
+      "source": "LICENSE",
+      "url": "https://raw.githubusercontent.com/bazelbuild/rules_java/f8786592b079c5e23580a4e91ac865620177d189/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  }
+}

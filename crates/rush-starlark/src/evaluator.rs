@@ -6406,6 +6406,16 @@ impl Evaluator {
                     return Ok(val.clone());
                 }
 
+                // Predeclared provider values are not module exports unless
+                // the module explicitly assigns an alias to them.
+                match name.as_str() {
+                    "JavaInfo" => return Ok(crate::builtins::native_java_info_provider()),
+                    "JavaPluginInfo" => {
+                        return Ok(crate::builtins::native_java_plugin_info_provider())
+                    }
+                    _ => {}
+                }
+
                 // Check if it's a builtin function
                 if let Some(builtin) = self.builtins.get(name).copied() {
                     // For namespace-like builtins (config_common, cc_common, etc.),
@@ -8381,21 +8391,63 @@ impl Evaluator {
                 }
             }
             Value::Provider { name, fields, init } => {
-                // A public provider constructor delegates argument handling to
-                // its Starlark init function. The init function must return the
-                // field dictionary used to construct the provider instance.
+                // Native and Starlark initializers must return the field
+                // dictionary used to construct the provider instance.
                 let encoded_instance_fields = if let Some(init) = init {
-                    const INIT_BINDING: &str = "__rush_provider_initializer__";
-                    let saved_env = self.env.clone();
-                    self.env.define(INIT_BINDING.to_string(), *init);
-                    let init_result = self.eval_call(
-                        &Expr::Ident(INIT_BINDING.to_string()),
-                        args,
-                        args_unpack,
-                        kwargs,
-                        kwargs_unpack,
-                    );
-                    self.env = saved_env;
+                    let init_result = match *init {
+                        Value::NativeFunction(initializer) => {
+                            let native = self.builtins.get(&initializer).copied().ok_or_else(|| {
+                                anyhow!("Unknown native provider initializer: {}", initializer)
+                            })?;
+                            let eval_args = merge_args(args, args_unpack, self)?;
+                            let mut named = HashMap::new();
+                            for (key, expression) in kwargs {
+                                let value = self.eval_expression(expression)?;
+                                if named.insert(key.clone(), value).is_some() {
+                                    return Err(anyhow!(
+                                        "Provider {} received multiple values for argument '{}'",
+                                        name, key
+                                    ));
+                                }
+                            }
+                            for expression in kwargs_unpack {
+                                let Value::Dict(values) = self.eval_expression(expression)? else {
+                                    return Err(anyhow!(
+                                        "Provider {} cannot unpack a non-dict argument", name
+                                    ));
+                                };
+                                for (key, value) in values {
+                                    let Value::String(key) = dictionary_key_value(&key) else {
+                                        return Err(anyhow!(
+                                            "Provider {} argument names must be strings", name
+                                        ));
+                                    };
+                                    if named.insert(key.clone(), value).is_some() {
+                                        return Err(anyhow!(
+                                            "Provider {} received multiple values for argument '{}'",
+                                            name, key
+                                        ));
+                                    }
+                                }
+                            }
+                            let eval_kwargs: Vec<_> = named.into_iter().collect();
+                            native(&eval_args, &eval_kwargs)
+                        }
+                        init => {
+                            const INIT_BINDING: &str = "__rush_provider_initializer__";
+                            let saved_env = self.env.clone();
+                            self.env.define(INIT_BINDING.to_string(), init);
+                            let init_result = self.eval_call(
+                                &Expr::Ident(INIT_BINDING.to_string()),
+                                args,
+                                args_unpack,
+                                kwargs,
+                                kwargs_unpack,
+                            );
+                            self.env = saved_env;
+                            init_result
+                        }
+                    };
 
                     match init_result? {
                         Value::Dict(values) => values,

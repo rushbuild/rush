@@ -218,6 +218,14 @@ pub fn get_builtins() -> HashMap<String, BuiltinFn> {
     builtins.insert("platform_common".to_string(), builtin_platform_common);
     builtins.insert("proto_common".to_string(), builtin_proto_common);
     builtins.insert("java_common".to_string(), builtin_java_common);
+    builtins.insert(
+        "__rush_java_info_init".to_string(),
+        builtin_java_info_init,
+    );
+    builtins.insert(
+        "__rush_java_plugin_info_init".to_string(),
+        builtin_java_plugin_info_init,
+    );
     builtins.insert("apple_common".to_string(), builtin_apple_common);
     builtins.insert(
         "apple_common.apple_toolchain".to_string(),
@@ -4696,22 +4704,48 @@ fn builtin_proto_common(_args: &[Value], _kwargs: &[(String, Value)]) -> Result<
     Ok(Value::Namespace(fields))
 }
 
+/// Expose the native provider identity without fabricating Java artifacts.
+pub(crate) fn native_java_info_provider() -> Value {
+    Value::Provider {
+        name: "JavaInfo".to_string(),
+        fields: Vec::new(),
+        init: Some(Box::new(Value::NativeFunction(
+            "__rush_java_info_init".to_string(),
+        ))),
+    }
+}
+
+/// Expose the native plugin provider identity without fabricating processors.
+pub(crate) fn native_java_plugin_info_provider() -> Value {
+    Value::Provider {
+        name: "JavaPluginInfo".to_string(),
+        fields: Vec::new(),
+        init: Some(Box::new(Value::NativeFunction(
+            "__rush_java_plugin_info_init".to_string(),
+        ))),
+    }
+}
+
+fn builtin_java_info_init(_args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
+    Err(anyhow!(
+        "JavaInfo construction is unsupported: Java artifact and transitive classpath semantics are not implemented"
+    ))
+}
+
+fn builtin_java_plugin_info_init(_args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
+    Err(anyhow!(
+        "JavaPluginInfo construction is unsupported: Java annotation-processor semantics are not implemented"
+    ))
+}
+
 /// java_common module - Bazel's Java common functions
 fn builtin_java_common(_args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     let mut fields = HashMap::new();
     fields.insert("compile".to_string(), Value::NativeFunction("java_common.compile".to_string()));
     fields.insert("merge".to_string(), Value::NativeFunction("java_common.merge".to_string()));
     fields.insert("make_non_strict".to_string(), Value::NativeFunction("java_common.make_non_strict".to_string()));
-    fields.insert("provider".to_string(), Value::Provider {
-        name: "JavaInfo".to_string(),
-        fields: vec![],
-        init: None,
-    });
-    fields.insert("JavaPluginInfo".to_string(), Value::Provider {
-        name: "JavaPluginInfo".to_string(),
-        fields: vec![],
-        init: None,
-    });
+    fields.insert("provider".to_string(), native_java_info_provider());
+    fields.insert("JavaPluginInfo".to_string(), native_java_plugin_info_provider());
     fields.insert("JavaToolchainInfo".to_string(), Value::Provider {
         name: "JavaToolchainInfo".to_string(),
         fields: vec![],
