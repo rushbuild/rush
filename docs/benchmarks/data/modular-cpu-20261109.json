@@ -1,0 +1,1200 @@
+{
+  "schema": "rush.modular-cpu-comparison.v1",
+  "date": "2026-11-09",
+  "source_commit": "4e87649567a82e3bdac178ea61d62daddc7477bb",
+  "target": "//mojo/stdlib/std:std",
+  "before_engine_commit": "b003cc3a3f068449510ba69e9ef1070c4598cc4a",
+  "after_engine_commit": "b059a257874270dbb17ebebeb2bee6f3546688c3",
+  "tested_public_revision": "f9d97fe8d2c7540f28da7a88657c21c4b9b5879f",
+  "mojo_version": "1.0.0b3.dev2026080406",
+  "bazel_version": "10.0.0-pre-46c5e789f84c7bf4ba1edb105eefa7bc4ebc841b",
+  "cpu_platform_flags": [
+    "--platforms=@platforms//host",
+    "--host_platform=@platforms//host",
+    "--repo_env=MODULAR_SKIP_AUTO_PLATFORMS=1"
+  ],
+  "reference_flags": [
+    "--remote_cache=",
+    "--remote_executor=",
+    "--bes_backend=",
+    "--disk_cache=",
+    "--noremote_accept_cached",
+    "--noremote_upload_local_results"
+  ],
+  "edit": {
+    "path": "mojo/stdlib/std/builtin/int.mojo",
+    "kind": "distinct appended comment",
+    "template": "\n# private-rush-cpu-novel-{sample:06d}\n",
+    "expected_mojo_precompiles": 1
+  },
+  "artifact": {
+    "path": "mojo/stdlib/std/std.mojoc",
+    "bytes": 3265666,
+    "sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9"
+  },
+  "cache_definition": "Clear engine outputs, ActionResult caches and Rush CAS; retain fetched repositories, analysis metadata and normal compiler/tool caches. Include fresh engine daemon startup in clean commands. Keep daemons for no-op/edit. Exclude preparation and bootstrap.",
+  "measured_controller_sha256": "3f0b32a6ab99d25801cb07e5f9c9a287d07c69995d219bd264c9ae27998cc4bc",
+  "timer": "Monotonic perf_counter_ns; wait for pidfd readiness, then reap the completed process. No timeout polling in accepted rows.",
+  "excluded_attempts": "Exclude preparation, bootstrap, dependency checksum refusals, missing generated setup directory, and all 96 preliminary timing rows collected with Popen.wait(timeout). Retain their failures/correctness evidence privately.",
+  "dependency_bootstrap": {
+    "llvm_archive_expected_sha256": "c4d55430a963e1b939df42703d8328a2092d73c08ceffc897b3e65059bb4a047",
+    "rejected_download_sha256": "b189538689e3bef05418713ec0f67e7b6f79c221cd7817715a3db109b635a647",
+    "resolution": "Supply the exact original archive from a verified download cache; keep the upstream checksum and source unchanged."
+  },
+  "hosts": [
+    {
+      "host_label": "Host C",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "jobs": 8,
+      "binaries": {
+        "bazel": {
+          "sha256": "202e4c8ef0e1014e85648ba27d137769bb94e27a1cd04b1b347405b24f8c6f0a"
+        },
+        "mojo": {
+          "sha256": "d72d688ed65788a577100299e69d56878289271ad2c8d35e8395e17a905e791b"
+        },
+        "rush-after": {
+          "sha256": "9869e0b075a3923b07cef4365cfbf9def89a7e71b2f4646ba5b66bae0933390a"
+        },
+        "rush-before": {
+          "sha256": "bb59c5c93317f1e31b0b553ef25fdf8b28ed04878408277e81e066d71f896133"
+        },
+        "toolchain_tree": {
+          "sha256": "82bbd2f1794a7c42cdd9a33eff91e19c53d2c1949006f2bd8e39ab848c1c8222"
+        }
+      },
+      "rows": [
+        {
+          "engine": "rush-before",
+          "mode": "clean",
+          "sample": 0,
+          "seconds": 14.797793129,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "clean",
+          "sample": 0,
+          "seconds": 14.783328166,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "clean",
+          "sample": 0,
+          "seconds": 12.850901815,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "clean",
+          "sample": 1,
+          "seconds": 14.867409939,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "clean",
+          "sample": 1,
+          "seconds": 12.986016704,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "clean",
+          "sample": 1,
+          "seconds": 14.918927496,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "clean",
+          "sample": 2,
+          "seconds": 13.08335648,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "clean",
+          "sample": 2,
+          "seconds": 14.952014715,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "clean",
+          "sample": 2,
+          "seconds": 14.764816389,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 0,
+          "seconds": 0.003875312,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 0,
+          "seconds": 0.002056952,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 0,
+          "seconds": 0.079801166,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 1,
+          "seconds": 0.003302572,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 1,
+          "seconds": 0.07139812,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 1,
+          "seconds": 0.003999742,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 2,
+          "seconds": 0.054635191,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 2,
+          "seconds": 0.004053513,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 2,
+          "seconds": 0.002733001,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 3,
+          "seconds": 0.003210462,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 3,
+          "seconds": 0.002222401,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 3,
+          "seconds": 0.056690962,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 4,
+          "seconds": 0.003147692,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 4,
+          "seconds": 0.058578743,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 4,
+          "seconds": 0.003498603,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 5,
+          "seconds": 0.052497709,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 5,
+          "seconds": 0.003998002,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 5,
+          "seconds": 0.002593491,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 6,
+          "seconds": 0.003040592,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 6,
+          "seconds": 0.002086481,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 6,
+          "seconds": 0.048560077,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 7,
+          "seconds": 0.002833372,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 7,
+          "seconds": 0.049207268,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 7,
+          "seconds": 0.003380502,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 8,
+          "seconds": 0.047170657,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 8,
+          "seconds": 0.003743782,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 8,
+          "seconds": 0.002947102,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 9,
+          "seconds": 0.003087272,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 9,
+          "seconds": 0.002168851,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 9,
+          "seconds": 0.044241976,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "novel-edit",
+          "sample": 0,
+          "seconds": 10.778693236,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "42a936c937fdb4a7c55d4bfa17233023d5669006fb97399d559557e4154c0e73"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "novel-edit",
+          "sample": 0,
+          "seconds": 10.767260637,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "42a936c937fdb4a7c55d4bfa17233023d5669006fb97399d559557e4154c0e73"
+        },
+        {
+          "engine": "bazel",
+          "mode": "novel-edit",
+          "sample": 0,
+          "seconds": 10.857754624,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "42a936c937fdb4a7c55d4bfa17233023d5669006fb97399d559557e4154c0e73"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "novel-edit",
+          "sample": 1,
+          "seconds": 10.846816297,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "58fa51aa91cdd8e2440de86ba72a821ed84f7502dd3367c66dc6e0b4d3838228"
+        },
+        {
+          "engine": "bazel",
+          "mode": "novel-edit",
+          "sample": 1,
+          "seconds": 10.768326924,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "58fa51aa91cdd8e2440de86ba72a821ed84f7502dd3367c66dc6e0b4d3838228"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "novel-edit",
+          "sample": 1,
+          "seconds": 10.821678136,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "58fa51aa91cdd8e2440de86ba72a821ed84f7502dd3367c66dc6e0b4d3838228"
+        },
+        {
+          "engine": "bazel",
+          "mode": "novel-edit",
+          "sample": 2,
+          "seconds": 10.921072901,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "db7b470fb734a08a50f0620732f135a313ffa0461e5d2f1f0d11036428b3d055"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "novel-edit",
+          "sample": 2,
+          "seconds": 10.855125902,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "db7b470fb734a08a50f0620732f135a313ffa0461e5d2f1f0d11036428b3d055"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "novel-edit",
+          "sample": 2,
+          "seconds": 10.803289652,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "db7b470fb734a08a50f0620732f135a313ffa0461e5d2f1f0d11036428b3d055"
+        }
+      ],
+      "summary": {
+        "clean": {
+          "rush-before": {
+            "samples": 3,
+            "median_seconds": 14.918927496,
+            "min_seconds": 14.797793129,
+            "max_seconds": 14.952014715
+          },
+          "rush-after": {
+            "samples": 3,
+            "median_seconds": 14.783328166,
+            "min_seconds": 14.764816389,
+            "max_seconds": 14.867409939
+          },
+          "bazel": {
+            "samples": 3,
+            "median_seconds": 12.986016704,
+            "min_seconds": 12.850901815,
+            "max_seconds": 13.08335648
+          }
+        },
+        "noop": {
+          "rush-before": {
+            "samples": 10,
+            "median_seconds": 0.0036211925000000002,
+            "min_seconds": 0.003040592,
+            "max_seconds": 0.004053513
+          },
+          "rush-after": {
+            "samples": 10,
+            "median_seconds": 0.002663246,
+            "min_seconds": 0.002056952,
+            "max_seconds": 0.003302572
+          },
+          "bazel": {
+            "samples": 10,
+            "median_seconds": 0.05356645,
+            "min_seconds": 0.044241976,
+            "max_seconds": 0.079801166
+          }
+        },
+        "novel-edit": {
+          "rush-before": {
+            "samples": 3,
+            "median_seconds": 10.821678136,
+            "min_seconds": 10.778693236,
+            "max_seconds": 10.855125902
+          },
+          "rush-after": {
+            "samples": 3,
+            "median_seconds": 10.803289652,
+            "min_seconds": 10.767260637,
+            "max_seconds": 10.846816297
+          },
+          "bazel": {
+            "samples": 3,
+            "median_seconds": 10.857754624,
+            "min_seconds": 10.768326924,
+            "max_seconds": 10.921072901
+          }
+        }
+      },
+      "sources_restored": true,
+      "cleanup_errors": []
+    },
+    {
+      "host_label": "Host D",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "jobs": 8,
+      "binaries": {
+        "bazel": {
+          "sha256": "202e4c8ef0e1014e85648ba27d137769bb94e27a1cd04b1b347405b24f8c6f0a"
+        },
+        "mojo": {
+          "sha256": "d72d688ed65788a577100299e69d56878289271ad2c8d35e8395e17a905e791b"
+        },
+        "rush-after": {
+          "sha256": "9869e0b075a3923b07cef4365cfbf9def89a7e71b2f4646ba5b66bae0933390a"
+        },
+        "rush-before": {
+          "sha256": "bb59c5c93317f1e31b0b553ef25fdf8b28ed04878408277e81e066d71f896133"
+        },
+        "toolchain_tree": {
+          "sha256": "e5ec9d0f0ac007199405728303a6e768064a8842cdbf2dd32ff427a9b06d9ac3"
+        }
+      },
+      "rows": [
+        {
+          "engine": "rush-before",
+          "mode": "clean",
+          "sample": 0,
+          "seconds": 15.198664585,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "clean",
+          "sample": 0,
+          "seconds": 15.359801937,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "clean",
+          "sample": 0,
+          "seconds": 13.508868249,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "clean",
+          "sample": 1,
+          "seconds": 15.355360052,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "clean",
+          "sample": 1,
+          "seconds": 13.459302966,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "clean",
+          "sample": 1,
+          "seconds": 15.398121045,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "clean",
+          "sample": 2,
+          "seconds": 13.469529302,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "clean",
+          "sample": 2,
+          "seconds": 15.518106897,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "clean",
+          "sample": 2,
+          "seconds": 15.576783119,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 0,
+          "seconds": 0.00518899,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 0,
+          "seconds": 0.002883025,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 0,
+          "seconds": 0.077269605,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 1,
+          "seconds": 0.003826087,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 1,
+          "seconds": 0.061990307,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 1,
+          "seconds": 0.003933467,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 2,
+          "seconds": 0.059547412,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 2,
+          "seconds": 0.003657217,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 2,
+          "seconds": 0.002976216,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 3,
+          "seconds": 0.003444907,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 3,
+          "seconds": 0.002465195,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 3,
+          "seconds": 0.058314289,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 4,
+          "seconds": 0.003739698,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 4,
+          "seconds": 0.054697932,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 4,
+          "seconds": 0.004088308,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 5,
+          "seconds": 0.050833136,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 5,
+          "seconds": 0.004494969,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 5,
+          "seconds": 0.003121245,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 6,
+          "seconds": 0.003172636,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 6,
+          "seconds": 0.002574035,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 6,
+          "seconds": 0.054929454,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 7,
+          "seconds": 0.003752356,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 7,
+          "seconds": 0.047536129,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 7,
+          "seconds": 0.003848057,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 8,
+          "seconds": 0.057306308,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 8,
+          "seconds": 0.004223178,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 8,
+          "seconds": 0.002830455,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "noop",
+          "sample": 9,
+          "seconds": 0.003353446,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "noop",
+          "sample": 9,
+          "seconds": 0.002306124,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "bazel",
+          "mode": "noop",
+          "sample": 9,
+          "seconds": 0.054440051,
+          "mojo_precompiles": 0,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "novel-edit",
+          "sample": 0,
+          "seconds": 11.184557279,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "42a936c937fdb4a7c55d4bfa17233023d5669006fb97399d559557e4154c0e73"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "novel-edit",
+          "sample": 0,
+          "seconds": 11.208147081,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "42a936c937fdb4a7c55d4bfa17233023d5669006fb97399d559557e4154c0e73"
+        },
+        {
+          "engine": "bazel",
+          "mode": "novel-edit",
+          "sample": 0,
+          "seconds": 11.382104514,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "42a936c937fdb4a7c55d4bfa17233023d5669006fb97399d559557e4154c0e73"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "novel-edit",
+          "sample": 1,
+          "seconds": 11.205502393,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "58fa51aa91cdd8e2440de86ba72a821ed84f7502dd3367c66dc6e0b4d3838228"
+        },
+        {
+          "engine": "bazel",
+          "mode": "novel-edit",
+          "sample": 1,
+          "seconds": 11.310432897,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "58fa51aa91cdd8e2440de86ba72a821ed84f7502dd3367c66dc6e0b4d3838228"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "novel-edit",
+          "sample": 1,
+          "seconds": 11.277789005,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "58fa51aa91cdd8e2440de86ba72a821ed84f7502dd3367c66dc6e0b4d3838228"
+        },
+        {
+          "engine": "bazel",
+          "mode": "novel-edit",
+          "sample": 2,
+          "seconds": 11.28632113,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "db7b470fb734a08a50f0620732f135a313ffa0461e5d2f1f0d11036428b3d055"
+        },
+        {
+          "engine": "rush-before",
+          "mode": "novel-edit",
+          "sample": 2,
+          "seconds": 11.22169277,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "db7b470fb734a08a50f0620732f135a313ffa0461e5d2f1f0d11036428b3d055"
+        },
+        {
+          "engine": "rush-after",
+          "mode": "novel-edit",
+          "sample": 2,
+          "seconds": 11.268241397,
+          "mojo_precompiles": 1,
+          "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+          "std_mojoc_bytes": 3265666,
+          "edit_sha256": "db7b470fb734a08a50f0620732f135a313ffa0461e5d2f1f0d11036428b3d055"
+        }
+      ],
+      "summary": {
+        "clean": {
+          "rush-before": {
+            "samples": 3,
+            "median_seconds": 15.398121045,
+            "min_seconds": 15.198664585,
+            "max_seconds": 15.518106897
+          },
+          "rush-after": {
+            "samples": 3,
+            "median_seconds": 15.359801937,
+            "min_seconds": 15.355360052,
+            "max_seconds": 15.576783119
+          },
+          "bazel": {
+            "samples": 3,
+            "median_seconds": 13.469529302,
+            "min_seconds": 13.459302966,
+            "max_seconds": 13.508868249
+          }
+        },
+        "noop": {
+          "rush-before": {
+            "samples": 10,
+            "median_seconds": 0.0038907620000000003,
+            "min_seconds": 0.003172636,
+            "max_seconds": 0.00518899
+          },
+          "rush-after": {
+            "samples": 10,
+            "median_seconds": 0.0029296204999999997,
+            "min_seconds": 0.002306124,
+            "max_seconds": 0.003826087
+          },
+          "bazel": {
+            "samples": 10,
+            "median_seconds": 0.056117881,
+            "min_seconds": 0.047536129,
+            "max_seconds": 0.077269605
+          }
+        },
+        "novel-edit": {
+          "rush-before": {
+            "samples": 3,
+            "median_seconds": 11.22169277,
+            "min_seconds": 11.184557279,
+            "max_seconds": 11.277789005
+          },
+          "rush-after": {
+            "samples": 3,
+            "median_seconds": 11.208147081,
+            "min_seconds": 11.205502393,
+            "max_seconds": 11.268241397
+          },
+          "bazel": {
+            "samples": 3,
+            "median_seconds": 11.310432897,
+            "min_seconds": 11.28632113,
+            "max_seconds": 11.382104514
+          }
+        }
+      },
+      "sources_restored": true,
+      "cleanup_errors": []
+    }
+  ]
+}
