@@ -294,6 +294,12 @@ struct TfProtoLibraryInstance {
     role: TfProtoRole,
 }
 
+impl TfProtoLibraryInstance {
+    fn generates_grpc(&self) -> bool {
+        self.has_services || self.create_grpc_library
+    }
+}
+
 /// Resolve the ordered include roots carried by proto dependencies into owned
 /// paths for command construction.  A TensorFlow proto may publicly import a
 /// proto from another repository; its generated `.pb.cc` then includes that
@@ -514,7 +520,7 @@ impl RuleInstance for TfProtoLibraryInstance {
         // again with the grpc plugin to emit `.grpc.pb.h`/.cc siblings so
         // consumers that #include "<pkg>/<base>.grpc.pb.h" resolve against
         // the same genfiles tree the .pb.h files land in.
-        if self.has_services {
+        if self.generates_grpc() {
             // Locate grpc_cpp_plugin: probe PATH and a couple known
             // distro paths. No silent skip — if the declared services
             // require grpc codegen but the plugin isn't installed,
@@ -771,7 +777,7 @@ impl RuleInstance for TfProtoLibraryInstance {
         // The action graph is still declared so producer
         // validation works, but ExecutableAction stays unset and
         // the eligibility predicate routes through legacy.
-        let grpc_path = self.has_services;
+        let grpc_path = self.generates_grpc();
         // ROOT-1b: the CcImpl role reuses the Default's package-qualified
         // generated .pb.{h,cc} (so it must NOT re-declare ProtocCompile —
         // that would duplicate the producer) and instead compiles+archives
@@ -1181,7 +1187,7 @@ impl RuleInstance for TfProtoLibraryInstance {
 
         // ----- CcInfo with typed provider exposure -----
         let direct_link_fragments: Vec<LinkFragment> =
-            compute_proto_link_flags(self.has_services)
+            compute_proto_link_flags(self.generates_grpc())
                 .iter()
                 .map(|f| LinkFragment::Flag(ctx.intern_string(f)))
                 .collect();
@@ -1226,7 +1232,7 @@ impl RuleInstance for TfProtoLibraryInstance {
     /// `SchedulerEligibilityReason::UnsupportedShape`, which
     /// blocks dispatch and routes the target to legacy.
     fn scheduler_shape_unsupported(&self) -> Option<&'static str> {
-        if self.has_services {
+        if self.generates_grpc() {
             Some(
                 "tf_proto_library grpc path not scheduler-verified \
                  (has_services or create_grpc_library is set; \
@@ -1251,7 +1257,7 @@ impl RuleInstance for TfProtoLibraryInstance {
     /// retrofit needed.
     fn scheduler_required_tools(&self) -> Vec<rush_rules::RequiredTool> {
         let mut tools = vec![rush_rules::RequiredTool::Protoc];
-        if self.has_services {
+        if self.generates_grpc() {
             tools.push(rush_rules::RequiredTool::GrpcCppPlugin);
         }
         tools
@@ -1281,7 +1287,7 @@ impl RuleInstance for TfProtoLibraryInstance {
         // Returning empty here is allowed because the eligibility
         // predicate (ActionGraphIncomplete) keeps grpc targets
         // off the scheduler; verifier never reaches them.
-        if self.has_services {
+        if self.generates_grpc() {
             return specs;
         }
 
@@ -1979,6 +1985,27 @@ mod tests {
         let tools = rule.scheduler_required_tools();
         assert!(tools.contains(&rush_rules::RequiredTool::Protoc));
         assert!(tools.contains(&rush_rules::RequiredTool::GrpcCppPlugin));
+    }
+
+    #[test]
+    fn parsed_service_attributes_share_the_scheduler_tool_and_shape_policy() {
+        for has_services in [false, true] {
+            for create_grpc_library in [false, true] {
+                let attributes = HashMap::from([
+                    ("name".to_string(), Value::String("messages".to_string())),
+                    ("has_services".to_string(), Value::Bool(has_services)),
+                    ("create_grpc_library".to_string(), Value::Bool(create_grpc_library)),
+                    ("use_grpc_namespace".to_string(), Value::Bool(true)),
+                ]);
+                let rule = TfProtoLibraryRule.parse_attributes(&attributes).unwrap();
+                let requested = has_services || create_grpc_library;
+                assert_eq!(rule.scheduler_shape_unsupported().is_some(), requested);
+                assert_eq!(
+                    rule.scheduler_required_tools().contains(&rush_rules::RequiredTool::GrpcCppPlugin),
+                    requested,
+                );
+            }
+        }
     }
 
     #[test]
