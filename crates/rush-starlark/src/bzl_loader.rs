@@ -6599,9 +6599,7 @@ impl BzlLoader {
         };
         if label.starts_with("//") && owner.as_deref().unwrap_or("").is_empty() {
             let package = label[2..].split(':').next().unwrap_or("");
-            if package.starts_with("third_party/googleapis") {
-                owner = Some("com_google_googleapis".to_string());
-            } else if let Some(alias) = package.split('/').next().and_then(|first| self.repo_aliases.get(first)) {
+            if let Some(alias) = package.split('/').next().and_then(|first| self.repo_aliases.get(first)) {
                 owner = Some(alias.value().clone());
             }
         }
@@ -6621,9 +6619,6 @@ impl BzlLoader {
         let file_parent = path.parent().ok_or_else(|| anyhow!("No parent for .bzl file {}", path.display()))?.to_path_buf();
         let package_dir = if let Some((_, target)) = label.split_once("//") {
             target.split_once(':').map(|(package, _)| {
-                let package = if label.starts_with("//third_party/googleapis") {
-                    package.strip_prefix("third_party/googleapis").unwrap_or(package).trim_start_matches('/')
-                } else { package };
                 root.join(package)
             })
                 .unwrap_or_else(|| file_parent.clone())
@@ -6705,7 +6700,7 @@ impl BzlLoader {
         // `.bzl`'s full transitive dependency set; a later cache HIT replays it.
         // `None` outside a command scope (capture/replay then no-op).
         let dep_mark = rush_incremental::tracked::mark();
-        let normalized_label = Self::normalize_load_label(bzl_label);
+        let normalized_label = bzl_label.to_string();
         if let Some(cycle_path) = detect_local_cycle_path(&normalized_label) {
             return Err(anyhow!(
                 "Circular dependency detected while loading {}.\n\
@@ -9676,16 +9671,6 @@ impl BzlLoader {
         // This supports TensorFlow-style vendored repos (e.g., //tsl → @local_tsl//tsl).
         if let Some(ctx) = self.current_thread_context() {
             if ctx.repo_root == self.workspace_root {
-                if package.starts_with("third_party/googleapis") {
-                    let rest = package.strip_prefix("third_party/googleapis").unwrap();
-                    let ext_pkg = rest.trim_start_matches('/');
-                    let ext_label = if ext_pkg.is_empty() {
-                        format!("@com_google_googleapis//:{}", filename)
-                    } else {
-                        format!("@com_google_googleapis//{}:{}", ext_pkg, filename)
-                    };
-                    return self.resolve_external_bzl(&ext_label);
-                }
                 if let Some(first) = package.split('/').next() {
                     if let Some(mapped) = self.repo_aliases.get(first) {
                         let ext = format!("@{}//{}:{}", mapped.value(), package, filename);
@@ -9725,29 +9710,6 @@ impl BzlLoader {
         }
 
         Ok(bzl_path)
-    }
-
-    fn normalize_load_label(bzl_label: &str) -> String {
-        Self::rewrite_googleapis_label(bzl_label).unwrap_or_else(|| bzl_label.to_string())
-    }
-
-    fn rewrite_googleapis_label(bzl_label: &str) -> Option<String> {
-        if !bzl_label.starts_with("//") {
-            return None;
-        }
-        let rest = &bzl_label[2..];
-        if !rest.starts_with("third_party/googleapis") {
-            return None;
-        }
-        let (path, filename) = rest.split_once(':')?;
-        let suffix = path.strip_prefix("third_party/googleapis").unwrap();
-        let ext_pkg = suffix.trim_start_matches('/');
-        let ext_label = if ext_pkg.is_empty() {
-            format!("@com_google_googleapis//:{}", filename)
-        } else {
-            format!("@com_google_googleapis//{}:{}", ext_pkg, filename)
-        };
-        Some(ext_label)
     }
 
     /// Resolve package-relative .bzl file (:file.bzl)

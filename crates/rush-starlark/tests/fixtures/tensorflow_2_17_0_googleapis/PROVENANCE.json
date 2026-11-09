@@ -1,0 +1,29 @@
+{
+  "scope": "Byte-authentic load of the TensorFlow wrapper and its external Googleapis module; no repository execution.",
+  "pins": {
+    "tensorflow": "v2.17.0",
+    "googleapis": "6b3fdcea8bc5398be4e7e9930c693f0ea09316a0"
+  },
+  "files": [
+    {
+      "path": "repository_rules.bzl",
+      "url": "https://raw.githubusercontent.com/tensorflow/tensorflow/v2.17.0/third_party/googleapis/repository_rules.bzl",
+      "sha256": "11b2eb7d943f1c24462a9c88b4a84ba03be8751b826fd85aa34305074bd4fea7"
+    },
+    {
+      "path": "googleapis_repository_rules.bzl",
+      "url": "https://raw.githubusercontent.com/googleapis/googleapis/6b3fdcea8bc5398be4e7e9930c693f0ea09316a0/repository_rules.bzl",
+      "sha256": "1ea9af576a42da2b02af67bc1209774fad566bc9cf4b2e5a697e854af808300e"
+    },
+    {
+      "path": "LICENSE.tensorflow",
+      "url": "https://raw.githubusercontent.com/tensorflow/tensorflow/v2.17.0/LICENSE",
+      "sha256": "71c6915d04265772a0339bed47276942c678b45cc01534210ebe6984fd1aec65"
+    },
+    {
+      "path": "LICENSE.googleapis",
+      "url": "https://raw.githubusercontent.com/googleapis/googleapis/6b3fdcea8bc5398be4e7e9930c693f0ea09316a0/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  ]
+}
