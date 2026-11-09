@@ -1848,6 +1848,16 @@ impl DependencyGraph {
         &self,
         critical_set: &HashSet<Label>,
     ) -> Vec<(Label, Label)> {
+        self.find_all_missing_in_scope_with_configuration(critical_set).0
+    }
+
+    /// Retain the configuration-metadata provenance already found by the
+    /// scoped traversal. Compatibility library resolvers must not replace
+    /// these declarations, including alias destinations, with library stubs.
+    pub(crate) fn find_all_missing_in_scope_with_configuration(
+        &self,
+        critical_set: &HashSet<Label>,
+    ) -> (Vec<(Label, Label)>, HashMap<Label, Label>) {
         let mut missing = Vec::new();
         let missing_conditions =
             self.missing_configuration_references_for_scope(critical_set);
@@ -1893,7 +1903,7 @@ impl DependencyGraph {
                 missing.push((owner, condition));
             }
         }
-        missing
+        (missing, condition_owners)
     }
 
     /// Resolve dependencies and build reverse dependency edges
@@ -3801,6 +3811,26 @@ mod tests {
         off_uses_ordinary_default
             .resolve_within_scope(&scope)
             .unwrap();
+    }
+
+    #[test]
+    fn missing_dependency_batch_retains_exact_configuration_alias_provenance() {
+        let mut graph = DependencyGraph::new();
+        add_select_consumer(&mut graph, "//consumer:target", &["//aliases:mode"]);
+        add_alias(&mut graph, "//aliases:mode", "@generated//:condition", None);
+        let consumer = Label::parse("//consumer:target", None, None).unwrap();
+        let ordinary = Label::parse("@generated//:library", None, None).unwrap();
+        graph.add_node(Label::parse("//consumer:ordinary", None, None).unwrap(), Box::new(DummyInstance {
+            deps: vec![ordinary.to_string()],
+        })).unwrap();
+        let scope = HashSet::from([consumer, Label::parse("//consumer:ordinary", None, None).unwrap()]);
+        let (missing, configuration) = graph.find_all_missing_in_scope_with_configuration(&scope);
+        let condition = Label::parse("@generated//:condition", None, None).unwrap();
+        assert_eq!(configuration, HashMap::from([(
+            condition.clone(), Label::parse("//aliases:mode", None, None).unwrap(),
+        )]));
+        let missing_labels: HashSet<_> = missing.into_iter().map(|(_, label)| label).collect();
+        assert_eq!(missing_labels, HashSet::from([condition, ordinary]));
     }
 
     #[test]

@@ -3972,7 +3972,8 @@ impl BuildOrchestrator {
                     needed.len()
                 ),
             );
-            let batch = graph.find_all_missing_in_scope(&needed);
+            let (batch, missing_configuration) =
+                graph.find_all_missing_in_scope_with_configuration(&needed);
             census_phase(
                 "lazy-loop post-find",
                 &format!(
@@ -4118,6 +4119,7 @@ impl BuildOrchestrator {
                         // label here: doing so loses explicit @// and self-alias
                         // main-repository identity.
                         let missing_label = graph.canonicalize_label(missing_label);
+                        let is_configuration_metadata = missing_configuration.contains_key(&missing_label);
 
                         // This target is on the critical path — record it so
                         // that when we later chase ITS transitive deps, they
@@ -4149,7 +4151,7 @@ impl BuildOrchestrator {
                             continue;
                         }
 
-                        if self
+                        if !is_configuration_metadata && self
                             .repository_manager
                             .resolve_missing_dependency(self, &mut graph, &missing_label)
                             .await?
@@ -4347,6 +4349,11 @@ impl BuildOrchestrator {
                             // Test dependencies (test_benchmark, test_main, etc.) may not
                             // exist in our graph because we skip test targets. Stub them
                             // instead of failing the entire build.
+                            if is_configuration_metadata {
+                                return Err(e).with_context(|| format!(
+                                    "Configuration metadata target {} is not declared in its loaded package", missing_label
+                                ));
+                            }
                             let target_is_test_related = missing_label.target.contains("test")
                                 || missing_label.target.contains("benchmark")
                                 || missing_label.package.ends_with("/tests")
@@ -4407,6 +4414,11 @@ impl BuildOrchestrator {
                                     // targets outside the requested scope (common for TF's
                                     // kernel-only external deps like @sobol_data, @icu) stay
                                     // harmless.
+                                    if is_configuration_metadata {
+                                        return Err(e).with_context(|| format!(
+                                            "Repository for configuration metadata {} is unavailable", missing_label
+                                        ));
+                                    }
                                     eprintln!(
                                         "    ⚠️  Unknown external repo '@{}'; stubbing {} as empty SystemCcLibrary",
                                         ws_name, missing_label
@@ -4423,6 +4435,11 @@ impl BuildOrchestrator {
                         let build_path = match self.preferred_build_file(&package_dir) {
                             Some(path) => path,
                             None => {
+                                if is_configuration_metadata {
+                                    return Err(e).with_context(|| format!(
+                                        "BUILD file for configuration metadata {} is missing", missing_label
+                                    ));
+                                }
                                 if self.with_tracked_scope(|| {
                                     Self::unresolved_label_should_fail(
                                         &missing_label,
@@ -4462,13 +4479,13 @@ impl BuildOrchestrator {
                         {
                             Ok(v) => v,
                             Err(parse_err) => {
-                                if missing_label.workspace.is_none() {
+                                if is_configuration_metadata || missing_label.workspace.is_none() {
                                     return Err(parse_err).with_context(|| {
-                                        format!(
-                                            "Failed to load main-repository \
-                                             dependency {}",
-                                            missing_label
-                                        )
+                                        if is_configuration_metadata {
+                                            format!("Failed to load configuration metadata dependency {}", missing_label)
+                                        } else {
+                                            format!("Failed to load main-repository dependency {}", missing_label)
+                                        }
                                     });
                                 }
                                 // Use the alternate Display (`{:#}`) to
@@ -20597,6 +20614,66 @@ filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//co
             semantics_with_define(root, "//:root", "flavor", "main")?,
         ).await.expect_err("the default branch must load its broken configuration only when selected");
         assert!(format!("{error:#}").contains("broken/BUILD"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generated_repository_conditions_load_declarations_and_preserve_aliases_and_errors() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), r#"workspace(name = "generated_conditions")
+local_repository(name = "llvm_terminfo", path = "generated")
+"#)?;
+        write_file(&root.join("generated/WORKSPACE"), "workspace(name = \"llvm_terminfo\")\n")?;
+        // This predicate is the declaration emitted by the existing disabled
+        // generated ROCm repository. A different compatibility-mapped repo
+        // name proves that metadata loading does not infer ROCm label meaning.
+        write_file(&root.join("generated/BUILD"), r#"
+package(default_visibility = ["//visibility:public"])
+config_setting(name = "is_rocm_enabled", define_values = {"ROCM_ENABLED": "1"})
+alias(name = "enabled_alias", actual = ":is_rocm_enabled")
+config_setting(name = "private_condition", define_values = {"ROCM_ENABLED": "1"}, visibility = ["//visibility:private"])
+filegroup(name = "ordinary_library")
+"#)?;
+        write_file(&root.join("generated/broken/BUILD"), "config_setting(name =\n")?;
+        write_file(&root.join("BUILD"), r#"
+filegroup(name = "cpu")
+filegroup(name = "enabled", srcs = select({"//broken:condition": [], "//conditions:default": []}))
+filegroup(name = "root", srcs = select({
+    "@llvm_terminfo//:enabled_alias": [":enabled"], "//conditions:default": [":cpu"],
+}))
+filegroup(name = "real_generated", srcs = select({
+    "@local_config_rocm//:is_rocm_enabled": [":enabled"], "//conditions:default": [":cpu"],
+}))
+filegroup(name = "uses_missing", srcs = select({"@llvm_terminfo//:missing": [], "//conditions:default": []}))
+filegroup(name = "uses_broken", srcs = select({"@llvm_terminfo//broken:condition": [], "//conditions:default": []}))
+filegroup(name = "uses_private", srcs = select({"@llvm_terminfo//:private_condition": [], "//conditions:default": []}))
+filegroup(name = "uses_wrong_kind", srcs = select({"@llvm_terminfo//:ordinary_library": [], "//conditions:default": []}))
+"#)?;
+        write_file(&root.join("broken/BUILD"), "config_setting(name =\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
+        for target in ["//:root", "//:real_generated"] {
+            for _ in 0..2 {
+                orchestrator.build_with_dependencies_with_semantics(vec![target.to_string()],
+                    semantics_with_define(root, target, "ROCM_ENABLED", "0")?).await?;
+            }
+            let error = orchestrator.build_with_dependencies_with_semantics(vec![target.to_string()],
+                semantics_with_define(root, target, "ROCM_ENABLED", "1")?).await
+                .expect_err("the declared enabled predicate must select the broken branch");
+            assert!(format!("{error:#}").contains("broken/BUILD"), "{target}: {error:#}");
+        }
+        for (target, expected) in [
+            ("//:uses_missing", "missing"), ("//:uses_broken", "generated/broken/BUILD"),
+            ("//:uses_private", "private visibility"), ("//:uses_wrong_kind", "not a config_setting"),
+        ] {
+            let error = orchestrator.build_with_dependencies_with_semantics(vec![target.to_string()],
+                semantics_with_define(root, target, "ROCM_ENABLED", "0")?).await
+                .expect_err("invalid metadata must fail even when the predicate is inactive");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{target}: {message}");
+            assert!(!message.contains("system_cc_library"), "{target}: genuine metadata must never become a library stub: {message}");
+        }
         Ok(())
     }
 
