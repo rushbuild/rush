@@ -13,6 +13,7 @@ rush-profiling = { path = "../rush-profiling" }
 rush-protocol = { path = "../rush-protocol" }
 rush-command-core = { path = "../rush-command-core" }
 rush-transport-grpc = { path = "../rush-transport-grpc" }
+rush-remote = { path = "../rush-remote" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

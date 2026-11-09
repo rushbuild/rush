@@ -9,6 +9,7 @@
 pub mod cas;
 pub mod executor;
 pub mod http_cache;
+pub mod reapi;
 
 /// Standard Remote Execution API wire types, generated from pinned upstreams.
 #[allow(missing_docs)]
@@ -20,18 +21,5 @@ pub use cas::{CasClient, CasStats, Digest, DirectoryManifest};
 pub use executor::{RemoteExecutor, RemoteExecutorStats, RemoteStrategy};
 pub use http_cache::HttpCache;
 
-/// Remote execution client (gRPC).
-///
-/// Will implement Remote Execution API v2 protocol.
-pub struct RemoteClient {
-    _endpoint: String,
-}
-
-impl RemoteClient {
-    /// Create a new remote client.
-    pub fn new(endpoint: String) -> Self {
-        RemoteClient {
-            _endpoint: endpoint,
-        }
-    }
-}
+/// Standard Remote Execution API client with verified CAS transfer.
+pub use reapi::ReapiClient as RemoteClient;

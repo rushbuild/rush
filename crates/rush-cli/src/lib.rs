@@ -6,7 +6,7 @@
 
 #![warn(missing_docs)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use rush_build::{
@@ -440,6 +440,27 @@ enum ActionManifestErrorFormat {
 /// Available commands
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Execute a declared file-based action through the standard Remote Execution API.
+    #[command(visible_alias = "rexec")]
+    RemoteExecute {
+        /// JSON action description: argv, explicit inputs, outputs and platform.
+        manifest: PathBuf,
+        /// gRPC endpoint; use HTTPS or an authenticated loopback tunnel.
+        #[arg(long)]
+        endpoint: String,
+        /// Local root for relative inputs and verified outputs.
+        #[arg(long, default_value = ".")]
+        execution_root: PathBuf,
+        /// Backend instance name.
+        #[arg(long, default_value = "")]
+        instance: String,
+        /// Total client deadline, including queue and transfer time.
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..))]
+        deadline_seconds: u32,
+        /// Save outcome metadata and captured streams as JSON.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Build specified targets
     #[command(visible_alias = "b")]
     #[command(after_help = "\
@@ -1311,6 +1332,30 @@ impl Cli {
         let cli = Cli::parse();
 
         match cli.command {
+            Some(Commands::RemoteExecute { manifest, endpoint, execution_root,
+                instance, deadline_seconds, report }) => {
+                use std::io::Write;
+                let spec: rush_remote::reapi::ActionSpec =
+                    serde_json::from_slice(&std::fs::read(manifest)?)?;
+                let deadline = std::time::Duration::from_secs(deadline_seconds.into());
+                let outcome = tokio::time::timeout(deadline, async {
+                    let client = rush_remote::reapi::ReapiClient::connect(endpoint, instance).await?;
+                    client.execute(&execution_root, &spec, deadline).await
+                }).await.context("remote execution client deadline exceeded")??;
+                std::io::stdout().write_all(&outcome.stdout)?;
+                std::io::stderr().write_all(&outcome.stderr)?;
+                if let Some(path) = report {
+                    std::fs::write(path, serde_json::to_vec_pretty(&outcome)?)?;
+                }
+                eprintln!("remote action {}: exit={} cached={}", outcome.action_digest,
+                    outcome.exit_code, outcome.cached);
+                if outcome.exit_code != 0 {
+                    std::process::exit(if (1..=255).contains(&outcome.exit_code) {
+                        outcome.exit_code
+                    } else { 1 });
+                }
+                ()
+            }
             Some(Commands::Build {
                 targets,
                 config,
@@ -5430,5 +5475,18 @@ mod daemon_protocol_rollout_tests {
         };
         assert!(error.contains("does not match client protocol"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reapi_cli_tests {
+    use super::*;
+
+    #[test]
+    fn reject_zero_client_deadline_and_accept_rexec_alias() {
+        assert!(Cli::try_parse_from(["rush", "rexec", "action.json",
+            "--endpoint", "http://127.0.0.1:9000"]).is_ok());
+        assert!(Cli::try_parse_from(["rush", "remote-execute", "action.json",
+            "--endpoint", "http://127.0.0.1:9000", "--deadline-seconds", "0"]).is_err());
     }
 }

@@ -3357,6 +3357,7 @@ dependencies = [
  "rush-parse",
  "rush-profiling",
  "rush-protocol",
+ "rush-remote",
  "rush-transport-grpc",
  "serde_json",
  "tokio",
