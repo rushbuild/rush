@@ -1391,12 +1391,14 @@ struct ModuleCacheKey {
     mappings: Vec<(String, Vec<(String, String)>)>,
     repository_roots: Vec<(String, PathBuf, PathBuf)>,
     aliases: Vec<(String, String)>,
+    implicit_adapters: Vec<(String, PathBuf)>,
+    managed_workspace_sources: Vec<(String, PathBuf)>,
     workspace_repository_context: Option<PathBuf>,
 }
 
 impl ModuleCacheKey {
     fn unqualified(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), workspace: PathBuf::new(), context: None, label: None, mappings: Vec::new(), repository_roots: Vec::new(), aliases: Vec::new(), workspace_repository_context: None }
+        Self { path: path.to_path_buf(), workspace: PathBuf::new(), context: None, label: None, mappings: Vec::new(), repository_roots: Vec::new(), aliases: Vec::new(), implicit_adapters: Vec::new(), managed_workspace_sources: Vec::new(), workspace_repository_context: None }
     }
 
     fn display(&self) -> std::path::Display<'_> { self.path.display() }
@@ -4420,6 +4422,10 @@ pub struct BzlLoader {
     /// External repository paths (@repo -> path)
     /// Uses DashMap for lock-free concurrent reads during parallel BUILD parsing
     pub external_repos: Arc<DashMap<String, PathBuf>>,
+    /// Explicit origin of Rush-created compatibility registrations, bound to
+    /// that exact registration path. User/local sources are never inferred.
+    implicit_system_adapters: Arc<DashSet<(String, PathBuf)>>,
+    managed_workspace_sources: Arc<DashSet<(String, PathBuf)>>,
 
     /// Resource manager for memory-aware .bzl loading (optional for tests)
     resource_manager: Option<Arc<ResourceManager>>,
@@ -4684,6 +4690,8 @@ impl BzlLoader {
             load_dep_cache: Arc::new(DashMap::new()),
             evaluating_paths: HashSet::new(),
             external_repos: Arc::new(DashMap::new()),
+            implicit_system_adapters: Arc::new(DashSet::new()),
+            managed_workspace_sources: Arc::new(DashSet::new()),
             resource_manager,
             memory_budget,
             repo_aliases: Arc::new(DashMap::new()),
@@ -4802,6 +4810,8 @@ impl BzlLoader {
             load_dep_cache: Arc::clone(&self.load_dep_cache),
             evaluating_paths: HashSet::new(), // Each instance tracks its own evaluation
             external_repos: Arc::clone(&self.external_repos), // Shared external repo metadata
+            implicit_system_adapters: Arc::clone(&self.implicit_system_adapters),
+            managed_workspace_sources: Arc::clone(&self.managed_workspace_sources),
             resource_manager: self.resource_manager.clone(), // Shared resource manager
             memory_budget: self.memory_budget.clone(), // Shared memory budget
             repo_aliases: Arc::clone(&self.repo_aliases), // Shared repo aliases
@@ -4902,6 +4912,8 @@ impl BzlLoader {
             key.mappings != self.repository_mapping_cache_identity()
                 || key.repository_roots != self.repository_root_cache_identity()
                 || key.aliases != self.repository_alias_cache_identity()
+                || key.implicit_adapters != self.implicit_system_adapter_cache_identity()
+                || key.managed_workspace_sources != self.managed_workspace_source_cache_identity()
         ) {
             if let Some(ref global) = self.global_cache {
                 let generation = global.symbol_cache.get(&key).map(|entry| entry.generation);
@@ -6073,9 +6085,80 @@ impl BzlLoader {
         }
     }
 
-    /// Add a single external repository path
+    /// Add an explicit user/local source path. Internal analyzer results use
+    /// add_managed_workspace_source so mirrors retain their proof requirement.
     pub fn add_external_repo(&mut self, name: String, path: PathBuf) {
+        self.external_repos.insert(name.clone(), path.clone());
+        // Reclassify only this explicit registration. Keep older path-bound
+        // adapter origins: an orchestrator mirror may still hold that old path.
+        self.implicit_system_adapters.remove(&(name.clone(), path.clone()));
+        self.managed_workspace_sources.remove(&(name, path));
+    }
+
+    /// Record a source admitted by the genuine WORKSPACE analyzer. Keep this
+    /// path-bound origin even when a later client chooses a different cache:
+    /// an old materialization must be re-admitted under that client's context.
+    pub fn add_managed_workspace_source(&self, name: String, path: PathBuf) {
+        self.managed_workspace_sources.insert((name.clone(), path.clone()));
+        self.implicit_system_adapters.remove(&(name.clone(), path.clone()));
         self.external_repos.insert(name, path);
+    }
+
+    pub fn is_managed_workspace_source(&self, name: &str, path: &Path) -> bool {
+        self.managed_workspace_sources.contains(&(name.to_string(), path.to_path_buf()))
+    }
+
+    fn managed_workspace_source_cache_identity(&self) -> Vec<(String, PathBuf)> {
+        let mut origins = self.managed_workspace_sources.iter()
+            .filter(|entry| self.external_repos.get(&entry.key().0).is_some_and(|path| path.value() == &entry.key().1))
+            .map(|entry| entry.key().clone()).collect::<Vec<_>>();
+        origins.sort();
+        origins
+    }
+
+    /// Register a Rush-created compatibility adapter. Only its creator may
+    /// classify it; an arbitrary user path is not an implicit system adapter.
+    pub fn add_implicit_system_adapter(&mut self, name: String, path: PathBuf) {
+        self.implicit_system_adapters.insert((name.clone(), path.clone()));
+        self.external_repos.insert(name, path);
+    }
+
+    pub fn is_implicit_system_adapter(&self, name: &str, path: &Path) -> bool {
+        self.implicit_system_adapters.contains(&(name.to_string(), path.to_path_buf()))
+    }
+
+    pub fn is_main_workspace_repository(&self, name: &str) -> bool {
+        self.is_main_workspace_name(name)
+    }
+
+    fn implicit_system_adapter_cache_identity(&self) -> Vec<(String, PathBuf)> {
+        let mut origins = self.implicit_system_adapters.iter()
+            .filter(|entry| self.external_repos.get(&entry.key().0).is_some_and(|path| path.value() == &entry.key().1))
+            .map(|entry| entry.key().clone()).collect::<Vec<_>>();
+        origins.sort();
+        origins
+    }
+
+    /// Reconcile an async registry mirror with this loader's current source.
+    /// Explicit owner registrations outrank analyzer materializations, which
+    /// outrank automatic compatibility/discovery paths. A newer module-side
+    /// materialization wins over its old managed mirror across client changes.
+    pub fn preferred_registered_repository_path(&self, name: &str, registered: Option<&Path>) -> Option<PathBuf> {
+        let module = self.external_repo_path(name);
+        let rank = |path: &Path| {
+            if self.is_implicit_system_adapter(name, path) { 0 }
+            else if self.is_managed_workspace_source(name, path) { 1 }
+            else { 2 }
+        };
+        match (registered, module) {
+            (Some(registered), Some(module)) => {
+                if rank(&module) > rank(registered) || (rank(&module) == 1 && rank(registered) == 1) {
+                    Some(module)
+                } else { Some(registered.to_path_buf()) }
+            }
+            (Some(registered), None) => Some(registered.to_path_buf()),
+            (None, module) => module,
+        }
     }
 
     /// Return an external repository materialized by this loader.
@@ -6283,6 +6366,7 @@ impl BzlLoader {
                 b"dump_repo_mapping".to_vec(),
                 owner.as_bytes().to_vec(),
             ];
+            rush_incremental::tracked::refresh_filesystem_observations();
             let output = rush_incremental::tracked::probe_process_stdout(
                 &bazel_binary,
                 &args,
@@ -6391,6 +6475,7 @@ impl BzlLoader {
         }
         let path = output_base.join("external").join(&repository);
         if !path.exists() {
+            rush_incremental::tracked::refresh_filesystem_observations();
             let status = StdCommand::new(&bazel_binary)
                 .arg("--output_base")
                 .arg(&output_base)
@@ -6422,6 +6507,7 @@ impl BzlLoader {
             );
         }
 
+        self.implicit_system_adapters.insert((repository.clone(), path.clone()));
         self.external_repos.insert(repository.clone(), path.clone());
         Ok(Some((repository, path)))
     }
@@ -6657,6 +6743,8 @@ impl BzlLoader {
         let mappings = self.repository_mapping_cache_identity();
         Ok((ModuleCacheKey { path: path.to_path_buf(), workspace: self.workspace_root.clone(), context: Some(context), label: Some(label), mappings,
             repository_roots: self.repository_root_cache_identity(), aliases: self.repository_alias_cache_identity(),
+            implicit_adapters: self.implicit_system_adapter_cache_identity(),
+            managed_workspace_sources: self.managed_workspace_source_cache_identity(),
             workspace_repository_context: self.workspace_repository_context.clone() }, root, package_dir))
     }
 
@@ -7134,6 +7222,7 @@ impl BzlLoader {
                     repo_name,
                     candidate.display()
                 );
+                self.implicit_system_adapters.insert((repo_name.to_string(), candidate.clone()));
                 self.external_repos.insert(repo_name.clone(), candidate.clone());
                 repo_root_opt = Some(candidate);
             }
@@ -7154,8 +7243,8 @@ impl BzlLoader {
                     repo_name,
                     stub_path.display()
                 );
-                self.external_repos
-                    .insert(repo_name.to_string(), stub_path.clone());
+                self.implicit_system_adapters.insert((repo_name.to_string(), stub_path.clone()));
+                self.external_repos.insert(repo_name.to_string(), stub_path.clone());
                 repo_root_opt = Some(stub_path);
             }
         }
@@ -7170,6 +7259,7 @@ impl BzlLoader {
                         repo_name,
                         path.display()
                     );
+                    self.implicit_system_adapters.insert((repo_name.to_string(), path.clone()));
                     self.external_repos.insert(repo_name.to_string(), path.clone());
                     repo_root_opt = Some(path);
                 }
@@ -7233,6 +7323,7 @@ impl BzlLoader {
                     repo_name,
                     external_path.display()
                 );
+                self.implicit_system_adapters.insert((repo_name.to_string(), external_path.clone()));
                 self.external_repos.insert(repo_name.to_string(), external_path.clone());
                 repo_root_opt = Some(external_path);
             }
@@ -7245,6 +7336,7 @@ impl BzlLoader {
                     repo_name,
                     cache_external.display()
                 );
+                self.implicit_system_adapters.insert((repo_name.to_string(), cache_external.clone()));
                 self.external_repos
                     .insert(repo_name.to_string(), cache_external.clone());
                 repo_root_opt = Some(cache_external);
@@ -7328,6 +7420,26 @@ impl BzlLoader {
         requested_module: Option<&Path>,
         requested_label: Option<&str>,
     ) -> Result<Option<PathBuf>> {
+        let path = self.try_fetch_known_repo_source(repo_name, canonical, requested_module, requested_label)?;
+        if let Some(path) = &path {
+            if self.workspace_root.join("WORKSPACE").exists() || self.workspace_root.join("WORKSPACE.bazel").exists() {
+                self.add_managed_workspace_source(repo_name.to_string(), path.clone());
+            } else {
+                // Automatically discovered compatibility/Bzlmod roots are not
+                // user registrations if a later command introduces WORKSPACE.
+                self.implicit_system_adapters.insert((repo_name.to_string(), path.clone()));
+            }
+        }
+        Ok(path)
+    }
+
+    fn try_fetch_known_repo_source(
+        &self,
+        repo_name: &str,
+        canonical: bool,
+        requested_module: Option<&Path>,
+        requested_label: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
         let workspace_root = &self.workspace_root;
         // GUARD AGAINST INFINITE RECURSION: Check if we're already fetching this repo
         // This prevents stack overflow when WORKSPACE load() statements reference
@@ -7354,10 +7466,14 @@ impl BzlLoader {
             let _guard = FetchGuard::new(repo_name.to_string());
             // Preserve the original package/target separator. A filesystem
             // path loses the distinction in //defs:subdir/child.bzl.
-            return match requested_label {
+            let materialized = match requested_label {
                 Some(module) => Self::fetch_declared_workspace_repository_for_module(workspace_root, repo_name, module),
                 None => Self::fetch_declared_workspace_repository(workspace_root, repo_name),
-            };
+            }?;
+            if let Some(path) = &materialized {
+                self.add_managed_workspace_source(repo_name.to_string(), path.clone());
+            }
+            return Ok(materialized);
         }
 
         if std::env::var("RUSH_DISABLE_FETCH_DEDUP").ok().as_deref() != Some("1") {
@@ -7856,17 +7972,22 @@ impl BzlLoader {
         let bzlmod_only = self.workspace_root.join("MODULE.bazel").exists()
             && !self.workspace_root.join("WORKSPACE").exists()
             && !self.workspace_root.join("WORKSPACE.bazel").exists();
-        if !bzlmod_only && !repo_name.is_empty() {
-            let cache_root = tracked_command_environment("RUSH_WORKSPACE_CACHE_ROOT")?
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.workspace_root.join(".cache").join("rush"));
-            let expected = cache_root.join("bazel_output_base").join("external").join(repo_name);
-            if path == expected {
+        let managed = self.is_managed_workspace_source(repo_name, path);
+        // A prior WORKSPACE materialization never becomes an explicit source
+        // merely because its defining file was removed or replaced by Bzlmod.
+        // The declared fetch API refuses that unsupported authority transition.
+        if (!bzlmod_only || managed) && !repo_name.is_empty() {
+            let declared_adapter = (self.workspace_root.join("WORKSPACE").exists()
+                || self.workspace_root.join("WORKSPACE.bazel").exists())
+                && self.is_implicit_system_adapter(repo_name, path);
+            if declared_adapter || managed {
                 let materialized = match requested_label {
                     Some(module) => Self::fetch_declared_workspace_repository_for_module(&self.workspace_root, repo_name, module),
                     None => Self::fetch_declared_workspace_repository(&self.workspace_root, repo_name),
                 }?;
-                return materialized.ok_or_else(|| anyhow!("declared repository @{} has no verified source root", repo_name));
+                let materialized = materialized.ok_or_else(|| anyhow!("declared repository @{} has no verified source root", repo_name))?;
+                self.add_managed_workspace_source(repo_name.to_string(), materialized.clone());
+                return Ok(materialized);
             }
         }
         Ok(path.to_path_buf())
@@ -8028,21 +8149,24 @@ impl BzlLoader {
         let workspace_fetch_context = if bzlmod_only {
             None
         } else {
-            let context = crate::fetch_strategy::prepare_workspace_repository_fetch(workspace_root, &bazel_binary)?;
+            let context = crate::fetch_strategy::prepare_workspace_repository_fetch(workspace_root, &bazel_binary)
+                .with_context(|| format!("prepare declared WORKSPACE analyzer context for @{}", repo_name))?;
             let context = match required_module {
                 Some(module) => context.for_required_module(repo_name, module)?,
                 None => context,
             };
             if crate::fetch_strategy::workspace_repository_inputs_are_current(
                 workspace_root, &output_base, repo_name, &context,
-            )? {
+            ).with_context(|| format!("validate declared WORKSPACE inputs for @{}", repo_name))? {
                 return Ok(Some(output_base.join("external").join(repo_name)));
             }
-            if context.native_local_source_is_materialized(&output_base, repo_name)? {
+            if context.native_local_source_is_materialized(&output_base, repo_name)
+                .with_context(|| format!("validate declared local source for @{}", repo_name))? {
                 crate::fetch_strategy::record_workspace_repository_fetch(workspace_root, &output_base, repo_name, &context)?;
                 return Ok(Some(output_base.join("external").join(repo_name)));
             }
-            if context.required_module_source_is_materialized(workspace_root, &output_base, repo_name)? {
+            if context.required_module_source_is_materialized(workspace_root, &output_base, repo_name)
+                .with_context(|| format!("validate required WORKSPACE module for @{}", repo_name))? {
                 // The successful WORKSPACE declaration query is the genuine
                 // consumer of this exact source module. Preserve its original
                 // package:target; do not load an unrelated package BUILD merely
@@ -8101,6 +8225,7 @@ impl BzlLoader {
                 String::new()
             };
 
+            rush_incremental::tracked::refresh_filesystem_observations();
             let mapping_output = StdCommand::new(&bazel_binary)
                 .arg("--output_base")
                 .arg(&output_base)
@@ -8180,6 +8305,9 @@ impl BzlLoader {
         } else {
             fetch_command.arg("fetch").arg(&workspace_target);
         }
+        // The analyzer may materialize paths previously observed absent.
+        // Retain their dependencies but stop reusing pre-mutation observations.
+        rush_incremental::tracked::refresh_filesystem_observations();
         let status = fetch_command.status().map_err(|error| {
             anyhow!(
                 "failed to start `{} {}`: {}",

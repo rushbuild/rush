@@ -4476,9 +4476,9 @@ impl BuildOrchestrator {
 
                         // Instantiate all rules in this BUILD file. If BUILD
                         // evaluation itself fails, main-repository packages
-                        // fail at the loading cause. Retain the documented
-                        // compatibility fallback only for external packages
-                        // whose .bzl syntax Rush does not yet support.
+                        // fail at the loading cause, as do source-backed
+                        // external packages. Compatibility fallback cannot
+                        // replace an explicit or declared source's BUILD.
                         let condition_targets = HashSet::from([declaration_seed]);
                         let rule_instances = match self
                             .instantiate_build_file_for_repository_targets(
@@ -4490,10 +4490,15 @@ impl BuildOrchestrator {
                         {
                             Ok(v) => v,
                             Err(parse_err) => {
-                                if is_configuration_metadata || missing_label.workspace.is_none() {
+                                let source_backed = missing_label.workspace.as_deref().is_some_and(|name|
+                                    self.requires_declared_workspace_source(name)
+                                        || self.has_registered_source_repository(name));
+                                if is_configuration_metadata || missing_label.workspace.is_none() || source_backed {
                                     return Err(parse_err).with_context(|| {
                                         if is_configuration_metadata {
                                             format!("Failed to load configuration metadata dependency {}", missing_label)
+                                        } else if source_backed {
+                                            format!("Failed to load source-backed repository dependency {}", missing_label)
                                         } else {
                                             format!("Failed to load main-repository dependency {}", missing_label)
                                         }
@@ -10102,6 +10107,9 @@ impl BuildOrchestrator {
     }
 
     pub fn register_absl_strings_stub(&self, graph: &mut DependencyGraph) -> Result<()> {
+        if self.requires_declared_workspace_source("com_google_absl") || self.has_registered_source_repository("com_google_absl") {
+            anyhow::bail!("required declared WORKSPACE Abseil targets cannot be replaced by compatibility stubs");
+        }
         let targets = vec![
             ("strings", Vec::<String>::new()),
             (
@@ -10128,6 +10136,9 @@ impl BuildOrchestrator {
     }
 
     pub fn register_system_stub(&self, graph: &mut DependencyGraph, label: &Label) -> Result<()> {
+        if label.workspace.as_deref().is_some_and(|name| self.requires_declared_workspace_source(name) || self.has_registered_source_repository(name)) {
+            anyhow::bail!("required declared WORKSPACE target {} cannot be replaced by a compatibility stub", label);
+        }
         if graph.has_node(label) {
             return Ok(());
         }
@@ -10966,6 +10977,9 @@ impl BuildOrchestrator {
     }
 
     pub fn register_local_tsl_external_stubs(&self, graph: &mut DependencyGraph) -> Result<()> {
+        if self.requires_declared_workspace_source("local_tsl") || self.has_registered_source_repository("local_tsl") {
+            anyhow::bail!("source-backed @local_tsl targets cannot be replaced by compatibility stubs");
+        }
         let targets = vec![("grpc_lib", Vec::<String>::new())];
 
         for (name, deps) in targets {
@@ -11291,12 +11305,19 @@ impl BuildOrchestrator {
     }
 
     async fn ensure_known_repo_registered(&self, repo_name: &str) -> Result<bool> {
+        if self.requires_declared_workspace_source(repo_name) {
+            self.fetch_workspace_repository_with_bazel(repo_name, &HashMap::new(), None).await?;
+            return Ok(true);
+        }
         let known_repos = SystemPackageMapper::get_known_repository_paths(&self.workspace_root)?;
         if let Some(path) = known_repos.get(repo_name) {
             let mut repo_paths = self.external_repo_paths.lock().await;
             if !repo_paths.contains_key(repo_name) {
                 eprintln!("    ⚙️  Registering system repository @{}", repo_name);
                 repo_paths.insert(repo_name.to_string(), path.clone());
+            }
+            if let Ok(mut loader) = self.bzl_loader.lock() {
+                loader.add_implicit_system_adapter(repo_name.to_string(), path.clone());
             }
             return Ok(true);
         }
@@ -11321,7 +11342,7 @@ impl BuildOrchestrator {
         })?.ok_or_else(|| anyhow!("WORKSPACE repository @{} was not materialized by its declared repository rule", repository))?;
         self.external_repo_paths.lock().await.insert(repository.to_string(), path.clone());
         let mut loader = self.bzl_loader.lock().map_err(|_| anyhow!("BzlLoader lock poisoned while registering declared repository"))?;
-        loader.add_external_repo(repository.to_string(), path.clone());
+        loader.add_managed_workspace_source(repository.to_string(), path.clone());
         if !mapping.is_empty() {
             loader.set_command_repo_mapping_for(repository.to_string(), mapping.clone());
         }
@@ -11329,6 +11350,10 @@ impl BuildOrchestrator {
     }
 
     pub(crate) async fn fetch_repo_with_bazel(&self, repo_name: &str) -> Result<bool> {
+        if self.requires_declared_workspace_source(repo_name) {
+            self.fetch_workspace_repository_with_bazel(repo_name, &HashMap::new(), None).await?;
+            return Ok(true);
+        }
         if SystemPackageMapper::is_system_repo(repo_name) {
             return Ok(false);
         }
@@ -11691,11 +11716,15 @@ impl BuildOrchestrator {
         self.record_bazel_fetch_marker(repo_name, &target_repo_path)?;
 
         let mut repo_paths = self.external_repo_paths.lock().await;
-        repo_paths.insert(repo_name.to_string(), target_repo_path);
+        repo_paths.insert(repo_name.to_string(), target_repo_path.clone());
+        if let Ok(mut loader) = self.bzl_loader.lock() {
+            loader.add_implicit_system_adapter(repo_name.to_string(), target_repo_path);
+        }
         Ok(true)
     }
 
     async fn register_cached_repo(&self, repo_name: &str) -> Result<bool> {
+        if self.requires_declared_workspace_source(repo_name) { return Ok(false); }
         if FORCE_BAZEL_FETCH_REPOS.contains(&repo_name) {
             eprintln!(
                 "    ⚠️  Cached repository @{} requires Bazel-managed contents; forcing re-fetch",
@@ -11765,7 +11794,7 @@ impl BuildOrchestrator {
                 // "//absl:copts/configure_copts.bzl") resolve against the
                 // MAIN workspace.
                 if let Ok(mut loader) = self.bzl_loader.lock() {
-                    loader.add_external_repo(repo_name.to_string(), candidate);
+                    loader.add_implicit_system_adapter(repo_name.to_string(), candidate);
                 }
             }
             return Ok(true);
@@ -19931,7 +19960,7 @@ filegroup(name = "globbed", srcs = glob(["**/*.cc"]))
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn external_build_parse_failure_keeps_compatibility_fallback() -> Result<()> {
+    async fn external_source_build_parse_failure_refuses_compatibility_fallback() -> Result<()> {
         once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
         let temp = TempDir::new()?;
         let workspace_root = temp.path();
@@ -19958,9 +19987,14 @@ filegroup(name = "globbed", srcs = glob(["**/*.cc"]))
             .expect("BzlLoader lock")
             .add_external_repo("repo".to_string(), external_root);
 
-        orchestrator
+        let before = poisoned_stub_note();
+        let error = orchestrator
             .build_with_dependencies(vec!["//p:root".to_string()])
-            .await?;
+            .await.expect_err("a registered source BUILD error must not become an empty library");
+        let message = format!("{error:#}");
+        assert!(message.contains("Failed to load source-backed repository dependency @repo//broken:target"), "{message}");
+        assert!(message.contains("parse configuration package") && message.contains("Unexpected token"), "{message}");
+        assert_eq!(poisoned_stub_note(), before, "a refused source must not register a poisoned stub");
         Ok(())
     }
 
@@ -20721,17 +20755,141 @@ int main() { printf("%d\n", fixture::float8_value + fixture::intn_value); return
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_local_repository_targets_bypass_reserved_name_stubs() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), r#"workspace(name = "explicit_reserved_source")
+local_repository(name = "flatbuffers", path = "real")
+"#)?;
+        write_file(&root.join("real/WORKSPACE"), r#"workspace(name = "flatbuffers")
+"#)?;
+        write_file(&root.join("real/BUILD"), r#"cc_library(name = "actual", hdrs = ["actual.h"], visibility = ["//visibility:public"])
+"#)?;
+        write_file(&root.join("real/actual.h"), "#define DECLARED_HEADER_VALUE 42\n")?;
+        write_file(&root.join("BUILD"), r#"cc_library(name = "consumer", deps = ["@flatbuffers//:actual"])
+"#)?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+        orchestrator.load_workspace(false).await?;
+        let target = Label::parse("@flatbuffers//:actual", None, None)?;
+        let mut graph = DependencyGraph::new();
+        assert!(!orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &target).await?);
+        assert!(!graph.has_node(&target));
+        assert!(orchestrator.register_system_stub(&mut graph, &target).is_err());
+        let targets = vec!["//:consumer".to_string()];
+        let semantics = semantics_with_define(root, "//:consumer", "source_fixture", "true")?;
+        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
+        orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        let snapshot = orchestrator.snapshot_cache.get(&key).expect("real source graph");
+        let node = snapshot.graph.get(&target).expect("declared external target");
+        assert_eq!(node.rule_instance.rule_type(), "cc_library");
+        assert!(snapshot.graph.has_node(&Label::parse("@flatbuffers//:actual.h", None, None)?));
+        drop(snapshot);
+        write_file(&root.join("BUILD"), r#"cc_library(name = "consumer", deps = ["@flatbuffers//:absent"])
+"#)?;
+        let error = orchestrator.build_with_dependencies_with_semantics(targets, semantics).await
+            .expect_err("a missing declared target must not become a reserved-name stub");
+        assert!(format!("{error:#}").contains("absent"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatibility_configuration_setup_preserves_explicit_local_repository_sources() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path().join("workspace");
+        let declared = root.join("declared");
+        let names = ["local_config_rocm", "local_config_cuda", "local_config_python", "local_xla", "local_tsl", "org_tensorflow"];
+        let mut workspace = String::from("workspace(name = \"explicit_config_sources\")\n");
+        for name in names {
+            workspace.push_str(&format!("local_repository(name = {name:?}, path = \"declared\")\n"));
+        }
+        write_file(&root.join("WORKSPACE"), &workspace)?;
+        write_file(&root.join("BUILD"), "filegroup(name = \"main\")\n")?;
+        write_file(&declared.join("WORKSPACE"), "workspace(name = \"declared_sources\")\n")?;
+        write_file(&declared.join("BUILD"), "filegroup(name = \"actual_source\")\n")?;
+        // Make the ordinary legacy TensorFlow-vendor fallback available too;
+        // it must not replace a local_repository with a reserved-looking name.
+        write_file(&temp.path().join("tensorflow/third_party/xla/BUILD"),
+            "filegroup(name = \"wrong_fallback\")\n")?;
+        write_file(&temp.path().join("tensorflow/third_party/xla/third_party/tsl/BUILD"),
+            "filegroup(name = \"wrong_fallback\")\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.clone());
+        orchestrator.ensure_tracked_io();
+        for _ in 0..2 {
+            orchestrator.load_workspace(false).await?;
+            let paths = orchestrator.external_repo_paths.lock().await;
+            let loader = orchestrator.bzl_loader.lock().unwrap();
+            for name in names {
+                assert_eq!(paths.get(name), Some(&declared), "async registry changed declared source for {name}");
+                assert_eq!(loader.external_repo_path(name), Some(declared.clone()), "module registry changed declared source for {name}");
+                assert!(!loader.is_implicit_system_adapter(name, &declared));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(declared.join("BUILD"))?, "filegroup(name = \"actual_source\")\n");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatibility_setup_reconciles_explicit_loader_sources_with_stale_adapter_mirrors() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path().join("workspace");
+        let source = root.join("provided");
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"split_registry_sources\")\n")?;
+        write_file(&root.join("BUILD"), "filegroup(name = \"main\")\n")?;
+        write_file(&source.join("BUILD"), "filegroup(name = \"actual_source\")\n")?;
+        write_file(&temp.path().join("tensorflow/third_party/xla/BUILD"),
+            "filegroup(name = \"wrong_vendor\")\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.clone());
+        orchestrator.ensure_tracked_io();
+        for name in ["local_config_cuda", "local_xla", "flatbuffers", "managed_source"] {
+            let old = crate::cache_paths::workspace_external_dir(&root).join(name);
+            write_file(&old.join("BUILD"), "filegroup(name = \"old_adapter\")\n")?;
+            orchestrator.external_repo_paths.lock().await.insert(name.into(), old.clone());
+            let mut loader = orchestrator.bzl_loader.lock().unwrap();
+            if name == "managed_source" {
+                loader.add_managed_workspace_source(name.into(), old.clone());
+            } else {
+                loader.add_implicit_system_adapter(name.into(), old.clone());
+            }
+            loader.add_external_repo(name.into(), source.clone());
+            assert!(loader.is_implicit_system_adapter(name, &old) || loader.is_managed_workspace_source(name, &old));
+            assert!(!loader.is_implicit_system_adapter(name, &source));
+        }
+        for name in ["flatbuffers", "managed_source"] {
+            let registered = orchestrator.external_repo_paths.lock().await.get(name).cloned();
+            assert!(!orchestrator.requires_declared_workspace_source_for_path(name, registered.as_deref()),
+                "an explicit module source must outrank its stale async mirror before workspace setup");
+        }
+        for _ in 0..2 {
+            orchestrator.load_workspace(false).await?;
+            let paths = orchestrator.external_repo_paths.lock().await;
+            let loader = orchestrator.bzl_loader.lock().unwrap();
+            for name in ["local_config_cuda", "local_xla", "flatbuffers", "managed_source"] {
+                assert_eq!(paths.get(name), Some(&source), "stale async adapter must yield to module source for {name}");
+                assert_eq!(loader.external_repo_path(name), Some(source.clone()), "fallback must preserve module source for {name}");
+                assert!(!loader.is_implicit_system_adapter(name, &source));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(source.join("BUILD"))?, "filegroup(name = \"actual_source\")\n");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn generated_repository_conditions_load_declarations_and_preserve_aliases_and_errors() -> Result<()> {
         once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
         let temp = TempDir::new()?;
         let root = temp.path();
         write_file(&root.join("WORKSPACE"), r#"workspace(name = "generated_conditions")
 local_repository(name = "llvm_terminfo", path = "generated")
+local_repository(name = "local_config_rocm", path = "generated")
 "#)?;
         write_file(&root.join("generated/WORKSPACE"), "workspace(name = \"llvm_terminfo\")\n")?;
-        // This predicate is the declaration emitted by the existing disabled
-        // generated ROCm repository. A different compatibility-mapped repo
-        // name proves that metadata loading does not infer ROCm label meaning.
+        // Declare both generated-configuration names explicitly: a required
+        // WORKSPACE reference must not depend on an implicit system adapter.
+        // The shared source fixture proves that metadata loading follows its
+        // declared predicate and aliases rather than inferring ROCm meaning.
         write_file(&root.join("generated/BUILD"), r#"
 package(default_visibility = ["//visibility:public"])
 config_setting(name = "is_rocm_enabled", define_values = {"ROCM_ENABLED": "1"})
@@ -20760,6 +20918,8 @@ filegroup(name = "uses_wrong_kind", srcs = select({"@llvm_terminfo//:ordinary_li
             for _ in 0..2 {
                 orchestrator.build_with_dependencies_with_semantics(vec![target.to_string()],
                     semantics_with_define(root, target, "ROCM_ENABLED", "0")?).await?;
+                assert_eq!(orchestrator.external_repo_paths.lock().await.get("local_config_rocm"),
+                    Some(&root.join("generated")), "explicit generated repository must survive compatibility setup");
             }
             let error = orchestrator.build_with_dependencies_with_semantics(vec![target.to_string()],
                 semantics_with_define(root, target, "ROCM_ENABLED", "1")?).await

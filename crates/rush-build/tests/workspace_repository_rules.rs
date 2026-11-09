@@ -398,3 +398,142 @@ load("@source_fixture//nested:subdir/child.bzl", CHILD = "VALUE")
     assert_eq!(std::fs::read(&proof_path).unwrap(), proof_bytes);
     assert_eq!(std::fs::read_to_string(source.join("defs.bzl")).unwrap(), "VALUE = 42\n");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires explicitly configured RUSH_BAZEL_PATH pointing to Bazel 6.5.0"]
+async fn implicit_system_adapter_yields_to_declared_workspace_module_and_target() {
+    use bytes::Bytes;
+    use rush_command_core::CommandSemantics;
+    use rush_incremental::{tracked, RealTrackedIo};
+    use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+    use rush_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::{Arc, Mutex};
+    let binary = PathBuf::from(std::env::var_os("RUSH_BAZEL_PATH").expect("set exact Bazel 6.5.0"));
+    assert!(binary.is_absolute());
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "bazel 6.5.0");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let cache = rush_build::cache_paths::workspace_cache_root(root);
+    assert!(cache.starts_with(root));
+    let _shutdown = BazelShutdown { binary: binary.clone(), output: cache.join("bazel_output_base"), workspace: root.to_owned() };
+    std::fs::write(root.join("BUILD"), "load(\"@com_google_absl//:defs.bzl\", \"VALUE\")\ncc_library(name = \"main_value_%s\" % VALUE)\nexports_files([\"rules.bzl\", \"source.txt\", \"fix.patch\"])\n").unwrap();
+    std::fs::write(root.join("rules.bzl"), r##"
+def _impl(ctx):
+    source = int(ctx.read(Label("//:source.txt")).strip())
+    ctx.file("value.h", "#define PATCHED 0\n")
+    ctx.patch(ctx.path(Label("//:fix.patch")), strip = 1)
+    patched = int(ctx.read("value.h").strip().split(" ")[-1])
+    value = source + patched + int(ctx.os.environ.get("IMPLICIT_SOURCE_ENV", "0"))
+    ctx.file("defs.bzl", "VALUE = %d\n" % value)
+    ctx.file("BUILD", 'filegroup(name = "module", srcs = ["defs.bzl"])\n')
+    ctx.file("absl/strings/value.h", "int declared_value();\n")
+    ctx.file("absl/strings/value.cc", "int declared_value() { return %d; }\n" % value)
+    ctx.file("absl/strings/BUILD", 'cc_library(name = "strings", srcs = ["value.cc"], hdrs = ["value.h"], visibility = ["//visibility:public"])\n')
+source_repository = repository_rule(implementation = _impl, environ = ["IMPLICIT_SOURCE_ENV"])
+"##).unwrap();
+    std::fs::write(root.join("WORKSPACE"), "workspace(name = \"implicit_precedence_control\")\nload(\"//:rules.bzl\", \"source_repository\")\nsource_repository(name = \"com_google_absl\")\n").unwrap();
+    std::fs::write(root.join("source.txt"), "40\n").unwrap();
+    let patch = |value| format!("--- a/value.h\n+++ b/value.h\n@@ -1 +1 @@\n-#define PATCHED 0\n+#define PATCHED {value}\n");
+    std::fs::write(root.join("fix.patch"), patch(1)).unwrap();
+    let orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+    let adapter = cache.join("external/com_google_absl");
+    assert!(adapter.join("absl/strings/BUILD").exists());
+    // This is deliberately conflicting data in a known implicit adapter, not
+    // a fetched source or a requested-function fallback.
+    std::fs::write(adapter.join("defs.bzl"), "VALUE = 99\n").unwrap();
+    let adapter_build = std::fs::read(adapter.join("absl/strings/BUILD")).unwrap();
+    let io = orchestrator.install_fresh_tracked_io_for_test();
+    // Resolve the module through the actual orchestrator first. This changes
+    // its loader's source root while the async registry may still hold the old
+    // adapter path; that old registration must retain its implicit origin.
+    let main = orchestrator.instantiate_build_file(&root.join("BUILD"), None).unwrap();
+    assert!(main.iter().any(|instance| instance.target_name() == "main_value_41"));
+    let target = Label::parse("@com_google_absl//absl/strings:strings", None, None).unwrap();
+    let mut graph = DependencyGraph::new();
+    assert!(orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &target).await.unwrap());
+    let source = orchestrator.external_repo_paths.lock().await["com_google_absl"].clone();
+    assert!(source.starts_with(cache.join("bazel_output_base/external")));
+    assert_eq!(std::fs::read_to_string(source.join("defs.bzl")).unwrap(), "VALUE = 41\n");
+    assert!(std::fs::read_to_string(source.join("absl/strings/BUILD")).unwrap().contains("srcs = [\"value.cc\"]"));
+    let instances = orchestrator.instantiate_build_file(&source.join("absl/strings/BUILD"), Some(&source)).unwrap();
+    assert!(instances.iter().any(|instance| instance.target_name() == "strings"));
+    // The module route must independently bypass an explicitly origin-tagged
+    // adapter, including with a new genuine captured client environment.
+    let alternate_cache = root.join("alternate-command-cache");
+    let _alternate_shutdown = BazelShutdown { binary: binary.clone(), output: alternate_cache.join("bazel_output_base"), workspace: root.to_owned() };
+    let persistent_loader = Arc::new(Mutex::new(rush_starlark::BzlLoader::new_with_global_cache(
+        root.to_owned(), rush_starlark::bzl_loader::GlobalBzlCache::new(),
+    )));
+    persistent_loader.lock().unwrap().add_implicit_system_adapter("com_google_absl".into(), adapter.clone());
+    let module_value = |environment_value: &str, command_cache: &std::path::Path| {
+        let mut environment = std::env::vars_os().filter(|(name, _)| name != "IMPLICIT_SOURCE_ENV" && name != "RUSH_WORKSPACE_CACHE_ROOT")
+            .map(|(name, value)| EnvironmentVariable {
+                name: Bytes::copy_from_slice(name.as_os_str().as_bytes()),
+                value: Bytes::copy_from_slice(value.as_os_str().as_bytes()),
+            }).collect::<Vec<_>>();
+        environment.push(EnvironmentVariable { name: Bytes::from_static(b"IMPLICIT_SOURCE_ENV"), value: Bytes::from(environment_value.to_owned()) });
+        environment.push(EnvironmentVariable { name: Bytes::from_static(b"RUSH_WORKSPACE_CACHE_ROOT"), value: Bytes::copy_from_slice(command_cache.as_os_str().as_bytes()) });
+        let request = RunRequest {
+            auth_cookie: Bytes::new(), argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build"), Bytes::from_static(b"//:test")],
+            working_directory: Bytes::from(root.to_str().unwrap().to_owned()), environment,
+            block_for_lock: true, client_build_id: "implicit-source-control".into(),
+            protocol_major: PROTOCOL_MAJOR, protocol_minor: PROTOCOL_MINOR, workspace_config: vec![],
+        };
+        let io = Arc::new(RealTrackedIo::new(CommandSemantics::from_run_request(&request).unwrap(), root));
+        tokio::task::block_in_place(|| tracked::scope(io, || {
+            rush_starlark::BzlLoader::load_bzl_from_evaluator(persistent_loader.clone(), "@com_google_absl//:defs.bzl", &[("VALUE".into(), "VALUE".into())])
+                .map(|values| values["VALUE"].clone())
+        }))
+    };
+    assert_eq!(module_value("0", &cache).unwrap(), rush_starlark::Value::Int(41));
+    let manifest = io.manifest();
+    std::fs::write(root.join("fix.patch"), patch(2)).unwrap();
+    assert!(matches!(io.validate_manifest(&manifest).staleness, Staleness::Stale { .. }));
+    assert_eq!(module_value("0", &cache).unwrap(), rush_starlark::Value::Int(42));
+    std::fs::write(root.join("source.txt"), "41\n").unwrap();
+    assert_eq!(module_value("0", &cache).unwrap(), rush_starlark::Value::Int(43));
+    assert_eq!(module_value("1", &cache).unwrap(), rush_starlark::Value::Int(44));
+    // Reuse this loader and its resident global exports with a different
+    // immutable client cache root and repository-rule environment. The old
+    // genuine path remains managed authority, never an explicit user source.
+    let first_source = persistent_loader.lock().unwrap().external_repo_path("com_google_absl").unwrap();
+    assert!(persistent_loader.lock().unwrap().is_managed_workspace_source("com_google_absl", &first_source));
+    assert_eq!(module_value("2", &alternate_cache).unwrap(), rush_starlark::Value::Int(45));
+    let second_source = persistent_loader.lock().unwrap().external_repo_path("com_google_absl").unwrap();
+    assert_ne!(first_source, second_source);
+    assert!(second_source.starts_with(alternate_cache.join("bazel_output_base/external")));
+    assert_eq!(module_value("1", &cache).unwrap(), rush_starlark::Value::Int(44));
+    assert_eq!(std::fs::read(adapter.join("absl/strings/BUILD")).unwrap(), adapter_build);
+    assert_eq!(std::fs::read_to_string(adapter.join("defs.bzl")).unwrap(), "VALUE = 99\n");
+    // Unknown/deleted declarations and missing source inputs fail rather than
+    // returning either the old genuine materialization or adapter value99.
+    std::fs::remove_file(root.join("source.txt")).unwrap();
+    assert!(module_value("1", &cache).is_err());
+    std::fs::write(root.join("source.txt"), "41\n").unwrap();
+    std::fs::write(root.join("WORKSPACE"), "workspace(name = \"implicit_precedence_control\")\n").unwrap();
+    assert!(module_value("1", &cache).is_err());
+    orchestrator.install_fresh_tracked_io_for_test();
+    assert!(orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &target).await.is_err());
+    let unknown = Label::parse("@unavailable_declared_source//:target", None, None).unwrap();
+    assert!(orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &unknown).await.is_err());
+    assert!(!graph.has_node(&target));
+    assert!(!graph.has_node(&unknown));
+    // Removing WORKSPACE entirely must not reinterpret a known managed root as
+    // an explicit/no-WORKSPACE compatibility registration in either loader.
+    std::fs::remove_file(root.join("WORKSPACE")).unwrap();
+    assert!(module_value("1", &cache).is_err());
+    orchestrator.install_fresh_tracked_io_for_test();
+    assert!(orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &target).await.is_err());
+    // A transition to Bzlmod likewise needs a new supported ownership proof;
+    // neither graph nor module loading may reuse the former WORKSPACE bytes.
+    std::fs::write(root.join("MODULE.bazel"), "module(name = \"authority_transition\")\n").unwrap();
+    let error = module_value("1", &cache).unwrap_err();
+    assert!(format!("{error:#}").contains("declared WORKSPACE repository fetch cannot use Bzlmod discovery"), "{error:#}");
+    orchestrator.install_fresh_tracked_io_for_test();
+    let error = orchestrator.repository_manager.resolve_missing_dependency(&orchestrator, &mut graph, &target).await.unwrap_err();
+    assert!(format!("{error:#}").contains("declared WORKSPACE repository fetch cannot use Bzlmod discovery"), "{error:#}");
+    assert!(!graph.has_node(&target));
+}

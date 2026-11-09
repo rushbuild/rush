@@ -440,6 +440,19 @@ impl RepositoryManager {
         missing_label: &Label,
     ) -> Result<bool> {
         let missing_label_str = missing_label.to_string();
+        if let Some(repository) = missing_label.workspace.as_deref() {
+            let registered = orchestrator.external_repo_paths.lock().await.get(repository).cloned();
+            if orchestrator.requires_declared_workspace_source_for_path(repository, registered.as_deref()) {
+                let mapping = self.get_http_archive(repository).map(|archive| archive.repo_mapping).unwrap_or_default();
+                orchestrator.fetch_workspace_repository_with_bazel(repository, &mapping, Some(missing_label)).await?;
+                return Ok(true);
+            }
+            if orchestrator.has_registered_source_repository_for_path(repository, registered.as_deref()) {
+                // The configured package loader must resolve the actual BUILD
+                // declaration, including errors for an absent target.
+                return Ok(false);
+            }
+        }
 
         // Check for known system stubs.
         //

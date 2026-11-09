@@ -1173,6 +1173,11 @@ impl BuildOrchestrator {
             builtin_repos_dashmap.insert(name.clone(), path.clone());
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
+        for (name, path) in &builtin_repos {
+            if name != "bazel_tools" {
+                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
+            }
+        }
 
         // Phase 5.C.4 commit 7: hold a clone for RushActionManager
         // before resource_manager moves into the struct literal.
@@ -1382,6 +1387,11 @@ impl BuildOrchestrator {
             builtin_repos_dashmap.insert(name.clone(), path.clone());
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
+        for (name, path) in &builtin_repos {
+            if name != "bazel_tools" {
+                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
+            }
+        }
 
         let cache = Arc::new(ActionCache::new());
 
@@ -1553,6 +1563,11 @@ impl BuildOrchestrator {
             builtin_repos_dashmap.insert(name.clone(), path.clone());
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
+        for (name, path) in &builtin_repos {
+            if name != "bazel_tools" {
+                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
+            }
+        }
 
         // Phase 5.C.4 commit 7: clone resource_manager for ActionManager.
         let action_manager_resource_manager = Arc::clone(&resource_manager);
@@ -1721,6 +1736,11 @@ impl BuildOrchestrator {
             builtin_repos_dashmap.insert(name.clone(), path.clone());
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
+        for (name, path) in &builtin_repos {
+            if name != "bazel_tools" {
+                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
+            }
+        }
 
         // Phase 5.C.4 commit 7: clone resource_manager for ActionManager.
         let action_manager_resource_manager = Arc::clone(&resource_manager);
@@ -1880,6 +1900,11 @@ impl BuildOrchestrator {
             builtin_repos_dashmap.insert(name.clone(), path.clone());
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
+        for (name, path) in &builtin_repos {
+            if name != "bazel_tools" {
+                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
+            }
+        }
 
         // Phase 5.C.4 commit 7: clone resource_manager for ActionManager.
         let action_manager_resource_manager = Arc::clone(&resource_manager);
@@ -1995,20 +2020,23 @@ impl BuildOrchestrator {
                 external_dir.display()
             )
         })?;
-        let python_repo_path = external_dir.join("local_config_python");
-        self.with_tracked_scope(|| {
-            python_config::materialize_local_config_python(
-                &self.workspace_root,
-                &python_repo_path,
-            )
-        })
-        .context("failed to configure @local_config_python")?;
-        self.external_repo_paths
-            .lock()
-            .await
-            .insert("local_config_python".to_string(), python_repo_path.clone());
-        if let Ok(mut loader) = self.bzl_loader.lock() {
-            loader.add_external_repo("local_config_python".to_string(), python_repo_path);
+        let registered_python = self.external_repo_paths.lock().await.get("local_config_python").cloned();
+        if !self.has_registered_source_repository_for_path("local_config_python", registered_python.as_deref()) {
+            let python_repo_path = external_dir.join("local_config_python");
+            self.with_tracked_scope(|| {
+                python_config::materialize_local_config_python(
+                    &self.workspace_root,
+                    &python_repo_path,
+                )
+            })
+            .context("failed to configure @local_config_python")?;
+            self.external_repo_paths.lock().await
+                .insert("local_config_python".to_string(), python_repo_path.clone());
+            if let Ok(mut loader) = self.bzl_loader.lock() {
+                // This is an automatic native configuration, not an explicit
+                // WORKSPACE source. A real declaration must still own the name.
+                loader.add_implicit_system_adapter("local_config_python".to_string(), python_repo_path);
+            }
         }
 
         eprintln!("📋 Loading WORKSPACE from: {}", workspace_file.display());
@@ -2189,7 +2217,7 @@ impl BuildOrchestrator {
                 drop(repo_paths);
 
                 if let Ok(mut loader) = self.bzl_loader.lock() {
-                    loader.add_external_repo(repo.name.clone(), repo_path.clone());
+                    loader.add_implicit_system_adapter(repo.name.clone(), repo_path.clone());
                 }
 
                 eprintln!(
@@ -2299,8 +2327,27 @@ impl BuildOrchestrator {
             ];
 
             let mut repo_paths = self.external_repo_paths.lock().await;
+            let preserve_declared_source = |name: &str, paths: &mut HashMap<String, PathBuf>| -> Result<bool> {
+                let mut loader = self.bzl_loader.lock()
+                    .map_err(|_| anyhow::anyhow!("BzlLoader lock poisoned while preserving repository source"))?;
+                if let Some(path) = loader.preferred_registered_repository_path(name, paths.get(name).map(PathBuf::as_path))
+                    .filter(|path| !loader.is_implicit_system_adapter(name, path))
+                {
+                    paths.insert(name.to_string(), path.clone());
+                    if loader.is_managed_workspace_source(name, &path) {
+                        loader.add_managed_workspace_source(name.to_string(), path);
+                    } else {
+                        loader.add_external_repo(name.to_string(), path);
+                    }
+                    return Ok(true);
+                }
+                Ok(false)
+            };
 
             for (repo_name, subdir, bzl_files) in minimal_repos {
+                // Compatibility setup fills missing/implicit registrations; a
+                // discovered local or genuine source is already authoritative.
+                if preserve_declared_source(repo_name, &mut repo_paths)? { continue; }
                 let repo_path = external_dir.join(repo_name);
 
                 // Create placeholder repo if it doesn't exist
@@ -2317,6 +2364,11 @@ impl BuildOrchestrator {
                 }
 
                 repo_paths.insert(repo_name.to_string(), repo_path.clone());
+                if repo_name != "bazel_tools" {
+                    if let Ok(mut loader) = self.bzl_loader.lock() {
+                        loader.add_implicit_system_adapter(repo_name.to_string(), repo_path.clone());
+                    }
+                }
             }
 
             // TEMPORARY HACK: Manually register org_tensorflow external repository
@@ -2326,12 +2378,15 @@ impl BuildOrchestrator {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| self.workspace_root.join("../tensorflow"));
 
-            if tf_path.exists() {
+            if tf_path.exists() && !preserve_declared_source("org_tensorflow", &mut repo_paths)? {
                 debug_log!(
                     "[DEBUG] Registered external repo: org_tensorflow -> {}",
                     tf_path.display()
                 );
                 repo_paths.insert("org_tensorflow".to_string(), tf_path.clone());
+                if let Ok(mut loader) = self.bzl_loader.lock() {
+                    loader.add_implicit_system_adapter("org_tensorflow".to_string(), tf_path.clone());
+                }
             }
 
             // Create symlinks for tf_vendored repositories (like local_xla, local_tsl)
@@ -2349,6 +2404,7 @@ impl BuildOrchestrator {
             ];
 
             for (repo_name, relpath) in vendored_repos {
+                if preserve_declared_source(repo_name, &mut repo_paths)? { continue; }
                 let repo_path = external_dir.join(repo_name);
                 let target_path = tf_path.join(relpath);
 
@@ -2381,6 +2437,9 @@ impl BuildOrchestrator {
                         target_path.display()
                     );
                     repo_paths.insert(repo_name.to_string(), repo_path.clone());
+                    if let Ok(mut loader) = self.bzl_loader.lock() {
+                        loader.add_implicit_system_adapter(repo_name.to_string(), repo_path.clone());
+                    }
                 } else {
                     debug_log!(
                         "[WARN] Vendored path does not exist: {}",
@@ -2392,17 +2451,25 @@ impl BuildOrchestrator {
 
         // Connect external repository paths to .bzl loader
         {
+            let mut repo_paths = self.external_repo_paths.lock().await;
             let mut bzl_loader = self
                 .bzl_loader
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock .bzl loader: {}", e))?;
-            // Clone the repo paths into a DashMap for bzl_loader
-            let repo_paths_data = self.external_repo_paths.lock().await.clone();
+            // A synchronous module load can update any repository before the
+            // async graph sees it. Reconcile all names before bulk mirroring;
+            // compatibility fallback lists are not a source-authority boundary.
+            let mut names = repo_paths.keys().cloned().collect::<std::collections::HashSet<_>>();
+            names.extend(bzl_loader.external_repos.iter().map(|entry| entry.key().clone()));
             let repo_paths_dashmap = Arc::new(dashmap::DashMap::new());
-            for (k, v) in repo_paths_data {
-                repo_paths_dashmap.insert(k, v);
+            for name in names {
+                if let Some(path) = bzl_loader.preferred_registered_repository_path(&name, repo_paths.get(&name).map(PathBuf::as_path)) {
+                    repo_paths.insert(name.clone(), path.clone());
+                    repo_paths_dashmap.insert(name, path);
+                }
             }
             bzl_loader.set_external_repos(repo_paths_dashmap);
+            drop(repo_paths);
 
             // Configure repository alias mappings (env/file-driven with sensible defaults)
             let aliases_dashmap = Arc::new(dashmap::DashMap::new());
@@ -2530,6 +2597,10 @@ impl BuildOrchestrator {
     /// This allows lazy loading of external repositories only when they're actually needed,
     /// keeping CPUs busy with builds instead of parsing hundreds of .bzl files upfront.
     async fn fetch_repository_on_demand(&self, repo_name: &str) -> Result<()> {
+        if self.requires_declared_workspace_source(repo_name) {
+            self.fetch_workspace_repository_with_bazel(repo_name, &HashMap::new(), None).await?;
+            return Ok(());
+        }
         if repo_name == "com_google_absl" {
             eprintln!(
                 "         Using system-provided stub repository for @{}",
@@ -2649,6 +2720,9 @@ impl BuildOrchestrator {
                             // Register in external_repo_paths
                             let mut repo_paths = self.external_repo_paths.lock().await;
                             repo_paths.insert(repo_name.to_string(), repo_path.clone());
+                            if let Ok(mut loader) = self.bzl_loader.lock() {
+                                loader.add_implicit_system_adapter(repo_name.to_string(), repo_path.clone());
+                            }
 
                             eprintln!(
                                 "         ✓ @{} fetched to {}",
@@ -5076,16 +5150,63 @@ cc_library(
     /// it. Mirror that path into the orchestrator registry so the configured
     /// graph consumes the already-resolved identity instead of trying a second,
     /// context-free fetch.
+    fn has_legacy_workspace(&self) -> bool {
+        self.workspace_root.join("WORKSPACE").exists() || self.workspace_root.join("WORKSPACE.bazel").exists()
+    }
+
+    fn requires_declared_workspace_source(&self, name: &str) -> bool {
+        self.requires_declared_workspace_source_for_path(name, None)
+    }
+
+    fn requires_declared_workspace_source_for_path(&self, name: &str, registered: Option<&Path>) -> bool {
+        if name == "bazel_tools" { return false; }
+        let Ok(loader) = self.bzl_loader.lock() else { return true; };
+        let candidate = loader.preferred_registered_repository_path(name, registered);
+        // A previously admitted WORKSPACE source keeps its proof obligation
+        // even after its defining file disappears or the workspace switches
+        // modes. Absence cannot turn managed bytes into an explicit root.
+        if candidate.as_ref().is_some_and(|path| loader.is_managed_workspace_source(name, path)) {
+            return true;
+        }
+        if !self.has_legacy_workspace() { return false; }
+        match candidate {
+            Some(path) => loader.is_implicit_system_adapter(name, &path)
+                || self.repository_manager.get_http_archive(name).is_some(),
+            None => !loader.is_main_workspace_repository(name),
+        }
+    }
+
+    /// Registered user/local and genuine source roots own their target
+    /// namespace. Compatibility synthesis must not hide a missing real target.
+    fn has_registered_source_repository(&self, name: &str) -> bool {
+        // Do not block a synchronous stub API on an async registry lock. A
+        // busy registry supplies no authority to invent a compatibility node.
+        let registered = match self.external_repo_paths.try_lock() {
+            Ok(paths) => paths.get(name).cloned(),
+            Err(_) => return true,
+        };
+        self.has_registered_source_repository_for_path(name, registered.as_deref())
+    }
+
+    fn has_registered_source_repository_for_path(&self, name: &str, registered: Option<&Path>) -> bool {
+        let Ok(loader) = self.bzl_loader.lock() else { return true; };
+        registered.is_some_and(|path| !loader.is_implicit_system_adapter(name, path))
+            || loader.external_repo_path(name)
+                .is_some_and(|path| !loader.is_implicit_system_adapter(name, &path))
+    }
+
     async fn registered_external_repository_path(&self, name: &str, requested: &crate::dependency_graph::Label) -> Result<Option<PathBuf>> {
         let registered = self.external_repo_paths.lock().await.get(name).cloned();
-        let loader_path = self.bzl_loader.lock().ok().and_then(|loader| loader.external_repo_path(name));
-        let candidate = registered.or(loader_path);
+        let candidate = self.bzl_loader.lock().map_err(|_| anyhow::anyhow!("BzlLoader lock poisoned"))?
+            .preferred_registered_repository_path(name, registered.as_deref());
         let declared = self.repository_manager.get_http_archive(name);
-        let bazel_root = cache_paths::workspace_cache_root(&self.workspace_root).join("bazel_output_base");
-        let materialized_workspace_rule = candidate.as_ref().is_some_and(|path| {
-            path.starts_with(&bazel_root) && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("external"))
-        }) && (self.workspace_root.join("WORKSPACE").exists() || self.workspace_root.join("WORKSPACE.bazel").exists());
-        if declared.is_some() || materialized_workspace_rule {
+        let implicit_or_missing = self.requires_declared_workspace_source_for_path(name, candidate.as_deref());
+        if candidate.is_none() && self.has_legacy_workspace() && !implicit_or_missing && name != "bazel_tools" {
+            let main = self.bzl_loader.lock().map_err(|_| anyhow::anyhow!("BzlLoader lock poisoned"))?
+                .is_main_workspace_repository(name);
+            if main { return Ok(Some(self.workspace_root.clone())); }
+        }
+        if declared.is_some() || implicit_or_missing {
             let mapping = declared.map(|archive| archive.repo_mapping).unwrap_or_default();
             return self.fetch_workspace_repository_with_bazel(name, &mapping, Some(requested)).await.map(Some);
         }
@@ -7499,7 +7620,14 @@ cc_library(
             target_path.split('/').next_back().unwrap_or(target_path)
         };
 
-        // Try to map to system packages first (avoids building external repos)
+        let registered = self.external_repo_paths.lock().await.get(repo_name).cloned();
+        let required_source = self.requires_declared_workspace_source_for_path(repo_name, registered.as_deref());
+        let explicit_source = self.bzl_loader.lock().ok().is_some_and(|loader|
+            loader.preferred_registered_repository_path(repo_name, registered.as_deref()).is_some_and(|path|
+                !loader.is_implicit_system_adapter(repo_name, &path)));
+        // Compatibility include-only mapping cannot replace a required
+        // declaration or an explicitly registered/local source provider.
+        if !required_source && !explicit_source {
         if let Ok(include_dirs) =
             SystemPackageMapper::resolve_external_target(repo_name, target, &self.workspace_root)
         {
@@ -7510,11 +7638,14 @@ cc_library(
             );
             return Ok((Vec::new(), include_dirs));
         }
+        }
 
         // System mapping failed - fall back to building from repository
 
         // Look up repository path - try on-demand fetch if not found
-        let repo_root = {
+        let requested = dependency_graph::Label::parse(dep_label, None, None)?;
+        let admitted = self.registered_external_repository_path(repo_name, &requested).await?;
+        let repo_root = if let Some(path) = admitted { path } else {
             let repo_paths = self.external_repo_paths.lock().await;
 
             if let Some(path) = repo_paths.get(repo_name) {
