@@ -4205,7 +4205,8 @@ mod tests {
                 assert!(deps.contains(&Value::String(
                     "@com_google_absl//absl/types:span".to_string()
                 )));
-                assert!(deps.contains(&Value::String("@nsync//:nsync_headers".to_string())));
+                assert!(deps.contains(&Value::String("@nsync//:nsync_cpp".to_string())));
+                assert!(!deps.contains(&Value::String("@nsync//:nsync_headers".to_string())));
             }
             _ => panic!("Expected List value"),
         }

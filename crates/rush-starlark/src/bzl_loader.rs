@@ -10170,48 +10170,46 @@ mod tests {
 
     #[test]
     fn test_resolve_workspace_bzl() {
-        let temp_dir = std::env::temp_dir();
-        let workspace = temp_dir.join("test_workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_path_buf();
+        rush_incremental::tracked::test_scope(&workspace, || {
+            let loader = BzlLoader::new(workspace.clone());
 
-        let loader = BzlLoader::new(workspace.clone());
+            // Test //package:file.bzl
+            let bzl_dir = workspace.join("mypackage");
+            std::fs::create_dir_all(&bzl_dir).unwrap();
+            let bzl_file = bzl_dir.join("helpers.bzl");
+            std::fs::write(&bzl_file, "def helper(): return []").unwrap();
 
-        // Test //package:file.bzl
-        let bzl_dir = workspace.join("mypackage");
-        std::fs::create_dir_all(&bzl_dir).unwrap();
-        let bzl_file = bzl_dir.join("helpers.bzl");
-        std::fs::write(&bzl_file, "def helper(): return []").unwrap();
-
-        let resolved = loader.resolve_bzl_path("//mypackage:helpers.bzl").unwrap();
-        assert_eq!(resolved, bzl_file);
-
-        // Cleanup
-        std::fs::remove_dir_all(&workspace).ok();
+            let resolved = loader.resolve_bzl_path("//mypackage:helpers.bzl").unwrap();
+            assert_eq!(resolved, bzl_file);
+        });
     }
 
     #[test]
     fn test_resolve_relative_bzl() {
-        let temp_dir = std::env::temp_dir();
-        let workspace = temp_dir.join("test_workspace_rel");
-        let package = workspace.join("pkg");
-        std::fs::create_dir_all(&package).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_path_buf();
+        rush_incremental::tracked::test_scope(&workspace, || {
+            let package = workspace.join("pkg");
+            std::fs::create_dir_all(&package).unwrap();
 
-        let loader = BzlLoader::new(workspace.clone());
+            let loader = BzlLoader::new(workspace.clone());
 
-        let bzl_file = package.join("test.bzl");
-        std::fs::write(&bzl_file, "def test(): pass").unwrap();
+            let bzl_file = package.join("test.bzl");
+            std::fs::write(&bzl_file, "def test(): pass").unwrap();
 
-        // Set up thread-local context for package-relative resolution
-        BzlLoader::push_thread_context(workspace.clone(), package.clone());
+            // Set up thread-local context for package-relative resolution
+            BzlLoader::push_thread_context(workspace.clone(), package.clone());
+            struct ContextGuard;
+            impl Drop for ContextGuard {
+                fn drop(&mut self) { BzlLoader::pop_thread_context(); }
+            }
+            let _context_guard = ContextGuard;
 
-        let resolved = loader.resolve_bzl_path(":test.bzl").unwrap();
-        assert_eq!(resolved, bzl_file);
-
-        // Clean up thread-local context
-        BzlLoader::pop_thread_context();
-
-        // Cleanup
-        std::fs::remove_dir_all(&workspace).ok();
+            let resolved = loader.resolve_bzl_path(":test.bzl").unwrap();
+            assert_eq!(resolved, bzl_file);
+        });
     }
 
     #[test]
@@ -10248,44 +10246,45 @@ mod tests {
 
     #[test]
     fn test_repo_root_affects_workspace_bzl_resolution() {
-        let temp_dir = std::env::temp_dir();
-        let main_workspace = temp_dir.join("main_workspace");
-        let external_repo = temp_dir.join("external_repo");
+        let root = tempfile::tempdir().unwrap();
+        let main_workspace = root.path().join("main_workspace");
+        let external_repo = root.path().join("external_repo");
+        rush_incremental::tracked::test_scope(root.path(), || {
+            struct ContextGuard;
+            impl Drop for ContextGuard {
+                fn drop(&mut self) { BzlLoader::pop_thread_context(); }
+            }
 
-        // Create both workspaces with different file contents
-        std::fs::create_dir_all(main_workspace.join("pkg")).unwrap();
-        std::fs::create_dir_all(external_repo.join("pkg")).unwrap();
+            // Create both workspaces with different file contents
+            std::fs::create_dir_all(main_workspace.join("pkg")).unwrap();
+            std::fs::create_dir_all(external_repo.join("pkg")).unwrap();
 
-        let main_bzl = main_workspace.join("pkg/test.bzl");
-        let external_bzl = external_repo.join("pkg/test.bzl");
+            let main_bzl = main_workspace.join("pkg/test.bzl");
+            let external_bzl = external_repo.join("pkg/test.bzl");
 
-        std::fs::write(&main_bzl, "# main workspace").unwrap();
-        std::fs::write(&external_bzl, "# external repo").unwrap();
+            std::fs::write(&main_bzl, "# main workspace").unwrap();
+            std::fs::write(&external_bzl, "# external repo").unwrap();
 
-        let loader = BzlLoader::new(main_workspace.clone());
+            let loader = BzlLoader::new(main_workspace.clone());
 
-        // Resolving //pkg:test.bzl should use current_repo_root from thread context
-        // Set up thread-local context for main workspace
-        BzlLoader::push_thread_context(main_workspace.clone(), main_workspace.join("pkg"));
+            // Resolving //pkg:test.bzl should use current_repo_root from thread context
+            // Set up thread-local context for main workspace
+            BzlLoader::push_thread_context(main_workspace.clone(), main_workspace.join("pkg"));
+            let main_context = ContextGuard;
 
-        let resolved = loader.resolve_bzl_path("//pkg:test.bzl").unwrap();
-        assert_eq!(resolved, main_bzl);
+            let resolved = loader.resolve_bzl_path("//pkg:test.bzl").unwrap();
+            assert_eq!(resolved, main_bzl);
 
-        // Pop main workspace context
-        BzlLoader::pop_thread_context();
+            // Pop main workspace context
+            drop(main_context);
 
-        // Switch to external repo via thread-local context
-        BzlLoader::push_thread_context(external_repo.clone(), external_repo.join("pkg"));
+            // Switch to external repo via thread-local context
+            BzlLoader::push_thread_context(external_repo.clone(), external_repo.join("pkg"));
+            let _external_context = ContextGuard;
 
-        let resolved = loader.resolve_bzl_path("//pkg:test.bzl").unwrap();
-        assert_eq!(resolved, external_bzl);
-
-        // Clean up thread-local context
-        BzlLoader::pop_thread_context();
-
-        // Cleanup
-        std::fs::remove_dir_all(&main_workspace).ok();
-        std::fs::remove_dir_all(&external_repo).ok();
+            let resolved = loader.resolve_bzl_path("//pkg:test.bzl").unwrap();
+            assert_eq!(resolved, external_bzl);
+        });
     }
 
     #[test]
@@ -10420,13 +10419,14 @@ mod tests {
         let dec = evaluate_materialized_skip(&ws, "foo", true)
             .expect("env-on materialized repo with BUILD must return Some");
         match dec {
-            FetchDecision::SkippedMaterialized {
-                repo_name, path,
+            FetchDecision::SkippedMaterializedTrustMode {
+                repo_name, path, manifest_status,
             } => {
                 assert_eq!(repo_name, "foo");
                 assert_eq!(path, ws.join("external").join("foo"));
+                assert_eq!(manifest_status, "absent");
             }
-            other => panic!("expected SkippedMaterialized, got {:?}", other),
+            other => panic!("expected SkippedMaterializedTrustMode, got {:?}", other),
         }
     }
 

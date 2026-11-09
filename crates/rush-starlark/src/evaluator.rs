@@ -9953,14 +9953,17 @@ dict_value = {"base": "yes"} | select({
 
     #[test]
     fn test_function_call() {
-        let source = r#"
+        let root = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(root.path(), || {
+            let source = r#"
 def add(a, b):
     return a + b
 
 result = add(10, 20)
 "#;
-        let evaluator = eval(source).unwrap();
-        assert_eq!(evaluator.get_var("result"), Some(Value::Int(30)));
+            let evaluator = eval(source).unwrap();
+            assert_eq!(evaluator.get_var("result"), Some(Value::Int(30)));
+        });
     }
 
     #[test]
