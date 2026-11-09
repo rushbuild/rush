@@ -13,7 +13,7 @@ before implementation. All remain open until their evidence is recorded.
 | P1 | Extract Kbuild receipt/provenance modules | One private-module move with unchanged snapshot encoding and rejection tests |
 | P1 | Extract orchestration phases | Preserve graph publication and freshness; affected command/no-op tests pass |
 | P1 | Extend remote-execution qualification | Qualify a second backend, TLS and nonempty instances; add recovery/cancellation and declared dynamic dependencies; resolve the retained HIP runtime failure before claiming GPU parity |
-| P1 | Profile incremental overhead against Buck2 | Explain the larger generated graph's no-op and edit gap in docs/benchmarks/buck2.md; retain matched CPU/cache controls and correct outputs |
+| P1 | Extend Buck2 performance coverage | Add optimized/compilation-heavy graphs, varied edits, a second measured host and remote timings; preserve exact work, output and invalidation checks |
 | P1 | Qualify daemon build-option handling | Reproduce job-limit and disk-cache-disable routing across daemon and in-process commands; require matching requested behavior |
 | P1 | Split observation syscall handlers | Preserve process/descriptor state and incomplete-capture rejection |
 | P2 | Separate C/C++ compile and link planners | Preserve argv ordering, archive semantics and toolchain selection |
@@ -27,3 +27,9 @@ this proposal into a list of presumed successes.
 Completed on 2026-11-06: the replacement status docs were published, the
 separate tracker received its relocation notice, and its GitHub archived state
 was verified. See [the status index](docs/status/README.md) for the record.
+
+Completed on 2026-11-08: profile and remove repeated graph preparation and
+retained-artifact copying in the local Buck2 comparison. Verify sixteen daemon
+controls and publish twenty samples per engine/mode at two graph sizes. Rush
+has lower medians in all eight rows; retain the scope, overlapping edit ranges
+and inherited test failures in [the report](docs/benchmarks/buck2.md).

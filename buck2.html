@@ -58,24 +58,25 @@ Use the source and linked documentation to check each claim.</p>
 <section id="measurements"><p class="eyebrow">Local execution · matched inputs</p><h2>Measure both engines.</h2>
 <p>Build identical generated C++ sources with native rules on one Linux
 host. Give both engines the same eight CPUs, GCC 16.2, C++17, <code>-O0</code>
-and <code>-g</code>. Read five-sample medians below; all times use milliseconds.</p>
+and <code>-g</code>. Read 20-sample medians below; all times use milliseconds.</p>
 <div class="table-wrap"><table class="metrics"><caption>Local C++ command wall time · lower is faster</caption><thead><tr><th scope="col">Headers / libraries</th><th scope="col">Operation</th><th scope="col">Rush ms</th><th scope="col">Buck2 ms</th></tr></thead><tbody>
-<tr><td>1,024 / 64</td><td>Clean compilation</td><td>325.30</td><td>435.65</td></tr>
-<tr><td>1,024 / 64</td><td>Unchanged command</td><td>3.06</td><td>5.82</td></tr>
-<tr><td>1,024 / 64</td><td>Novel source edit</td><td>38.71</td><td>53.98</td></tr>
-<tr><td>1,024 / 64</td><td>Novel header edit</td><td>38.18</td><td>54.72</td></tr>
-<tr><td>18,432 / 384</td><td>Clean compilation</td><td>1,579.80</td><td>1,938.20</td></tr>
-<tr><td>18,432 / 384</td><td>Unchanged command</td><td>10.09</td><td>6.64</td></tr>
-<tr><td>18,432 / 384</td><td>Novel source edit</td><td>143.19</td><td>86.73</td></tr>
-<tr><td>18,432 / 384</td><td>Novel header edit</td><td>141.87</td><td>85.62</td></tr>
+<tr><td>1,024 / 64</td><td>Clean compilation</td><td>320.74</td><td>429.49</td></tr>
+<tr><td>1,024 / 64</td><td>Unchanged command</td><td>2.38</td><td>6.04</td></tr>
+<tr><td>1,024 / 64</td><td>Novel source edit</td><td>34.30</td><td>53.25</td></tr>
+<tr><td>1,024 / 64</td><td>Novel header edit</td><td>33.96</td><td>53.61</td></tr>
+<tr><td>18,432 / 384</td><td>Clean compilation</td><td>1,526.12</td><td>1,912.88</td></tr>
+<tr><td>18,432 / 384</td><td>Unchanged command</td><td>3.47</td><td>5.91</td></tr>
+<tr><td>18,432 / 384</td><td>Novel source edit</td><td>80.80</td><td>85.62</td></tr>
+<tr><td>18,432 / 384</td><td>Novel header edit</td><td>80.19</td><td>85.92</td></tr>
 </tbody></table></div>
-<p>Rush takes less time in all four modes at the smaller scale. Buck2 takes
-less time for unchanged commands and one-file rebuilds at the larger scale;
-Rush takes less time for clean compilation. Use this result to guide profiling.</p>
+<p>Rush has lower median wall time in all eight measured rows. On the larger
+graph, measure unchanged commands at 3.47 ms versus 5.91 ms, source edits at
+80.80 ms versus 85.62 ms and header edits at 80.19 ms versus 85.92 ms.
+Read the ranges in the report; the larger edit distributions overlap.</p>
 <p>Include fresh daemon startup and empty action caches in clean builds.
 Retain daemons and caches for unchanged commands and novel edits. Require
 full compiler counts for clean builds, zero for unchanged commands and one
-compile per edit. All <strong>84/84</strong> measured and warm-up executions
+compile, one archive creation and one link per edit. All <strong>324/324</strong> measured and warm-up executions
 print the expected content-dependent result.</p>
 <p><a href="docs/benchmarks/buck2.md">Inspect exact versions, ranges, all samples and controls →</a></p>
 <div class="grid"><article class="card"><h3>Hold the work constant.</h3><p>Use the same source bytes, compiler, optimization flags and CPU budget. Request the same job count. Pin both engines and the Buck2 prelude. Check the executable's content-dependent result after every build.</p></article>
@@ -86,6 +87,18 @@ configuration. The output sum checks bounded behavior; it establishes no
 byte-identical artifacts. A synthetic C++ test establishes no TensorFlow,
 Modular, Linux, optimized-build or remote-execution performance result.</p>
 </section>
+<section id="incremental"><p class="eyebrow">Incremental work</p><h2>Build the changed closure.</h2>
+<p>Retain the analyzed graph and reusable header layout. For one-file edits,
+prepare the active targets and their dependency boundary, then borrow unchanged
+artifact roots while recording replacements. Keep the freshness checks that
+make reuse valid.</p>
+<div class="grid"><article class="card"><h3>1. Validate inputs.</h3><p>Use established watcher coverage and directly check every uncovered dependency. Reanalyze changed analysis values. Fall back to full validation after overflow or lost continuity.</p></article>
+<article class="card"><h3>2. Execute the active closure.</h3><p>Reuse immutable graph facts and header layout. Reread include contents and execute the required compile, archive and link actions. Retain full-map fallback for compatibility lookups.</p></article>
+<article class="card"><h3>3. Publish verified replacements.</h3><p>Check generation, forest identity, exact coverage and the refreshed ledger/watch baseline before replacing existing artifact roots. Preserve old roots for outstanding readers.</p></article></div>
+<p>Read <a href="https://github.com/rushbuild/rush/commit/b059a2578742">the measured engine revision</a> and <a href="docs/benchmarks/buck2.md#check-the-changed-behavior">the correctness results</a>. All sixteen daemon controls pass. Inherited broader-suite failures remain listed in the report.</p>
+<p class="note">Restart existing workspace daemons after installing this build.
+The ctime-aware source fix uses a new legacy action-cache namespace; expect
+those older entries to miss once.</p></section>
 <section><h2>Reproduce before choosing.</h2><p><a href="README.md">Build Rush from source</a> and follow <a href="https://buck2.build/docs/getting_started/install/">Buck2's installation guide</a>. Start with a bounded target, verify its outputs and exercise source and header edits. Expand the target set after those checks pass.</p></section>
 <section id="remote"><p class="eyebrow">Remote execution · one shared backend protocol</p><h2>Send the work to a worker.</h2>
 <p>Both engines build the same small C++ program through NativeLink 1.8.3.

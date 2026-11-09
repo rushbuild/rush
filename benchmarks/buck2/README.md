@@ -14,9 +14,9 @@ and its children; the first N allowed CPUs define the requested N-CPU budget.
 It terminates only its verified task-local Rush daemon and its Buck2 server.
 Keep the output path short enough for Linux's Unix-domain socket path limit.
 
-Pin the engine binaries and prelude before running. The first report uses
-Rush source `72f0e3f615ffa864bbefca0cd2fe498c4f43f52e`, built with
-`cargo build --release --locked --bin rush -j8` and Rust 1.90.0. Use the
+Pin the engine binaries and prelude before running. The current report uses
+Rush source `b059a257874270dbb17ebebeb2bee6f3546688c3`, built with
+`cargo build --release --locked -j8` and Rust 1.90.0. Use the
 [Buck2 2026-11-01 release](https://github.com/meta/buck2/releases/tag/2026-11-01)
 and [prelude 02bac085](https://github.com/meta/buck2-prelude/tree/02bac0856e1f29d9bb30380072b1819216effe0a).
 Check binary identities against [the report](../../docs/benchmarks/buck2.md).
@@ -26,7 +26,7 @@ python3 benchmarks/buck2/run.py \
   --rush /path/to/rush --buck2 /path/to/buck2 \
   --prelude /path/to/pinned-prelude \
   --output /path/to/new-evaluation --packages 64 --headers 16 \
-  --jobs 8 --samples 5
+  --jobs 8 --samples 20
 ```
 
 Repeat with 384 packages and 48 headers in another new output directory.
@@ -54,3 +54,14 @@ Treat this as a small local control-plane experiment. It measures neither an
 optimized application nor TensorFlow, Modular, Linux, remote execution, cache
 restoration, failure recovery or byte-identical artifacts. The printed sum is
 a bounded functional check. Expand correctness and workload coverage separately.
+
+Run the separate incremental correctness controls against the same binary:
+
+```sh
+python3 tests/incremental_perf_smoke.py \
+  --rush /path/to/rush --output /short/new-controls
+```
+
+Require the sixteen cases to pass before accepting performance improvements.
+Keep this output directory short enough for Unix-domain socket discovery.
+Retain the emitted case summary and logs outside the source checkout.
