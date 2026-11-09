@@ -2240,8 +2240,8 @@ impl BuildOrchestrator {
 
         // RUSH_PROFILE_PHASES: begin a per-build structured timing record of
         // the no-op decision path. Cheap no-op unless the env var names a path.
-        let profile_phases = crate::phase_profile::enabled();
         crate::phase_profile::begin(&target_patterns);
+        let profile_phases = crate::phase_profile::enabled();
         crate::action_timing::begin(&semantics);
         // Phase 4 mode + per-build counters, from the CLIENT's env: a
         // resident daemon must not virtualize every later client's build
