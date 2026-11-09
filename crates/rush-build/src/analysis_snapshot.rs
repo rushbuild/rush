@@ -366,6 +366,8 @@ pub struct AnalysisSnapshot {
     pub manifest_fingerprint: [u8; 32],
     /// Cached watcher admission index for the immutable manifest.
     pub manifest_watch_index: crate::workspace_watcher::ManifestWatchIndex,
+    /// Inputs outside established analysis watches; validate on every reuse.
+    pub unwatched_manifest: DependencyManifest,
 
     /// The analyzed dependency graph (nodes hold `Arc<dyn RuleInstance>`).
     pub graph: DependencyGraph,

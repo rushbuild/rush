@@ -151,6 +151,7 @@ pub enum ManifestWatchAdmission {
 #[derive(Debug, Clone, Default)]
 pub struct ManifestWatchIndex {
     exact_file_paths: HashSet<PathBuf>,
+    analysis_value_paths: HashSet<PathBuf>,
     symlink_paths: HashSet<PathBuf>,
     dir_listing_paths: HashSet<PathBuf>,
     /// Every directory that must have an active inotify watch for this manifest:
@@ -169,6 +170,9 @@ impl ManifestWatchIndex {
     pub fn from_manifest(manifest: &rush_incremental::DependencyManifest) -> Self {
         let mut index = Self::default();
         for dep in manifest.deps() {
+            if let Dependency::FileContent { path, .. } | Dependency::FileMetadata { path, .. } = dep {
+                index.analysis_value_paths.insert(path.clone());
+            }
             match dep {
                 Dependency::FileContent { path, .. }
                 | Dependency::FileExistence { path, .. }
@@ -512,6 +516,56 @@ impl WorkspaceWatcher {
         }
     }
 
+    /// Split immutable analysis dependencies by established watch coverage.
+    /// The uncovered half must be authoritatively validated on every reuse;
+    /// unavailable watches never turn an input into an ignored dependency.
+    pub fn partition_manifest(
+        &self,
+        manifest: &rush_incremental::DependencyManifest,
+    ) -> (ManifestWatchIndex, rush_incremental::DependencyManifest) {
+        // Process probes can have side effects. Preserve the complete
+        // manifest's observation ordering instead of running a probe ahead of
+        // an earlier covered filesystem dependency that may have changed.
+        if manifest
+            .deps()
+            .iter()
+            .any(|dep| matches!(dep, Dependency::ProcessProbe { .. }))
+        {
+            return (
+                ManifestWatchIndex::from_manifest(manifest),
+                rush_incremental::DependencyManifest::from_deps(Vec::new()),
+            );
+        }
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (covered, uncovered): (Vec<_>, Vec<_>) =
+            manifest.deps().iter().cloned().partition(|dep| {
+                let path = match dep {
+                    Dependency::FileContent { path, .. }
+                    | Dependency::FileExistence { path, .. }
+                    | Dependency::Symlink { path, .. }
+                    | Dependency::DirListing { path, .. } => path,
+                    // Filtered children can change a directory's metadata
+                    // without producing a retained dirty event. Preserve the
+                    // complete metadata observation through a direct check.
+                    Dependency::FileMetadata { .. } => return false,
+                    _ => return false,
+                };
+                let ignored = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_ignored_entry_name);
+                !ignored
+                    && dependency_watch_dir(dep)
+                        .is_some_and(|dir| inner.analysis_dirs.contains(dir))
+            });
+        (
+            ManifestWatchIndex::from_manifest(&rush_incremental::DependencyManifest::from_deps(
+                covered,
+            )),
+            rush_incremental::DependencyManifest::from_deps(uncovered),
+        )
+    }
+
     /// Recursively add a watch on `dir` and every sub-directory (skipping
     /// [`SKIP_DIR_NAMES`]). Symlinked directories are NOT followed (we watch the
     /// link node's parent for the symlink dep; following could escape the roots
@@ -794,6 +848,9 @@ impl WorkspaceWatcher {
             }
         }
         for path in &inner.state.dirty_paths {
+            if index.analysis_value_paths.contains(path) {
+                return Err(format!("analysis value changed: {}", path.display()));
+            }
             if index.symlink_paths.contains(path) {
                 return Err(format!("symlink dep changed: {}", path.display()));
             }
@@ -865,6 +922,9 @@ impl WorkspaceWatcher {
         for dep in manifest.deps() {
             ensure_dependency_watch_coverage(&inner, dep)?;
             if let Some(path) = dep_exact_dirty_path(&inner.state, dep)? {
+                if matches!(dep, Dependency::FileContent { .. } | Dependency::FileMetadata { .. }) {
+                    return Err(format!("analysis value changed: {}", path.display()));
+                }
                 if covers_path(path) {
                     dirty_paths.insert(path.to_path_buf());
                 } else {
@@ -1671,6 +1731,165 @@ mod tests {
     }
 
     #[test]
+    fn e2e_directory_metadata_detects_filtered_child_changes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let watcher = WorkspaceWatcher::unarmed();
+        watcher.arm(&[root]);
+        let analyzed_at = Instant::now();
+        let meta = rush_incremental::stat_meta(&directory);
+        let all = manifest(vec![Dependency::FileMetadata {
+            path: directory.clone(),
+            present: meta.present,
+            len: meta.len,
+            mode: meta.mode,
+            mtime_ns: meta.mtime_ns,
+            ctime_ns: meta.ctime_ns,
+            dev: meta.dev,
+            ino: meta.ino,
+        }]);
+        let (index, direct) = watcher.partition_manifest(&all);
+        let semantics = rush_command_core::CommandSemantics::from_process();
+        assert_eq!(direct.len(), 1);
+        assert!(matches!(
+            direct.validate_staleness(&semantics),
+            rush_incremental::Staleness::Fresh
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(directory.join("compile_commands.json"), b"[]").unwrap();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| true)
+            .is_ok());
+        assert!(matches!(
+            direct.validate_staleness(&semantics),
+            rush_incremental::Staleness::Stale { .. }
+        ));
+    }
+
+    #[test]
+    fn e2e_probe_order_and_filtered_names_require_authoritative_validation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        std::fs::write(&source, b"before").unwrap();
+        let marker = root.join("probe-ran");
+        let watcher = WorkspaceWatcher::unarmed();
+        watcher.arm(&[root.clone()]);
+        let analyzed_at = Instant::now();
+        let original = Dependency::FileContent {
+            path: source.clone(),
+            digest: *blake3::hash(b"before").as_bytes(),
+        };
+        let probe = Dependency::ProcessProbe {
+            program: "/usr/bin/touch".into(),
+            args: vec![marker.display().to_string().into_bytes()],
+            env_keys: Vec::new(),
+            cwd: root.clone(),
+            status: 0,
+            stdout_digest: *blake3::hash(b"").as_bytes(),
+            stderr_digest: *blake3::hash(b"").as_bytes(),
+            compare_stderr: true,
+        };
+        let all = manifest(vec![original, probe]);
+        let (index, direct) = watcher.partition_manifest(&all);
+        assert!(direct.is_empty());
+        std::fs::write(&source, b"changed input").unwrap();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| true)
+            .is_err());
+        let semantics = rush_command_core::CommandSemantics::from_process();
+        assert!(matches!(
+            all.validate_staleness(&semantics),
+            rush_incremental::Staleness::Stale { .. }
+        ));
+        assert!(
+            !marker.exists(),
+            "a stale preceding input must prevent probe execution"
+        );
+
+        let filtered = root.join("compile_commands.json");
+        let (index, direct) =
+            watcher.partition_manifest(&manifest(vec![neg_existence_dep(&filtered)]));
+        assert_eq!(direct.len(), 1);
+        assert!(matches!(
+            direct.validate_staleness(&semantics),
+            rush_incremental::Staleness::Fresh
+        ));
+        std::fs::write(filtered, b"appeared").unwrap();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| true)
+            .is_ok());
+        assert!(matches!(
+            direct.validate_staleness(&semantics),
+            rush_incremental::Staleness::Stale { .. }
+        ));
+    }
+
+    #[test]
+    fn e2e_analysis_values_cannot_be_covered_by_action_ledger_membership() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let input = root.join("rules.bzl");
+        std::fs::write(&input, b"before").unwrap();
+        let watcher = WorkspaceWatcher::unarmed();
+        watcher.arm(&[root]);
+        let analyzed_at = Instant::now();
+        let all = manifest(vec![content_dep(&input)]);
+        let index = ManifestWatchIndex::from_manifest(&all);
+        std::fs::write(&input, b"after").unwrap();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| true)
+            .is_err());
+        assert!(watcher
+            .admit_manifest_with_covered_dirty_paths(&all, analyzed_at, |_| true)
+            .is_err());
+    }
+
+    #[test]
+    fn e2e_unwatched_inputs_stay_in_the_authoritative_reuse_check() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let covered = root.join("source.cc");
+        std::fs::write(&covered, b"before").unwrap();
+        std::fs::create_dir(root.join(".cache")).unwrap();
+        let uncovered = root.join(".cache/config");
+        let watcher = WorkspaceWatcher::unarmed();
+        watcher.arm(&[root.clone()]);
+        let analyzed_at = Instant::now();
+        let all = manifest(vec![content_dep(&covered), neg_existence_dep(&uncovered)]);
+        let (index, direct) = watcher.partition_manifest(&all);
+        assert_eq!(direct.len(), 1);
+        let semantics = rush_command_core::CommandSemantics::from_process();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| false)
+            .is_ok());
+        assert!(matches!(
+            direct.validate_staleness(&semantics),
+            rush_incremental::Staleness::Fresh
+        ));
+        std::fs::write(&uncovered, b"new configuration").unwrap();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| false)
+            .is_ok());
+        assert!(matches!(
+            direct.validate_staleness(&semantics),
+            rush_incremental::Staleness::Stale { .. }
+        ));
+        std::fs::write(&covered, b"changed").unwrap();
+        settle_drain(&watcher);
+        assert!(watcher
+            .admit_manifest_indexed_with_covered_dirty_paths(&index, analyzed_at, |_| false)
+            .is_err());
+    }
+    #[test]
     fn e2e_quiet_workspace_is_clean_zero_paths() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
@@ -1779,10 +1998,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&a, b"v2-different-length").unwrap();
         settle_drain(&w);
-        let m = manifest(vec![content_dep(&a)]);
+        let m = manifest(vec![Dependency::FileExistence { path: a.clone(), exists: true, kind: None }]);
         let covered = w
             .manifest_dirty_paths_covered_by(&m, analyzed_at, |p| p == a.as_path())
-            .expect("exact content dirty covered by the ledger should be admissible");
+            .expect("exact execution-only dirty path covered by the ledger should be admissible");
         assert_eq!(covered, vec![a.clone()]);
         let index = ManifestWatchIndex::from_manifest(&m);
         assert_eq!(

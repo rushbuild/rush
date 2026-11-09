@@ -2448,7 +2448,7 @@ impl BuildOrchestrator {
                 } else {
                     candidate.retained_execution_state()
                 };
-                let watcher_manifest_admission = if watchfs_mode
+                let mut watcher_manifest_admission = if watchfs_mode
                     != crate::workspace_watcher::WatchFsMode::Off
                 {
                     match candidate.analyzed_at {
@@ -2466,6 +2466,15 @@ impl BuildOrchestrator {
                 } else {
                     Err("watchfs=off".to_string())
                 };
+                if watcher_manifest_admission.is_ok()
+                    && !matches!(
+                        candidate.unwatched_manifest.validate_staleness(&command_semantics),
+                        rush_incremental::Staleness::Fresh
+                    )
+                {
+                    watcher_manifest_admission =
+                        Err("unwatched analysis dependency changed".to_string());
+                }
                 let watcher_proved_clean = matches!(
                     &watcher_manifest_admission,
                     Ok(crate::workspace_watcher::ManifestWatchAdmission::Clean)
@@ -2473,11 +2482,12 @@ impl BuildOrchestrator {
                 let manifest_stat_walk_skipped = watcher_manifest_admission.is_ok();
                 let (validated_staleness, validation_token) = match &watcher_manifest_admission {
                     Ok(crate::workspace_watcher::ManifestWatchAdmission::Clean) => {
-                        // Watcher proved clean → 0-path validate. Mint a token
+                        // Watcher plus uncovered checks proved clean. Mint a token
                         // pinned to this snapshot + manifest generation + epoch.
                         eprintln!(
-                            "👁️  watcher CLEAN — no manifest dep dirtied since arm; skipping the {}-dep stat-walk (validate 0 paths)",
-                            candidate.manifest.len(),
+                            "👁️  watcher CLEAN — checking {} uncovered deps; skipping {} covered deps",
+                            candidate.unwatched_manifest.len(),
+                            candidate.manifest.len() - candidate.unwatched_manifest.len(),
                         );
                         let token = crate::analysis_snapshot::ValidationToken {
                             snapshot_id: candidate.key_hash,
@@ -2490,10 +2500,11 @@ impl BuildOrchestrator {
                     Ok(crate::workspace_watcher::ManifestWatchAdmission::CoveredDirty(paths)) => {
                         eprintln!(
                             "👁️  watcher DIRTY only on {} ledger-tracked action path(s) \
-                             ({}); skipping the {}-dep manifest stat-walk (validate 0 paths)",
+                             ({}); checking {} uncovered deps and skipping {} covered deps",
                             paths.len(),
                             format_prune_paths(paths),
-                            candidate.manifest.len(),
+                            candidate.unwatched_manifest.len(),
+                            candidate.manifest.len() - candidate.unwatched_manifest.len(),
                         );
                         let token = crate::analysis_snapshot::ValidationToken {
                             snapshot_id: candidate.key_hash,
@@ -2519,10 +2530,10 @@ impl BuildOrchestrator {
                 let validate1_dt = t_v0.elapsed();
                 if profile_phases {
                     crate::phase_profile::record("manifest_validate", validate1_dt);
-                    // The "universe walked" is 0 when the watcher authorized the
-                    // skip, else the full dep count.
+                    // Count direct checks when watcher admission skips the
+                    // covered portion, otherwise count the full manifest.
                     crate::phase_profile::set_manifest_deps(if manifest_stat_walk_skipped {
-                        0
+                        candidate.unwatched_manifest.len()
                     } else {
                         candidate.manifest.len()
                     });
@@ -6350,8 +6361,8 @@ impl BuildOrchestrator {
             }
             let key_hash = analysis_key.stable_hash();
             let manifest_fingerprint = manifest.fingerprint();
-            let manifest_watch_index =
-                crate::workspace_watcher::ManifestWatchIndex::from_manifest(&manifest);
+            let (manifest_watch_index, unwatched_manifest) =
+                self.watcher().partition_manifest(&manifest);
             let snap = std::sync::Arc::new(crate::analysis_snapshot::AnalysisSnapshot {
                 key: analysis_key.clone(),
                 key_hash,
@@ -6359,6 +6370,7 @@ impl BuildOrchestrator {
                 manifest,
                 manifest_fingerprint,
                 manifest_watch_index,
+                unwatched_manifest,
                 graph,
                 build_order,
                 artifact_registry,
