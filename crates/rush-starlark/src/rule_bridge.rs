@@ -62,7 +62,7 @@ fn starlark_to_configurable_rule_value(value: &StarlarkValue) -> Result<RuleValu
         StarlarkValue::Float(_) => Err(anyhow!(
             "configurable float operands are not supported by the rule bridge"
         )),
-        StarlarkValue::List(items) => Ok(RuleValue::List(
+        StarlarkValue::List(items) | StarlarkValue::Tuple(items) => Ok(RuleValue::List(
             items
                 .iter()
                 .map(starlark_to_configurable_rule_value)
@@ -110,7 +110,7 @@ pub fn starlark_to_rule_value(value: &StarlarkValue) -> Result<RuleValue> {
         StarlarkValue::Float(f) => Ok(RuleValue::Int(*f as i64)), // Lossy conversion
         StarlarkValue::Bool(b) => Ok(RuleValue::Bool(*b)),
         StarlarkValue::None => Ok(RuleValue::None),
-        StarlarkValue::List(items) => {
+        StarlarkValue::List(items) | StarlarkValue::Tuple(items) => {
             let converted: Result<Vec<_>> = items.iter().map(starlark_to_rule_value).collect();
             Ok(RuleValue::List(converted?))
         }
@@ -200,6 +200,38 @@ mod tests {
         let starlark = StarlarkValue::Bool(true);
         let rule = starlark_to_rule_value(&starlark).unwrap();
         assert_eq!(rule, RuleValue::Bool(true));
+    }
+
+    #[test]
+    fn tuple_attributes_keep_existing_sequence_conversion() {
+        let items = vec![
+            StarlarkValue::String("a.cc".to_string()),
+            StarlarkValue::Tuple(vec![StarlarkValue::String("nested.h".to_string())]),
+        ];
+        let tuple = StarlarkValue::Tuple(items.clone());
+        let list = StarlarkValue::List(items);
+        assert_eq!(
+            starlark_to_rule_value(&tuple).unwrap(),
+            starlark_to_rule_value(&list).unwrap()
+        );
+        assert_eq!(
+            starlark_to_rule_value(&tuple).unwrap(),
+            RuleValue::List(vec![
+                RuleValue::String("a.cc".to_string()),
+                RuleValue::List(vec![RuleValue::String("nested.h".to_string())]),
+            ])
+        );
+        assert_eq!(
+            starlark_to_configurable_rule_value(&StarlarkValue::Tuple(vec![
+                StarlarkValue::Int(7),
+                StarlarkValue::Tuple(vec![StarlarkValue::Bool(true)]),
+            ]))
+            .unwrap(),
+            RuleValue::List(vec![
+                RuleValue::Int(7),
+                RuleValue::List(vec![RuleValue::Bool(true)])
+            ])
+        );
     }
 
     #[test]

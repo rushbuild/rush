@@ -1002,7 +1002,7 @@ fn convert_configurable_value(value: &StarlarkValue) -> Result<Value> {
         StarlarkValue::Int(value) => Ok(Value::Int(*value)),
         StarlarkValue::Bool(value) => Ok(Value::Bool(*value)),
         StarlarkValue::None => Ok(Value::None),
-        StarlarkValue::List(values) => Ok(Value::List(
+        StarlarkValue::List(values) | StarlarkValue::Tuple(values) => Ok(Value::List(
             values
                 .iter()
                 .map(convert_configurable_value)
@@ -1064,7 +1064,7 @@ fn convert_value(value: &StarlarkValue) -> Result<Value> {
     match value {
         StarlarkValue::String(s) => Ok(Value::String(s.clone())),
         StarlarkValue::Bool(b) => Ok(Value::Bool(*b)),
-        StarlarkValue::List(items) => {
+        StarlarkValue::List(items) | StarlarkValue::Tuple(items) => {
             let converted: Result<Vec<_>> = items.iter().map(convert_value).collect();
             Ok(Value::List(converted?))
         }
@@ -1166,6 +1166,30 @@ mod tests {
         let value = StarlarkValue::Bool(true);
         let converted = convert_value(&value).unwrap();
         matches!(converted, Value::Bool(true));
+    }
+
+    #[test]
+    fn tuple_attributes_keep_existing_sequence_conversion() {
+        let tuple = StarlarkValue::Tuple(vec![
+            StarlarkValue::String("a.cc".to_string()),
+            StarlarkValue::Tuple(vec![StarlarkValue::String("nested.h".to_string())]),
+        ]);
+        let Value::List(items) = convert_value(&tuple).unwrap() else {
+            panic!("expected sequence attribute")
+        };
+        assert!(matches!(&items[0], Value::String(value) if value == "a.cc"));
+        assert!(
+            matches!(&items[1], Value::List(nested) if matches!(&nested[0], Value::String(value) if value == "nested.h"))
+        );
+        let Value::List(items) = convert_configurable_value(&StarlarkValue::Tuple(vec![
+            StarlarkValue::Int(7),
+            StarlarkValue::Tuple(vec![StarlarkValue::Bool(true)]),
+        ]))
+        .unwrap() else {
+            panic!("expected configurable sequence attribute")
+        };
+        assert!(matches!(items[0], Value::Int(7)));
+        assert!(matches!(&items[1], Value::List(nested) if matches!(nested[0], Value::Bool(true))));
     }
 
     #[test]

@@ -225,7 +225,7 @@ impl ConfigurableKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -233,6 +233,8 @@ pub enum Value {
     Bool(bool),
     None,
     List(Vec<Value>),
+    /// Immutable Starlark sequence; distinct from mutable lists.
+    Tuple(Vec<Value>),
     Dict(HashMap<String, Value>),
     Function {
         params: Vec<(String, Option<Expr>)>, // (name, default_value)
@@ -316,6 +318,141 @@ pub enum Value {
     },
 }
 
+// Match the previous derived equality for every non-tuple variant, while
+// allowing tuple equality to compose through lists, dicts, membership, and
+// removal. In particular, direct Int/Float equality is intentionally unchanged.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::None, Self::None) => true,
+            (Self::Tuple(_), Self::Tuple(_)) => tuple_element_equal(self, other),
+            (Self::List(a), Self::List(b)) => a == b,
+            (Self::Dict(a), Self::Dict(b))
+            | (Self::Namespace(a), Self::Namespace(b))
+            | (Self::Select(a), Self::Select(b)) => a == b,
+            (
+                Self::Function {
+                    params: ap,
+                    varargs_param: av,
+                    kwargs_param: ak,
+                    body: ab,
+                    closure: ac,
+                },
+                Self::Function {
+                    params: bp,
+                    varargs_param: bv,
+                    kwargs_param: bk,
+                    body: bb,
+                    closure: bc,
+                },
+            ) => ap == bp && av == bv && ak == bk && ab == bb && ac == bc,
+            (
+                Self::WorkspaceNativeNamespace {
+                    attrs: a,
+                    workspace_root: ar,
+                },
+                Self::WorkspaceNativeNamespace {
+                    attrs: b,
+                    workspace_root: br,
+                },
+            ) => a == b && ar == br,
+            (Self::RuleFunction(a), Self::RuleFunction(b))
+            | (Self::NativeFunction(a), Self::NativeFunction(b)) => a == b,
+            (
+                Self::Provider {
+                    name: an,
+                    fields: af,
+                    init: ai,
+                },
+                Self::Provider {
+                    name: bn,
+                    fields: bf,
+                    init: bi,
+                },
+            ) => an == bn && af == bf && ai == bi,
+            (
+                Self::ProviderInstance {
+                    provider_name: an,
+                    fields: af,
+                },
+                Self::ProviderInstance {
+                    provider_name: bn,
+                    fields: bf,
+                },
+            ) => an == bn && af == bf,
+            (
+                Self::Configurable {
+                    op: ao,
+                    left: al,
+                    right: ar,
+                },
+                Self::Configurable {
+                    op: bo,
+                    left: bl,
+                    right: br,
+                },
+            ) => ao == bo && al == bl && ar == br,
+            (
+                Self::BoundMethod {
+                    object: ao,
+                    method: am,
+                },
+                Self::BoundMethod {
+                    object: bo,
+                    method: bm,
+                },
+            ) => ao == bo && am == bm,
+            (
+                Self::Label {
+                    label: al,
+                    package: ap,
+                    name: an,
+                    workspace_name: aw,
+                    workspace_root: ar,
+                },
+                Self::Label {
+                    label: bl,
+                    package: bp,
+                    name: bn,
+                    workspace_name: bw,
+                    workspace_root: br,
+                },
+            ) => al == bl && ap == bp && an == bn && aw == bw && ar == br,
+            (
+                Self::LazyLoad {
+                    bzl_label: al,
+                    symbol_name: an,
+                },
+                Self::LazyLoad {
+                    bzl_label: bl,
+                    symbol_name: bn,
+                },
+            ) => al == bl && an == bn,
+            (
+                Self::Lambda {
+                    params: ap,
+                    varargs_param: av,
+                    kwargs_param: ak,
+                    body: ab,
+                    closure: ac,
+                },
+                Self::Lambda {
+                    params: bp,
+                    varargs_param: bv,
+                    kwargs_param: bk,
+                    body: bb,
+                    closure: bc,
+                },
+            ) => ap == bp && av == bv && ak == bk && ab == bb && ac == bc,
+            _ => false,
+        }
+    }
+}
+
 // `Value::Dict` remains string-keyed for compatibility with the evaluator's
 // existing representation, but config_setting must distinguish an actual
 // Starlark string key from a non-string key whose display happens to be the
@@ -336,21 +473,9 @@ fn dictionary_tuple_key(values: &[Value]) -> Result<String> {
     Ok(format!("{NON_STRING_DICT_KEY_PREFIX}tuple\0{payload}"))
 }
 
-fn is_select_condition_tuple(values: &[Value]) -> bool {
-    !values.is_empty()
-        && values.iter().all(|value| {
-            matches!(
-                value,
-                Value::String(label)
-                    if label.starts_with("//")
-                        || label.starts_with('@')
-                        || label.starts_with(':')
-            )
-        })
-}
-
 fn dictionary_key(value: &Value) -> Result<String> {
     match value {
+        Value::Tuple(values) => dictionary_tuple_key(values),
         Value::String(value)
             if value.starts_with(NON_STRING_DICT_KEY_PREFIX)
                 || value.starts_with(ESCAPED_STRING_DICT_KEY_PREFIX) =>
@@ -439,6 +564,22 @@ pub(crate) fn dictionary_key_value(key: &str) -> Value {
         return Value::String(key.to_string());
     };
     match kind {
+        "tuple" => {
+            // Each nested key is UTF-8 byte-length prefixed, so embedded colons,
+            // NULs, and non-ASCII strings cannot collide or split a code point.
+            let decode = || -> Option<Vec<Value>> {
+                let mut rest = visible;
+                let mut values = Vec::new();
+                while !rest.is_empty() {
+                    let (length, payload) = rest.split_once(':')?;
+                    let length = length.parse::<usize>().ok()?;
+                    values.push(dictionary_key_value(payload.get(..length)?));
+                    rest = payload.get(length..)?;
+                }
+                Some(values)
+            };
+            decode().map(Value::Tuple).unwrap_or_else(|| Value::String(key.to_string()))
+        }
         "number" => visible
             .parse::<i64>()
             .map(Value::Int)
@@ -528,6 +669,127 @@ enum LvalueStep {
     Index(Value),
 }
 
+// Internal mutation detection must retain type/representation changes even
+// when Starlark tuple equality says the values compare equal (1 vs 1.0).
+fn same_value_representation(left: &Value, right: &Value) -> bool {
+    let sequence = |left: &[Value], right: &[Value]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| same_value_representation(left, right))
+    };
+    let mapping = |left: &HashMap<String, Value>, right: &HashMap<String, Value>| {
+        left.len() == right.len()
+            && left.iter().all(|(key, value)| {
+                right
+                    .get(key)
+                    .is_some_and(|other| same_value_representation(value, other))
+            })
+    };
+    match (left, right) {
+        (Value::Tuple(left), Value::Tuple(right)) | (Value::List(left), Value::List(right)) => {
+            sequence(left, right)
+        }
+        (Value::Dict(left), Value::Dict(right))
+        | (Value::Namespace(left), Value::Namespace(right))
+        | (Value::Select(left), Value::Select(right)) => mapping(left, right),
+        (
+            Value::WorkspaceNativeNamespace {
+                attrs: left,
+                workspace_root: lr,
+            },
+            Value::WorkspaceNativeNamespace {
+                attrs: right,
+                workspace_root: rr,
+            },
+        ) => lr == rr && mapping(left, right),
+        (
+            Value::ProviderInstance {
+                provider_name: ln,
+                fields: left,
+            },
+            Value::ProviderInstance {
+                provider_name: rn,
+                fields: right,
+            },
+        ) => ln == rn && mapping(left, right),
+        (
+            Value::Provider {
+                name: ln,
+                fields: lf,
+                init: li,
+            },
+            Value::Provider {
+                name: rn,
+                fields: rf,
+                init: ri,
+            },
+        ) => {
+            ln == rn
+                && lf == rf
+                && match (li, ri) {
+                    (Some(left), Some(right)) => same_value_representation(left, right),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (
+            Value::Configurable {
+                op: lo,
+                left: ll,
+                right: lr,
+            },
+            Value::Configurable {
+                op: ro,
+                left: rl,
+                right: rr,
+            },
+        ) => lo == ro && same_value_representation(ll, rl) && same_value_representation(lr, rr),
+        (
+            Value::BoundMethod {
+                object: left,
+                method: lm,
+            },
+            Value::BoundMethod {
+                object: right,
+                method: rm,
+            },
+        ) => lm == rm && same_value_representation(left, right),
+        _ => left == right,
+    }
+}
+
+// Use Starlark numeric equality while traversing a tuple. The existing Value
+// Direct scalar equality retains its existing type distinction.
+fn tuple_element_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(integer), Value::Float(float)) | (Value::Float(float), Value::Int(integer)) => {
+            float.is_finite()
+                && float.fract() == 0.0
+                && *float >= i64::MIN as f64
+                && *float < 9_223_372_036_854_775_808.0
+                && *float as i64 == *integer
+        }
+        (Value::Tuple(left), Value::Tuple(right)) | (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| tuple_element_equal(left, right))
+        }
+        (Value::Dict(left), Value::Dict(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| tuple_element_equal(value, other))
+                })
+        }
+        _ => left == right,
+    }
+}
+
 impl Value {
     fn is_configurable(&self) -> bool {
         matches!(self, Value::Select(_) | Value::Configurable { .. })
@@ -556,7 +818,8 @@ impl Value {
             Value::Configurable { op, left, right } => {
                 Self::configurable_result_kinds(*op, left, right)
             }
-            Value::Function { .. }
+            Value::Tuple(_)
+            | Value::Function { .. }
             | Value::Namespace(_)
             | Value::WorkspaceNativeNamespace { .. }
             | Value::RuleFunction(_)
@@ -644,7 +907,7 @@ impl Value {
             Value::Int(0) => false,
             Value::Float(f) if *f == 0.0 => false,
             Value::String(s) if s.is_empty() => false,
-            Value::List(l) if l.is_empty() => false,
+            Value::List(l) | Value::Tuple(l) if l.is_empty() => false,
             Value::Dict(d) if d.is_empty() => false,
             Value::Namespace(m) if m.is_empty() => false,
             _ => true,
@@ -677,6 +940,7 @@ impl Value {
             Value::String(s) => s.clone(),
             Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
             Value::None => "None".to_string(),
+            Value::Tuple(_) => starlark_repr(self),
             Value::List(items) => {
                 let items_str: Vec<_> = items.iter().map(|v| v.to_string()).collect();
                 format!("[{}]", items_str.join(", "))
@@ -776,7 +1040,7 @@ impl Value {
         match self {
             Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) => size_of::<Value>(),
             Value::String(s) => size_of::<Value>() + s.capacity(),
-            Value::List(items) => {
+            Value::List(items) | Value::Tuple(items) => {
                 size_of::<Value>()
                     + items.capacity() * size_of::<Value>()
                     + items
@@ -947,7 +1211,7 @@ impl ValueCensus {
         }
         match v {
             Value::String(s) => self.string_bytes += s.len(),
-            Value::List(items) => {
+            Value::List(items) | Value::Tuple(items) => {
                 self.list_elements += items.len();
                 for i in items {
                     self.walk_value(i, seen_envs);
@@ -1185,7 +1449,7 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value> {
         Value::Int(n) => serde_json::Value::from(*n),
         Value::Float(f) => serde_json::json!(*f),
         Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::List(items) => serde_json::Value::Array(
+        Value::List(items) | Value::Tuple(items) => serde_json::Value::Array(
             items
                 .iter()
                 .map(value_to_json)
@@ -1307,7 +1571,7 @@ fn exports_files_sources(args: &[Value], kwargs: &HashMap<String, Value>) -> Res
     };
 
     match source_value {
-        Value::List(items) => items
+        Value::List(items) | Value::Tuple(items) => items
             .iter()
             .map(|item| match item {
                 Value::String(s) => Ok(s.clone()),
@@ -1336,7 +1600,7 @@ fn exports_files_visibility(kwargs: &HashMap<String, Value>) -> Result<Vec<Value
         // exports_files(): the source target is public, independent of the
         // package's default_visibility.
         Value::None => Ok(vec![Value::String("//visibility:public".to_string())]),
-        Value::List(specifications) => {
+        Value::List(specifications) | Value::Tuple(specifications) => {
             if specifications
                 .iter()
                 .all(|specification| matches!(specification, Value::String(_)))
@@ -1463,7 +1727,7 @@ fn expand_tf_custom_op_library(
 
     // Extract existing deps or create empty list
     let mut all_deps = match expanded_kwargs.get("deps") {
-        Some(Value::List(deps)) => deps.clone(),
+        Some(Value::List(deps) | Value::Tuple(deps)) => deps.clone(),
         _ => Vec::new(),
     };
 
@@ -1486,7 +1750,7 @@ fn expand_tf_custom_op_library(
 
     // Extract copts and add -fPIC for shared library
     let mut copts = match expanded_kwargs.get("copts") {
-        Some(Value::List(opts)) => opts.clone(),
+        Some(Value::List(opts) | Value::Tuple(opts)) => opts.clone(),
         _ => Vec::new(),
     };
 
@@ -1502,7 +1766,7 @@ fn expand_tf_custom_op_library(
 
     // Extract linkopts and add -shared for shared library
     let mut linkopts = match expanded_kwargs.get("linkopts") {
-        Some(Value::List(opts)) => opts.clone(),
+        Some(Value::List(opts) | Value::Tuple(opts)) => opts.clone(),
         _ => Vec::new(),
     };
 
@@ -1537,12 +1801,12 @@ fn expand_cc_header_only_library(
 
     // Extract existing deps or create empty list
     let mut all_deps = match expanded_kwargs.get("deps") {
-        Some(Value::List(deps)) => deps.clone(),
+        Some(Value::List(deps) | Value::Tuple(deps)) => deps.clone(),
         _ => Vec::new(),
     };
 
     // Add extra_deps to the deps list (TensorFlow-specific attribute)
-    if let Some(Value::List(extra_deps)) = expanded_kwargs.get("extra_deps") {
+    if let Some(Value::List(extra_deps) | Value::Tuple(extra_deps)) = expanded_kwargs.get("extra_deps") {
         all_deps.extend(extra_deps.clone());
     }
 
@@ -1691,7 +1955,7 @@ fn expand_tf_gen_op_wrappers_cc(
     };
     let get_list = |k: &str| -> Vec<String> {
         match kwargs.get(k) {
-            Some(Value::List(l)) => l
+            Some(Value::List(l) | Value::Tuple(l)) => l
                 .iter()
                 .filter_map(|v| match v {
                     Value::String(s) => Some(s.clone()),
@@ -1922,7 +2186,7 @@ fn expand_tf_gen_op_wrapper_cc(
     };
     let get_list = |k: &str| -> Vec<String> {
         match kwargs.get(k) {
-            Some(Value::List(l)) => l
+            Some(Value::List(l) | Value::Tuple(l)) => l
                 .iter()
                 .filter_map(|v| match v {
                     Value::String(s) => Some(s.clone()),
@@ -2048,7 +2312,7 @@ fn expand_flatbuffer_cc_library(
     };
 
     let srcs: Vec<String> = match kwargs.get("srcs") {
-        Some(Value::List(l)) => l
+        Some(Value::List(l) | Value::Tuple(l)) => l
             .iter()
             .filter_map(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -2070,7 +2334,7 @@ fn expand_flatbuffer_cc_library(
     };
 
     let flatc_args: Vec<String> = match kwargs.get("flatc_args") {
-        Some(Value::List(l)) => l
+        Some(Value::List(l) | Value::Tuple(l)) => l
             .iter()
             .filter_map(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -2282,7 +2546,7 @@ fn expand_tf_gpu_cc_test(
         _ => return Ok(vec![]),
     };
     let tags: Vec<Value> = match kwargs.get("tags") {
-        Some(Value::List(t)) => t.clone(),
+        Some(Value::List(t) | Value::Tuple(t)) => t.clone(),
         _ => vec![],
     };
     let has_gpu_tag = tags
@@ -2311,7 +2575,7 @@ fn expand_tf_gpu_cc_test(
     let gpu_name = format!("{}_gpu", name);
     gpu.insert("name".to_string(), Value::String(gpu_name.clone()));
     let mut gdeps = match kwargs.get("deps") {
-        Some(Value::List(d)) => d.clone(),
+        Some(Value::List(d) | Value::Tuple(d)) => d.clone(),
         _ => vec![],
     };
     let gpu_runtime = "//tensorflow/core:gpu_runtime".to_string();
@@ -2382,10 +2646,10 @@ fn expand_cc_library_with_android_deps(
     // Combine deps and common_deps, ignoring android_deps
     if let (Some(deps), Some(common_deps)) = (kwargs.get("deps"), kwargs.get("common_deps")) {
         let mut combined_deps = Vec::new();
-        if let Value::List(d) = deps {
+        if let Value::List(d) | Value::Tuple(d) = deps {
             combined_deps.extend(d.clone());
         }
-        if let Value::List(cd) = common_deps {
+        if let Value::List(cd) | Value::Tuple(cd) = common_deps {
             combined_deps.extend(cd.clone());
         }
         new_kwargs.insert("deps".to_string(), Value::List(combined_deps));
@@ -2539,7 +2803,7 @@ fn expand_tf_proto_library(
         }
         let mut impl_protodeps: Vec<Value> =
             vec![Value::String(format!(":{}", gen_owner))];
-        if let Some(Value::List(pds)) = kwargs.get("protodeps") {
+        if let Some(Value::List(pds) | Value::Tuple(pds)) = kwargs.get("protodeps") {
             for pd in pds {
                 if let Value::String(l) = pd {
                     impl_protodeps.push(Value::String(rewrite_proto_label_to_cc_impl(l)));
@@ -3446,7 +3710,7 @@ impl Evaluator {
         let Some(default_visibility) = kwargs.get("default_visibility") else {
             return Ok(());
         };
-        let Value::List(specifications) = default_visibility else {
+        let (Value::List(specifications) | Value::Tuple(specifications)) = default_visibility else {
             return Err(anyhow!(
                 "package(default_visibility) must be a list of labels"
             ));
@@ -3621,7 +3885,7 @@ impl Evaluator {
                 .kwargs
                 .get("constraint_values")
                 .map(|value| {
-                    let Value::List(values) = value else {
+                    let (Value::List(values) | Value::Tuple(values)) = value else {
                         unreachable!("config_setting attributes are validated before activation")
                     };
                     values
@@ -3740,7 +4004,7 @@ impl Evaluator {
             }
 
             if let Some(value) = kwargs.get("constraint_values") {
-                let Value::List(values) = value else {
+                let (Value::List(values) | Value::Tuple(values)) = value else {
                     return Err(anyhow!(
                         "in call to config_setting(), parameter 'constraint_values' got value of type '{}', want 'sequence'",
                         starlark_type_name(value)?
@@ -3786,7 +4050,7 @@ impl Evaluator {
             let Some(value) = kwargs.get(attribute) else {
                 continue;
             };
-            let Value::List(values) = value else {
+            let (Value::List(values) | Value::Tuple(values)) = value else {
                 return Err(anyhow!(
                     "in call to package_group(), parameter '{}' got value of type '{}', want 'sequence'",
                     attribute,
@@ -5349,7 +5613,7 @@ impl Evaluator {
                 Ok(())
             }
             BindingPattern::Tuple(patterns) => {
-                let Value::List(values) = value else {
+                let (Value::List(values) | Value::Tuple(values)) = value else {
                     return Err(anyhow!(
                         "Cannot unpack {:?} into {} bindings",
                         value,
@@ -5439,7 +5703,7 @@ impl Evaluator {
                         map.get_mut(&key)
                             .ok_or_else(|| anyhow!("Key {} not found in dictionary", key))?
                     }
-                    Value::List(items) => {
+                    Value::List(items) | Value::Tuple(items) => {
                         let position = Self::list_index(index, items.len())?;
                         &mut items[position]
                     }
@@ -5537,7 +5801,7 @@ impl Evaluator {
                                         }
                                         let iterable = self.eval_expression(&call.args[0])?;
                                         match iterable {
-                                            Value::List(items) => {
+                                            Value::List(items) | Value::Tuple(items) => {
                                                 new_list.extend(items);
                                             }
                                             _ => {
@@ -5611,7 +5875,7 @@ impl Evaluator {
                                     }
                                     for unpack in &call.args_unpack {
                                         match self.eval_expression(unpack)? {
-                                            Value::List(items) => update_args.extend(items),
+                                            Value::List(items) | Value::Tuple(items) => update_args.extend(items),
                                             value => {
                                                 return Err(anyhow!(
                                                     "Cannot unpack non-list value in *args: {:?}",
@@ -5851,7 +6115,7 @@ impl Evaluator {
             } => {
                 let iter_val = self.eval_expression(iterable)?;
                 let items = match iter_val {
-                    Value::List(items) => items,
+                    Value::List(items) | Value::Tuple(items) => items,
                     Value::String(s) => {
                         // Strings are iterable in Starlark (yield 1-char strings).
                         s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -6242,57 +6506,14 @@ impl Evaluator {
                     match key_expr {
                         Some(key) => {
                             // Regular key: value pair
-                            let is_tuple_key = matches!(key, Expr::Tuple(_));
                             let key_val = self.eval_expression(key)?;
                             let val = self.eval_expression(val_expr)?;
-                            match (is_tuple_key, key_val) {
-                                // Tuple keys (Starlark tuples evaluate to
-                                // Value::List here) are the `selects.with_or`
-                                // ORed-condition form, e.g.
-                                //   {("//foo:a", "//conditions:default"): [...]}
-                                // Bazel skylib's `_with_or_dict` expands such a
-                                // tuple key into one entry per element. Rush's
-                                // Value::Dict is String-keyed, so stringifying
-                                // the whole tuple collapsed it into a single
-                                // bogus key that `select()` could never match
-                                // (and `//conditions:default` never surfaced),
-                                // dropping the matched branch's deps entirely.
-                                // Expand here so the produced map is exactly the
-                                // dict skylib's _with_or_dict would build; plain
-                                // string keys are unaffected, and a label that
-                                // appears both standalone and inside a tuple
-                                // still trips _with_or_dict's duplicate check.
-                                (true, Value::List(elems))
-                                    if is_select_condition_tuple(&elems) =>
-                                {
-                                    for elem in elems {
-                                        let encoded = dictionary_key(&elem)?;
-                                        if map.insert(encoded, val.clone()).is_some() {
-                                            return Err(anyhow!(
-                                                "dictionary expression has duplicate key: {}",
-                                                starlark_repr(&elem)
-                                            ));
-                                        }
-                                    }
-                                }
-                                (true, Value::List(elems)) => {
-                                    let encoded = dictionary_tuple_key(&elems)?;
-                                    if map.insert(encoded, val).is_some() {
-                                        return Err(anyhow!(
-                                            "dictionary expression has duplicate key: {}",
-                                            starlark_repr(&Value::List(elems))
-                                        ));
-                                    }
-                                }
-                                (_, key_val) => {
-                                    let encoded = dictionary_key(&key_val)?;
-                                    if map.insert(encoded, val).is_some() {
-                                        return Err(anyhow!(
-                                            "dictionary expression has duplicate key: {}",
-                                            starlark_repr(&key_val)
-                                        ));
-                                    }
-                                }
+                            let encoded = dictionary_key(&key_val)?;
+                            if map.insert(encoded, val).is_some() {
+                                return Err(anyhow!(
+                                    "dictionary expression has duplicate key: {}",
+                                    starlark_repr(&key_val)
+                                ));
                             }
                         }
                         None => {
@@ -6345,18 +6566,6 @@ impl Evaluator {
                         // All other operators: evaluate both sides then apply
                         let left_val = self.eval_expression(left)?;
                         let right_val = self.eval_expression(right)?;
-                        if matches!(left.as_ref(), Expr::Tuple(_)) {
-                            if let (Value::List(items), Value::Dict(map)) =
-                                (&left_val, &right_val)
-                            {
-                                let present = map.contains_key(&dictionary_tuple_key(items)?);
-                                return match op {
-                                    BinOp::In => Ok(Value::Bool(present)),
-                                    BinOp::NotIn => Ok(Value::Bool(!present)),
-                                    _ => self.apply_binop(&left_val, *op, &right_val),
-                                };
-                            }
-                        }
                         self.apply_binop(&left_val, *op, &right_val)
                     }
                 }
@@ -6386,18 +6595,8 @@ impl Evaluator {
             Expr::Index { object, index } => {
                 let obj_val = self.eval_expression(object)?;
                 let idx_val = self.eval_expression(index)?;
-                let tuple_dict_key = match (index.as_ref(), &idx_val) {
-                    (Expr::Tuple(_), Value::List(items)) => {
-                        Some(dictionary_tuple_key(items)?)
-                    }
-                    _ => None,
-                };
                 match (obj_val, idx_val) {
-                    (Value::Dict(map), _) if tuple_dict_key.is_some() => map
-                        .get(tuple_dict_key.as_ref().expect("tuple key checked"))
-                        .cloned()
-                        .ok_or_else(|| anyhow!("Dictionary key not found")),
-                    (Value::List(items), Value::Int(idx)) => {
+                    (Value::List(items) | Value::Tuple(items), Value::Int(idx)) => {
                         let idx = if idx < 0 {
                             (items.len() as i64 + idx) as usize
                         } else {
@@ -6550,7 +6749,7 @@ impl Evaluator {
 
                     // Convert iterable to list
                     let items = match iterable_val {
-                        Value::List(items) => items,
+                        Value::List(items) | Value::Tuple(items) => items,
                         Value::String(s) => {
                             // Strings are iterable in Python/Starlark
                             s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -6571,7 +6770,7 @@ impl Evaluator {
                         } else {
                             // Multiple variables: unpack tuple/list
                             let values = match item {
-                                Value::List(ref values) => values,
+                                Value::List(ref values) | Value::Tuple(ref values) => values,
                                 _ => {
                                     return Err(anyhow!(
                                         "Cannot unpack {:?} into {} variables",
@@ -6641,21 +6840,7 @@ impl Evaluator {
                         let key_val = evaluator.eval_expression(key_expr)?;
                         let val_val = evaluator.eval_expression(value_expr)?;
 
-                        // Convert key to string
-                        let key_str = match key_val {
-                            value @ (Value::String(_)
-                            | Value::Int(_)
-                            | Value::Float(_)
-                            | Value::Bool(_)
-                            | Value::None
-                            | Value::Label { .. }) => dictionary_key(&value)?,
-                            _ => {
-                                return Err(anyhow!(
-                                    "Dict key must be string, int, float, or bool, got {:?}",
-                                    key_val
-                                ))
-                            }
-                        };
+                        let key_str = dictionary_key(&key_val)?;
 
                         result.insert(key_str, val_val);
                         return Ok(());
@@ -6668,7 +6853,7 @@ impl Evaluator {
 
                     // Convert iterable to list
                     let items = match iterable_val {
-                        Value::List(items) => items,
+                        Value::List(items) | Value::Tuple(items) => items,
                         Value::String(s) => {
                             // Strings are iterable in Python/Starlark
                             s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -6689,7 +6874,7 @@ impl Evaluator {
                         } else {
                             // Multiple variables: unpack tuple/list
                             let values = match item {
-                                Value::List(ref values) => values,
+                                Value::List(ref values) | Value::Tuple(ref values) => values,
                                 _ => {
                                     return Err(anyhow!(
                                         "Cannot unpack {:?} into {} variables",
@@ -6760,8 +6945,7 @@ impl Evaluator {
                 // Evaluate all tuple elements
                 let values: Result<Vec<_>> =
                     elements.iter().map(|e| self.eval_expression(e)).collect();
-                // Represent tuples as lists (Starlark tuples are immutable lists)
-                Ok(Value::List(values?))
+                Ok(Value::Tuple(values?))
             }
             Expr::Slice {
                 object,
@@ -6813,6 +6997,23 @@ impl Evaluator {
                 }
 
                 match obj_val {
+                    Value::Tuple(items) => {
+                        let len = items.len() as i64;
+                        let bound = |value: i64| {
+                            let value = if value < 0 { value.saturating_add(len) } else { value };
+                            if step_val > 0 { value.clamp(0, len) }
+                            else { value.clamp(-1, len - 1) }
+                        };
+                        let mut i = start_val.map(bound).unwrap_or(if step_val > 0 { 0 } else { len - 1 });
+                        let end = end_val.map(bound).unwrap_or(if step_val > 0 { len } else { -1 });
+                        let mut result = Vec::new();
+                        while if step_val > 0 { i < end } else { i > end } {
+                            result.push(items[i as usize].clone());
+                            let Some(next) = i.checked_add(step_val) else { break };
+                            i = next;
+                        }
+                        Ok(Value::Tuple(result))
+                    }
                     Value::List(items) => {
                         let len = items.len();
                         let start_idx = normalize_idx(start_val.unwrap_or(0), len);
@@ -6893,6 +7094,47 @@ impl Evaluator {
         }
     }
 
+    fn tuple_element_order(&self, left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        let compare_integer_float = |integer: i64, float: f64| -> Result<Ordering> {
+            if float.is_nan() {
+                return Err(anyhow!("comparison involving NaN"));
+            }
+            if float >= 9_223_372_036_854_775_808.0 {
+                return Ok(Ordering::Less);
+            }
+            if float < i64::MIN as f64 {
+                return Ok(Ordering::Greater);
+            }
+            match integer.cmp(&(float as i64)) {
+                Ordering::Equal if float.fract() > 0.0 => Ok(Ordering::Less),
+                Ordering::Equal if float.fract() < 0.0 => Ok(Ordering::Greater),
+                order => Ok(order),
+            }
+        };
+        match (left, right) {
+            (Value::Int(integer), Value::Float(float)) => compare_integer_float(*integer, *float),
+            (Value::Float(float), Value::Int(integer)) => {
+                compare_integer_float(*integer, *float).map(Ordering::reverse)
+            }
+            // Nested lists inside a tuple participate in the same recursive
+            // ordering. Ordinary top-level List ordering stays unchanged.
+            (Value::List(left), Value::List(right)) => {
+                for (left, right) in left.iter().zip(right) {
+                    if tuple_element_equal(left, right) {
+                        continue;
+                    }
+                    match self.tuple_element_order(left, right)? {
+                        Ordering::Equal => continue,
+                        order => return Ok(order),
+                    }
+                }
+                Ok(left.len().cmp(&right.len()))
+            }
+            _ => self.starlark_order(left, right),
+        }
+    }
+
     /// Starlark ordering: numbers numerically, strings/bools by natural order,
     /// lists/tuples lexicographically (recursively, element by element, shorter
     /// is less when one is a prefix of the other). Errors on incomparable type
@@ -6909,6 +7151,20 @@ impl Evaluator {
                 let x = a.to_float()?;
                 let y = b.to_float()?;
                 x.partial_cmp(&y).ok_or_else(|| anyhow!("comparison involving NaN"))
+            }
+            (Value::Tuple(xs), Value::Tuple(ys)) => {
+                for (xi, yi) in xs.iter().zip(ys.iter()) {
+                    // Equality is enough to skip a common prefix; those values
+                    // need not themselves support ordering (e.g. None/dicts).
+                    if tuple_element_equal(xi, yi) {
+                        continue;
+                    }
+                    match self.tuple_element_order(xi, yi)? {
+                        Ordering::Equal => continue,
+                        ord => return Ok(ord),
+                    }
+                }
+                Ok(xs.len().cmp(&ys.len()))
             }
             (Value::List(xs), Value::List(ys)) => {
                 for (xi, yi) in xs.iter().zip(ys.iter()) {
@@ -6964,6 +7220,11 @@ impl Evaluator {
                     result.extend(b.clone());
                     Ok(Value::List(result))
                 }
+                (Value::Tuple(a), Value::Tuple(b)) => {
+                    let mut result = a.clone();
+                    result.extend(b.iter().cloned());
+                    Ok(Value::Tuple(result))
+                }
                 // None + List = List (Starlark treats None as empty list in concatenation)
                 (Value::None, Value::List(b)) => Ok(Value::List(b.clone())),
                 (Value::List(a), Value::None) => Ok(Value::List(a.clone())),
@@ -6991,6 +7252,11 @@ impl Evaluator {
                 (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
                 (Value::String(s), Value::Int(n)) | (Value::Int(n), Value::String(s)) => {
                     Ok(Value::String(s.repeat(*n as usize)))
+                }
+                (Value::Tuple(items), Value::Int(n)) | (Value::Int(n), Value::Tuple(items)) => {
+                    let mut result = Vec::new();
+                    for _ in 0..(*n).max(0) { result.extend(items.iter().cloned()); }
+                    Ok(Value::Tuple(result))
                 }
                 // List repetition: [1, 2] * 3 = [1, 2, 1, 2, 1, 2]
                 (Value::List(l), Value::Int(n)) | (Value::Int(n), Value::List(l)) => {
@@ -7022,7 +7288,7 @@ impl Evaluator {
                 if let Value::String(format_str) = &left {
                     // Python/Starlark string formatting: "foo-%s" % value
                     let values: Vec<Value> = match &right {
-                        Value::List(items) => items.clone(),
+                        Value::Tuple(items) => items.clone(),
                         Value::String(s) => vec![Value::String(s.clone())],
                         other => vec![(*other).clone()],
                     };
@@ -7081,8 +7347,14 @@ impl Evaluator {
                 let b = right.to_float()?;
                 Ok(Value::Float(a.powf(b)))
             }
-            BinOp::Eq => Ok(Value::Bool(left == right)),
-            BinOp::NotEq => Ok(Value::Bool(left != right)),
+            BinOp::Eq => Ok(Value::Bool(match (left, right) {
+                (Value::Tuple(_), Value::Tuple(_)) => tuple_element_equal(left, right),
+                _ => left == right,
+            })),
+            BinOp::NotEq => Ok(Value::Bool(match (left, right) {
+                (Value::Tuple(_), Value::Tuple(_)) => !tuple_element_equal(left, right),
+                _ => left != right,
+            })),
             BinOp::Lt => Ok(Value::Bool(
                 self.starlark_order(left, right)? == std::cmp::Ordering::Less,
             )),
@@ -7181,6 +7453,7 @@ impl Evaluator {
                 }
             }
             BinOp::In => match right {
+                Value::Tuple(items) => Ok(Value::Bool(items.iter().any(|item| tuple_element_equal(item, left)))),
                 Value::List(items) => Ok(Value::Bool(items.contains(left))),
                 Value::String(s) => {
                     let needle = left.to_string();
@@ -7194,6 +7467,7 @@ impl Evaluator {
                 _ => Err(anyhow!("Cannot check membership in {:?}", right)),
             },
             BinOp::NotIn => match right {
+                Value::Tuple(items) => Ok(Value::Bool(!items.iter().any(|item| tuple_element_equal(item, left)))),
                 Value::List(items) => Ok(Value::Bool(!items.contains(left))),
                 Value::String(s) => {
                     let needle = left.to_string();
@@ -7244,12 +7518,13 @@ impl Evaluator {
                 for list_expr in unpack {
                     let list_val = evaluator.eval_expression(list_expr)?;
                     match list_val {
-                        Value::List(items) => {
+                        Value::List(items) | Value::Tuple(items) => {
                             merged.extend(items);
                         }
+                        Value::Dict(map) => merged.extend(sorted_dictionary_key_values(&map)),
                         _ => {
                             return Err(anyhow!(
-                                "Cannot unpack non-list value in *args: {:?}",
+                                "Cannot unpack non-iterable value in *args: {:?}",
                                 list_val
                             ))
                         }
@@ -7589,16 +7864,14 @@ impl Evaluator {
                 // Create new environment with closure
                 let mut func_env = Environment::with_parent(closure.clone());
                 let mut mutable_aliases: Vec<(String, String, Value)> = Vec::new();
-                let is_mutable_value = |value: &Value| {
-                    matches!(
-                        value,
-                        Value::List(_)
-                            | Value::Dict(_)
-                            | Value::Namespace(_)
-                            | Value::WorkspaceNativeNamespace { .. }
-                            | Value::ProviderInstance { .. }
-                    )
-                };
+                fn is_mutable_value(value: &Value) -> bool {
+                    match value {
+                        Value::Tuple(items) => items.iter().any(is_mutable_value),
+                        Value::List(_) | Value::Dict(_) | Value::Namespace(_)
+                        | Value::WorkspaceNativeNamespace { .. } | Value::ProviderInstance { .. } => true,
+                        _ => false,
+                    }
+                }
 
                 // Merge args and args_unpack to get all positional arguments
                 let all_args = merge_args(args, args_unpack, self)?;
@@ -7640,7 +7913,7 @@ impl Evaluator {
 
                 // Bind *args if present
                 if let Some(varargs_name) = &varargs_param {
-                    func_env.define(varargs_name.clone(), Value::List(varargs_values));
+                    func_env.define(varargs_name.clone(), Value::Tuple(varargs_values));
                 }
 
                 // Separate kwargs into named params and **kwargs
@@ -7760,7 +8033,7 @@ impl Evaluator {
                     .filter(|_| result.is_ok())
                     .filter_map(|(param_name, caller_name, original)| {
                         self.env.get(&param_name).and_then(|updated| {
-                            (updated != original).then_some((caller_name, updated))
+                            (!same_value_representation(&updated, &original)).then_some((caller_name, updated))
                         })
                     })
                     .collect();
@@ -7881,7 +8154,7 @@ impl Evaluator {
                         let mut seen = Vec::new();
                         if let Some(first) = eval_args.first() {
                             let items = match first {
-                                Value::List(items) => items.clone(),
+                                Value::List(items) | Value::Tuple(items) => items.clone(),
                                 Value::Dict(map) => {
                                     sorted_dictionary_key_values(map)
                                 }
@@ -7905,7 +8178,7 @@ impl Evaluator {
                         }
                         let first = &eval_args[0];
                         let list = match first {
-                            Value::List(items) => items.clone(),
+                            Value::List(items) | Value::Tuple(items) => items.clone(),
                             Value::String(s) => vec![Value::String(s.clone())],
                             _ => Vec::new(),
                         };
@@ -8399,7 +8672,7 @@ impl Evaluator {
                                 }
                                 let result = match &eval_args[0] {
                                     Value::String(prefix) => s.starts_with(prefix),
-                                    Value::List(prefixes) => prefixes.iter().try_fold(
+                                    Value::Tuple(prefixes) => prefixes.iter().try_fold(
                                         false,
                                         |matched, prefix| match prefix {
                                             Value::String(prefix) => {
@@ -8424,7 +8697,7 @@ impl Evaluator {
                                 }
                                 let result = match &eval_args[0] {
                                     Value::String(suffix) => s.ends_with(suffix),
-                                    Value::List(suffixes) => suffixes.iter().try_fold(
+                                    Value::Tuple(suffixes) => suffixes.iter().try_fold(
                                         false,
                                         |matched, suffix| match suffix {
                                             Value::String(suffix) => {
@@ -8551,13 +8824,13 @@ impl Evaluator {
                                 if let Some(pos) = s.find(separator) {
                                     let before = &s[..pos];
                                     let after = &s[pos + separator.len()..];
-                                    Ok(Value::List(vec![
+                                    Ok(Value::Tuple(vec![
                                         Value::String(before.to_string()),
                                         Value::String(separator.clone()),
                                         Value::String(after.to_string()),
                                     ]))
                                 } else {
-                                    Ok(Value::List(vec![
+                                    Ok(Value::Tuple(vec![
                                         Value::String(s.clone()),
                                         Value::String(String::new()),
                                         Value::String(String::new()),
@@ -8584,14 +8857,14 @@ impl Evaluator {
                                     // Separator found - split into (before, sep, after)
                                     let before = &s[..pos];
                                     let after = &s[pos + separator.len()..];
-                                    Ok(Value::List(vec![
+                                    Ok(Value::Tuple(vec![
                                         Value::String(before.to_string()),
                                         Value::String(separator.clone()),
                                         Value::String(after.to_string()),
                                     ]))
                                 } else {
                                     // Separator not found - return ("", "", original_string)
-                                    Ok(Value::List(vec![
+                                    Ok(Value::Tuple(vec![
                                         Value::String(String::new()),
                                         Value::String(String::new()),
                                         Value::String(s.clone()),
@@ -8603,7 +8876,7 @@ impl Evaluator {
                                     return Err(anyhow!("join() requires an argument"));
                                 }
                                 let items = match &eval_args[0] {
-                                    Value::List(items) => items,
+                                    Value::List(items) | Value::Tuple(items) => items,
                                     _ => return Err(anyhow!("join() argument must be a list")),
                                 };
                                 let strings: Result<Vec<String>> = items
@@ -8779,7 +9052,7 @@ impl Evaluator {
                                 let items: Vec<Value> = map
                                     .iter()
                                     .map(|(k, v)| {
-                                        Value::List(vec![
+                                        Value::Tuple(vec![
                                             dictionary_key_value(k),
                                             v.clone(),
                                         ])
@@ -8937,7 +9210,7 @@ impl Evaluator {
                 if let Some(varargs_name) = &varargs_param {
                     func_env.define(
                         varargs_name.clone(),
-                        Value::List(all_args.into_iter().skip(params.len()).collect()),
+                        Value::Tuple(all_args.into_iter().skip(params.len()).collect()),
                     );
                 }
 
@@ -9087,7 +9360,7 @@ mod tests {
                     Some(Value::String(value)) if value == name
                 )
         })?;
-        let Value::List(specifications) = rule.kwargs.get("visibility")? else {
+        let (Value::List(specifications) | Value::Tuple(specifications)) = rule.kwargs.get("visibility")? else {
             return None;
         };
         specifications
@@ -10030,39 +10303,20 @@ pkg = native.package_name()
     }
 
     #[test]
-    fn test_dict_tuple_key_expands_for_with_or() {
-        // selects.with_or ORed-condition keys are written as tuples, e.g.
-        //   {("//foo:off", "//conditions:default"): [":portable"]}
-        // Rush must expand the tuple key into one string entry per element so
-        // the resulting dict matches what Bazel skylib's _with_or_dict builds
-        // (otherwise the whole tuple collapses to one bogus key and select()
-        // can never match //conditions:default, dropping the deps).
-        let source = r#"
-d = {
-    "//foo:a": [":depA"],
-    ("//foo:off", "//conditions:default"): [":portable"],
-}
-"#;
-        let mut evaluator = Evaluator::new();
-        let program = crate::parse(source).unwrap();
-        evaluator.eval_program(&program).unwrap();
-        match evaluator.get_var("d") {
-            Some(Value::Dict(map)) => {
-                assert!(map.contains_key("//foo:a"), "plain key preserved");
-                assert!(
-                    map.contains_key("//foo:off"),
-                    "first tuple element expanded to its own key"
-                );
-                assert!(
-                    map.contains_key("//conditions:default"),
-                    "//conditions:default expanded to its own key (was the bug)"
-                );
-                // Both expanded keys share the tuple's value.
-                assert_eq!(map.get("//foo:off"), map.get("//conditions:default"));
-                assert_eq!(map.len(), 3);
-            }
-            other => panic!("expected dict, got {:?}", other),
-        }
+    fn dictionary_label_tuple_keys_keep_their_identity() {
+        let evaluator = eval(r#"
+key = ("//foo:off", "//conditions:default")
+d = {"//foo:a": [":depA"], key: [":portable"]}
+value = d[key]
+present = key in d
+"#).unwrap();
+        let Some(Value::Dict(map)) = evaluator.get_var("d") else { panic!("expected dict") };
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("//foo:a"));
+        assert!(!map.contains_key("//foo:off"));
+        assert!(!map.contains_key("//conditions:default"));
+        assert_eq!(evaluator.get_var("present"), Some(Value::Bool(true)));
+        assert_eq!(evaluator.get_var("value"), Some(Value::List(vec![Value::String(":portable".into())])));
     }
 
     #[test]
@@ -10086,7 +10340,7 @@ rendered = repr(d)
         assert_eq!(evaluator.get_var("listed"), Some(Value::List(vec![label.clone()])));
         assert_eq!(
             evaluator.get_var("enumerated"),
-            Some(Value::List(vec![Value::List(vec![
+            Some(Value::List(vec![Value::Tuple(vec![
                 Value::Int(0),
                 label.clone(),
             ])]))
@@ -10098,7 +10352,7 @@ rendered = repr(d)
         assert!(!rendered.contains("rush-non-string-dict-key"), "{rendered}");
         assert_eq!(
             evaluator.get_var("items"),
-            Some(Value::List(vec![Value::List(vec![
+            Some(Value::List(vec![Value::Tuple(vec![
                 label,
                 Value::String("value".to_string()),
             ])]))
@@ -10257,11 +10511,11 @@ zero_lookup = d[0]
     }
 
     #[test]
-    fn dictionary_literals_reject_numeric_and_tuple_expansion_duplicates() {
+    fn dictionary_literals_reject_numeric_and_tuple_key_duplicates() {
         for source in [
             r#"d = {1: "int", 1.0: "float"}"#,
-            r#"d = {("//cfg:a", "//cfg:a"): []}"#,
-            r#"d = {"//cfg:a": [], ("//cfg:a", "//cfg:b"): []}"#,
+            r#"d = {("//cfg:a",): [], ("//cfg:a",): []}"#,
+            r#"d = {(1, ("x",)): [], tuple([1, ("x",)]): []}"#,
         ] {
             let error = match eval(source) {
                 Ok(_) => panic!("literal duplicate must fail eagerly: {source}"),
@@ -10413,10 +10667,10 @@ items = d.items()
         match items_val {
             Value::List(items) => {
                 assert_eq!(items.len(), 2);
-                // Each item should be a [key, value] list (tuple)
+                // Each item is an immutable (key, value) tuple.
                 for item in items {
                     match item {
-                        Value::List(pair) => {
+                        Value::Tuple(pair) => {
                             assert_eq!(pair.len(), 2);
                             // First element should be string key
                             match &pair[0] {
@@ -10433,7 +10687,7 @@ items = d.items()
                                 _ => panic!("Expected int value in tuple"),
                             }
                         }
-                        _ => panic!("Expected list (tuple), got {:?}", item),
+                        _ => panic!("Expected tuple, got {:?}", item),
                     }
                 }
             }

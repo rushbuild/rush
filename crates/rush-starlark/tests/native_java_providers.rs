@@ -258,7 +258,7 @@ fn native_java_initializers_validate_unpacked_arguments() {
             ),
             ("JavaInfo(**{1: None})", "argument names must be strings"),
             ("JavaInfo(**None)", "cannot unpack a non-dict argument"),
-            ("JavaInfo(*None)", "Cannot unpack non-list value"),
+            ("JavaInfo(*None)", "Cannot unpack non-iterable value"),
             (
                 "JavaInfo(**{\"output_jar\": None})",
                 "JavaInfo construction is unsupported",

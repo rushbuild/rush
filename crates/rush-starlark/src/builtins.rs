@@ -24,6 +24,7 @@ pub fn get_builtins() -> HashMap<String, BuiltinFn> {
     builtins.insert("float".to_string(), builtin_float);
     builtins.insert("bool".to_string(), builtin_bool);
     builtins.insert("list".to_string(), builtin_list);
+    builtins.insert("tuple".to_string(), builtin_tuple);
     builtins.insert("dict".to_string(), builtin_dict);
     builtins.insert("print".to_string(), builtin_print);
     builtins.insert("type".to_string(), builtin_type);
@@ -270,7 +271,7 @@ fn builtin_len(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 
     match &args[0] {
         Value::String(s) => Ok(Value::Int(s.len() as i64)),
-        Value::List(items) => Ok(Value::Int(items.len() as i64)),
+        Value::List(items) | Value::Tuple(items) => Ok(Value::Int(items.len() as i64)),
         Value::Dict(map) => Ok(Value::Int(map.len() as i64)),
         _ => Err(anyhow!("len() argument must be a sequence")),
     }
@@ -306,9 +307,9 @@ fn builtin_hash(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
             "None".hash(&mut hasher);
             Ok(Value::Int(hasher.finish() as i64))
         }
-        // Tuples can be hashed if all their elements are hashable
+        // Preserve the existing nonstandard list hash extension. Real Tuple
+        // values do not enter this arm (Bazel 6.5 hash() accepts strings only).
         Value::List(items) => {
-            // Treat as a tuple for hashing purposes
             for item in items {
                 match item {
                     Value::String(s) => s.hash(&mut hasher),
@@ -331,7 +332,7 @@ fn builtin_max(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 
     // Handle single list argument
     let items = if args.len() == 1 {
-        if let Value::List(list) = &args[0] {
+        if let Value::List(list) | Value::Tuple(list) = &args[0] {
             if list.is_empty() {
                 return Err(anyhow!("max() arg is an empty sequence"));
             }
@@ -370,7 +371,7 @@ fn builtin_min(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 
     // Handle single list argument
     let items = if args.len() == 1 {
-        if let Value::List(list) = &args[0] {
+        if let Value::List(list) | Value::Tuple(list) = &args[0] {
             if list.is_empty() {
                 return Err(anyhow!("min() arg is an empty sequence"));
             }
@@ -478,6 +479,10 @@ pub(crate) fn starlark_repr(value: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Value::Tuple(values) => {
+            let items = values.iter().map(starlark_repr).collect::<Vec<_>>().join(", ");
+            format!("({}{})", items, if values.len() == 1 { "," } else { "" })
+        }
         Value::Dict(values) => {
             let mut entries: Vec<_> = values.iter().collect();
             entries.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -524,6 +529,7 @@ pub(crate) fn starlark_type_name(value: &Value) -> Result<&str> {
         Value::Bool(_) => Ok("bool"),
         Value::None => Ok("NoneType"),
         Value::List(_) => Ok("list"),
+        Value::Tuple(_) => Ok("tuple"),
         Value::Dict(_) => Ok("dict"),
         Value::Function { .. } | Value::Lambda { .. } => Ok("function"),
         Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => Ok("namespace"),
@@ -642,6 +648,21 @@ fn builtin_bool(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
 }
 
 /// list(iterable) - Convert to list
+/// Bazel 6.5 MethodLibrary.tuple: an optional positional Starlark iterable.
+/// Strings are not StarlarkIterable; an existing tuple retains its value/kind.
+fn builtin_tuple(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
+    if !kwargs.is_empty() {
+        return Err(anyhow!("tuple() does not accept keyword arguments"));
+    }
+    match args {
+        [] => Ok(Value::Tuple(Vec::new())),
+        [Value::List(items) | Value::Tuple(items)] => Ok(Value::Tuple(items.clone())),
+        [Value::Dict(map)] => Ok(Value::Tuple(sorted_dictionary_key_values(map))),
+        [value] => Err(anyhow!("tuple() argument must be iterable, got {}", starlark_type_name(value)?)),
+        _ => Err(anyhow!("tuple() accepts at most 1 positional argument")),
+    }
+}
+
 fn builtin_list(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     if args.is_empty() {
         return Ok(Value::List(Vec::new()));
@@ -652,7 +673,7 @@ fn builtin_list(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     match &args[0] {
-        Value::List(items) => Ok(Value::List(items.clone())),
+        Value::List(items) | Value::Tuple(items) => Ok(Value::List(items.clone())),
         Value::String(s) => {
             let chars: Vec<Value> = s.chars().map(|c| Value::String(c.to_string())).collect();
             Ok(Value::List(chars))
@@ -704,7 +725,7 @@ fn extract_glob_patterns(
 ) -> Result<(Vec<String>, Vec<String>)> {
     let patterns: Vec<String> = if !args.is_empty() {
         match &args[0] {
-            Value::List(items) => items.iter().map(|v| v.to_string()).collect(),
+            Value::List(items) | Value::Tuple(items) => items.iter().map(|v| v.to_string()).collect(),
             Value::String(s) => vec![s.clone()],
             _ => {
                 return Err(anyhow!(
@@ -717,7 +738,7 @@ fn extract_glob_patterns(
             .iter()
             .find(|(k, _)| k == "include")
             .and_then(|(_, v)| match v {
-                Value::List(items) => Some(items.iter().map(|v| v.to_string()).collect()),
+                Value::List(items) | Value::Tuple(items) => Some(items.iter().map(|v| v.to_string()).collect()),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -728,7 +749,7 @@ fn extract_glob_patterns(
         .iter()
         .find(|(k, _)| k == "exclude")
         .and_then(|(_, v)| match v {
-            Value::List(items) => Some(items.iter().map(|v| v.to_string()).collect()),
+            Value::List(items) | Value::Tuple(items) => Some(items.iter().map(|v| v.to_string()).collect()),
             _ => None,
         })
         .unwrap_or_default();
@@ -1375,7 +1396,7 @@ fn builtin_provider(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value>
 
     // Extract field names from list or dict, or use empty vec if not specified
     let fields = match fields_value {
-        Some(Value::List(items)) => {
+        Some(Value::List(items) | Value::Tuple(items)) => {
             // List format: fields = ["foo", "bar"]
             let mut field_names = Vec::new();
             for item in items {
@@ -1558,7 +1579,7 @@ fn builtin_depset(_args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> 
     // Extract 'direct' parameter
     if let Some((_, direct_value)) = kwargs.iter().find(|(k, _)| k == "direct") {
         match direct_value {
-            Value::List(items) => {
+            Value::List(items) | Value::Tuple(items) => {
                 for item in items {
                     let item_str = item.to_string();
                     if seen.insert(item_str.clone()) {
@@ -1573,11 +1594,11 @@ fn builtin_depset(_args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> 
     // Extract 'transitive' parameter (list of depsets)
     if let Some((_, transitive_value)) = kwargs.iter().find(|(k, _)| k == "transitive") {
         match transitive_value {
-            Value::List(depsets) => {
+            Value::List(depsets) | Value::Tuple(depsets) => {
                 for depset in depsets {
                     // Each depset is just a list in our current implementation
                     match depset {
-                        Value::List(items) => {
+                        Value::List(items) | Value::Tuple(items) => {
                             for item in items {
                                 let item_str = item.to_string();
                                 if seen.insert(item_str.clone()) {
@@ -2053,7 +2074,7 @@ fn builtin_sorted(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     let items = match &args[0] {
-        Value::List(items) => items.clone(),
+        Value::List(items) | Value::Tuple(items) => items.clone(),
         _ => return Err(anyhow!("sorted() argument must be a list")),
     };
 
@@ -2114,7 +2135,7 @@ fn builtin_enumerate(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
     }
 
     let items = match &args[0] {
-        Value::List(items) => items.clone(),
+        Value::List(items) | Value::Tuple(items) => items.clone(),
         Value::String(value) => value
             .chars()
             .map(|character| Value::String(character.to_string()))
@@ -2143,7 +2164,7 @@ fn builtin_enumerate(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value
     let result: Vec<Value> = items
         .into_iter()
         .enumerate()
-        .map(|(idx, val)| Value::List(vec![Value::Int(start + idx as i64), val]))
+        .map(|(idx, val)| Value::Tuple(vec![Value::Int(start + idx as i64), val]))
         .collect();
 
     Ok(Value::List(result))
@@ -2168,7 +2189,7 @@ fn builtin_zip(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     let lists: Result<Vec<&Vec<Value>>> = args
         .iter()
         .map(|arg| match arg {
-            Value::List(items) => Ok(items),
+            Value::List(items) | Value::Tuple(items) => Ok(items),
             _ => Err(anyhow!("zip() arguments must be lists")),
         })
         .collect();
@@ -2181,7 +2202,7 @@ fn builtin_zip(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     let mut result = Vec::new();
     for i in 0..min_len {
         let tuple: Vec<Value> = lists.iter().map(|list| list[i].clone()).collect();
-        result.push(Value::List(tuple));
+        result.push(Value::Tuple(tuple));
     }
 
     Ok(Value::List(result))
@@ -2205,7 +2226,7 @@ fn builtin_any(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     let items = match &args[0] {
-        Value::List(items) => items,
+        Value::List(items) | Value::Tuple(items) => items,
         _ => return Err(anyhow!("any() argument must be iterable")),
     };
 
@@ -2237,7 +2258,7 @@ fn builtin_all(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     }
 
     let items = match &args[0] {
-        Value::List(items) => items,
+        Value::List(items) | Value::Tuple(items) => items,
         _ => return Err(anyhow!("all() argument must be iterable")),
     };
 
@@ -3977,15 +3998,15 @@ mod tests {
                 // Each item should be a tuple (index, value)
                 assert_eq!(
                     items[0],
-                    Value::List(vec![Value::Int(0), Value::String("a".to_string())])
+                    Value::Tuple(vec![Value::Int(0), Value::String("a".to_string())])
                 );
                 assert_eq!(
                     items[1],
-                    Value::List(vec![Value::Int(1), Value::String("b".to_string())])
+                    Value::Tuple(vec![Value::Int(1), Value::String("b".to_string())])
                 );
                 assert_eq!(
                     items[2],
-                    Value::List(vec![Value::Int(2), Value::String("c".to_string())])
+                    Value::Tuple(vec![Value::Int(2), Value::String("c".to_string())])
                 );
             }
             _ => panic!("Expected List value"),
@@ -4009,11 +4030,11 @@ mod tests {
                 assert_eq!(items.len(), 2);
                 assert_eq!(
                     items[0],
-                    Value::List(vec![Value::Int(10), Value::String("x".to_string())])
+                    Value::Tuple(vec![Value::Int(10), Value::String("x".to_string())])
                 );
                 assert_eq!(
                     items[1],
-                    Value::List(vec![Value::Int(11), Value::String("y".to_string())])
+                    Value::Tuple(vec![Value::Int(11), Value::String("y".to_string())])
                 );
             }
             _ => panic!("Expected List value"),
@@ -4041,15 +4062,15 @@ mod tests {
                 assert_eq!(items.len(), 3);
                 assert_eq!(
                     items[0],
-                    Value::List(vec![Value::Int(1), Value::String("a".to_string())])
+                    Value::Tuple(vec![Value::Int(1), Value::String("a".to_string())])
                 );
                 assert_eq!(
                     items[1],
-                    Value::List(vec![Value::Int(2), Value::String("b".to_string())])
+                    Value::Tuple(vec![Value::Int(2), Value::String("b".to_string())])
                 );
                 assert_eq!(
                     items[2],
-                    Value::List(vec![Value::Int(3), Value::String("c".to_string())])
+                    Value::Tuple(vec![Value::Int(3), Value::String("c".to_string())])
                 );
             }
             _ => panic!("Expected List value"),
@@ -4078,11 +4099,11 @@ mod tests {
                 assert_eq!(items.len(), 2);
                 assert_eq!(
                     items[0],
-                    Value::List(vec![Value::Int(1), Value::String("a".to_string())])
+                    Value::Tuple(vec![Value::Int(1), Value::String("a".to_string())])
                 );
                 assert_eq!(
                     items[1],
-                    Value::List(vec![Value::Int(2), Value::String("b".to_string())])
+                    Value::Tuple(vec![Value::Int(2), Value::String("b".to_string())])
                 );
             }
             _ => panic!("Expected List value"),
@@ -4110,7 +4131,7 @@ mod tests {
                 assert_eq!(items.len(), 2);
                 assert_eq!(
                     items[0],
-                    Value::List(vec![
+                    Value::Tuple(vec![
                         Value::Int(1),
                         Value::String("a".to_string()),
                         Value::Bool(true)
@@ -4118,7 +4139,7 @@ mod tests {
                 );
                 assert_eq!(
                     items[1],
-                    Value::List(vec![
+                    Value::Tuple(vec![
                         Value::Int(2),
                         Value::String("b".to_string()),
                         Value::Bool(false)
