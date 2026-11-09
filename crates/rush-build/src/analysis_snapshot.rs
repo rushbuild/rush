@@ -99,6 +99,8 @@ pub struct PassBPruneIndex {
     /// the dirty path is mapped to a seed, so no pruned plan may trust this
     /// index while any genrule lacks one exact output manifest.
     pub genrule_manifest_mismatch: Option<String>,
+    /// Genrule build-order indices, avoiding whole-graph scans on every edit.
+    pub genrule_indices: Vec<usize>,
 }
 
 /// The complete per-label artifact DAG produced by a successful execution.
@@ -110,14 +112,22 @@ pub(crate) type BuiltArtifactForest = HashMap<String, Arc<NestedSet<Artifact>>>;
 /// This is a certification gate, not dependency lookup: fuzzy-equivalent label
 /// spellings must not satisfy it because a retained forest is authoritative
 /// state for the exact analyzed graph.
+#[cfg(test)]
 pub(crate) fn artifact_forest_exactly_covers(
     build_order: &[Label],
     forest: &BuiltArtifactForest,
 ) -> bool {
-    forest.len() == build_order.len()
-        && build_order
+    artifact_forest_covers_keys(
+        &build_order
             .iter()
-            .all(|label| forest.contains_key(&label.to_string()))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        forest,
+    )
+}
+
+pub(crate) fn artifact_forest_covers_keys(keys: &[String], forest: &BuiltArtifactForest) -> bool {
+    forest.len() == keys.len() && keys.iter().all(|key| forest.contains_key(key))
 }
 
 /// One coherent post-build generation retained by an analyzed snapshot.
@@ -374,6 +384,8 @@ pub struct AnalysisSnapshot {
     /// The topological build order (scoped to the reachable closure of the
     /// requested patterns).
     pub build_order: Vec<Label>,
+    /// Canonical keys for repeated exact forest checks without label formatting.
+    pub build_order_keys: Vec<String>,
     /// The action-graph registry produced by PASS-A. Shared (push-only during
     /// analysis; idempotent on key). Execution reads the declared action graph
     /// from it; per-run execution OUTPUTS live in `execute_analyzed`'s own
@@ -385,6 +397,8 @@ pub struct AnalysisSnapshot {
     /// Cached pruned PASS-B planner index. Populated after the first full
     /// successful PASS-B run, when legacy rules have declared their actions.
     pub pass_b_prune_index: Mutex<Option<Arc<PassBPruneIndex>>>,
+    /// Archive boundaries derived from this immutable graph and requested roots.
+    pub static_archive_materialization: std::collections::HashSet<String>,
     /// label string -> stable `TargetId` mapping assigned during analysis.
     pub target_id_by_label: HashMap<String, TargetId>,
     /// The expanded target set (package-discovery output of analysis).
@@ -507,7 +521,7 @@ impl AnalysisSnapshot {
         if !expected_matches
             || ledger.is_empty()
             || watch_baseline_id.is_none()
-            || !artifact_forest_exactly_covers(&self.build_order, &artifact_forest)
+            || !artifact_forest_covers_keys(&self.build_order_keys, &artifact_forest)
         {
             *guard = None;
             return false;
@@ -547,7 +561,7 @@ impl AnalysisSnapshot {
             .retained_execution_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !artifact_forest_exactly_covers(&self.build_order, &artifact_forest) {
+        if !artifact_forest_covers_keys(&self.build_order_keys, &artifact_forest) {
             *guard = None;
             return None;
         }

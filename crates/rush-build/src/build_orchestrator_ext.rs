@@ -1043,6 +1043,11 @@ async fn build_pass_b_prune_index(
         path_to_seed_indices,
         rev_deps,
         supported_rule_kind,
+        genrule_indices: rule_kind_name
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (name == "genrule").then_some(index))
+            .collect(),
         rule_kind_name,
         output_equivalence_skip_safe,
         fwd_deps,
@@ -1209,8 +1214,8 @@ async fn plan_pass_b_prune(
     {
         return None;
     }
-    if !crate::analysis_snapshot::artifact_forest_exactly_covers(
-        &snapshot.build_order,
+    if !crate::analysis_snapshot::artifact_forest_covers_keys(
+        &snapshot.build_order_keys,
         retained_state.artifact_forest.as_ref(),
     ) {
         prune_debug(|| {
@@ -1259,12 +1264,9 @@ async fn plan_pass_b_prune(
     // coherent retained forest, not merely the eventual active slice: an
     // inactive genrule may be an active target's hydrated source/tool boundary.
     // Never infer outputs from an arbitrary returned artifact set.
-    let retained_genrule_manifest_mismatch = snapshot
-        .build_order
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| prune_index.rule_kind_name[*idx] == "genrule")
-        .find_map(|(idx, label)| {
+    let retained_genrule_manifest_mismatch = prune_index.genrule_indices.iter().copied()
+        .find_map(|idx| {
+            let label = &snapshot.build_order[idx];
             let root = retained_state.artifact_forest.get(&label.to_string())?;
             let direct = root.direct();
             let mut retained_paths: Vec<PathBuf> = direct
@@ -1312,18 +1314,17 @@ async fn plan_pass_b_prune(
     // ledger/forest. Reject every such cross-target direct-root collision
     // snapshot-wide. Pure forwarders are safe: they borrow the producer's
     // Artifact without writing the path.
-    let genrule_output_owners: HashMap<PathBuf, usize> = snapshot
-        .build_order
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| prune_index.rule_kind_name[*idx] == "genrule")
-        .flat_map(|(idx, _)| {
+    let genrule_output_owners: HashMap<PathBuf, usize> = prune_index.genrule_indices.iter().copied()
+        .flat_map(|idx| {
             prune_index.output_paths_by_target[idx]
                 .iter()
                 .map(move |path| (normalize_prune_path(path, workspace_root), idx))
         })
         .collect();
-    let retained_genrule_output_collision = snapshot
+    let retained_genrule_output_collision = if genrule_output_owners.is_empty() {
+        None
+    } else {
+        snapshot
         .build_order
         .iter()
         .enumerate()
@@ -1344,7 +1345,8 @@ async fn plan_pass_b_prune(
                     )
                 })
             })
-        });
+        })
+    };
     if let Some(collision) = retained_genrule_output_collision {
         prune_debug(|| format!("no prune: ambiguous genrule output ownership: {}", collision));
         return None;
@@ -6372,10 +6374,12 @@ impl BuildOrchestrator {
                 manifest_watch_index,
                 unwatched_manifest,
                 graph,
+                build_order_keys: build_order.iter().map(ToString::to_string).collect(),
                 build_order,
                 artifact_registry,
                 analysis_providers: built_providers,
                 pass_b_prune_index: std::sync::Mutex::new(None),
+                static_archive_materialization,
                 target_id_by_label,
                 expanded_targets,
                 resolver_repo_paths,
@@ -6631,8 +6635,7 @@ impl BuildOrchestrator {
             .map(|s| Label::parse(s, None, None))
             .map(|label| label.map(|label| graph.canonicalize_label(label)))
             .collect::<Result<Vec<_>>>()?;
-        let static_archive_materialization =
-            static_archive_materialization_labels(graph, build_order, &root_labels);
+        let static_archive_materialization = &snapshot.static_archive_materialization;
         if std::env::var("RUSH_DEBUG_ARCHIVE_MATERIALIZATION").as_deref() == Ok("1") {
             let producer_count = build_order
                 .iter()
@@ -6654,7 +6657,6 @@ impl BuildOrchestrator {
         // Providers always start from immutable PASS-A state. Retaining a
         // previous execution's post-build providers would make fill-only
         // provider refresh preserve stale slots after an active rebuild.
-        let mut built_providers = snapshot.analysis_providers.clone();
         let mut current_retained_state = snapshot.retained_execution_state();
         if let Some(plan) = prune_plan.as_ref() {
             let plan_is_current = current_retained_state.as_ref().is_some_and(|state| {
@@ -6664,8 +6666,8 @@ impl BuildOrchestrator {
                         &state.artifact_forest,
                         &plan.retained_artifact_forest,
                     )
-                    && crate::analysis_snapshot::artifact_forest_exactly_covers(
-                        build_order,
+                    && crate::analysis_snapshot::artifact_forest_covers_keys(
+                        &snapshot.build_order_keys,
                         plan.retained_artifact_forest.as_ref(),
                     )
             });
@@ -6677,6 +6679,48 @@ impl BuildOrchestrator {
                 prune_plan = None;
             }
         }
+        let mut built_providers = if let Some(plan) = prune_plan.as_ref().filter(|_| {
+            std::env::var("RUSH_USE_SCHEDULER").as_deref() != Ok("1")
+                && std::env::var("RUSH_VALIDATE_PRODUCERS").as_deref() != Ok("1")
+        }) {
+            // Only active nodes and their direct dependency boundary enter a
+            // BuildContext. Preserve the full-map compatibility fallback when
+            // any boundary needs a non-exact provider lookup.
+            let mut selected = HashMap::new();
+            let mut exact = true;
+            for (index, label) in build_order.iter().enumerate() {
+                if !plan.active[index] {
+                    continue;
+                }
+                let key = label.to_string();
+                if let Some(value) = snapshot.analysis_providers.get(&key) {
+                    selected.insert(key, value.clone());
+                }
+                if let Some(node) = graph.get(label) {
+                    for dep in &node.dependencies {
+                        let key = dep.to_string();
+                        if let Some(value) = snapshot.analysis_providers.get(&key) {
+                            selected.entry(key).or_insert_with(|| value.clone());
+                        } else if resolve_dep_provider(
+                            &snapshot.analysis_providers,
+                            &key,
+                            &label.package,
+                        )
+                        .is_some()
+                        {
+                            exact = false;
+                        }
+                    }
+                }
+            }
+            if exact {
+                selected
+            } else {
+                snapshot.analysis_providers.clone()
+            }
+        } else {
+            snapshot.analysis_providers.clone()
+        };
         let mut full_execution_expected = None;
         let (mut built_artifacts, previous_ledger_for_output_equiv) =
             if let Some(plan) = prune_plan.as_ref() {
@@ -7149,6 +7193,7 @@ impl BuildOrchestrator {
         let idx_by_label: HashMap<String, usize> = build_order
             .iter()
             .enumerate()
+            .filter(|(index, _)| prune_plan.as_ref().map_or(true, |plan| plan.active[*index]))
             .map(|(i, l)| (l.to_string(), i))
             .collect();
         let nt = build_order.len();
@@ -7218,7 +7263,7 @@ impl BuildOrchestrator {
         let idx_by_target_id: std::collections::HashMap<
             rush_action::ids::TargetId,
             usize,
-        > = build_order
+        > = if action_aware_scheduler_wavefront { build_order
             .iter()
             .enumerate()
             .filter_map(|(index, label)| {
@@ -7227,7 +7272,7 @@ impl BuildOrchestrator {
                     .copied()
                     .map(|target_id| (target_id, index))
             })
-            .collect();
+            .collect() } else { HashMap::new() };
         let (mut in_degree, mut rev_deps) = if action_aware_scheduler_wavefront {
             let mut action_in_degree = vec![0usize; nt];
             let mut action_rev_deps: Vec<Vec<usize>> = vec![Vec::new(); nt];
