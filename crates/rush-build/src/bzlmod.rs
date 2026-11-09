@@ -910,12 +910,12 @@ fn cached_repository_is_reusable(repository: &Path, expected_marker: &[u8]) -> R
 
 /// Fresh, atomically-created parent for one BCR materialization attempt.
 ///
-/// RepositoryManager treats any existing destination directory as a cache hit,
-/// so it must never receive the path of a stale staging directory. `tempdir_in`
-/// creates a random parent with mkdir/create-new semantics; RepositoryManager
-/// writes a previously-nonexistent child beneath it. A crash can strand an old
-/// parent, but a later attempt gets a different random parent and cannot reuse
-/// the stranded child. TempDir removes the parent and partial child normally.
+/// RepositoryManager requires an absent destination or a matching source
+/// receipt. `tempdir_in` creates a random parent with mkdir/create-new semantics;
+/// RepositoryManager writes a previously-nonexistent child beneath it. A crash
+/// can strand an old parent, but a later attempt gets a different random parent
+/// and cannot reuse the stranded child. TempDir removes the parent and partial
+/// child normally.
 struct BcrStaging {
     _parent: tempfile::TempDir,
     archive_name: String,
