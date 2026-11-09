@@ -3589,6 +3589,19 @@ cc_library(
         self.remote_executor = Some(Arc::new(RemoteExecutor::new(endpoint)));
     }
 
+    /// Select strict standard-protocol execution for native file actions.
+    pub fn set_reapi_executor(&mut self, endpoint: String, instance: String,
+        platform: std::collections::BTreeMap<String, String>) -> Result<()> {
+        self.remote_executor = Some(Arc::new(RemoteExecutor::with_reapi(
+            endpoint, self.workspace_root.clone(), instance, platform)?));
+        self.action_manager = Arc::new(RushActionManager::new(
+            Arc::new(ActionCache::new()),
+            Arc::new(rush_remote::executor::ReapiStrategy(Arc::clone(self.remote_executor.as_ref().unwrap()))),
+            Arc::clone(&self.resource_manager),
+        ));
+        Ok(())
+    }
+
     /// Set maximum number of parallel jobs for compilation.
     ///
     /// Controls the global concurrency limit across all compilation actions.

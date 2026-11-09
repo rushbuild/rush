@@ -7718,6 +7718,13 @@ impl BuildOrchestrator {
                 let use_scheduler = !archive_elided_for_legacy && target_id_for_dispatch
                     .map(|t| scheduler_eligible_after_allowlist.contains(&t))
                     .unwrap_or(false);
+                if self.remote_executor.as_ref().is_some_and(|executor| executor.is_reapi()) {
+                    anyhow::ensure!(!use_scheduler,
+                        "native REAPI builds currently require the action-manager path; disable --use-scheduler");
+                    anyhow::ensure!(matches!(node.rule_instance.rule_type(),
+                        "cc_library" | "cc_binary" | "source_file"),
+                        "remote native rule is unsupported: {}; use a portable remote action manifest", label);
+                }
                 let scheduler_action_ids_for_target = if use_scheduler {
                     target_id_for_dispatch.and_then(|target_id| {
                         scheduler_dispatch_plan_by_target

@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod build_executor;
 pub mod cas;
 pub mod executor;
 pub mod http_cache;

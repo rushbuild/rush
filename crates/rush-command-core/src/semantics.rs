@@ -207,6 +207,18 @@ impl CommandSemantics {
         let mut idx = 1usize; // skip argv[0] (program name)
         while idx < argv.len() {
             let tok = &argv[idx];
+            // Worker selection and backend identity change executable results.
+            // Retain space-form values in the same fingerprint as KEY=VALUE.
+            if [b"--remote-executor".as_slice(), b"--remote-instance", b"--remote-platform"]
+                .contains(&tok.as_ref()) {
+                if let Some(value) = argv.get(idx + 1) {
+                    let mut canonical = tok.to_vec();
+                    canonical.push(b'='); canonical.extend_from_slice(value);
+                    flags.push(Bytes::from(canonical));
+                    idx += 2;
+                    continue;
+                }
+            }
             if tok.starts_with(b"-") {
                 // Exclude NON-analysis-affecting routing/watcher flags from the
                 // fingerprint flags: `--daemon` selects the transport and
@@ -587,6 +599,20 @@ mod workspace_config_tests {
         let none = fp_with(&[]);
         let empty = fp_with(&[(b".bazelrc".to_vec(), Vec::new())]);
         assert_ne!(none, empty, "present-empty must differ from absent");
+    }
+
+    #[test]
+    fn remote_worker_and_backend_values_change_reuse_identity() {
+        fn key(args: &[&'static str]) -> [u8; 32] {
+            CommandSemantics::from_parts(args.iter().map(|s| Bytes::from_static(s.as_bytes())).collect(),
+                BTreeMap::new(), Bytes::from_static(b"/workspace"), Vec::new()).config_fingerprint
+        }
+        for flag in ["--remote-platform", "--remote-executor", "--remote-instance"] {
+            let first = key(&["rush", "build", flag, "first"]);
+            assert_ne!(first, key(&["rush", "build", flag, "second"]));
+        }
+        assert_eq!(key(&["rush", "build", "--remote-platform", "toolchain=one"]),
+            key(&["rush", "build", "--remote-platform=toolchain=one"]));
     }
 
     #[test]

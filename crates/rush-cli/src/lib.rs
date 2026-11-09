@@ -518,6 +518,14 @@ FLAGS:
         #[arg(long)]
         remote_executor: Option<String>,
 
+        /// Worker platform property, including a pinned toolchain=VALUE.
+        #[arg(long = "remote-platform", value_name = "KEY=VALUE", requires = "remote_executor")]
+        remote_platform: Vec<String>,
+
+        /// Remote Execution API instance name.
+        #[arg(long, default_value = "", requires = "remote_executor")]
+        remote_instance: String,
+
         /// Remote cache endpoint
         #[arg(long)]
         remote_cache: Option<String>,
@@ -1365,6 +1373,8 @@ impl Cli {
                 disk_cache,
                 disk_cache_dir,
                 remote_executor,
+                remote_platform,
+                remote_instance,
                 remote_cache,
                 benchmark,
                 profile,
@@ -1540,7 +1550,7 @@ impl Cli {
                         ));
                     }
                 }
-                let effective_mode = if introspection_request { "off" } else { daemon_mode.as_str() };
+                let effective_mode = if introspection_request || remote_executor.is_some() { "off" } else { daemon_mode.as_str() };
                 if matches!(effective_mode, "auto" | "on") {
                     match Self::run_build_via_daemon(verbose).await {
                         Ok(exit_code) => {
@@ -1567,6 +1577,8 @@ impl Cli {
                     disk_cache,
                     disk_cache_dir,
                     remote_executor,
+                    remote_platform,
+                    remote_instance,
                     remote_cache,
                     benchmark,
                     profile,
@@ -1814,6 +1826,8 @@ impl Cli {
         disk_cache: bool,
         disk_cache_dir: Option<PathBuf>,
         remote_executor: Option<String>,
+        remote_platform: Vec<String>,
+        remote_instance: String,
         remote_cache: Option<String>,
         _benchmark: bool,
         profile: Option<PathBuf>,
@@ -2078,7 +2092,15 @@ impl Cli {
 
         // Configure remote execution if requested
         if let Some(ref endpoint) = remote_executor {
-            orchestrator.set_remote_executor(endpoint.clone());
+            let mut platform = std::collections::BTreeMap::new();
+            for value in remote_platform {
+                let (key, value) = value.split_once('=').ok_or_else(||
+                    anyhow::anyhow!("--remote-platform requires KEY=VALUE"))?;
+                anyhow::ensure!(!key.is_empty() && !value.is_empty() &&
+                    platform.insert(key.to_string(), value.to_string()).is_none(),
+                    "remote platform properties must be nonempty and unique");
+            }
+            orchestrator.set_reapi_executor(endpoint.clone(), remote_instance, platform)?;
             if verbose {
                 eprintln!("🌐 Remote execution enabled: {}", endpoint);
             }
@@ -3888,6 +3910,8 @@ impl Cli {
             false, // disk_cache
             None,  // disk_cache_dir
             None,  // remote_executor
+            Vec::new(), // remote_platform
+            String::new(), // remote_instance
             None,  // remote_cache
             false, // benchmark
             None,  // profile
@@ -3940,6 +3964,8 @@ impl Cli {
                     false,
                     None,
                     None,
+                    Vec::new(),
+                    String::new(),
                     None,
                     false,
                     None,
@@ -5481,6 +5507,18 @@ mod daemon_protocol_rollout_tests {
 #[cfg(test)]
 mod reapi_cli_tests {
     use super::*;
+
+    #[test]
+    fn remote_selection_requires_an_endpoint() {
+        assert!(Cli::try_parse_from(["rush", "build", "//:app",
+            "--remote-platform", "toolchain=pinned"]).is_err());
+        assert!(Cli::try_parse_from(["rush", "build", "//:app",
+            "--remote-instance", "test"]).is_err());
+        assert!(Cli::try_parse_from(["rush", "build", "//:app",
+            "--remote-executor", "http://127.0.0.1:9000",
+            "--remote-platform", "toolchain=pinned"]).is_ok());
+        assert!(Cli::try_parse_from(["rush", "build", "//:app"]).is_ok());
+    }
 
     #[test]
     fn reject_zero_client_deadline_and_accept_rexec_alias() {
