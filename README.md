@@ -19,23 +19,32 @@ to evaluate the experimental release.
 Read [Rush vs Buck2](https://rushbuild.github.io/rush/buck2.html) for the
 architecture, adoption requirements and matched-workload comparison.
 
-| Workload and operation | Rush | Reference | Scope |
-| --- | ---: | ---: | --- |
-| TensorFlow unchanged command | **9.3 ms** | Bazel 64.2 ms; watchfs 54.5 ms | 30-sample p50; `//tensorflow/core:framework`; 18,522 dependencies |
-| Modular output restoration | **32 s** | Bazel 63 s | 4,175 targets; populated disk caches |
-| Modular unchanged command | **0.05 s** | Bazel 12.6 s | Warm no-op |
-| Modular novel one-file edit | **26.0 s** | Bazel 30.1 s | Distinct input bytes per sample |
-| Modular repeated cached edit | **0.15 s** | Bazel ~13 s | Reuse a known input state |
+The November 9 checks compare Rush before the incremental changes with the
+current engine on two Linux hosts, using eight CPUs and eight requested jobs.
+
+| Workload and operation | Rush before | Rush current | Bazel reference |
+| --- | ---: | ---: | ---: |
+| Modular stdlib package, unchanged command, Host C | 3.62 ms | **2.66 ms** | 53.57 ms |
+| Modular stdlib package, unchanged command, Host D | 3.89 ms | **2.93 ms** | 56.12 ms |
+| TensorFlow 2.17 framework, fresh build, both hosts | Rule loading fails | Rule loading fails | Build completes |
+
+Use the Modular medians within their ten-sample no-op scope. All 96 Modular
+commands pass compiler-count and package-byte checks. Clean-output and novel
+comment-edit differences are small with overlapping ranges; these checks
+establish no broad compilation speedup. TensorFlow executes zero compiler
+calls under both Rush versions because `JavaInfo` fails to load. Assign no
+speed ratio to those failed builds.
 
 Read the [TensorFlow](docs/benchmarks/tensorflow.md) and
-[Modular](docs/benchmarks/modular.md) reports for configuration, samples and
-cache controls. Keep command latency, compilation and restoration separate.
-The single-sample Modular compile row (362 s versus 611 s) requires
-cache-reset revalidation; do not use it as a confirmed uncached speed ratio.
+[Modular](docs/benchmarks/modular.md) reports for every sample, exact engine
+and toolchain pins, configuration, cache controls and separate imported
+multi-target records.
 
 ### Compare the Linux kernel with GNU Make
 
-Populated-cache Rush replay takes **40.24 s** versus **50.92 s** for a clean
+Read the separate three-pair experiment while the new two-host snapshot
+checks run. That retained experiment reports **40.24 s** for populated-cache
+Rush replay versus **50.92 s** for a clean
 Make build at the median of three alternating pairs, with 12,397 persistent
 output entries matched. Both arms use the same tree carrying
 [Lorenzo Stoakes's v1 build-speedup patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/).

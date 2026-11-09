@@ -40,19 +40,23 @@ then compare the result with the same targets and toolchains under Bazel.</p>
 <p class="eyebrow">Experimental release · measured workloads</p><h2 id="performance-title">Compare build times.</h2>
 <p>Choose the workload and operation. Keep unchanged commands, novel edits and cache restoration separate; each measures different work.</p>
 <h3>TensorFlow against Bazel</h3>
-<p>Measure unchanged <code>//tensorflow/core:framework</code> commands over an 18,522-dependency manifest. Use the median of 30 samples.</p>
-<div class="results-table"><table><thead><tr><th scope="col">Operation</th><th scope="col">Rush</th><th scope="col">Bazel</th><th scope="col">Bazel --watchfs</th></tr></thead><tbody>
-<tr><td>Warm no-op command</td><td><strong>9.3 ms</strong></td><td>64.2 ms</td><td>54.5 ms</td></tr>
-</tbody></table></div><p class="note">Read this as command latency for one target. <a href="docs/benchmarks/tensorflow.md">Check the scope and reproduction inputs.</a> Use the separate <a href="docs/status/tensorflow.md">463-test CPU runtime gate</a> to evaluate test behavior.</p>
+<p>Build pristine TensorFlow 2.17's <code>//tensorflow/core:framework</code> before comparing latency. Use eight CPUs and eight jobs on each host.</p>
+<div class="results-table"><table><thead><tr><th scope="col">Host</th><th scope="col">Rush before</th><th scope="col">Rush current</th><th scope="col">Bazel 6.5.0</th></tr></thead><tbody>
+<tr><td>Host C</td><td>Rule loading fails</td><td>Rule loading fails</td><td>Build completes</td></tr>
+<tr><td>Host D</td><td>Rule loading fails</td><td>Rule loading fails</td><td>Build completes</td></tr>
+</tbody></table></div><p class="note">Both Rush versions stop at undefined <code>JavaInfo</code> before any compiler runs. Assign no speed ratio to failed builds. <a href="docs/benchmarks/tensorflow.md">Inspect exact inputs and the separate imported no-op record.</a> Keep the <a href="docs/status/tensorflow.md">TF 2.15 runtime corpus</a> within its own scope.</p>
 <h3>Modular against Bazel</h3>
-<p>Build the same 4,175-target ledger at Modular pin <code>cc7155d</code>. Report three-run medians for these modes.</p>
-<div class="results-table"><table><thead><tr><th scope="col">Operation</th><th scope="col">Rush</th><th scope="col">Bazel</th><th scope="col">Cache/input state</th></tr></thead><tbody>
-<tr><td>Restore deleted outputs</td><td><strong>32 s</strong></td><td>63 s</td><td>Populated disk caches</td></tr>
-<tr><td>Leave inputs unchanged</td><td><strong>0.05 s</strong></td><td>12.6 s</td><td>Warm no-op</td></tr>
-<tr><td>Compile a novel one-file edit</td><td><strong>26.0 s</strong></td><td>30.1 s</td><td>Distinct edit bytes per run</td></tr>
-<tr><td>Repeat an already-cached edit</td><td><strong>0.15 s</strong></td><td>~13 s</td><td>Reuse a known input state</td></tr>
-</tbody></table></div><p class="note">Read the <a href="docs/benchmarks/modular.md">full tables and plots</a>. Revalidate cache clearing before treating the single-sample 362 s / 611 s compile result as an uncached speed ratio.</p>
+<p>Build one pinned CPU stdlib package, <code>//mojo/stdlib/std:std</code>, with the same Mojo compiler. Compare Rush before the incremental changes with the current engine. Use eight CPUs and eight requested jobs per host.</p>
+<div class="results-table"><table><thead><tr><th scope="col">Host / operation</th><th scope="col">Rush before</th><th scope="col">Rush current</th><th scope="col">Bazel</th></tr></thead><tbody>
+<tr><td>Host C / unchanged command</td><td>3.62 ms</td><td><strong>2.66 ms</strong></td><td>53.57 ms</td></tr>
+<tr><td>Host D / unchanged command</td><td>3.89 ms</td><td><strong>2.93 ms</strong></td><td>56.12 ms</td></tr>
+<tr><td>Host C / clear outputs and engine caches</td><td>14.919 s</td><td>14.783 s</td><td>12.986 s</td></tr>
+<tr><td>Host D / clear outputs and engine caches</td><td>15.398 s</td><td>15.360 s</td><td>13.470 s</td></tr>
+<tr><td>Host C / novel comment edit</td><td>10.822 s</td><td>10.803 s</td><td>10.858 s</td></tr>
+<tr><td>Host D / novel comment edit</td><td>11.222 s</td><td>11.208 s</td><td>11.310 s</td></tr>
+</tbody></table></div><p class="note">Read ten-sample no-op medians and three-sample clean/edit medians within this package scope. All 96 commands pass compiler-count and byte-parity checks. Keep analysis metadata, fetched dependencies and compiler/tool caches for clean commands. Clean/edit ranges overlap; infer no broad compilation speedup. <a href="docs/benchmarks/modular.md">Inspect every sample, ranges, the plot, reproduction steps and separate multi-target records.</a></p>
 <div class="kernel-results"><h3>Linux kernel against GNU Make</h3>
+<p class="note">Read this separate three-pair record within its original scope. Fresh two-host snapshot checks are in progress; the table supplies no new current-engine speed result.</p>
 <p>Use the same Linux tree carrying <a href="https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/">Lorenzo Stoakes's v1 build-speedup patches</a>. Compare populated-cache Rush replay into a clean output root with clean Make compilation.</p>
 <div class="results-table"><table><thead><tr><th scope="col">Rush replay median</th><th scope="col">GNU Make median</th><th scope="col">Samples and output checks</th></tr></thead><tbody>
 <tr><td><strong>40.24 s</strong></td><td>50.92 s</td><td>Three alternating pairs; 12,397 persistent entries matched</td></tr>

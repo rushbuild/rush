@@ -3,10 +3,40 @@
 Use this record to distinguish a measured workload from validation of a
 particular release candidate. The release presents project measurements;
 the complete workload acceptance matrix for source baseline
-`8c6bb55e39de7d78283a3e57b0b89df11ee773ea` remains open. This documentation
-change runs no new build or performance experiment.
+`8c6bb55e39de7d78283a3e57b0b89df11ee773ea` remains open. The November 9 checks
+below exercise the published incremental engine without changing its source.
 
-## TensorFlow and Modular
+## November 9 workload checks
+
+Compare Rush `b003cc3a3f068449510ba69e9ef1070c4598cc4a` with engine
+`b059a257874270dbb17ebebeb2bee6f3546688c3` published in `f9d97fe`.
+The before binary was built at `7e185b1049f0253b682ddee3c3de378c263e6f9e`;
+`b003cc3` changes documentation only. The current binary was built at
+`b059a25`; `f9d97fe` changes documentation only. Freeze the 2,012-file
+published source archive and verify it on both hosts.
+Use identical before/after executable bytes on both hosts, with task-local
+source copies, homes, caches and runtime directories. Limit work to eight
+CPUs and eight requested jobs. Run no competing task build during accepted
+timings; no exclusive host reservation is claimed. Host C uses mixed memory
+without a full memory-stability qualification.
+
+* [TensorFlow data](data/tensorflow-build-retest-20261109.json) records pristine
+  2.17 sources, tool/binary hashes, command/environment templates and both
+  hosts' failed Rush builds plus successful Bazel reference builds. These
+  failures establish a rule-loading boundary; they supply no speed ratio.
+* [Modular data](data/modular-cpu-20261109.json) retains all 96 accepted samples,
+  compiler counts, edit digests, output hashes, upstream/tool pins and the
+  controller hash. The report covers one CPU stdlib package. Require actual
+  prepare/qualify/measure checks on each host before accepting timing data.
+  Exclude all 96 preliminary polling-timer rows; the accepted samples use a
+  monotonic clock and pidfd completion notification.
+
+Read the workload reports for precise cache scopes and assertions. Keep raw
+paths, process records, source archives and compiler binaries outside public
+Git. The [public controller](../../benchmarks/workloads/README.md) explains
+how to repeat the Modular experiment with independently supplied tools.
+
+## Imported TensorFlow and Modular records
 
 The [import manifest](../status/import-manifest.json) identifies source
 reports from published status revision
