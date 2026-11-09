@@ -10,6 +10,12 @@ pub mod cas;
 pub mod executor;
 pub mod http_cache;
 
+/// Standard Remote Execution API wire types, generated from pinned upstreams.
+#[allow(missing_docs)]
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/reapi.rs"));
+}
+
 pub use cas::{CasClient, CasStats, Digest, DirectoryManifest};
 pub use executor::{RemoteExecutor, RemoteExecutorStats, RemoteStrategy};
 pub use http_cache::HttpCache;
