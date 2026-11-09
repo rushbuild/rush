@@ -1108,7 +1108,9 @@ fn convert_value(value: &StarlarkValue) -> Result<Value> {
         StarlarkValue::Float(f) => Ok(Value::String(f.to_string())),
         StarlarkValue::None => Ok(Value::String("None".to_string())),
         StarlarkValue::Function { .. } => Ok(Value::String("<function>".to_string())),
-        StarlarkValue::Namespace(_) => Ok(Value::String("<namespace>".to_string())),
+        StarlarkValue::Namespace(_) | StarlarkValue::WorkspaceNativeNamespace { .. } => {
+            Ok(Value::String("<namespace>".to_string()))
+        }
         StarlarkValue::RuleFunction(name) => Ok(Value::String(format!("<rule:{}>", name))),
         StarlarkValue::NativeFunction(name) => Ok(Value::String(format!("<native:{}>", name))),
         StarlarkValue::Provider { name, .. } => Ok(Value::String(format!("<provider:{}>", name))),

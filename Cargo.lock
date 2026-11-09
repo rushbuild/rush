@@ -3591,6 +3591,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
  "dashmap 6.1.0",
  "futures",
  "glob",
@@ -3603,6 +3604,7 @@ dependencies = [
  "rush-command-core",
  "rush-incremental",
  "rush-profiling",
+ "rush-protocol",
  "rush-repo",
  "rush-resource",
  "serde",

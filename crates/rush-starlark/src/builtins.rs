@@ -526,7 +526,7 @@ pub(crate) fn starlark_type_name(value: &Value) -> Result<&str> {
         Value::List(_) => Ok("list"),
         Value::Dict(_) => Ok("dict"),
         Value::Function { .. } | Value::Lambda { .. } => Ok("function"),
-        Value::Namespace(_) => Ok("namespace"),
+        Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => Ok("namespace"),
         Value::RuleFunction(_) => Ok("rule_function"),
         Value::NativeFunction(_) => Ok("builtin_function_or_method"),
         Value::Provider { .. } => Ok("provider"),
@@ -1778,6 +1778,9 @@ fn builtin_hasattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
     };
 
     let has_attr = match obj {
+        Value::WorkspaceNativeNamespace { attrs, .. } => {
+            attr_name == "bazel_version" || attrs.contains_key(attr_name)
+        }
         Value::Namespace(attrs) => attrs.contains_key(attr_name),
         Value::ProviderInstance { fields, .. } => fields.contains_key(attr_name),
         Value::Label { .. } => {
@@ -1835,6 +1838,15 @@ fn builtin_getattr(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
         _ => return Err(anyhow!("getattr() attribute name must be a string")),
     };
     let default_value = args.get(2).unwrap_or(&Value::None);
+
+    if let Value::WorkspaceNativeNamespace { attrs, workspace_root } = obj {
+        return if attr_name == "bazel_version" {
+            crate::bzl_loader::workspace_repository_analyzer_version(workspace_root)
+                .map(Value::String)
+        } else {
+            Ok(attrs.get(attr_name).cloned().unwrap_or_else(|| default_value.clone()))
+        };
+    }
 
     let attr_value = match obj {
         Value::Namespace(attrs) => attrs.get(attr_name),

@@ -80,12 +80,14 @@ impl WorkspaceLoader {
             evaluator.register_rule_function(rule.to_string());
         }
         evaluator.register_workspace_native_namespace();
+        evaluator.set_workspace_repository_context(self.workspace_root.clone());
 
         // Create BzlLoader for this WORKSPACE evaluation
-        let bzl_loader = BzlLoader::new_with_global_cache(
+        let mut bzl_loader = BzlLoader::new_with_global_cache(
             self.workspace_root.clone(),
             self.global_bzl_cache.clone(),
         );
+        bzl_loader.set_workspace_repository_context(Some(self.workspace_root.clone()));
 
         evaluator.register_rule_function("tf_workspace0".to_string());
 

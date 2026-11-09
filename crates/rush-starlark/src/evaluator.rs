@@ -243,6 +243,13 @@ pub enum Value {
     },
     /// Namespace object for attribute access (e.g., native.cc_library)
     Namespace(HashMap<String, Value>),
+    /// WORKSPACE native bindings delegated to this workspace's selected Bazel
+    /// repository analyzer. The version is measured lazily, never a claim that
+    /// Rush implements that Bazel release's BUILD or execution semantics.
+    WorkspaceNativeNamespace {
+        attrs: HashMap<String, Value>,
+        workspace_root: std::path::PathBuf,
+    },
     /// Rule function marker (for native.cc_library, etc.)
     RuleFunction(String),
     /// Native function marker (for native.glob, native.existing_rules, etc.)
@@ -551,6 +558,7 @@ impl Value {
             }
             Value::Function { .. }
             | Value::Namespace(_)
+            | Value::WorkspaceNativeNamespace { .. }
             | Value::RuleFunction(_)
             | Value::NativeFunction(_)
             | Value::Provider { .. }
@@ -683,7 +691,7 @@ impl Value {
                 format!("{{{}}}", pairs.join(", "))
             }
             Value::Function { .. } => "<function>".to_string(),
-            Value::Namespace(_) => "<namespace>".to_string(),
+            Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => "<namespace>".to_string(),
             Value::RuleFunction(name) => format!("<rule:{}>", name),
             Value::NativeFunction(name) => format!("<native:{}>", name),
             Value::Provider { name, .. } => format!("<provider:{}>", name),
@@ -776,8 +784,13 @@ impl Value {
                         .map(|v| v.estimate_size_internal(visited))
                         .sum::<usize>()
             }
-            Value::Dict(map) | Value::Namespace(map) => {
+            Value::Dict(map) | Value::Namespace(map)
+            | Value::WorkspaceNativeNamespace { attrs: map, .. } => {
                 size_of::<Value>()
+                    + match self {
+                        Value::WorkspaceNativeNamespace { workspace_root, .. } => workspace_root.as_os_str().len(),
+                        _ => 0,
+                    }
                     + map.capacity() * (size_of::<String>() + size_of::<Value>())
                     + map
                         .iter()
@@ -929,6 +942,9 @@ impl ValueCensus {
 
     fn walk_value(&mut self, v: &Value, seen_envs: &mut std::collections::HashSet<usize>) {
         self.value_nodes += 1;
+        if let Value::WorkspaceNativeNamespace { workspace_root, .. } = v {
+            self.string_bytes += workspace_root.as_os_str().len();
+        }
         match v {
             Value::String(s) => self.string_bytes += s.len(),
             Value::List(items) => {
@@ -937,7 +953,8 @@ impl ValueCensus {
                     self.walk_value(i, seen_envs);
                 }
             }
-            Value::Dict(m) | Value::Namespace(m) | Value::Select(m) => {
+            Value::Dict(m) | Value::Namespace(m) | Value::Select(m)
+            | Value::WorkspaceNativeNamespace { attrs: m, .. } => {
                 self.dict_entries += m.len();
                 for (k, val) in m {
                     self.string_bytes += k.len();
@@ -1190,6 +1207,9 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value> {
                 obj.insert(k.clone(), value_to_json(val)?);
             }
             serde_json::Value::Object(obj)
+        }
+        Value::WorkspaceNativeNamespace { .. } => {
+            return Err(anyhow!("WORKSPACE native namespace is not a JSON data value; read an individual field"));
         }
         Value::ProviderInstance { fields, .. } => {
             let mut obj = serde_json::Map::new();
@@ -3068,6 +3088,25 @@ impl Evaluator {
         let native_attrs = Self::workspace_native_bindings();
         self.env
             .define("native".to_string(), Value::Namespace(native_attrs));
+    }
+
+    /// Enable the WORKSPACE-only native version API. Loading an ordinary Rush
+    /// module does not resolve or run Bazel; only reading bazel_version probes
+    /// the repository analyzer selected by the current tracked client context.
+    pub fn set_workspace_repository_context(&mut self, workspace_root: std::path::PathBuf) {
+        let attrs = match self.env.get("native") {
+            Some(Value::Namespace(attrs)) | Some(Value::WorkspaceNativeNamespace { attrs, .. }) => {
+                attrs.clone()
+            }
+            _ => Self::workspace_native_bindings(),
+        };
+        self.env.define(
+            "native".to_string(),
+            Value::WorkspaceNativeNamespace {
+                attrs,
+                workspace_root,
+            },
+        );
     }
 
     /// Register the native namespace for macro support
@@ -6399,6 +6438,14 @@ impl Evaluator {
                 let obj_val = self.eval_expression(object)?;
 
                 match obj_val {
+                    Value::WorkspaceNativeNamespace { attrs, workspace_root } => {
+                        if attr == "bazel_version" {
+                            crate::bzl_loader::workspace_repository_analyzer_version(&workspace_root)
+                                .map(Value::String)
+                        } else {
+                            attrs.get(attr).cloned().ok_or_else(|| anyhow!("Attribute '{}' not found in namespace", attr))
+                        }
+                    }
                     Value::Namespace(attrs) => {
                         // Look up attribute in namespace
                         attrs
@@ -7548,6 +7595,7 @@ impl Evaluator {
                         Value::List(_)
                             | Value::Dict(_)
                             | Value::Namespace(_)
+                            | Value::WorkspaceNativeNamespace { .. }
                             | Value::ProviderInstance { .. }
                     )
                 };
@@ -8033,6 +8081,11 @@ impl Evaluator {
                                 fields.keys().cloned().collect()
                             }
                             Some(Value::Namespace(map)) => map.keys().cloned().collect(),
+                            Some(Value::WorkspaceNativeNamespace { attrs, .. }) => {
+                                let mut fields: Vec<_> = attrs.keys().cloned().collect();
+                                fields.push("bazel_version".to_string());
+                                fields
+                            }
                             Some(Value::Dict(map)) => sorted_dictionary_key_values(map)
                                 .into_iter()
                                 .filter_map(|key| match key {

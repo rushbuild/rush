@@ -189,6 +189,78 @@ fn resolve_bazel_binary_for_fetch(workspace_root: &Path) -> Result<PathBuf> {
     )
 }
 
+fn parse_repository_analyzer_version(stdout: &[u8]) -> Result<String> {
+    let output = std::str::from_utf8(stdout).context("Bazel --version output is not UTF-8")?;
+    let version = output
+        .trim()
+        .strip_prefix("bazel ")
+        .context("Bazel --version did not report an identifiable release")?;
+    let numeric_len = version
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit() || *byte == b'.')
+        .count();
+    let numeric = &version[..numeric_len];
+    let components: Vec<_> = numeric.split('.').collect();
+    let suffix = &version[numeric_len..];
+    if components.len() != 3
+        || components
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        || (!suffix.is_empty()
+            && (!(suffix.starts_with("rc") || suffix.starts_with('-') || suffix.starts_with('+'))
+                || !suffix.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
+                })
+                || !suffix.bytes().any(|byte| byte.is_ascii_alphanumeric())))
+    {
+        anyhow::bail!("Bazel --version returned an unknown or ambiguous release: {output:?}");
+    }
+    Ok(version.to_string())
+}
+
+/// Read the actual analyzer selected for this WORKSPACE's delegated repository
+/// rules. This is deliberately not a version or compatibility claim about Rush.
+/// Lazy field access keeps ordinary native Rush projects independent of Bazel.
+pub(crate) fn workspace_repository_analyzer_version(workspace_root: &Path) -> Result<String> {
+    use rush_incremental::tracked;
+    let environment = tracked::command_environment()?;
+    let binary = resolve_bazel_binary_for_fetch(workspace_root)?;
+    let binary = tracked::canonicalize(&binary)?;
+    if !tracked::metadata_full(&binary) {
+        anyhow::bail!("WORKSPACE repository analyzer executable is unavailable");
+    }
+    tracked::read_file(&binary).context("track WORKSPACE repository analyzer executable")?;
+    for name in [".bazelversion", ".bazeliskrc"] {
+        track_optional_repository_mapping_input(&workspace_root.join(name))?;
+    }
+    if let Some((_, home)) = environment.iter().find(|(name, _)| name == b"HOME") {
+        #[cfg(unix)]
+        let home = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(OsStr::from_bytes(home))
+        };
+        #[cfg(not(unix))]
+        let home =
+            PathBuf::from(std::str::from_utf8(home).context("Bazel analyzer HOME is not UTF-8")?);
+        track_optional_repository_mapping_input(&home.join(".bazeliskrc"))?;
+    }
+    let env_keys = environment
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let output =
+        tracked::probe_process_stdout(&binary, &[b"--version".to_vec()], &env_keys, workspace_root)
+            .context("probe selected WORKSPACE repository analyzer with --version")?;
+    if output.status != 0 {
+        anyhow::bail!(
+            "WORKSPACE repository analyzer --version failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    parse_repository_analyzer_version(&output.stdout)
+}
+
 // Global set to detect circular dependencies in .bzl loading across all threads
 //
 // FIX #8: Changed from thread-local stack to global DashSet to prevent infinite loops
@@ -1319,11 +1391,12 @@ struct ModuleCacheKey {
     mappings: Vec<(String, Vec<(String, String)>)>,
     repository_roots: Vec<(String, PathBuf, PathBuf)>,
     aliases: Vec<(String, String)>,
+    workspace_repository_context: Option<PathBuf>,
 }
 
 impl ModuleCacheKey {
     fn unqualified(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), workspace: PathBuf::new(), context: None, label: None, mappings: Vec::new(), repository_roots: Vec::new(), aliases: Vec::new() }
+        Self { path: path.to_path_buf(), workspace: PathBuf::new(), context: None, label: None, mappings: Vec::new(), repository_roots: Vec::new(), aliases: Vec::new(), workspace_repository_context: None }
     }
 
     fn display(&self) -> std::path::Display<'_> { self.path.display() }
@@ -4359,6 +4432,9 @@ pub fn check_ram_floor_before_level(level_idx: usize, file_count: usize) -> Resu
 pub struct BzlLoader {
     /// Workspace root for path resolution
     workspace_root: PathBuf,
+    /// Distinct WORKSPACE module semantics, including a lazy analyzer-version
+    /// capability. Part of evaluated-module identity, never an eager probe.
+    workspace_repository_context: Option<PathBuf>,
 
     /// Current package path (for relative imports)
     current_package: Option<PathBuf>,
@@ -4436,6 +4512,7 @@ pub struct BzlContextFrame {
     pub package_dir: PathBuf,
     pub load_stack: Vec<String>,
     pub repository: Option<String>,
+    pub workspace_repository_context: Option<PathBuf>,
 }
 
 thread_local! {
@@ -4600,6 +4677,7 @@ impl BzlLoader {
             package_dir,
             load_stack: Vec::new(),
             repository: None,
+            workspace_repository_context: None,
         });
     }
 
@@ -4687,6 +4765,7 @@ impl BzlLoader {
 
         Self {
             workspace_root,
+            workspace_repository_context: None,
             current_package: None,
             current_repo_root,
             current_repo_name: None,
@@ -4705,6 +4784,12 @@ impl BzlLoader {
             command_repo_mapping_owners: Arc::new(DashSet::new()),
             main_workspace_name: None,
         }
+    }
+
+    /// Evaluate repository macros with WORKSPACE-only native fields. Modules
+    /// loaded in BUILD context use a separate cache identity and namespace.
+    pub fn set_workspace_repository_context(&mut self, workspace_root: Option<PathBuf>) {
+        self.workspace_repository_context = workspace_root;
     }
 
     /// Set the current repository root for .bzl file resolution
@@ -4796,6 +4881,7 @@ impl BzlLoader {
     pub fn clone_for_parallel_parsing(&self) -> Self {
         Self {
             workspace_root: self.workspace_root.clone(),
+            workspace_repository_context: self.workspace_repository_context.clone(),
             current_package: None, // Each instance starts with no package
             current_repo_root: self.workspace_root.clone(), // Start at workspace root
             current_repo_name: None,
@@ -4821,6 +4907,7 @@ impl BzlLoader {
     fn clone_for_workspace_chunk_scan(&self, workspace_root: &std::path::Path) -> Self {
         let mut temp_loader = self.clone_for_parallel_parsing();
         temp_loader.workspace_root = workspace_root.to_path_buf();
+        temp_loader.workspace_repository_context = Some(workspace_root.to_path_buf());
         temp_loader.current_repo_root = workspace_root.to_path_buf();
         // Legacy WORKSPACE scans use Rush's minimal @bazel_tools repository to
         // avoid recursive fetch loops. Bzlmod-only workspaces instead register
@@ -5641,6 +5728,7 @@ impl BzlLoader {
         let frame = BzlContextFrame {
             repo_root, package_dir, repository: Some(module_context.repository.clone().unwrap_or_default()),
             load_stack: current_stack_snapshot(),
+            workspace_repository_context: module_key.workspace_repository_context.clone(),
         };
 
         // Phase 2.75: Acquire resources before evaluation (OOM prevention)
@@ -6687,7 +6775,8 @@ impl BzlLoader {
         // the parent module's exports, even without a physical source edit.
         let mappings = self.repository_mapping_cache_identity();
         Ok((ModuleCacheKey { path: path.to_path_buf(), workspace: self.workspace_root.clone(), context: Some(context), label: Some(label), mappings,
-            repository_roots: self.repository_root_cache_identity(), aliases: self.repository_alias_cache_identity() }, root, package_dir))
+            repository_roots: self.repository_root_cache_identity(), aliases: self.repository_alias_cache_identity(),
+            workspace_repository_context: self.workspace_repository_context.clone() }, root, package_dir))
     }
 
     /// Reverse lookup: find repo name by its root path
@@ -6884,7 +6973,7 @@ impl BzlLoader {
         let subphase_eval_start = std::time::Instant::now();
         let symbols_map = match Self::evaluate_bzl_static(&program, loader_arc,
             module_key.context.clone().expect("qualified module context"),
-            BzlContextFrame { repo_root, package_dir, repository: Some(module_key.context.as_ref().and_then(|ctx| ctx.repository.clone()).unwrap_or_default()), load_stack: current_stack_snapshot() }) {
+            BzlContextFrame { repo_root, package_dir, repository: Some(module_key.context.as_ref().and_then(|ctx| ctx.repository.clone()).unwrap_or_default()), load_stack: current_stack_snapshot(), workspace_repository_context: module_key.workspace_repository_context.clone() }) {
             Ok(m) => m,
             Err(e) => {
                 let _ = pop_cold_load_frame(cold_load_start.elapsed().as_nanos() as u64);
@@ -6998,6 +7087,7 @@ impl BzlLoader {
         context: DefinitionLabelContext,
         frame: BzlContextFrame,
     ) -> Result<HashMap<String, Value>> {
+        let workspace_repository_context = frame.workspace_repository_context.clone();
         Self::push_thread_context_frame(frame);
         struct ContextGuard;
         impl Drop for ContextGuard {
@@ -7009,6 +7099,9 @@ impl BzlLoader {
 
         // Register native namespace for macros (native.cc_library, etc.)
         evaluator.register_native_namespace();
+        if let Some(root) = workspace_repository_context {
+            evaluator.set_workspace_repository_context(root);
+        }
 
         // Set the bzl_loader so .bzl files can recursively load other .bzl files
         if let Some(loader) = loader_arc {
@@ -8369,6 +8462,7 @@ impl BzlLoader {
         let mut ev = crate::Evaluator::new();
         // Provide workspace-native repo rules and common aliases
         ev.register_workspace_native_namespace();
+        ev.set_workspace_repository_context(workspace_root.to_path_buf());
         ev.register_repo_rule_alias("tf_http_archive", "http_archive");
         ev.register_repo_rule_alias("new_http_archive", "http_archive");
         let mut temp_loader = loader.clone_for_workspace_chunk_scan(workspace_root);
@@ -8528,6 +8622,7 @@ impl BzlLoader {
         };
         let mut ev = crate::Evaluator::new();
         ev.register_workspace_native_namespace();
+        ev.set_workspace_repository_context(workspace_root.to_path_buf());
         let mut temp_loader = loader.clone_for_workspace_chunk_scan(workspace_root);
 
         let loader_arc = std::sync::Arc::new(std::sync::Mutex::new(temp_loader));
@@ -8591,6 +8686,7 @@ impl BzlLoader {
         };
         let mut ev = crate::Evaluator::new();
         ev.register_workspace_native_namespace();
+        ev.set_workspace_repository_context(workspace_root.to_path_buf());
         let mut temp_loader = loader.clone_for_workspace_chunk_scan(workspace_root);
 
         let loader_arc = std::sync::Arc::new(std::sync::Mutex::new(temp_loader));
@@ -8739,6 +8835,7 @@ impl BzlLoader {
         };
         let mut ev = crate::Evaluator::new();
         ev.register_workspace_native_namespace();
+        ev.set_workspace_repository_context(_workspace_root.to_path_buf());
         let _ = ev.eval_program(&program);
         for rc in ev.captured_rule_calls() {
             let kind = rc.rule_type.as_str();
