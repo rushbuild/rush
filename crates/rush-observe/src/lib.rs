@@ -35,6 +35,7 @@ pub use stream::{
     write_process_capture_stream_tree_with_writes_test_fixture,
     write_process_capture_stream_unmodeled_completed_test_fixture,
     write_process_capture_stream_unmodeled_terminal_test_fixture,
+    write_process_capture_stream_terminal_open_test_fixture,
     ProcessCaptureStreamTestFinalValueBoundary, ProcessCaptureStreamTestProcess,
     ProcessCaptureStreamTestRead, ProcessCaptureStreamTestTransientSymlink,
     ProcessCaptureStreamTestWrite,

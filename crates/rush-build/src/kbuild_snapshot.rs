@@ -24478,6 +24478,7 @@ mod tests {
         write_process_capture_stream_tree_with_final_values_and_transient_symlinks_test_fixture,
         write_process_capture_stream_tree_with_final_values_test_fixture,
         write_process_capture_stream_unmodeled_completed_test_fixture,
+        write_process_capture_stream_terminal_open_test_fixture,
         write_process_capture_stream_unmodeled_terminal_test_fixture, CapturedChildWaitAttempt,
         CapturedChildWaitOutcome, CapturedChildWaitRequest, CapturedChildWaitSelector,
         CapturedCloseAttempt, CapturedCloseOutcome, CapturedCloseRequest, CapturedCwdChangeAttempt,
@@ -29146,7 +29147,50 @@ mod tests {
             post_mutation
                 .analyzer_directory_checkpoints()
                 .candidate_action_boundary_observations(),
-            0
+            1
+        );
+        let checkpoint = &post_mutation.analyzer_directory_checkpoints[0];
+        assert_eq!(checkpoint.process, 11);
+        assert_eq!(checkpoint.syscall_index, 5);
+        assert_eq!(checkpoint.stream_ordinal, 5);
+        assert_eq!(checkpoint.object.device, output.object.device);
+        assert_eq!(checkpoint.object.inode, output.object.inode);
+        assert_eq!(checkpoint.object.mount_id, Some(output.object.mount_id));
+        assert!(checkpoint.members.is_empty());
+        assert_eq!(checkpoint.before_actions, BTreeSet::from([0]));
+        assert!(checkpoint.after_actions.is_empty());
+        assert!(checkpoint.unresolved_actions.is_empty());
+        assert!(!checkpoint.has_analyzer_effect);
+        assert!(checkpoint.candidate_action_boundary);
+
+        let index = KbuildInputMutationIndex::from_events(&mutations).unwrap();
+        let batches = kbuild_directory_effect_batches(
+            index.directory_epoch_events.get(&directory).unwrap(),
+        ).unwrap();
+        assert_eq!(batches, vec![KbuildDirectoryEffectBatch {
+            owner: KbuildProcessOwner::Action(0),
+            event: KbuildProcessEventKey { process: 10, syscall_index: 2, stream_ordinal: 4 },
+            effects: vec![KbuildDirectoryEffectDescriptor {
+                kind_tag: 4,
+                subject: KbuildDirectoryEffectSubject::DirectoryObject,
+            }],
+        }]);
+        let observed = KbuildProcessEventKey { process: 11, syscall_index: 5, stream_ordinal: 5 };
+        let causality = KbuildProcessCausality::default();
+        assert_eq!(kbuild_process_event_relation(&causality, batches[0].event, observed).unwrap(), 2);
+        assert_eq!(kbuild_directory_batch_relations(&batches, &causality, observed, &[], None).unwrap(), vec![0]);
+        let removal = KbuildDirectoryEffectBatch {
+            owner: KbuildProcessOwner::Action(1),
+            event: KbuildProcessEventKey { process: 12, syscall_index: 2, stream_ordinal: 6 },
+            effects: vec![KbuildDirectoryEffectDescriptor {
+                kind_tag: 2,
+                subject: KbuildDirectoryEffectSubject::DirectoryObject,
+            }],
+        };
+        assert_eq!(
+            kbuild_directory_batch_relations(&[batches[0].clone(), removal], &causality, observed, &[], None).unwrap(),
+            vec![2, 2],
+            "a directory-object removal must prevent fresh-directory proof",
         );
         assert_eq!(
             post_mutation.analyzer_pre_producer_mutation_observations(),
@@ -29718,7 +29762,7 @@ mod tests {
                 .unwrap(),
             },
         };
-        let prove_many =
+        let try_prove_many =
             |observations: &[KbuildInputObservation],
              mutations: &[(KbuildProcessOwner, KbuildMutationCandidate)],
              candidates: &BTreeMap<KbuildProcessOwner, BTreeSet<PathBuf>>,
@@ -29768,8 +29812,13 @@ mod tests {
                     &final_outputs,
                     &output_root,
                 )
-                .unwrap()
             };
+        let prove_many = |observations: &[KbuildInputObservation],
+                          mutations: &[(KbuildProcessOwner, KbuildMutationCandidate)],
+                          candidates: &BTreeMap<KbuildProcessOwner, BTreeSet<PathBuf>>,
+                          anchors: &BTreeMap<u64, KbuildDirectoryPathAnchor>| {
+            try_prove_many(observations, mutations, candidates, anchors).unwrap()
+        };
         let prove_with =
             |observation: &KbuildInputObservation,
              mutations: &[(KbuildProcessOwner, KbuildMutationCandidate)],
@@ -29798,9 +29847,9 @@ mod tests {
         assert_eq!(checkpoints.effects_before_observations(), 0);
         assert_eq!(checkpoints.observations_before_effects(), 0);
         assert_eq!(checkpoints.causally_unresolved_effects(), 2);
-        assert_eq!(checkpoints.before_only_external_action_relations(), 0);
+        assert_eq!(checkpoints.before_only_external_action_relations(), 2);
         assert_eq!(checkpoints.after_only_external_action_relations(), 0);
-        assert_eq!(checkpoints.unresolved_external_action_relations(), 2);
+        assert_eq!(checkpoints.unresolved_external_action_relations(), 0);
         assert_eq!(checkpoints.straddling_external_action_relations(), 0);
         assert_eq!(checkpoints.self_effect_batches(), 0);
         assert_eq!(checkpoints.analyzer_effect_batches(), 0);
@@ -29809,11 +29858,32 @@ mod tests {
         assert_eq!(seal.directory_checkpoints[0].consumer_action_index, 2);
         assert_eq!(seal.directory_checkpoints[0].observation_ordinal, 0);
         assert_eq!(seal.directory_checkpoints[0].members.len(), 2);
-        assert!(seal.directory_checkpoints[0].before_actions.is_empty());
+        assert_eq!(seal.directory_checkpoints[0].before_actions, BTreeSet::from([0, 1]));
         assert!(seal.directory_checkpoints[0].after_actions.is_empty());
+        assert!(seal.directory_checkpoints[0].unresolved_actions.is_empty());
+        assert_eq!(observation.owner, KbuildProcessOwner::Action(2));
+        assert_eq!(observation.process, 3);
+        assert_eq!(seal.directory_checkpoints[0].members, vec![b"first".to_vec(), b"second".to_vec()]);
+        let index = KbuildInputMutationIndex::from_events(&mutations).unwrap();
+        let batches = kbuild_directory_effect_batches(index.directory_epoch_events.get(&directory).unwrap()).unwrap();
+        for (batch, owner, process, ordinal, member) in [
+            (&batches[0], 0, 1, 2, b"first".as_slice()),
+            (&batches[1], 1, 2, 5, b"second".as_slice()),
+        ] {
+            assert_eq!(batch.owner, KbuildProcessOwner::Action(owner));
+            assert_eq!(batch.event, KbuildProcessEventKey { process, syscall_index: ordinal, stream_ordinal: ordinal });
+            assert_eq!(batch.effects, vec![KbuildDirectoryEffectDescriptor {
+                kind_tag: 0,
+                subject: KbuildDirectoryEffectSubject::Member(member.to_vec()),
+            }]);
+            assert_eq!(kbuild_process_event_relation(
+                &KbuildProcessCausality::default(), batch.event,
+                KbuildProcessEventKey { process: 3, syscall_index: 4, stream_ordinal: 4 },
+            ).unwrap(), 2, "membership normalization must not invent a process-order edge");
+        }
         assert_eq!(
-            seal.directory_checkpoints[0].unresolved_actions,
-            BTreeSet::from([0, 1])
+            kbuild_membership_neutral_actions(&batches, &seal.directory_checkpoints[0].members, 3).unwrap(),
+            BTreeSet::from([0, 1]),
         );
         assert!(!seal.directory_checkpoints[0].has_self_effect);
         assert!(!seal.directory_checkpoints[0].has_analyzer_effect);
@@ -30017,14 +30087,28 @@ mod tests {
             KbuildMutationCandidateKind::PathModeChange,
         )];
         directory_lifecycle_observation.owner = KbuildProcessOwner::Action(0);
+        directory_lifecycle_observation.process = 1;
+        directory_lifecycle_observation.syscall_index = Some(6);
         directory_lifecycle_observation.stream_ordinal = 6;
-        let metadata_only = prove_with(
-            &directory_lifecycle_observation,
+        let metadata_index = KbuildInputMutationIndex::from_events(&metadata_only_mutations).unwrap();
+        assert_eq!(metadata_only_mutations[0].0, KbuildProcessOwner::Action(2));
+        assert_eq!(metadata_only_mutations[0].1.process, 3);
+        assert_eq!(metadata_only_mutations[0].1.path, directory);
+        assert_eq!(metadata_only_mutations[0].1.kind, KbuildMutationCandidateKind::PathModeChange);
+        assert_eq!(metadata_index.classify(&directory_lifecycle_observation), KbuildInputProvenanceClass::CrossOwnerMutation);
+        assert!(!metadata_index.directory_epoch_events.contains_key(&directory));
+        assert!(kbuild_directory_epoch_boundary(&directory_lifecycle_observation, &metadata_index).unwrap().is_none());
+        let metadata_observations = std::slice::from_ref(&directory_lifecycle_observation);
+        let metadata_error = try_prove_many(
+            metadata_observations,
             &metadata_only_mutations,
             &directory_candidates,
+            &test_directory_path_anchors(metadata_observations),
+        ).err().expect("cross-owner directory metadata needs an exact checkpoint effect");
+        assert_eq!(
+            metadata_error.root_cause().to_string(),
+            "Kbuild generated directory checkpoint has no candidate effects",
         );
-        assert_eq!(metadata_only.directory_epoch_observations(), 0);
-        assert_eq!(metadata_only.distinct_directory_epoch_paths(), 0);
     }
 
     #[cfg(unix)]
@@ -38235,6 +38319,45 @@ mod tests {
             "{error:#}"
         );
 
+        let typed_terminal_private = temp.path().join("typed-terminal-private-capture");
+        std::fs::create_dir(&typed_terminal_private).unwrap();
+        std::fs::set_permissions(&typed_terminal_private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stream_path = typed_terminal_private.join("process-capture.stream");
+        let limits = test_process_capture_limits();
+        let summary = write_process_capture_stream_terminal_open_test_fixture(
+            &stream_path,
+            ProcessCaptureStreamIdentity::new([7; 16], [11; 32]),
+            limits,
+            &process_tree,
+            11,
+        ).unwrap();
+        let census = summary.census();
+        assert_eq!(census.open_attempts, 1);
+        assert_eq!(census.unmodeled_syscall_attempts, 0);
+        assert_eq!(census.syscall_entries, 3);
+        assert_eq!(census.syscall_exits, 2);
+        assert_eq!(census.terminal_syscalls, 1);
+        let mut typed_terminal_envelope = envelope.clone();
+        typed_terminal_envelope.process_capture = KbuildProcessCapture {
+            stream_path,
+            summary,
+            max_stream_bytes: limits.max_stream_bytes(),
+            max_records: limits.max_records(),
+            max_processes: limits.max_processes(),
+            max_frame_bytes: limits.max_frame_bytes(),
+        };
+        typed_terminal_envelope.coverage.stream_records_observed = summary.record_count();
+        typed_terminal_envelope.coverage.stream_records_classified = summary.record_count();
+        let error = preflight_kbuild_graph_envelope(typed_terminal_envelope, &src, &obj).unwrap_err();
+        assert_eq!(
+            error.root_cause().to_string(),
+            "Kbuild path-open attempt terminated while its syscall was in flight",
+        );
+
+        let unsupported_runtime_error = format!(
+            "Kbuild process 11 has unsupported runtime syscall {} arguments [0, 0, 0, 0, 0, 0]",
+            u64::MAX,
+        );
         let terminal_private = temp.path().join("terminal-private-capture");
         std::fs::create_dir(&terminal_private).unwrap();
         std::fs::set_permissions(&terminal_private, std::fs::Permissions::from_mode(0o700))
@@ -38279,6 +38402,10 @@ mod tests {
             terminal_process_capture.summary.census().terminal_syscalls,
             1
         );
+        let terminal_census = terminal_process_capture.summary.census();
+        assert_eq!(terminal_census.syscall_entries, 3);
+        assert_eq!(terminal_census.syscall_exits, 2);
+        assert_eq!(terminal_census.unmodeled_syscall_attempts, 1);
         let mut terminal_envelope = envelope.clone();
         terminal_envelope.process_capture = terminal_process_capture;
         terminal_envelope.coverage.stream_records_observed =
@@ -38286,10 +38413,7 @@ mod tests {
         terminal_envelope.coverage.stream_records_classified =
             terminal_envelope.process_capture.summary.record_count();
         let error = preflight_kbuild_graph_envelope(terminal_envelope, &src, &obj).unwrap_err();
-        assert!(
-            error.to_string().contains("terminal in-flight syscall"),
-            "{error:#}"
-        );
+        assert_eq!(error.root_cause().to_string(), unsupported_runtime_error);
 
         let unmodeled_private = temp.path().join("unmodeled-private-capture");
         std::fs::create_dir(&unmodeled_private).unwrap();
@@ -38343,12 +38467,7 @@ mod tests {
         unmodeled_envelope.coverage.stream_records_classified =
             unmodeled_envelope.process_capture.summary.record_count();
         let error = preflight_kbuild_graph_envelope(unmodeled_envelope, &src, &obj).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("modeled-syscall coverage is 2/3, with 1 sealed unmodeled attempt"),
-            "{error:#}"
-        );
+        assert_eq!(error.root_cause().to_string(), unsupported_runtime_error);
 
         let input_seal = certify_process_capture_input_witnesses(
             &envelope.process_capture.stream_path,

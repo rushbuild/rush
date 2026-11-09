@@ -4302,7 +4302,7 @@ pub fn write_process_capture_stream_unmodeled_terminal_test_fixture(
         &[],
         &[],
         &[],
-        Some((terminal_process, true)),
+        Some((terminal_process, FixtureSyscall::Unknown { terminal: true })),
         false,
         None,
     )
@@ -4329,10 +4329,43 @@ pub fn write_process_capture_stream_unmodeled_completed_test_fixture(
         &[],
         &[],
         &[],
-        Some((unmodeled_process, false)),
+        Some((unmodeled_process, FixtureSyscall::Unknown { terminal: false })),
         false,
         None,
     )
+}
+
+/// Write a synthetic process tree with one typed open terminated in flight.
+///
+/// This negative fixture tests semantic rejection independently of unknown
+/// syscall-number rejection. It exists only with the `test-fixtures` feature.
+#[cfg(feature = "test-fixtures")]
+pub fn write_process_capture_stream_terminal_open_test_fixture(
+    path: &Path,
+    identity: ProcessCaptureStreamIdentity,
+    limits: ProcessCaptureStreamLimits,
+    processes: &[ProcessCaptureStreamTestProcess],
+    terminal_process: CapturedProcessId,
+) -> Result<ProcessCaptureStreamSummary> {
+    write_process_capture_stream_tree_fixture(
+        path,
+        identity,
+        limits,
+        processes,
+        &[],
+        &[],
+        &[],
+        Some((terminal_process, FixtureSyscall::TerminalOpen)),
+        false,
+        None,
+    )
+}
+
+#[cfg(feature = "test-fixtures")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureSyscall {
+    Unknown { terminal: bool },
+    TerminalOpen,
 }
 
 #[cfg(feature = "test-fixtures")]
@@ -4344,7 +4377,7 @@ fn write_process_capture_stream_tree_fixture(
     writes: &[ProcessCaptureStreamTestWrite],
     reads: &[ProcessCaptureStreamTestRead],
     transient_symlinks: &[ProcessCaptureStreamTestTransientSymlink],
-    unmodeled_syscall: Option<(CapturedProcessId, bool)>,
+    extra_syscall: Option<(CapturedProcessId, FixtureSyscall)>,
     model_lifecycle_exits: bool,
     final_value_boundary: Option<ProcessCaptureStreamTestFinalValueBoundary>,
 ) -> Result<ProcessCaptureStreamSummary> {
@@ -4371,8 +4404,8 @@ fn write_process_capture_stream_tree_fixture(
         parents.insert(process.process, process.parent);
     }
     let root = root.context("process capture test fixture has no root")?;
-    if unmodeled_syscall.is_some_and(|(process, _)| !parents.contains_key(&process)) {
-        anyhow::bail!("process capture test fixture unmodeled process is absent");
+    if extra_syscall.is_some_and(|(process, _)| !parents.contains_key(&process)) {
+        anyhow::bail!("process capture test fixture extra-syscall process is absent");
     }
     if writes.iter().any(|write| {
         !parents.contains_key(&write.process)
@@ -4406,15 +4439,23 @@ fn write_process_capture_stream_tree_fixture(
                   write_count: u64,
                   close_count: u64,
                   transient_count: u64,
-                  unmodeled_terminal: Option<bool>,
+                  extra_syscall: Option<FixtureSyscall>,
                   lifecycle_exit_count: u64,
                   outcome: CapturedProcessOutcome|
      -> Result<ProcessFinish> {
-        let unmodeled_count = u64::from(unmodeled_terminal.is_some());
-        let terminal_count = u64::from(unmodeled_terminal == Some(true))
+        let unmodeled_count = u64::from(matches!(
+            extra_syscall, Some(FixtureSyscall::Unknown { .. })
+        ));
+        let open_count = u64::from(extra_syscall == Some(FixtureSyscall::TerminalOpen));
+        let terminal_count = u64::from(matches!(
+            extra_syscall,
+            Some(FixtureSyscall::Unknown { terminal: true } | FixtureSyscall::TerminalOpen)
+        ))
             .checked_add(lifecycle_exit_count)
             .context("process capture test-fixture terminal count overflowed")?;
-        let completed_count = u64::from(unmodeled_terminal == Some(false));
+        let completed_count = u64::from(
+            extra_syscall == Some(FixtureSyscall::Unknown { terminal: false })
+        );
         let syscall_entries = exec_count
             .checked_add(read_count)
             .context("process capture test-fixture syscall count overflowed")?
@@ -4428,7 +4469,7 @@ fn write_process_capture_stream_tree_fixture(
                     .context("process capture test-fixture syscall count overflowed")?,
             )
             .context("process capture test-fixture syscall count overflowed")?
-            .checked_add(unmodeled_count)
+            .checked_add(unmodeled_count + open_count)
             .and_then(|count| count.checked_add(lifecycle_exit_count))
             .context("process capture test-fixture syscall count overflowed")?;
         let syscall_exits = exec_count
@@ -4449,7 +4490,7 @@ fn write_process_capture_stream_tree_fixture(
         Ok(ProcessFinish {
             invocations: invocation_count,
             exec_syscalls: exec_count,
-            open_syscalls: 0,
+            open_syscalls: open_count,
             newfstatat_syscalls: 0,
             fstat_syscalls: 0,
             getrandom_syscalls: 0,
@@ -4797,32 +4838,51 @@ fn write_process_capture_stream_tree_fixture(
                 },
             })?;
         }
-        let process_unmodeled = unmodeled_syscall
-            .filter(|(unmodeled_process, _)| *unmodeled_process == process.process)
-            .map(|(_, terminal)| terminal);
-        if let Some(terminal) = process_unmodeled {
+        let process_extra = extra_syscall
+            .filter(|(extra_process, _)| *extra_process == process.process)
+            .map(|(_, syscall)| syscall);
+        if let Some(syscall) = process_extra {
             let syscall_index = exec_count
                 .checked_add(read_count)
                 .and_then(|count| count.checked_add(write_count))
                 .and_then(|count| count.checked_add(close_count))
                 .and_then(|count| count.checked_add(transient_count.checked_mul(2)?))
-                .context("process capture test-fixture unmodeled index overflowed")?;
-            sink.record(ProcessCaptureEvent::UnmodeledSyscallAttempt {
-                process: process.process,
-                attempt: CapturedUnmodeledSyscallAttempt {
-                    syscall_index,
-                    number: u64::MAX,
-                    arguments: [0; 6],
-                    outcome: if terminal {
-                        crate::CapturedUnmodeledSyscallOutcome::Terminated
-                    } else {
-                        crate::CapturedUnmodeledSyscallOutcome::Returned {
-                            return_value: 0,
-                            is_error: false,
-                        }
+                .context("process capture test-fixture extra-syscall index overflowed")?;
+            match syscall {
+                FixtureSyscall::Unknown { terminal } => {
+                    sink.record(ProcessCaptureEvent::UnmodeledSyscallAttempt {
+                        process: process.process,
+                        attempt: CapturedUnmodeledSyscallAttempt {
+                            syscall_index,
+                            number: u64::MAX,
+                            arguments: [0; 6],
+                            outcome: if terminal {
+                                crate::CapturedUnmodeledSyscallOutcome::Terminated
+                            } else {
+                                crate::CapturedUnmodeledSyscallOutcome::Returned {
+                                    return_value: 0,
+                                    is_error: false,
+                                }
+                            },
+                        },
+                    })?;
+                }
+                FixtureSyscall::TerminalOpen => sink.record(ProcessCaptureEvent::OpenAttempt {
+                    process: process.process,
+                    attempt: crate::CapturedOpenAttempt {
+                        syscall_index,
+                        request: crate::CapturedOpenRequest {
+                            system_call: crate::CapturedOpenSystemCall::Open,
+                            path: b"/fixture-blocked-open".to_vec(),
+                            directory: None,
+                            flags: libc::O_RDONLY as u64,
+                            mode: 0,
+                            resolve: 0,
+                        },
+                        outcome: crate::CapturedOpenOutcome::Terminated,
                     },
-                },
-            })?;
+                })?,
+            }
         }
         let lifecycle_exit_count = u64::from(model_lifecycle_exits);
         if model_lifecycle_exits {
@@ -4840,7 +4900,7 @@ fn write_process_capture_stream_tree_fixture(
                 .checked_add(write_count)
                 .and_then(|count| count.checked_add(close_count))
                 .and_then(|count| count.checked_add(transient_count.checked_mul(2)?))
-                .and_then(|count| count.checked_add(u64::from(process_unmodeled.is_some())))
+                .and_then(|count| count.checked_add(u64::from(process_extra.is_some())))
                 .context("process capture test-fixture lifecycle-exit index overflowed")?;
             let open_file_values = if final_value_boundary
                 == Some(ProcessCaptureStreamTestFinalValueBoundary::LifecycleExit)
@@ -4896,7 +4956,7 @@ fn write_process_capture_stream_tree_fixture(
                 write_count,
                 close_count,
                 transient_count,
-                process_unmodeled,
+                process_extra,
                 lifecycle_exit_count,
                 process.outcome,
             )?,
