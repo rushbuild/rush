@@ -65,6 +65,15 @@ Run the same target again to exercise reuse. For correctness investigations,
 compare clean outputs and source/header edits with the reference build. A fast
 no-op alone does not establish dependency correctness.
 
+## Execute on remote workers
+
+Use `rush build --remote-executor ENDPOINT --remote-platform toolchain=IMAGE`
+for scoped native C++ builds. Use `rush remote-execute action.json` for explicit
+file actions, including GPU commands on an allocated worker. Rush uploads
+inputs, restores verified outputs and propagates remote failures. Read the
+[remote execution guide](docs/remote-execution.md) and
+[acceptance results](docs/benchmarks/remote-execution.md) for setup and limits.
+
 ## Find your way around
 
 The workspace contains separate crates for analysis, action identity, execution,

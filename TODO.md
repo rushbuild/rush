@@ -12,6 +12,7 @@ before implementation. All remain open until their evidence is recorded.
 | P1 | Add PR polling and bounded dispatch | Deduplication, exclusive claims, budgets, auth loss and restart tests; human adopts schedule |
 | P1 | Extract Kbuild receipt/provenance modules | One private-module move with unchanged snapshot encoding and rejection tests |
 | P1 | Extract orchestration phases | Preserve graph publication and freshness; affected command/no-op tests pass |
+| P1 | Extend remote-execution qualification | Qualify a second backend, TLS and nonempty instances; add recovery/cancellation and declared dynamic dependencies; resolve the retained HIP runtime failure before claiming GPU parity |
 | P1 | Profile incremental overhead against Buck2 | Explain the larger generated graph's no-op and edit gap in docs/benchmarks/buck2.md; retain matched CPU/cache controls and correct outputs |
 | P1 | Qualify daemon build-option handling | Reproduce job-limit and disk-cache-disable routing across daemon and in-process commands; require matching requested behavior |
 | P1 | Split observation syscall handlers | Preserve process/descriptor state and incomplete-capture rejection |

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="Compare Rush and Buck2: build rules, incremental architecture, caching, adoption and measured local builds.">
+<meta name="description" content="Compare Rush and Buck2: build rules, incremental architecture, caching, adoption, measured local builds and remote execution.">
 <meta property="og:title" content="Rush vs Buck2">
 <meta property="og:image" content="https://rushbuild.github.io/rush/images/rush.png">
 <link rel="canonical" href="https://rushbuild.github.io/rush/buck2.html">
@@ -20,7 +20,7 @@ section{padding:34px 0;border-top:1px solid var(--line)}.grid{display:grid;grid-
 </style>
 </head>
 <body>
-<nav aria-label="Main navigation"><a href="index.html"><img src="images/rush.png" width="737" height="748" alt="Rush"> Rush</a><a href="#architecture">Architecture</a><a href="#measurements">Build comparison</a><a href="https://buck2.build/">Buck2 docs ↗</a></nav>
+<nav aria-label="Main navigation"><a href="index.html"><img src="images/rush.png" width="737" height="748" alt="Rush"> Rush</a><a href="#architecture">Architecture</a><a href="#measurements">Build comparison</a><a href="#remote">Remote execution</a><a href="https://buck2.build/">Buck2 docs ↗</a></nav>
 <main>
 <header><p class="eyebrow">Compare the engines · check the rules · measure the work</p>
 <h1>Rush vs Buck2.</h1>
@@ -49,7 +49,7 @@ Use the source and linked documentation to check each claim.</p>
 <tr><td>Language rules</td><td>Implements substantial language-rule behavior in Rust alongside Starlark evaluation. See <a href="https://github.com/rushbuild/rush/blob/main/crates/rush-rules/src/rules_cc.rs">C/C++ rules</a>.</td><td>Keeps language rules in Starlark and the binary language-agnostic. See <a href="https://buck2.build/docs/about/why/">the rule and engine design</a>.</td></tr>
 <tr><td>Incremental computation</td><td>Retains analysis snapshots and action state, validates freshness, and schedules work through separate components. Read <a href="docs/architecture.md">the component map</a>.</td><td>Uses a single dynamic computation graph on DICE, allowing dependencies across analysis and execution. Read <a href="https://buck2.build/docs/about/why/">the incremental design</a>.</td></tr>
 <tr><td>Output reuse</td><td>Uses action identities, content-addressed outputs and materialization policies. Validate the selected path and its invalidation behavior.</td><td>Uses action caching and <a href="https://buck2.build/docs/users/advanced/deferred_materialization/">deferred materialization</a>. Avoiding unnecessary output downloads is a shared technique.</td></tr>
-<tr><td>Remote services</td><td>Contains experimental remote-service code. Do not assume interoperability with a standard remote-execution backend; inspect <a href="https://github.com/rushbuild/rush/blob/main/crates/rush-remote/src/executor.rs">the current protocol</a> and qualify it.</td><td>Supports the <a href="https://buck2.build/docs/users/remote_execution/">Bazel Remote Execution API</a> and documented backend integration.</td></tr>
+<tr><td>Remote services</td><td>Executes declared file actions and scoped native C++ builds through REAPI v2, SHA256 CAS and an action cache. Read <a href="docs/remote-execution.md">the supported contracts</a> and <a href="#remote">backend checks</a>.</td><td>Supports the <a href="https://buck2.build/docs/users/remote_execution/">Bazel Remote Execution API</a> and documented backend integration.</td></tr>
 <tr><td>Build-integrated tools</td><td>Provides command and profiling interfaces. No equivalent to the full BXL interface is established by this comparison.</td><td>Provides <a href="https://buck2.build/docs/bxl/">BXL</a> for Starlark tools that query, analyze and build through the engine.</td></tr>
 <tr><td>External build graphs</td><td>Explores Make/Kbuild graph capture, snapshot validation and direct action replay. Read <a href="docs/benchmarks/linux.md">the Linux experiment and acceptance limits</a>.</td><td>The reviewed documentation does not establish an equivalent Kbuild capture/replay workflow. Evaluate a port or integration separately.</td></tr>
 </tbody></table></div>
@@ -87,6 +87,32 @@ byte-identical artifacts. A synthetic C++ test establishes no TensorFlow,
 Modular, Linux, optimized-build or remote-execution performance result.</p>
 </section>
 <section><h2>Reproduce before choosing.</h2><p><a href="README.md">Build Rush from source</a> and follow <a href="https://buck2.build/docs/getting_started/install/">Buck2's installation guide</a>. Start with a bounded target, verify its outputs and exercise source and header edits. Expand the target set after those checks pass.</p></section>
+<section id="remote"><p class="eyebrow">Remote execution · one shared backend protocol</p><h2>Send the work to a worker.</h2>
+<p>Both engines build the same small C++ program through NativeLink 1.8.3.
+Use two libraries, two headers per library and one executable. Select the
+same GCC 15.3 worker and eight CPUs; check the executable prints the expected
+content-dependent result. These checks establish interoperability and output
+correctness. They supply no remote speed ranking.</p>
+<div class="table-wrap"><table><caption>Remote qualification · generated C++ graph</caption><thead><tr><th scope="col">Check</th><th scope="col">Rush</th><th scope="col">Buck2</th></tr></thead><tbody>
+<tr><td>First build</td><td>Six remote actions; local compiler and archiver execution blocked.</td><td>Six remote actions; zero local actions; remote-only mode.</td></tr>
+<tr><td>Program output</td><td>Expected total: 98,480.</td><td>Expected total: 98,480.</td></tr>
+<tr><td>Edits and restoration</td><td>Source/header edits, missing outputs and damaged executable repair pass in both host directions.</td><td>Initial remote build checked; edit/restoration checks remain unrun.</td></tr>
+<tr><td>Worker failure</td><td>Unavailable backend and compile failure propagate; no local fallback.</td><td>Remote-only mode used; failure injection remains unrun.</td></tr>
+</tbody></table></div>
+<div class="grid"><article class="card"><h3>Validate file actions.</h3>
+<p>Rush passes 16 action checks in each host direction: execute, cache restore,
+input changes, a 4 MiB transfer, rejected paths and symlinks, command failures
+and timeouts. Native C++ builds pass nine checks per direction.</p>
+<p><a href="docs/benchmarks/remote-execution.md">Read exact candidates, cases and failures →</a></p></article>
+<article class="card"><h3>Check device execution separately.</h3>
+<p>A remote CUDA action allocates, fills and reads back 1 MiB with verified
+bytes. HIP enumeration succeeds in a restricted worker, but memory
+initialization fails. HIP remains unqualified. Buck2 GPU actions and full
+TensorFlow, Modular or Linux remote builds remain unrun.</p></article></div>
+<p class="note">Provision and isolate the whole worker service, including its
+output collector. Pin toolchain properties and bound scratch storage. Read
+<a href="docs/remote-execution.md">setup, trust boundaries and current limits</a>
+before connecting a workspace.</p></section>
 </main>
 <footer>Rush · Experimental source release · <a href="index.html">Project overview</a> · <a href="https://github.com/rushbuild/rush">Source</a></footer>
 </body>

@@ -1,0 +1,502 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-08",
+  "engine_tree": "d5b4df7738e901b8e94ee0ef771177c3cf46b6af",
+  "base": "203ae67855b39a23b5e393d597ede54b323397c9",
+  "release_sha256": "bb59c5c93317f1e31b0b553ef25fdf8b28ed04878408277e81e066d71f896133",
+  "verified_source_paths_per_host": 2006,
+  "backend": {
+    "name": "NativeLink",
+    "version": "1.8.3",
+    "archive_sha256": "1a6596c96f059d4e99f7352164321e1f1cdff435275667ad8489e83f7e2977c5"
+  },
+  "Host_C_to_D": {
+    "file_actions": {
+      "complete": true,
+      "cases": [
+        {
+          "case": "execute",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "restore",
+          "passed": true,
+          "exit_code": 0,
+          "cached": true
+        },
+        {
+          "case": "source-edit",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "revert",
+          "passed": true,
+          "exit_code": 0,
+          "cached": true
+        },
+        {
+          "case": "no-cache-first",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "no-cache-second",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "streamed-transfer",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "failure-first",
+          "passed": true,
+          "exit_code": 7,
+          "cached": false
+        },
+        {
+          "case": "failure-repeat",
+          "passed": true,
+          "exit_code": 7,
+          "cached": false
+        },
+        {
+          "case": "missing-output",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-output-symlink",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-relative-output-symlink",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-traversal",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-input-symlink",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "worker-timeout",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "client-deadline",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        }
+      ]
+    },
+    "native_build": {
+      "complete": true,
+      "cases": [
+        {
+          "case": "first-build",
+          "passed": true
+        },
+        {
+          "case": "restore-missing-outputs",
+          "passed": true
+        },
+        {
+          "case": "source-edit",
+          "passed": true
+        },
+        {
+          "case": "header-edit",
+          "passed": true
+        },
+        {
+          "case": "unchanged",
+          "passed": true
+        },
+        {
+          "case": "repair-corrupt-output",
+          "passed": true
+        },
+        {
+          "case": "unavailable-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "compile-failure-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "local-compiler-and-archiver-never-executed",
+          "passed": true
+        }
+      ]
+    },
+    "matched_program": {
+      "matched_paths": [
+        {
+          "path": "main.cc",
+          "sha256": "a62863dba027316648c6f5769981afe28c5e303d038fa9c81cec11f38510fb56"
+        },
+        {
+          "path": "pkg_0/lib.cc",
+          "sha256": "96dfda1450e41cd45bc11d6b4031948b6319d4e1a9b4073ef5b39f37eece1c5f"
+        },
+        {
+          "path": "pkg_1/lib.cc",
+          "sha256": "4bac99af23adc871fcecc1088660e1b5dd7e8bdfa91cbd8a1ade5dbed0561dcb"
+        },
+        {
+          "path": "pkg_0/hdr_0.h",
+          "sha256": "a550b2e2d1aa0676c1c74677a3da3a697aa849101288e869b23468cb78196c6a"
+        },
+        {
+          "path": "pkg_0/hdr_1.h",
+          "sha256": "db9c1a10ca716af844bd08a7c0e8b37c10e7e3cd359ee41ad8c33462158b1f75"
+        },
+        {
+          "path": "pkg_1/hdr_0.h",
+          "sha256": "da07f2dbe95de96180e51df57b86b8ce0b10c3535cd7f28ba7a96a7a9ff0ffd4"
+        },
+        {
+          "path": "pkg_1/hdr_1.h",
+          "sha256": "3955bd7337b1f3f881570821b2409fecc5cc9e1b3c04c7609ada8342297fed1f"
+        }
+      ],
+      "expected_total": 98480,
+      "passed": true
+    },
+    "cuda": {
+      "backend": "cuda",
+      "bytes": 1048576,
+      "sha256": "a00d1a356de13b72a2b0ac1338e5cd6f2fd0c02dcb37bcfd06160c85a69c33bb",
+      "verified": true
+    },
+    "cuda_cache_hit": false,
+    "corruption": {
+      "passed": true,
+      "case": "corrupt-cas-preserves-existing-output"
+    },
+    "suite_results": {
+      "unit-7ffa.log": [
+        "ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s"
+      ],
+      "cache-7ffa.log": [
+        "ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+        "ok. 35 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "ok. 16 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+        "ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s",
+        "ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    "native_build_quoted_paths": {
+      "complete": true,
+      "cases": [
+        {
+          "case": "first-build",
+          "passed": true
+        },
+        {
+          "case": "restore-missing-outputs",
+          "passed": true
+        },
+        {
+          "case": "source-edit",
+          "passed": true
+        },
+        {
+          "case": "header-edit",
+          "passed": true
+        },
+        {
+          "case": "unchanged",
+          "passed": true
+        },
+        {
+          "case": "repair-corrupt-output",
+          "passed": true
+        },
+        {
+          "case": "unavailable-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "compile-failure-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "local-compiler-and-archiver-never-executed",
+          "passed": true
+        }
+      ]
+    }
+  },
+  "Host_D_to_C": {
+    "file_actions": {
+      "complete": true,
+      "cases": [
+        {
+          "case": "execute",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "restore",
+          "passed": true,
+          "exit_code": 0,
+          "cached": true
+        },
+        {
+          "case": "source-edit",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "revert",
+          "passed": true,
+          "exit_code": 0,
+          "cached": true
+        },
+        {
+          "case": "no-cache-first",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "no-cache-second",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "streamed-transfer",
+          "passed": true,
+          "exit_code": 0,
+          "cached": false
+        },
+        {
+          "case": "failure-first",
+          "passed": true,
+          "exit_code": 7,
+          "cached": false
+        },
+        {
+          "case": "failure-repeat",
+          "passed": true,
+          "exit_code": 7,
+          "cached": false
+        },
+        {
+          "case": "missing-output",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-output-symlink",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-relative-output-symlink",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-traversal",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "reject-input-symlink",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "worker-timeout",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        },
+        {
+          "case": "client-deadline",
+          "passed": true,
+          "exit_code": 1,
+          "cached": null
+        }
+      ]
+    },
+    "native_build": {
+      "complete": true,
+      "cases": [
+        {
+          "case": "first-build",
+          "passed": true
+        },
+        {
+          "case": "restore-missing-outputs",
+          "passed": true
+        },
+        {
+          "case": "source-edit",
+          "passed": true
+        },
+        {
+          "case": "header-edit",
+          "passed": true
+        },
+        {
+          "case": "unchanged",
+          "passed": true
+        },
+        {
+          "case": "repair-corrupt-output",
+          "passed": true
+        },
+        {
+          "case": "unavailable-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "compile-failure-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "local-compiler-and-archiver-never-executed",
+          "passed": true
+        }
+      ]
+    },
+    "orchestration_final": {
+      "summary": "FAILED. 1086 passed; 6 failed; 2 ignored; 0 measured; 0 filtered out; finished in 35.83s",
+      "failures": [
+        "build_orchestrator_ext::source_file_resolution_tests::modular_pycross_environment_alias_keeps_default_host_selection",
+        "build_orchestrator_ext::source_file_resolution_tests::semantic_config_setting_errors_are_deferred_to_the_configured_closure",
+        "external_analysis_snapshot::tests::initial_state_requires_owned_shape_and_matching_observation",
+        "kbuild_snapshot::tests::generated_input_provenance_censuses_directory_effect_epochs",
+        "kbuild_snapshot::tests::generated_input_provenance_partitions_analyzer_directories",
+        "kbuild_snapshot::tests::graph_capture_infers_and_replays_exact_producer_edges"
+      ]
+    },
+    "orchestration_base": {
+      "summary": "FAILED. 1084 passed; 8 failed; 2 ignored; 0 measured; 0 filtered out; finished in 33.22s",
+      "failures": [
+        "build_orchestrator_ext::source_file_resolution_tests::modular_pycross_environment_alias_keeps_default_host_selection",
+        "build_orchestrator_ext::source_file_resolution_tests::semantic_config_setting_errors_are_deferred_to_the_configured_closure",
+        "external_analysis_snapshot::tests::initial_state_requires_owned_shape_and_matching_observation",
+        "external_replay::tests::restart_noop_cas_restore_and_dirty_closure_are_make_free",
+        "external_replay::tests::sandboxed_uncacheable_action_executes_on_every_replay",
+        "kbuild_snapshot::tests::generated_input_provenance_censuses_directory_effect_epochs",
+        "kbuild_snapshot::tests::generated_input_provenance_partitions_analyzer_directories",
+        "kbuild_snapshot::tests::graph_capture_infers_and_replays_exact_producer_edges"
+      ]
+    },
+    "workspace_check_passed": true,
+    "native_build_quoted_paths": {
+      "complete": true,
+      "cases": [
+        {
+          "case": "first-build",
+          "passed": true
+        },
+        {
+          "case": "restore-missing-outputs",
+          "passed": true
+        },
+        {
+          "case": "source-edit",
+          "passed": true
+        },
+        {
+          "case": "header-edit",
+          "passed": true
+        },
+        {
+          "case": "unchanged",
+          "passed": true
+        },
+        {
+          "case": "repair-corrupt-output",
+          "passed": true
+        },
+        {
+          "case": "unavailable-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "compile-failure-no-local-fallback",
+          "passed": true
+        },
+        {
+          "case": "local-compiler-and-archiver-never-executed",
+          "passed": true
+        }
+      ]
+    }
+  },
+  "buck2": {
+    "revision": "e8edae33cd7cbc6d042c58bb55a2a900ac6ad489",
+    "prelude": "02bac0856e1f29d9bb30380072b1819216effe0a",
+    "remote_actions": 6,
+    "cache_hits": 0,
+    "local_actions": 0,
+    "output_total": 98480
+  },
+  "hip": [
+    {
+      "runtime": "6.4.3",
+      "status": "failed",
+      "reason": "internal blit compilation; memory fill signal 11"
+    },
+    {
+      "runtime": "7.14",
+      "status": "failed",
+      "reason": "hipMemset status 2"
+    }
+  ],
+  "not_run": [
+    "Buck2 remote edits/restoration/failure injection/GPU",
+    "TensorFlow/Modular/Linux remote builds",
+    "TLS and nonempty instance deployment",
+    "second backend and strict low-batch-limit integration",
+    "cancellation and recovery"
+  ],
+  "engine_commit": "7e185b1049f0253b682ddee3c3de378c263e6f9e",
+  "unsupported_rule_check": {
+    "passed": true,
+    "produced_output": false
+  },
+  "unit_suite_tree": "7ffa014778dd192fbca61f65dc1012767ddccd84",
+  "final_tree_difference": "Native smoke harness shell quoting only; Rust source and build inputs unchanged. Rebuild reuses identical release binary; native cases rerun with quoted workspace paths."
+}

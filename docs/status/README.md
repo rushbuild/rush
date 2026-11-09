@@ -9,6 +9,7 @@ target, configuration, toolchain and cache scope.
 | TensorFlow | [Build and runtime gates](tensorflow.md) | 463 C++ test programs; two pinned native-extension import checks; scoped no-op timing |
 | Modular | [Build and artifact coverage](modular.md) | 4,175-target build ledger; 38/39 comparable Mojo artifacts; selected runtime tests |
 | Linux kernel | [Replay against GNU Make](../benchmarks/linux.md) | Three timing pairs; 12,397 persistent output entries matched |
+| Remote execution | [REAPI and worker checks](../benchmarks/remote-execution.md) | File actions and native C++ in both host directions; CUDA readback; HIP failure retained |
 | Performance | [Compare build modes](../benchmarks/README.md) | Keep compile, restore, novel edit, repeated edit and no-op separate |
 
 Use the [measurement provenance](../benchmarks/PROVENANCE.md) to locate
