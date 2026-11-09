@@ -4,6 +4,19 @@ Use TensorFlow's unmodified upstream sources. Compare the same targets and
 configuration with Bazel, then check artifacts and program behavior. Keep each
 acceptance scope distinct.
 
+## Qualify fresh builds of the current release
+
+Run the [TensorFlow 2.17 framework build checks](../benchmarks/tensorflow.md)
+on both validation hosts. Rush before (`b003cc3`) and after (`b059a25`,
+published in `f9d97fe`) stops during rule loading on undefined `JavaInfo`;
+neither version reaches compilation. Bazel 6.5.0 completes the same target
+with the selected CPU configuration on both hosts.
+
+Repair the predeclared environment and native Java provider exports, then
+repeat fresh builds before measuring latency. Count these as build attempts,
+not a rerun of the TF 2.15 runtime corpus below. Keep the imported acceptance
+counts attached to their original candidates and ledgers.
+
 ## Read the acceptance results
 
 | Scope | Result | Apply this pass condition |
@@ -26,10 +39,11 @@ exports, import with the pinned interpreter and require their API results.
 
 ## Compare build-command latency
 
-Run unchanged `//tensorflow/core:framework` commands over the
-18,522-dependency manifest. Across 30 samples, Rush's median is **9.3 ms**,
-Bazel's is **64.2 ms**, and Bazel with `--watchfs` is **54.5 ms**.
-Read the [timing report](../benchmarks/tensorflow.md) for its exact scope.
+Complete fresh-build qualification first. The separate 30-sample unchanged
+command record reports 9.3 ms for Rush, 64.2 ms for Bazel and 54.5 ms with
+Bazel watchfs, but its exact timing candidate and complete sample series
+remain unrecovered. Use [the timing report](../benchmarks/tensorflow.md) to
+keep that record separate from current-release build failures.
 
 ## Extend the acceptance scope
 

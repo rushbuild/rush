@@ -5,6 +5,7 @@ before implementation. All remain open until their evidence is recorded.
 
 | Priority | Task | Completion condition |
 | --- | --- | --- |
+| P0 | Repair TensorFlow predeclared provider loading | Preserve initialized evaluator globals, export native Java providers correctly, load the real rules_java module and complete fresh TF 2.17 framework builds on both runners; use no placeholder providers |
 | P0 | Establish this source release's build/test baseline | Locked workspace check and component suites on an approved runner; classify every failure/skip |
 | P0 | Complete the workload acceptance matrix | Recover exact TF/Modular ledgers, run the relevant gates, reconcile runtime denominators and update docs/status with candidate-bound evidence |
 | P0 | Run the Chores supervised pilot | One real repair plus denied, stale, missing-test and interrupted cases; patch and evidence retained |
