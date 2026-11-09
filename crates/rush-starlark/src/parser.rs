@@ -942,10 +942,11 @@ impl Parser {
     }
 
     fn parse_postfix_expression(&mut self) -> Result<Expr> {
-        // Track the line where the expression starts and the last operation
-        let start_line = self.current.line;
-        let mut last_operation_line = start_line;
         let mut expr = self.parse_primary_expression()?;
+        // A multiline primary or postfix operation completes at its closing
+        // delimiter. A suffix on that line belongs to the same expression;
+        // a following-line call/list at statement depth may begin a new one.
+        let mut last_operation_line = self.last_consumed_line;
 
         loop {
             // Check if we're on a different line than the last operation
@@ -965,24 +966,21 @@ impl Parser {
 
             match &self.current.token_type {
                 TokenType::LeftParen => {
-                    let op_line = self.current.line; // Capture line BEFORE parsing
                     expr = self.parse_call_expression(expr)?;
-                    last_operation_line = op_line; // Use the line where the operation started
+                    last_operation_line = self.last_consumed_line;
                 }
                 TokenType::LeftBracket => {
-                    let op_line = self.current.line; // Capture line BEFORE parsing
                     expr = self.parse_index_expression(expr)?;
-                    last_operation_line = op_line; // Use the line where the operation started
+                    last_operation_line = self.last_consumed_line;
                 }
                 TokenType::Dot => {
-                    let op_line = self.current.line; // Capture line BEFORE parsing
                     self.advance();
                     let attr = self.expect_identifier()?;
                     expr = Expr::Attribute {
                         object: Box::new(expr),
                         attr,
                     };
-                    last_operation_line = op_line; // Use the line where the operation started
+                    last_operation_line = self.last_consumed_line;
                 }
                 _ => {
                     break;
