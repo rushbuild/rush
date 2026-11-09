@@ -231,6 +231,8 @@ fn json_labels_cumulative_vs_own_clearly() {
             parse: Some(Duration::from_millis(8)),
             eval: Some(Duration::from_millis(100)),
             finalize: Some(Duration::from_millis(13)),
+            resolve_lazy_loads: Some(Duration::from_millis(3)),
+            put_symbols_cache: Some(Duration::from_millis(10)),
         }),
     );
 
@@ -247,6 +249,8 @@ fn json_labels_cumulative_vs_own_clearly() {
     assert_eq!(e.subphase_parse_ns, Some(8_000_000));
     assert_eq!(e.subphase_eval_ns, Some(100_000_000));
     assert_eq!(e.subphase_finalize_ns, Some(13_000_000));
+    assert_eq!(e.subphase_resolve_lazy_loads_ns, Some(3_000_000));
+    assert_eq!(e.subphase_put_symbols_cache_ns, Some(10_000_000));
     // Verify the explicit identity by construction:
     // own + child == cumulative when both are present.
     let own = e.own_cold_load_duration_ns.unwrap();
