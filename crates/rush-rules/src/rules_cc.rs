@@ -734,6 +734,137 @@ async fn collect_sink_compile_header_inputs(context: &BuildContext) -> SinkCompi
     inputs
 }
 
+#[derive(Default)]
+struct CachedSinkHeaderInputs {
+    registry: Option<std::sync::Arc<tokio::sync::Mutex<rush_action::ids::ArtifactRegistry>>>,
+    compilations: Vec<std::sync::Arc<crate::providers::CcCompilationContext>>,
+    inputs: std::sync::Arc<SinkCompileHeaderInputs>,
+}
+
+async fn cached_sink_compile_header_inputs(
+    context: &BuildContext,
+    cache: &tokio::sync::Mutex<Option<CachedSinkHeaderInputs>>,
+) -> std::sync::Arc<SinkCompileHeaderInputs> {
+    use std::sync::Arc;
+    // Compilation providers and their nested sets are immutable. Retain their
+    // Arcs with the cache key, so allocator address reuse cannot imitate a hit.
+    let mut compilations: Vec<_> = context
+        .dependency_providers
+        .values()
+        .filter_map(|p| p.cc_info.as_ref().map(|cc| Arc::clone(&cc.compilation)))
+        .collect();
+    compilations.sort_unstable_by_key(|cc| Arc::as_ptr(cc) as usize);
+    compilations.dedup_by(|a, b| Arc::ptr_eq(a, b));
+    let mut slot = cache.lock().await;
+    if let Some(saved) = slot.as_ref() {
+        let same_registry = match (&saved.registry, &context.artifact_registry) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if same_registry
+            && saved.compilations.len() == compilations.len()
+            && saved
+                .compilations
+                .iter()
+                .zip(&compilations)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        {
+            return Arc::clone(&saved.inputs);
+        }
+    }
+    let inputs = Arc::new(collect_sink_compile_header_inputs(context).await);
+    *slot = Some(CachedSinkHeaderInputs {
+        registry: context.artifact_registry.clone(),
+        compilations,
+        inputs: Arc::clone(&inputs),
+    });
+    inputs
+}
+
+#[cfg(test)]
+mod sink_header_cache_tests {
+    use super::*;
+    use crate::providers::DirectCcInfo;
+    use rush_action::ids::{ArtifactKey, ArtifactKind, ArtifactRegistry, ConfigId, TargetId};
+    use std::sync::Arc;
+
+    fn header(registry: &mut ArtifactRegistry, path: &Path) -> rush_action::ids::ArtifactId {
+        let exec_path = registry.paths_mut().intern(path);
+        registry.intern_artifact(
+            ArtifactKey {
+                config: ConfigId::DEFAULT,
+                exec_path,
+            },
+            ArtifactKind::Header,
+            true,
+            TargetId(1),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn retain_layout_but_reread_header_content_and_replace_changed_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("first.h");
+        let second = root.join("second.h");
+        let source = root.join("main.cc");
+        std::fs::write(&source, "#include \"first.h\"\n").unwrap();
+        std::fs::write(&first, "// first\n").unwrap();
+        std::fs::write(&second, "// second\n").unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let a = header(&mut registry, &first);
+        let b = header(&mut registry, &second);
+        let cc = CcInfo::from_direct_and_deps(
+            DirectCcInfo {
+                headers: vec![a, b],
+                ..Default::default()
+            },
+            std::iter::empty(),
+        );
+        let mut context = BuildContext::new(root.into(), root.join("out"));
+        context.artifact_registry = Some(Arc::new(tokio::sync::Mutex::new(registry)));
+        context
+            .dependency_providers
+            .insert("//:lib".into(), ProviderSet::empty().with_cc_info(cc));
+        let cache = tokio::sync::Mutex::new(None);
+        let inputs = cached_sink_compile_header_inputs(&context, &cache).await;
+        assert_eq!(
+            reachable_source_headers_for_sink_source(&source, &inputs),
+            vec![first.clone()]
+        );
+        std::fs::write(&first, "#include \"second.h\"\n").unwrap();
+        let reused = cached_sink_compile_header_inputs(&context, &cache).await;
+        assert!(Arc::ptr_eq(&inputs, &reused));
+        let reachable = reachable_source_headers_for_sink_source(&source, &reused);
+        assert!(reachable.contains(&first) && reachable.contains(&second));
+        let replacement = CcInfo::from_direct_and_deps(
+            DirectCcInfo {
+                headers: vec![b],
+                ..Default::default()
+            },
+            std::iter::empty(),
+        );
+        context.dependency_providers.insert(
+            "//:lib".into(),
+            ProviderSet::empty().with_cc_info(replacement),
+        );
+        let changed = cached_sink_compile_header_inputs(&context, &cache).await;
+        assert!(!Arc::ptr_eq(&inputs, &changed));
+        assert_eq!(changed.source, vec![second]);
+
+        let mut other_registry = ArtifactRegistry::new();
+        header(&mut other_registry, &root.join("unused.h"));
+        let remapped = root.join("remapped.h");
+        header(&mut other_registry, &remapped);
+        context.artifact_registry = Some(Arc::new(tokio::sync::Mutex::new(other_registry)));
+        let remapped_inputs = cached_sink_compile_header_inputs(&context, &cache).await;
+        assert!(!Arc::ptr_eq(&changed, &remapped_inputs));
+        assert_eq!(remapped_inputs.source, vec![remapped]);
+    }
+}
+
 fn include_tokens_from_file(path: &Path) -> Option<Vec<String>> {
     let body = std::fs::read_to_string(path).ok()?;
     let mut tokens = Vec::new();
@@ -3308,6 +3439,7 @@ impl BuildRule for CcBinaryRule {
         let data = extract_string_list(attrs, "data")?;
 
         Ok(Box::new(CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name,
             srcs,
             deps,
@@ -3326,6 +3458,7 @@ impl BuildRule for CcBinaryRule {
 
 /// Instance of a cc_binary rule
 pub struct CcBinaryInstance {
+    header_inputs_cache: tokio::sync::Mutex<Option<CachedSinkHeaderInputs>>,
     name: String,
     srcs: Vec<String>,
     deps: Vec<String>,
@@ -4497,7 +4630,7 @@ impl RuleInstance for CcBinaryInstance {
             &package,
             &owned_header_paths,
         );
-        let header_inputs = collect_sink_compile_header_inputs(context).await;
+        let header_inputs = cached_sink_compile_header_inputs(context, &self.header_inputs_cache).await;
         for src in &expanded_srcs {
             // Skip non-compilable srcs (headers in srcs) — see the PCH-clobber
             // note above; compiling a .h emits a precompiled header that
@@ -6172,6 +6305,7 @@ mod cc_binary_response_tests {
 
     fn binary_with_linkopt(linkopt: String) -> CcBinaryInstance {
         CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "tool".to_string(),
             srcs: Vec::new(),
             deps: Vec::new(),
@@ -6185,6 +6319,7 @@ mod cc_binary_response_tests {
 
     fn binary_with_generated_header() -> CcBinaryInstance {
         CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "tool".to_string(),
             srcs: vec!["main.cc".to_string(), "gen.h".to_string()],
             deps: Vec::new(),
@@ -6383,6 +6518,7 @@ mod cc_binary_response_tests {
         let extra_paths = Vec::new();
         let mut registry = ArtifactRegistry::new();
         let extension = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "binding.so".to_string(),
             srcs: vec!["extension.cc".to_string()],
             deps: Vec::new(),
@@ -6414,6 +6550,7 @@ mod cc_binary_response_tests {
             Arc::clone(&extension_providers),
         )];
         let consumer = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "consumer".to_string(),
             srcs: vec!["main.cc".to_string()],
             deps: vec![":binding.so".to_string()],
@@ -6464,6 +6601,7 @@ mod cc_binary_response_tests {
         let extra_paths = Vec::new();
         let mut registry = ArtifactRegistry::new();
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "binding.so".to_string(),
             srcs: vec!["extension.cc".to_string()],
             deps: Vec::new(),
@@ -6531,6 +6669,7 @@ mod cc_binary_response_tests {
             .with_package(PathBuf::from("pkg"))
             .with_action_manager(manager.clone());
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "binding.so".to_string(),
             srcs: vec!["extension.cc".to_string()],
             deps: Vec::new(),
@@ -6659,6 +6798,7 @@ mod cc_binary_response_tests {
             ),
         ];
         let mut rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "binding.so".to_string(),
             srcs: vec!["extension.cc".to_string()],
             deps: vec![
@@ -6842,6 +6982,7 @@ mod cc_binary_response_tests {
         assert!(is_cc_header_input("inline.inl"));
 
         let archive = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             srcs: vec!["prebuilt.a".to_string()],
             ..binary_with_generated_header()
         };
@@ -6999,6 +7140,7 @@ mod cc_binary_response_tests {
             )
             .with_action_manager(manager);
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             srcs: vec!["main.cc".to_string(), "dir/gen.h".to_string()],
             ..binary_with_generated_header()
         };
@@ -7070,6 +7212,7 @@ mod cc_binary_response_tests {
             )
             .with_action_manager(Arc::new(ExecutingActionManager));
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             srcs: vec!["main.cc".to_string(), "@r//p:gen.h".to_string()],
             ..binary_with_generated_header()
         };
@@ -7143,6 +7286,7 @@ mod cc_binary_response_tests {
             .with_artifact_registry(shared_registry)
             .with_action_manager(manager.clone());
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "tool".to_string(),
             srcs: vec!["main.cc".to_string()],
             deps: vec!["//dep:public".to_string()],
@@ -7221,6 +7365,7 @@ mod cc_binary_response_tests {
             .with_package(PathBuf::from("p"))
             .with_action_manager(Arc::new(ExecutingActionManager));
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             srcs: vec!["main.cc".to_string(), "time.h".to_string()],
             ..binary_with_generated_header()
         };
@@ -8083,6 +8228,7 @@ mod cc_binary_response_tests {
                 > CC_BINARY_RESPONSE_FILE_THRESHOLD
         );
         let rule = CcBinaryInstance {
+            header_inputs_cache: Default::default(),
             name: "tool".to_string(),
             srcs: Vec::new(),
             deps: Vec::new(),
