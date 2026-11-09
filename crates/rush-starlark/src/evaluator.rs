@@ -16,6 +16,32 @@ type LoadWithSymbols = (String, Vec<(String, String)>);
 type LoadWithPriority = (String, Vec<(String, String)>, usize);
 type LoadPartition = (Vec<LoadWithSymbols>, Vec<LoadWithSymbols>);
 
+fn bzl_loading_environment(name: &str) -> Result<Option<String>> {
+    if rush_incremental::tracked::current().is_some() {
+        rush_incremental::tracked::getenv(name.as_bytes())
+            .map(|value| {
+                String::from_utf8(value.to_vec()).context(".bzl loading option is not UTF-8")
+            })
+            .transpose()
+    } else {
+        std::env::var(name).map(Some).or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err(anyhow!(".bzl loading option {name} is not UTF-8")),
+        })
+    }
+}
+
+fn bzl_requested_concurrency() -> Result<usize> {
+    match bzl_loading_environment("RUSH_BZL_MAX_CONCURRENT")? {
+        None => Ok(1),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value != 0)
+            .context("RUSH_BZL_MAX_CONCURRENT must be a positive integer"),
+    }
+}
+
 /// Fast hasher for the `visited` pointer-set in estimate_size_internal. The keys are usize pointer
 /// addresses (cycle detection); the default SipHash dominated no-op build time (~57% in perf
 /// profiling — SipHash on tiny usize keys is absurdly slow). FxHash-style single multiply gives
@@ -4626,6 +4652,10 @@ impl Evaluator {
             Some(l) => l.clone(),
             None => return Ok(()),
         };
+        let requested_concurrent = bzl_requested_concurrency()?;
+        if bzl_loading_environment("RUSH_PROFILE_BZL_LIMIT")?.is_some() {
+            anyhow::bail!("RUSH_PROFILE_BZL_LIMIT produces incomplete analysis; remove it to load the complete required module graph");
+        }
         debug_log!("[DEBUG Evaluator] Batch-loading {} .bzl files", loads.len());
         let total_loads = loads.len();
 
@@ -4640,7 +4670,7 @@ impl Evaluator {
                     loads.len(),
                     build_safe_limit
                 );
-                self.load_bzl_files_sequential(loader.clone(), loads);
+                self.load_bzl_files_sequential(loader.clone(), loads)?;
                 record_batch_loading_telemetry(
                     mode,
                     total_loads,
@@ -4664,7 +4694,7 @@ impl Evaluator {
                     debug_log!(
                         "[DEBUG Evaluator] RUSH_SKIP_BZL_DEP_GRAPH=1 - falling back to sequential BUILD-safe loading"
                     );
-                    self.load_bzl_files_sequential(loader.clone(), loads);
+                    self.load_bzl_files_sequential(loader.clone(), loads)?;
                     record_batch_loading_telemetry(
                         mode,
                         total_loads,
@@ -4734,7 +4764,7 @@ impl Evaluator {
                 "[DEBUG Evaluator] Found {} files with circular dependencies, loading sequentially",
                 sequential_files.len()
             );
-            self.load_bzl_files_sequential(loader.clone(), &sequential_files);
+            self.load_bzl_files_sequential(loader.clone(), &sequential_files)?;
         }
 
         if parallel_batches.is_empty() {
@@ -4773,315 +4803,83 @@ impl Evaluator {
             levels.len()
         );
 
-        // EMERGENCY BRAKE: Check total .bzl count across ALL levels
-        // With streaming evaluation, we process results as they arrive and drop ASTs.
-        // This dramatically reduces memory vs collecting all results into Vec.
-        let total_bzl_count: usize = levels.iter().map(|level| level.len()).sum();
-        const MAX_TOTAL_BZL_FILES: usize = 100; // Raised from 20 after streaming fix
-        if total_bzl_count > MAX_TOTAL_BZL_FILES
-            && std::env::var("RUSH_ALLOW_MANY_BZL").ok().as_deref() != Some("1")
-        {
-            return Err(anyhow::anyhow!(
-                "ABORT: Build requires loading {} .bzl files total (max {} allowed). \n\
-                 \n\
-                 Even with sequential loading (concurrency=1), each .bzl file allocates \n\
-                 2-5GB for AST parsing + evaluation. Loading {} files causes catastrophic \n\
-                 memory thrashing that OOM-kills your desktop session. \n\
-                 \n\
-                 Levels: {} (files per level: {}) \n\
-                 \n\
-                 TensorFlow builds require fixing the memory model: \n\
-                 - Lazy AST evaluation (parse on-demand, not eagerly) \n\
-                 - Atomic memory reservation via ResourceManager before each load \n\
-                 - AST/Value memory pooling to reuse allocations \n\
-                 - Stream-based evaluation that doesn't keep full ASTs in memory \n\
-                 \n\
-                 Set RUSH_ALLOW_MANY_BZL=1 to override (will kill your desktop).",
-                total_bzl_count,
-                MAX_TOTAL_BZL_FILES,
-                total_bzl_count,
-                levels.len(),
-                levels
-                    .iter()
-                    .map(|l| l.len().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        // Check if we're in a tokio runtime context
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // Load each level in sequence, but files within a level in parallel
-            let result = tokio::task::block_in_place(|| {
+        // Current-thread runtimes cannot enter block_in_place. They and plain
+        // synchronous callers use the same admitted sequential loading path.
+        let handle = tokio::runtime::Handle::try_current().ok().filter(|handle| {
+            matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        });
+        if let Some(handle) = handle {
+            tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    for (level_idx, level) in levels.iter().enumerate() {
-                        debug_log!(
-                            "[DEBUG Evaluator] Loading level {} with {} files (priorities: {})",
-                            level_idx,
-                            level.len(),
-                            level
-                                .iter()
-                                .map(|(f, _, p)| format!("{}={}", f, p))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-
-                        // MEMORY CHECK: Verify RAM is sufficient before processing this level
-                        // Prevents OOM from loading hundreds of .bzl files when RAM is already low
-                        // Uses same 15% hard floor as per-file checks to catch memory exhaustion early
-                        if let Err(e) =
-                            crate::bzl_loader::check_ram_floor_before_level(level_idx, level.len())
-                        {
-                            debug_log!(
-                                "[ERROR Evaluator] Aborting level {} due to low memory: {}",
-                                level_idx, e
-                            );
-                            return Err(e);
-                        }
-
-                        let start_time = std::time::Instant::now();
-
-                        // EMERGENCY BRAKE: Abort if too many .bzl files per level
-                        // With streaming evaluation, we process and drop ASTs as we go.
-                        // This allows more files per level without thrashing.
-                        const MAX_BZL_FILES_PER_LEVEL: usize = 50;  // Raised from 10 after streaming fix
-                        if level.len() > MAX_BZL_FILES_PER_LEVEL
-                            && std::env::var("RUSH_ALLOW_MANY_BZL").ok().as_deref() != Some("1")
-                        {
-                            return Err(anyhow::anyhow!(
-                                "ABORT: Level {} has {} .bzl files (max {} allowed without RUSH_ALLOW_MANY_BZL=1). \n\
-                                 \n\
-                                 Each .bzl file allocates 2-5GB for AST+evaluation. Loading {} files \n\
-                                 causes memory thrashing that OOM-kills your desktop session even when \n\
-                                 loaded sequentially (concurrency=1). \n\
-                                 \n\
-                                 TensorFlow builds require fixing the memory model first: \n\
-                                 - Implement lazy AST evaluation (don't parse until needed) \n\
-                                 - Add atomic memory reservation via ResourceManager \n\
-                                 - Implement proper AST/Value memory pooling \n\
-                                 \n\
-                                 Set RUSH_ALLOW_MANY_BZL=1 to override this safety check (kills desktop).",
-                                level_idx,
-                                level.len(),
-                                MAX_BZL_FILES_PER_LEVEL,
-                                level.len()
-                            ));
-                        }
-
-                        // Limit concurrent tasks to prevent memory spikes
-                        // .bzl evaluation is memory-intensive: TensorFlow shows 20%+ PSI with 4 concurrent
-                        // Even 2 concurrent drops RAM to 17.8% free, triggering strict 10% PSI threshold
-                        // Default to SEQUENTIAL (1) to maximize available RAM and stay in moderate tier (>20% RAM free = 20% PSI limit)
-                        // Can still override with RUSH_BZL_MAX_CONCURRENT for testing
-                        let default_concurrent = 1;
-                        let max_concurrent = std::env::var("RUSH_BZL_MAX_CONCURRENT")
-                            .ok()
-                            .and_then(|v| v.parse::<usize>().ok())
-                            .unwrap_or(default_concurrent);
-                        let semaphore =
-                            std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-
-                        debug_log!(
-                            "[DEBUG Evaluator] Level {}: Limiting to {} concurrent loads",
-                            level_idx, max_concurrent
-                        );
-
-                        // Capture thread context before spawning tasks
-                        // Tokio tasks run in different threads and don't inherit thread-local storage
-                        let captured_context =
-                            crate::bzl_loader::BzlLoader::capture_thread_context();
-
-                        // PROFILING MODE: Limit number of .bzl files to load for memory leak identification
-                        // Use RUSH_PROFILE_BZL_LIMIT to load only the first N files from each level
-                        // This enables binary search to identify which .bzl file causes OOM:
-                        //   1. Set RUSH_PROFILE_BZL_LIMIT=1, then 2, 4, 8, 16... (power of 2)
-                        //   2. Find which power of 2 causes OOM
-                        //   3. Narrow down with linear search between last good and first bad
-                        let profile_limit = std::env::var("RUSH_PROFILE_BZL_LIMIT")
-                            .ok()
-                            .and_then(|v| v.parse::<usize>().ok());
-
-                        let files_to_load: Vec<_> = if let Some(limit) = profile_limit {
-                            let truncated: Vec<_> = level.iter().take(limit).collect();
-                            debug_log!(
-                                "[PROFILE] Level {}: Loading {} of {} files (RUSH_PROFILE_BZL_LIMIT={})",
-                                level_idx, truncated.len(), level.len(), limit
-                            );
-                            debug_log!("[PROFILE] Files to load: {}",
-                                truncated.iter()
-                                    .map(|(f, _, _)| f.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", "));
-                            truncated
-                        } else {
-                            level.iter().collect()
-                        };
-
-                        if max_concurrent <= 1 {
-                            for (file, symbols, _priority) in files_to_load {
-                            match crate::bzl_loader::BzlLoader::load_bzl_from_evaluator(
-                                loader.clone(),
-                                file,
-                                symbols,
-                            ) {
-                                Ok(exported_symbols) => {
-                                    self.import_bzl_exports(file, exported_symbols, symbols);
-                                    debug_log!(
-                                        "[DEBUG Evaluator] Level {}: Sequentially loaded {}",
-                                        level_idx,
-                                        file
-                                    );
-                                    }
-                                    Err(e) => {
-                                        debug_log!(
-                                            "[WARN Evaluator] Level {}: Failed to load {}: {}",
-                                            level_idx,
-                                            file,
-                                            e
-                                        );
-                                        for (local_name, _) in symbols.iter() {
-                                            self.register_rule_function(local_name.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        // LAZY TASK SPAWNING: Use futures::stream to spawn tasks on-demand
-                        // Only spawns `max_concurrent` tasks at any time instead of all upfront
-                        // This prevents OOM from allocating hundreds of task structures before execution
-                        let bzl_stream = stream::iter(files_to_load.into_iter())
-                            .map(|(file, symbols, _priority)| {
-                                let loader_clone = loader.clone();
-                                let file_clone = file.clone();
-                                let symbols_clone = symbols.clone();
-                                let sem_clone = semaphore.clone();
-                                let ctx_clone = captured_context.clone();
-
-                                async move {
-                                    // Restore thread context for this task
-                                    // This allows .bzl path resolution to use the correct repository root
-                                    struct ContextGuard;
-                                    impl Drop for ContextGuard {
-                                        fn drop(&mut self) {
-                                            crate::bzl_loader::BzlLoader::pop_thread_context();
-                                        }
-                                    }
-                                    let _ctx_guard = if let Some(ctx) = ctx_clone.clone() {
-                                        crate::bzl_loader::BzlLoader::push_thread_context_frame(ctx);
-                                        Some(ContextGuard)
-                                    } else {
-                                        None
-                                    };
-
-                                    // Acquire semaphore permit before loading
-                                    let _permit = sem_clone.acquire().await.unwrap();
-                                    let result =
-                                        crate::bzl_loader::BzlLoader::load_bzl_from_evaluator(
-                                            loader_clone,
-                                            &file_clone,
-                                            &symbols_clone,
-                                        );
-                                    // Permit is dropped here, allowing next task to proceed
-                                    (file_clone, symbols_clone, result)
-                                }
-                            })
-                            .buffer_unordered(max_concurrent); // Only spawn max_concurrent futures at a time
-
-                        // CRITICAL: Process results as they arrive (streaming), don't collect()!
-                        // Collecting all results into Vec keeps all .bzl ASTs/symbols in memory.
-                        // Bazel uses 437MB for entire TensorFlow; we were using 2-5GB PER FILE
-                        // because we kept everything in memory simultaneously.
-                        //
-                        // By processing streaming with next().await, we:
-                        // - Import symbols immediately into self.env
-                        // - Drop the result (and its AST/symbols) right after
-                        // - Only keep what's actually referenced (not full ASTs)
-                        let mut bzl_stream = std::pin::pin!(bzl_stream);
-                        while let Some((file, symbols, result)) = bzl_stream.next().await {
-                            match result {
-                                Ok(exported_symbols) => {
-                                    // Successfully loaded - import symbols immediately so next level can use them
-                                    self.import_bzl_exports(&file, exported_symbols, &symbols);
-                                    debug_log!(
-                                        "[DEBUG Evaluator] Level {}: Successfully loaded {}",
-                                        level_idx, file
-                                    );
-                                }
-                                Err(e) => {
-                                    // Failed to load - fall back to registering as rule functions
-                                    debug_log!(
-                                        "[WARN Evaluator] Level {}: Failed to load {}: {}",
-                                        level_idx, file, e
-                                    );
-                                    for (local_name, _) in &symbols {
-                                        self.register_rule_function(local_name.clone());
-                                    }
-                                }
-                            }
-                        }
-
-                        let elapsed = start_time.elapsed();
-                        debug_log!(
-                            "[DEBUG Evaluator] Level {} completed in {:?}",
-                            level_idx, elapsed
-                        );
+                    let manager = loader
+                        .lock()
+                        .map_err(|error| anyhow!("lock .bzl resources: {error}"))?
+                        .loading_resource_manager();
+                    let cpu_limit = match manager {
+                        Some(manager) => manager.stats().await.max_cpu_slots,
+                        None => std::thread::available_parallelism()
+                            .context("measure available .bzl loader concurrency")?
+                            .get(),
+                    };
+                    if cpu_limit == 0 {
+                        anyhow::bail!(".bzl loader has no admitted CPU capacity");
                     }
-                    Ok(())
+                    let max_concurrent = requested_concurrent.min(cpu_limit);
+                    for (level_idx, level) in levels.iter().enumerate() {
+                        crate::bzl_loader::check_ram_floor_before_level(level_idx, level.len())?;
+                        // Consume each result immediately. Per-file atomic memory
+                        // admission remains authoritative, including recursive loads;
+                        // no CPU permit is retained across an import of a child.
+                        let context = crate::bzl_loader::BzlLoader::capture_thread_context();
+                        let work = stream::iter(level.iter().map(|(file, symbols, _)| {
+                            let loader = loader.clone();
+                            let file = file.clone();
+                            let symbols = symbols.clone();
+                            let context = context.clone();
+                            async move {
+                                struct ContextGuard;
+                                impl Drop for ContextGuard {
+                                    fn drop(&mut self) {
+                                        crate::bzl_loader::BzlLoader::pop_thread_context();
+                                    }
+                                }
+                                let _context = context.map(|context| {
+                                    crate::bzl_loader::BzlLoader::push_thread_context_frame(
+                                        context,
+                                    );
+                                    ContextGuard
+                                });
+                                let result = crate::bzl_loader::BzlLoader::load_bzl_from_evaluator(
+                                    loader, &file, &symbols,
+                                );
+                                (file, symbols, result)
+                            }
+                        }))
+                        .buffer_unordered(max_concurrent);
+                        let mut work = std::pin::pin!(work);
+                        while let Some((file, symbols, result)) = work.next().await {
+                            let exports = result
+                                .with_context(|| format!("load required .bzl module {file}"))?;
+                            self.import_bzl_exports(&file, exports, &symbols);
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
                 })
-            });
-            result?;
-
-            debug_log!("[DEBUG Evaluator] Level-based batch loading complete");
+            })?;
         } else {
-            // No tokio context - fall back to level-by-level sequential loading
-            debug_log!("[WARN Evaluator] No tokio context available, falling back to sequential level-by-level loading");
             for (level_idx, level) in levels.iter().enumerate() {
-                debug_log!(
-                    "[DEBUG Evaluator] Sequentially loading level {} with {} files",
-                    level_idx,
-                    level.len()
-                );
-
-                // MEMORY CHECK: Verify RAM is sufficient before processing this level
-                if let Err(e) =
-                    crate::bzl_loader::check_ram_floor_before_level(level_idx, level.len())
-                {
-                    debug_log!(
-                        "[ERROR Evaluator] Aborting level {} due to low memory: {}",
-                        level_idx,
-                        e
-                    );
-                    return Err(e);
-                }
-
-                for (file, symbols, _priority) in level {
-                    match crate::bzl_loader::BzlLoader::load_bzl_from_evaluator(
+                crate::bzl_loader::check_ram_floor_before_level(level_idx, level.len())?;
+                for (file, symbols, _) in level {
+                    let exports = crate::bzl_loader::BzlLoader::load_bzl_from_evaluator(
                         loader.clone(),
                         file,
                         symbols,
-                    ) {
-                        Ok(exported_symbols) => {
-                            self.import_bzl_exports(file, exported_symbols, symbols);
-                            debug_log!(
-                                "[DEBUG Evaluator] Level {}: Successfully loaded {}",
-                                level_idx,
-                                file
-                            );
-                        }
-                        Err(e) => {
-                            debug_log!(
-                                "[WARN Evaluator] Level {}: Failed to load {}: {}",
-                                level_idx,
-                                file,
-                                e
-                            );
-                            for (local_name, _) in symbols {
-                                self.register_rule_function(local_name.clone());
-                            }
-                        }
-                    }
+                    )
+                    .with_context(|| format!("load required .bzl module {file}"))?;
+                    self.import_bzl_exports(file, exports, symbols);
                 }
             }
         }
@@ -5093,7 +4891,7 @@ impl Evaluator {
         &mut self,
         loader: Arc<Mutex<crate::bzl_loader::BzlLoader>>,
         loads: &[(String, Vec<(String, String)>)],
-    ) {
+    ) -> Result<()> {
         // Load each file one at a time - used for cyclic groups or explicit fallbacks.
         for (file, symbols) in loads {
             match crate::bzl_loader::BzlLoader::load_bzl_from_evaluator(
@@ -5104,14 +4902,10 @@ impl Evaluator {
                 Ok(exported_symbols) => {
                     self.import_bzl_exports(file, exported_symbols, symbols);
                 }
-                Err(e) => {
-                    debug_log!("[WARN Evaluator] Failed to load {}: {}", file, e);
-                    for (local_name, _) in symbols {
-                        self.register_rule_function(local_name.clone());
-                    }
-                }
+                Err(e) => return Err(e.context(format!("load required .bzl module {file}"))),
             }
         }
+        Ok(())
     }
 
     fn import_bzl_exports(
@@ -6397,37 +6191,10 @@ impl Evaluator {
                             // Remove file from IN_FLIGHT tracking (load failed)
                             crate::bzl_loader::mark_bzl_inflight_end(file);
 
-                            // C-prime (Codex 019eebc6): under RUSH_ENABLE_BZLMOD, a load
-                            // whose every requested symbol is a peripheral non-C++ rule
-                            // (py_*/java_*) degrades to graph-only stubs instead of
-                            // aborting the BUILD — protobuf's kitchen-sink BUILD eagerly
-                            // loads those alongside cc_proto_library but the C++ targets
-                            // never reference them, and rush can't evaluate the Python/
-                            // Java rule machinery. C++/proto symbols still fail hard.
-                            if rush_incremental::tracked::getenv_str("RUSH_ENABLE_BZLMOD")
-                                .as_deref()
-                                == Some("1")
-                                && !symbols.is_empty()
-                                && symbols
-                                    .iter()
-                                    .all(|(_, original)| is_peripheral_language_symbol(original))
-                            {
-                                eprintln!(
-                                    "⚠️  bzlmod: load of {} failed ({}); binding peripheral non-C++ symbol(s) {:?} as graph-only stubs (unsupported if built)",
-                                    file,
-                                    e,
-                                    symbols.iter().map(|(_, o)| o.as_str()).collect::<Vec<_>>()
-                                );
-                                for (local_name, _) in symbols {
-                                    self.register_rule_function(local_name.clone());
-                                }
-                                return Ok(());
-                            }
-
                             // Fail loudly on .bzl load failures to avoid silent stub behavior
                             // This surfaces missing external repos or unimplemented rule sets early.
                             anyhow::bail!(
-                                "Failed to load .bzl file {}: {}. Rush does not support fallback registration; please ensure external repos and rule files exist (e.g., run project configuration or disable unsupported features).",
+                                "Failed to load .bzl file {}: {:#}. Rush does not support fallback registration; please ensure external repos and rule files exist (e.g., run project configuration or disable unsupported features).",
                                 file, e
                             )
                         }
@@ -10459,7 +10226,7 @@ emit()
                 Ok(_) => panic!("loaded module initialization must reject a list key"),
                 Err(error) => error,
             };
-            assert!(error.to_string().contains("unhashable type: 'list'"), "{error}");
+            assert!(format!("{error:#}").contains("unhashable type: 'list'"), "{error:#}");
         }
     }
 

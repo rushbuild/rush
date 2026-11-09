@@ -4343,82 +4343,29 @@ impl Default for GlobalBzlCache {
 /// which provides per-file atomic reservations with 15% headroom enforcement.
 /// This level-based check is kept for early detection before spawning parallel tasks.
 pub fn check_ram_floor_before_level(level_idx: usize, file_count: usize) -> Result<()> {
-    const HARD_RAM_FLOOR_PCT: f64 = 0.15; // 15% minimum available RAM (was 30%, too conservative)
-
-    // Read system memory from /proc/meminfo (Linux only)
-    #[cfg(target_os = "linux")]
-    {
-        let contents = match std::fs::read_to_string("/proc/meminfo") {
-            Ok(c) => c,
-            Err(_) => return Ok(()), // Can't read meminfo, skip check
-        };
-
-        let mut total_kb = 0;
-        let mut available_kb = 0;
-
-        for line in contents.lines() {
-            if line.starts_with("MemTotal:") {
-                if let Some(kb_str) = line.split_whitespace().nth(1) {
-                    total_kb = kb_str.parse::<usize>().unwrap_or(0);
-                }
-            } else if line.starts_with("MemAvailable:") {
-                if let Some(kb_str) = line.split_whitespace().nth(1) {
-                    available_kb = kb_str.parse::<usize>().unwrap_or(0);
-                }
-                break;
-            }
-        }
-
-        if total_kb > 0 && available_kb > 0 {
-            let available_pct = (available_kb as f64) / (total_kb as f64);
-            let total_mb = total_kb / 1024;
-            let available_mb = available_kb / 1024;
-
-            if available_pct < HARD_RAM_FLOOR_PCT {
-                debug_log!("╔════════════════════════════════════════════════════════════════╗");
-                debug_log!("║ RAM FLOOR BREACH - ABORTING LEVEL PROCESSING                   ║");
-                debug_log!("╚════════════════════════════════════════════════════════════════╝");
-                debug_log!(
-                    "Available RAM: {} MB / {} MB ({:.1}% free)",
-                    available_mb,
-                    total_mb,
-                    available_pct * 100.0
-                );
-                debug_log!("HARD MINIMUM: 15% available RAM required");
-                debug_log!();
-                debug_log!("System is approaching OOM condition.");
-                debug_log!(
-                    "Refusing to process level {} with {} .bzl files.",
-                    level_idx,
-                    file_count
-                );
-                debug_log!("This prevents desktop session termination by the OOM killer.");
-
-                return Err(anyhow::anyhow!(
-                    "RAM floor breach: {:.1}% available (need 15%). Refusing to process level {} with {} files to prevent OOM.",
-                    available_pct * 100.0,
-                    level_idx,
-                    file_count
-                ));
-            }
-
-            debug_log!(
-                "[DEBUG BzlLoader] RAM check passed for level {}: {:.1}% available ({} MB / {} MB)",
-                level_idx,
-                available_pct * 100.0,
-                available_mb,
-                total_mb
-            );
-        }
-    }
-
-    // Non-Linux platforms: skip check
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (level_idx, file_count); // Avoid unused variable warnings
-    }
-
+    let sample = rush_resource::ResourceManager::read_system_memory()
+        .context("measure memory before .bzl loading")?;
+    bzl_memory_capacity(sample)
+        .with_context(|| format!("cannot admit .bzl level {level_idx} ({file_count} files)"))?;
     Ok(())
+}
+
+/// Available memory after retaining 15% of measured total memory as headroom.
+/// Outstanding load reservations are deducted separately. Retained closure and
+/// cache allocations already reduce the live available-memory measurement.
+fn bzl_memory_capacity((total_mb, available_mb): (usize, usize)) -> Result<usize> {
+    if total_mb == 0 || available_mb == 0 || available_mb > total_mb {
+        anyhow::bail!(
+            "invalid system memory measurement: total={total_mb} MiB available={available_mb} MiB"
+        );
+    }
+    let floor = total_mb
+        .checked_mul(15)
+        .and_then(|value| value.checked_add(99))
+        .context(".bzl memory headroom calculation overflowed")?
+        / 100;
+    available_mb.checked_sub(floor).filter(|capacity| *capacity != 0)
+        .with_context(|| format!("insufficient .bzl memory headroom: available={available_mb} MiB required={floor} MiB"))
 }
 
 /// Loader for .bzl files
@@ -4542,108 +4489,68 @@ static REPOS_BEING_FETCHED: Lazy<std::sync::Mutex<std::collections::HashSet<Stri
 static BAZEL_SYNC_SERIALIZE: Lazy<std::sync::Mutex<()>> =
     Lazy::new(|| std::sync::Mutex::new(()));
 
-/// Dynamic memory budget system for .bzl loading
-/// Tracks reserved memory to prevent thrashing while maintaining system headroom.
-/// After optimizations (62% reduction): each .bzl file needs ~1.5 GB (was 2-5 GB before).
+/// Account active cold loads across all loaders. This is an admission estimate,
+/// not an allocator limit; live available memory also accounts for retained
+/// Values/caches. Nested loads reserve independently and fail rather than wait
+/// for a reservation held by their parent.
 static BZL_MEMORY_RESERVED_MB: Lazy<std::sync::atomic::AtomicUsize> =
     Lazy::new(|| std::sync::atomic::AtomicUsize::new(0));
 
-/// RAII guard for .bzl memory reservations - auto-releases on drop
-struct BzlMemoryGuard {
+struct BzlMemoryGuard<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
     reserved_mb: usize,
 }
 
-impl BzlMemoryGuard {
-    /// Atomically reserve memory for .bzl loading with headroom enforcement
-    ///
-    /// Maintains 15% free RAM headroom to prevent system thrashing.
-    /// Returns guard that auto-releases reservation on drop (even if load fails).
+impl BzlMemoryGuard<'static> {
     fn reserve(bzl_label: &str, estimated_mb: usize) -> Result<Self> {
-        let (total_mb, available_mb) =
-            rush_resource::ResourceManager::read_system_memory().unwrap_or((64 * 1024, 32 * 1024)); // Fallback: assume 64GB total, 32GB available
+        Self::reserve_with_sample(&BZL_MEMORY_RESERVED_MB, bzl_label, estimated_mb, || {
+            rush_resource::ResourceManager::read_system_memory()
+        })
+    }
+}
 
-        // Enforce 15% minimum free RAM headroom (85% max usable)
-        // Was 30% but that blocked builds with 29.1% free (18.6GB on 62GB system)
-        // 15% = 9.3GB free on 62GB system - still safe, allows builds to proceed
-        const MIN_FREE_HEADROOM_PCT: f64 = 0.15;
-        let max_usable_mb = (total_mb as f64 * (1.0 - MIN_FREE_HEADROOM_PCT)) as usize;
-
-        // Atomically check and reserve memory
-        let mut current_reserved =
-            BZL_MEMORY_RESERVED_MB.load(std::sync::atomic::Ordering::Acquire);
-
+impl<'a> BzlMemoryGuard<'a> {
+    fn reserve_with_sample(
+        counter: &'a std::sync::atomic::AtomicUsize,
+        bzl_label: &str,
+        estimated_mb: usize,
+        mut sample: impl FnMut() -> Result<(usize, usize)>,
+    ) -> Result<Self> {
+        use std::sync::atomic::Ordering;
+        if estimated_mb == 0 {
+            anyhow::bail!(".bzl reservation must be positive");
+        }
+        let mut reserved = counter.load(Ordering::Acquire);
         loop {
-            let new_reserved = current_reserved + estimated_mb;
-
-            // Check if reservation would exceed budget or violate headroom
-            if new_reserved > max_usable_mb {
-                let free_after_reservation = total_mb.saturating_sub(new_reserved);
-                let free_pct = (free_after_reservation as f64) / (total_mb as f64) * 100.0;
-
-                return Err(anyhow!(
-                    "MEMORY BUDGET EXCEEDED - Cannot load {}\n\
-                     \n\
-                     Memory Budget:\n\
-                     - Total RAM: {} MB\n\
-                     - Available: {} MB\n\
-                     - Currently reserved: {} MB\n\
-                     - Requested: {} MB\n\
-                     - After reservation: {} MB free ({:.1}% free)\n\
-                     - Maximum usable (85% of total): {} MB\n\
-                     - Minimum headroom required: 15% ({} MB)\n\
-                     \n\
-                     Rush maintains 15% free RAM headroom to prevent system thrashing.\n\
-                     Free up memory (close browsers, editors, etc.) and retry.",
-                    bzl_label,
-                    total_mb,
-                    available_mb,
-                    current_reserved,
-                    estimated_mb,
-                    free_after_reservation,
-                    free_pct,
-                    max_usable_mb,
-                    (total_mb as f64 * MIN_FREE_HEADROOM_PCT) as usize
-                ));
+            let capacity =
+                bzl_memory_capacity(sample().context("measure memory for .bzl admission")?)?;
+            let next = reserved
+                .checked_add(estimated_mb)
+                .context(".bzl reservation counter overflowed")?;
+            // Conservative: active allocations can already appear in the live
+            // memory sample. Retaining their full reservations avoids promising
+            // unavailable headroom; it can refuse earlier, never wait recursively.
+            if next > capacity {
+                anyhow::bail!("cannot admit .bzl {bzl_label}: request={estimated_mb} MiB reserved={reserved} MiB available-after-headroom={capacity} MiB; reduce concurrent loads or release memory");
             }
-
-            // Atomic compare-and-swap to reserve memory
-            match BZL_MEMORY_RESERVED_MB.compare_exchange_weak(
-                current_reserved,
-                new_reserved,
-                std::sync::atomic::Ordering::Release,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
+            match counter.compare_exchange_weak(reserved, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
-                    debug_log!(
-                        "[MEM BUDGET] Reserved {} MB for {} (total: {} MB / {} MB max, {:.1}% of budget)",
-                        estimated_mb,
-                        bzl_label,
-                        new_reserved,
-                        max_usable_mb,
-                        (new_reserved as f64) / (max_usable_mb as f64) * 100.0
-                    );
                     return Ok(Self {
+                        counter,
                         reserved_mb: estimated_mb,
-                    });
+                    })
                 }
-                Err(actual) => {
-                    // Another thread modified the counter, retry with updated value
-                    current_reserved = actual;
-                }
+                Err(current) => reserved = current,
             }
         }
     }
 }
 
-impl Drop for BzlMemoryGuard {
+impl Drop for BzlMemoryGuard<'_> {
     fn drop(&mut self) {
-        let prev = BZL_MEMORY_RESERVED_MB
-            .fetch_sub(self.reserved_mb, std::sync::atomic::Ordering::Release);
-        debug_log!(
-            "[MEM BUDGET] Released {} MB (remaining: {} MB)",
-            self.reserved_mb,
-            prev.saturating_sub(self.reserved_mb)
-        );
+        self.counter
+            .fetch_sub(self.reserved_mb, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -4790,6 +4697,10 @@ impl BzlLoader {
     /// loaded in BUILD context use a separate cache identity and namespace.
     pub fn set_workspace_repository_context(&mut self, workspace_root: Option<PathBuf>) {
         self.workspace_repository_context = workspace_root;
+    }
+
+    pub(crate) fn loading_resource_manager(&self) -> Option<Arc<ResourceManager>> {
+        self.resource_manager.clone()
     }
 
     /// Set the current repository root for .bzl file resolution
@@ -5456,43 +5367,18 @@ impl BzlLoader {
             return Ok(result);
         }
 
-        // PHASE 3: Use GlobalMemoryBudget for atomic memory reservation
-        // Realistic per-file estimate with DashMap caching: 50 MB
-        //
-        // Previous estimates were WAY too conservative:
-        // - 2560 MB: Blocked TensorFlow (8 files × 2.5GB = 20GB > budget!)
-        // - 768 MB: Still too high (31 files × 768MB = 24GB, triggering false pressure)
-        //
-        // Actual memory usage with GlobalBzlCache (DashMap-based, observed in production):
-        // - First load: parse + evaluate = ~20-30 MB (AST + symbols, cached immediately)
-        // - Cache hit: return cached symbols = ~5 MB (just reference cloning from DashMap)
-        // - Peak during evaluation: ~40 MB
-        // - New 50 MB estimate: 2x actual peak (safe margin without false pressure)
+        // Reserve the existing cold-load estimate against measured headroom
+        // and the configured shared budget. This does not bound allocator use.
         const ESTIMATED_BZL_SIZE_MB: u64 = 50; // 50 MB (was 768 MB)
 
-        // Enum to hold either type of guard for RAII cleanup
-        // Fields are intentionally "unused" - they exist only for Drop behavior
-        #[allow(dead_code)]
-        enum MemGuard<'a> {
-            Global(rush_resource::MemoryReservation<'a>),
-            Legacy(BzlMemoryGuard),
-        }
-
-        // Clone the budget Arc to avoid lifetime issues - keep Arc alive in outer scope
+        let _system_memory_guard = BzlMemoryGuard::reserve(bzl_label, ESTIMATED_BZL_SIZE_MB as usize)?;
         let budget_arc = {
             let loader = lock_loader_timed(&loader_arc)?;
             loader.memory_budget.clone()
         };
-
-        let _mem_guard = if let Some(ref budget) = budget_arc {
-            MemGuard::Global(budget.reserve(bzl_label, ESTIMATED_BZL_SIZE_MB)?)
-        } else {
-            // Fallback to old guard for backward compatibility
-            MemGuard::Legacy(BzlMemoryGuard::reserve(
-                bzl_label,
-                ESTIMATED_BZL_SIZE_MB as usize,
-            )?)
-        };
+        let _global_memory_guard = budget_arc.as_ref()
+            .map(|budget| budget.reserve(bzl_label, ESTIMATED_BZL_SIZE_MB))
+            .transpose()?;
 
         // Phase 4: Detect circular loads using evaluating_paths (per-loader HashSet)
         // If this call didn't acquire loading ownership, wait for the
@@ -6869,26 +6755,11 @@ impl BzlLoader {
         // With DashMap caching, actual usage is ~20-30 MB per file
         const ESTIMATED_BZL_SIZE_MB: u64 = 50; // 50 MB
 
-        // Enum to hold either type of guard for RAII cleanup
-        // Fields are intentionally "unused" - they exist only for Drop behavior
-        #[allow(dead_code)]
-        enum MemGuard<'a> {
-            Global(rush_resource::MemoryReservation<'a>),
-            Legacy(BzlMemoryGuard),
-        }
-
-        // Clone the budget Arc to avoid borrowing self - keep Arc alive in outer scope
+        let _system_memory_guard = BzlMemoryGuard::reserve(bzl_label, ESTIMATED_BZL_SIZE_MB as usize)?;
         let budget_arc = self.memory_budget.clone();
-
-        let _mem_guard = if let Some(ref budget) = budget_arc {
-            MemGuard::Global(budget.reserve(bzl_label, ESTIMATED_BZL_SIZE_MB)?)
-        } else {
-            // Fallback to old guard for backward compatibility
-            MemGuard::Legacy(BzlMemoryGuard::reserve(
-                bzl_label,
-                ESTIMATED_BZL_SIZE_MB as usize,
-            )?)
-        };
+        let _global_memory_guard = budget_arc.as_ref()
+            .map(|budget| budget.reserve(bzl_label, ESTIMATED_BZL_SIZE_MB))
+            .transpose()?;
 
         debug_log!("[DEBUG BzlLoader] Loading: {}", bzl_label);
         let bzl_path = canonical_path.clone();
@@ -7112,7 +6983,7 @@ impl BzlLoader {
         // Evaluate the program
         evaluator
             .eval_program(program)
-            .map_err(|e| anyhow!("Failed to evaluate .bzl file: {}", e))?;
+            .map_err(|e| anyhow!("Failed to evaluate .bzl file: {:#}", e))?;
 
         // Extract all symbols from the evaluator environment
         let symbols = evaluator.export_environment();
@@ -9925,7 +9796,7 @@ impl BzlLoader {
         // Evaluate the program
         evaluator
             .eval_program(program)
-            .map_err(|e| anyhow!("Failed to evaluate .bzl file: {}", e))?;
+            .map_err(|e| anyhow!("Failed to evaluate .bzl file: {:#}", e))?;
 
         // Extract all symbols from the evaluator environment
         let symbols = evaluator.export_environment();
@@ -9970,6 +9841,73 @@ impl BzlLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bzl_memory_admission_rejects_unknown_or_invalid_measurements() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for sample in [(0, 0), (1000, 0), (1000, 1001), (1000, 150), (1000, 149)] {
+            assert!(bzl_memory_capacity(sample).is_err());
+        }
+        let counter = AtomicUsize::new(0);
+        let result = BzlMemoryGuard::reserve_with_sample(&counter, "unknown", 50, || {
+            anyhow::bail!("memory source unavailable")
+        });
+        assert!(format!("{:#}", result.err().unwrap()).contains("memory source unavailable"));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bzl_memory_admission_accounts_nested_loads_and_releases_on_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = AtomicUsize::new(0);
+        assert_eq!(bzl_memory_capacity((1000, 400)).unwrap(), 250);
+        let parent =
+            BzlMemoryGuard::reserve_with_sample(&counter, "parent", 100, || Ok((1000, 400)))
+                .unwrap();
+        let child = BzlMemoryGuard::reserve_with_sample(&counter, "child", 100, || Ok((1000, 400)))
+            .unwrap();
+        assert!(
+            BzlMemoryGuard::reserve_with_sample(&counter, "grandchild", 100, || Ok((1000, 400)))
+                .is_err()
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 200);
+        drop(child);
+        assert_eq!(counter.load(Ordering::Acquire), 100);
+        drop(parent);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        counter.store(usize::MAX, Ordering::Release);
+        assert!(
+            BzlMemoryGuard::reserve_with_sample(&counter, "overflow", 1, || Ok((1000, 900)))
+                .is_err()
+        );
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
+    }
+
+    #[test]
+    fn bzl_memory_admission_is_atomic_across_competing_loads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let counter = counter.clone();
+            let attempted = attempted.clone();
+            workers.push(std::thread::spawn(move || {
+                let reservation =
+                    BzlMemoryGuard::reserve_with_sample(&counter, "competing", 100, || {
+                        Ok((1000, 300))
+                    });
+                attempted.wait();
+                reservation.is_ok()
+            }));
+        }
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(successes, 1);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn third_party_declaration_metadata_is_not_a_materialized_repository() {
