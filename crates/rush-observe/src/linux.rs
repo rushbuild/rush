@@ -76,6 +76,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 const MAX_EXEC_VECTOR_ENTRIES: usize = 131_072;
 const MAX_EXEC_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -88,6 +89,9 @@ const MAX_COMPLETE_DIRECTORY_NAME_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_READLINK_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_XATTR_RESULT_BYTES: u64 = 65_536;
 const MAX_GETCWD_RESULT_BYTES: u64 = 8 * 1024 * 1024;
+// A creation-capable FIFO open can need a peer which witness admission has
+// frozen. Bound acquisition and refuse that capture instead of deadlocking.
+const DIRECTORY_WITNESS_QUIESCENCE_LIMIT: Duration = Duration::from_secs(5);
 const MAX_IDENTITY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FDINFO_BYTES: usize = 64 * 1024;
 const LINUX_DIRENT64_HEADER_SIZE: usize = 19;
@@ -888,6 +892,108 @@ fn quiesce_shared_address_space(
     Ok(())
 }
 
+fn quiesce_directory_witness_writers(
+    current: Pid,
+    processes: &BTreeMap<Pid, PendingProcess>,
+    running: &mut BTreeSet<Pid>,
+    pending_statuses: &mut VecDeque<WaitStatus>,
+    interrupted: &mut BTreeSet<Pid>,
+) -> Result<()> {
+    // Independent address spaces can still mutate the enumerated namespace.
+    // Stop userspace peers and drain in-flight namespace mutations. Leave
+    // unrelated kernel waits alone: a parent blocked in vfork cannot stop
+    // until its child progresses, and the child may itself be stopped here. Those
+    // syscalls cannot enter userspace past their ptrace exit stop while the
+    // directory witness owner holds admission. External writers remain
+    // subject to the metadata/value rejection.
+    let peers = running
+        .iter()
+        .copied()
+        .filter(|pid| {
+            *pid != current
+                && processes
+                    .get(pid)
+                    .is_some_and(directory_witness_peer_needs_stop)
+        })
+        .collect::<Vec<_>>();
+    for pid in &peers {
+        // Interrupting an in-kernel syscall synthesizes syscall-exit/restart
+        // stops. Preserve its ordinary result and pending request instead.
+        if processes
+            .get(pid)
+            .is_some_and(|process| process.active_syscall.is_none())
+            && interrupted.insert(*pid)
+        {
+            ptrace::interrupt(*pid)
+                .with_context(|| format!("interrupt directory-witness peer PID {pid}"))?;
+        }
+    }
+    let mut awaiting = peers.into_iter().collect::<BTreeSet<_>>();
+    let deadline = Instant::now() + DIRECTORY_WITNESS_QUIESCENCE_LIMIT;
+    while !awaiting.is_empty() {
+        for pid in awaiting.iter().copied().collect::<Vec<_>>() {
+            let status = waitpid(pid, Some(WaitPidFlag::__WALL | WaitPidFlag::WNOHANG))
+                .with_context(|| format!("wait for directory-witness peer PID {pid}"))?;
+            if status == WaitStatus::StillAlive {
+                continue;
+            }
+            if !running.remove(&pid) {
+                anyhow::bail!("directory-witness peer PID {pid} was not running");
+            }
+            awaiting.remove(&pid);
+            pending_statuses.push_back(status);
+        }
+        if !awaiting.is_empty() {
+            if Instant::now() >= deadline {
+                let blocked = awaiting
+                    .iter()
+                    .filter_map(|pid| processes.get(pid))
+                    .map(|process| {
+                        (
+                            process.id,
+                            process.active_syscall.map(|entry| entry.number),
+                            process
+                                .pending_open
+                                .as_ref()
+                                .map(|pending| pending.request.flags),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::bail!(
+                    "directory witness writer did not quiesce within five seconds; \
+                     pending captured processes (id, syscall, open flags): {blocked:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+    Ok(())
+}
+
+fn directory_witness_peer_needs_stop(process: &PendingProcess) -> bool {
+    if process.active_syscall.is_none() {
+        return true;
+    }
+    process.pending_open.as_ref().is_some_and(|pending| {
+        pending.request.flags & libc::O_CREAT as u64 != 0
+            || pending.request.flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64
+    })
+        || process.pending_path_removal.is_some()
+        || process.pending_directory_creation.is_some()
+        || process.pending_path_rename.is_some()
+        || process.pending_path_mode_change.is_some()
+        || process.pending_descriptor_timestamp_change.is_some()
+        || process.pending_symbolic_link_creation.is_some()
+        || process.pending_xattr.as_ref().is_some_and(|pending| {
+            pending.request.system_call == CapturedXattrSystemCall::Fsetxattr
+        })
+        // pselect6 waits on descriptors and writes userspace fd sets; it
+        // cannot mutate directory membership. Preserve its raw syscall
+        // record without waiting for a peer held by witness admission.
+        || process.pending_unmodeled_syscall.as_ref()
+            .is_some_and(|pending| pending.number != libc::SYS_pselect6 as u64)
+}
+
 fn is_internal_restart(exit: SyscallExit) -> bool {
     exit.is_error != 0 && matches!(exit.return_value, -512 | -513 | -514 | -516)
 }
@@ -918,7 +1024,11 @@ fn tracee_can_advance(
     pid: Pid,
     processes: &BTreeMap<Pid, PendingProcess>,
     exclusive: &BTreeMap<CapturedProcessId, Pid>,
+    directory_witness_owner: Option<Pid>,
 ) -> bool {
+    if directory_witness_owner.is_some_and(|owner| owner != pid) {
+        return false;
+    }
     processes.get(&pid).is_none_or(|process| {
         exclusive
             .get(&process.address_space)
@@ -1326,6 +1436,7 @@ fn capture_process_tree_events_with_spawn(
     let mut pending_statuses = VecDeque::new();
     let mut interrupted = BTreeSet::new();
     let mut exclusive = BTreeMap::new();
+    let mut directory_witness_owner = None;
     continue_tracee(
         root_pid,
         Some(Signal::SIGCONT),
@@ -1336,7 +1447,7 @@ fn capture_process_tree_events_with_spawn(
     while !guard.active.is_empty() {
         let pending_index = pending_statuses.iter().position(|status| {
             wait_status_pid(*status)
-                .is_some_and(|pid| tracee_can_advance(pid, &by_pid, &exclusive))
+                .is_some_and(|pid| tracee_can_advance(pid, &by_pid, &exclusive, directory_witness_owner))
         });
         let status = if let Some(index) = pending_index {
             pending_statuses
@@ -1346,13 +1457,13 @@ fn capture_process_tree_events_with_spawn(
             let mut awaiting = running
                 .iter()
                 .copied()
-                .filter(|pid| tracee_can_advance(*pid, &by_pid, &exclusive))
+                .filter(|pid| tracee_can_advance(*pid, &by_pid, &exclusive, directory_witness_owner))
                 .collect::<BTreeSet<_>>();
             awaiting.extend(
                 newborn
                     .iter()
                     .copied()
-                    .filter(|pid| tracee_can_advance(*pid, &by_pid, &exclusive)),
+                    .filter(|pid| tracee_can_advance(*pid, &by_pid, &exclusive, directory_witness_owner)),
             );
             if awaiting.is_empty() {
                 anyhow::bail!("process capture has active tracees but no pending stop");
@@ -1362,6 +1473,18 @@ fn capture_process_tree_events_with_spawn(
         let status_pid = wait_status_pid(status).context("traced status has no PID")?;
         running.remove(&status_pid);
         let was_interrupted = interrupted.remove(&status_pid);
+
+        if matches!(status, WaitStatus::PtraceSyscall(pid)
+            if matches!(syscall_stop(pid)?, SyscallStop::Entry { entry, .. }
+                if entry.number == libc::SYS_getdents64 as u64))
+        {
+            if directory_witness_owner.replace(status_pid).is_some() {
+                anyhow::bail!("directory witness already has an exclusive tracee");
+            }
+            quiesce_directory_witness_writers(
+                status_pid, &by_pid, &mut running, &mut pending_statuses, &mut interrupted,
+            )?;
+        }
 
         if matches!(
             status,
@@ -2835,6 +2958,10 @@ fn capture_process_tree_events_with_spawn(
                             }
                             if entry.number == libc::SYS_getdents64 as u64 {
                                 finish_getdents64_attempt(process, pid, exit, sink)?;
+                                if directory_witness_owner != Some(pid) {
+                                    anyhow::bail!("getdents64 lost its exclusive directory witness");
+                                }
+                                directory_witness_owner = None;
                             }
                             if entry.number == libc::SYS_mmap as u64 {
                                 finish_mmap_attempt(
@@ -2914,6 +3041,9 @@ fn capture_process_tree_events_with_spawn(
                 )?;
             }
             WaitStatus::Exited(pid, code) => {
+                if directory_witness_owner == Some(pid) {
+                    directory_witness_owner = None;
+                }
                 interrupted.remove(&pid);
                 if let Some(address_space) = by_pid.get(&pid).map(|process| process.address_space) {
                     if exclusive.get(&address_space) == Some(&pid) {
@@ -2929,6 +3059,9 @@ fn capture_process_tree_events_with_spawn(
                 )?;
             }
             WaitStatus::Signaled(pid, signal, _) => {
+                if directory_witness_owner == Some(pid) {
+                    directory_witness_owner = None;
+                }
                 interrupted.remove(&pid);
                 if let Some(address_space) = by_pid.get(&pid).map(|process| process.address_space) {
                     if exclusive.get(&address_space) == Some(&pid) {
@@ -10809,6 +10942,245 @@ mod tests {
             serde_json::json!(process.open_attempts[0].syscall_index);
         let collision: ProcessCaptureReceipt = serde_json::from_value(collision).unwrap();
         assert!(collision.validate_complete().is_err());
+    }
+
+    #[test]
+    fn captures_getdents64_while_a_peer_waits_in_pselect6() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg(concat!(
+                "import os, select, sys, time\n",
+                "root = sys.argv[1]\n",
+                "read_fd, write_fd = os.pipe()\n",
+                "ready, start = os.pipe()\n",
+                "child = os.fork()\n",
+                "if child == 0:\n",
+                "    os.close(write_fd)\n",
+                "    os.close(ready)\n",
+                "    os.write(start, b'x')\n",
+                "    os.close(start)\n",
+                "    assert select.select([read_fd], [], [])[0] == [read_fd]\n",
+                "    assert os.read(read_fd, 1) == b'x'\n",
+                "    os.close(read_fd)\n",
+                "    os._exit(0)\n",
+                "os.close(read_fd)\n",
+                "os.close(start)\n",
+                "assert os.read(ready, 1) == b'x'\n",
+                "os.close(ready)\n",
+                "deadline = time.monotonic() + 3.0\n",
+                "while True:\n",
+                "    with open(f'/proc/{child}/syscall') as status:\n",
+                "        observed = status.read().split()\n",
+                "    with open(f'/proc/{child}/status') as status:\n",
+                "        state = next(line.split()[1] for line in status if line.startswith('State:'))\n",
+                "    if observed and observed[0] != 'running' and int(observed[0], 0) == int(sys.argv[2]) and state == 'S':\n",
+                "        break\n",
+                "    assert time.monotonic() < deadline, f'child did not block in pselect6: {observed}, state={state}'\n",
+                "    time.sleep(0.001)\n",
+                "with os.scandir(root) as entries:\n",
+                "    assert list(entries) == []\n",
+                "os.write(write_fd, b'x')\n",
+                "os.close(write_fd)\n",
+                "assert os.waitpid(child, 0) == (child, 0)\n",
+            ))
+            .arg(directory.path())
+            .arg(libc::SYS_pselect6.to_string())
+            .env_clear();
+        let receipt = capture_process_tree(&mut command).unwrap();
+        assert_syscall_census(&receipt);
+        receipt.require_witnessed_directory_enumerations().unwrap();
+        assert!(receipt
+            .processes()
+            .iter()
+            .flat_map(|process| &process.unmodeled_syscall_attempts)
+            .any(|attempt| attempt.number == libc::SYS_pselect6 as u64));
+    }
+
+    #[test]
+    fn captures_getdents64_while_a_peer_waits_in_a_noncreating_fifo_open() {
+        let receipt = capture_directory_with_blocked_fifo_open(false).unwrap();
+        assert_syscall_census(&receipt);
+        receipt.require_witnessed_directory_enumerations().unwrap();
+        assert!(receipt
+            .processes()
+            .iter()
+            .flat_map(|process| &process.unmodeled_syscall_attempts)
+            .all(|attempt| attempt.number != u64::MAX));
+    }
+
+    #[test]
+    fn refuses_getdents64_when_a_creating_fifo_open_cannot_quiesce() {
+        let started = Instant::now();
+        let error = capture_directory_with_blocked_fifo_open(true)
+            .expect_err("a creating FIFO open must not wait for a frozen writer forever");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= DIRECTORY_WITNESS_QUIESCENCE_LIMIT);
+        assert!(elapsed < Duration::from_secs(15));
+        assert!(
+            format!("{error:#}").contains("directory witness writer did not quiesce"),
+            "{error:#}"
+        );
+    }
+
+    fn capture_directory_with_blocked_fifo_open(create: bool) -> Result<ProcessCaptureReceipt> {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg(concat!(
+                "import os, sys, time\n",
+                "root = sys.argv[1]\n",
+                "fifo = root + '/fifo'\n",
+                "os.mkfifo(fifo, 0o600)\n",
+                "ready, start = os.pipe()\n",
+                "flags = os.O_RDONLY | (os.O_CREAT if sys.argv[2] == '1' else 0)\n",
+                "child = os.fork()\n",
+                "if child == 0:\n",
+                "    os.close(ready)\n",
+                "    os.write(start, b'x')\n",
+                "    os.close(start)\n",
+                "    fd = os.open(fifo, flags, 0o600)\n",
+                "    assert os.read(fd, 1) == b'x'\n",
+                "    os.close(fd)\n",
+                "    os._exit(0)\n",
+                "os.close(start)\n",
+                "assert os.read(ready, 1) == b'x'\n",
+                "os.close(ready)\n",
+                "deadline = time.monotonic() + 3.0\n",
+                "flag_indices = {int(sys.argv[3]): 2, int(sys.argv[4]): 3}\n",
+                "creation_mask = os.O_CREAT | os.O_TMPFILE\n",
+                "while True:\n",
+                "    with open(f'/proc/{child}/syscall') as status:\n",
+                "        observed = status.read().split()\n",
+                "    with open(f'/proc/{child}/status') as status:\n",
+                "        state = next(line.split()[1] for line in status if line.startswith('State:'))\n",
+                "    number = int(observed[0], 0) if observed and observed[0] != 'running' else None\n",
+                "    if number in flag_indices and state == 'S':\n",
+                "        actual_flags = int(observed[flag_indices[number]], 0)\n",
+                "        if actual_flags & creation_mask == flags & creation_mask and actual_flags & os.O_ACCMODE == os.O_RDONLY and not actual_flags & os.O_NONBLOCK:\n",
+                "            break\n",
+                "    assert time.monotonic() < deadline, f'child did not block in expected FIFO open: {observed}, state={state}, flags={flags}'\n",
+                "    time.sleep(0.001)\n",
+                "with os.scandir(root) as entries:\n",
+                "    assert sorted(entry.name for entry in entries) == ['fifo']\n",
+                "fd = os.open(fifo, os.O_WRONLY)\n",
+                "os.write(fd, b'x')\n",
+                "os.close(fd)\n",
+                "assert os.waitpid(child, 0) == (child, 0)\n",
+            ))
+            .arg(directory.path())
+            .arg(if create { "1" } else { "0" })
+            .arg(libc::SYS_open.to_string())
+            .arg(libc::SYS_openat.to_string())
+            .env_clear();
+        capture_process_tree(&mut command)
+    }
+
+    #[test]
+    fn captures_getdents64_while_a_sibling_process_publishes_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg(concat!(
+                "import os, sys\n",
+                "root = sys.argv[1]\n",
+                "ready, start = os.pipe()\n",
+                "child = os.fork()\n",
+                "if child == 0:\n",
+                "    os.close(start)\n",
+                "    assert os.read(ready, 1) == b'x'\n",
+                "    os.close(ready)\n",
+                "    for index in range(128):\n",
+                "        temporary = root + '/temporary'\n",
+                "        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n",
+                "        os.write(fd, str(index).encode())\n",
+                "        os.close(fd)\n",
+                "        os.replace(temporary, root + '/published')\n",
+                "    os._exit(0)\n",
+                "os.close(ready)\n",
+                "assert os.write(start, b'x') == 1\n",
+                "os.close(start)\n",
+                "for index in range(128):\n",
+                "    with os.scandir(root) as entries:\n",
+                "        names = sorted(entry.name for entry in entries)\n",
+                "    assert set(names) <= {'temporary', 'published'}\n",
+                "assert os.waitpid(child, 0) == (child, 0)\n",
+            ))
+            .arg(directory.path())
+            .env_clear();
+
+        let receipt = capture_process_tree(&mut command).unwrap();
+        assert_syscall_census(&receipt);
+        receipt.require_witnessed_directory_enumerations().unwrap();
+        assert!(receipt.processes().len() >= 2);
+        let target = directory.path().as_os_str().as_bytes();
+        let enumerations = receipt
+            .processes()
+            .iter()
+            .flat_map(|process| &process.getdents64_attempts)
+            .filter(|attempt| {
+                attempt
+                    .request
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.target == target)
+            })
+            .collect::<Vec<_>>();
+        assert!(enumerations.len() >= 128);
+        assert!(enumerations.iter().all(|attempt| matches!(
+            &attempt.outcome,
+            CapturedGetdents64Outcome::Enumerated {
+                directory_value: CapturedDirectoryValue::Complete { .. },
+                ..
+            }
+        )));
+        assert_eq!(
+            std::fs::read(directory.path().join("published")).unwrap(),
+            b"127"
+        );
+    }
+
+    #[test]
+    fn captures_getdents64_while_a_parent_uses_vfork_style_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("retained"), b"input").unwrap();
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg(concat!(
+                "import os, sys\n",
+                "root = sys.argv[1]\n",
+                "reader = os.fork()\n",
+                "if reader == 0:\n",
+                "    for index in range(128):\n",
+                "        with os.scandir(root) as entries:\n",
+                "            assert sorted(entry.name for entry in entries) == ['retained']\n",
+                "    os._exit(0)\n",
+                "children = [os.posix_spawn('/usr/bin/true', ['true'], {}) for _ in range(32)]\n",
+                "for child in children + [reader]:\n",
+                "    assert os.waitpid(child, 0) == (child, 0)\n",
+            ))
+            .arg(directory.path())
+            .env_clear();
+
+        let receipt = capture_process_tree(&mut command).unwrap();
+        assert_syscall_census(&receipt);
+        receipt.require_witnessed_directory_enumerations().unwrap();
+        assert_eq!(receipt.processes().len(), 34);
+        let enumerations = receipt
+            .processes()
+            .iter()
+            .flat_map(|process| &process.getdents64_attempts)
+            .filter(|attempt| {
+                attempt.request.identity.as_ref().is_some_and(|identity| {
+                    identity.target == directory.path().as_os_str().as_bytes()
+                })
+            })
+            .count();
+        assert!(enumerations >= 128);
     }
 
     #[test]
