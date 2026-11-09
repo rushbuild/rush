@@ -11789,7 +11789,7 @@ impl BuildOrchestrator {
     }
 
     fn allow_cached_repo_without_marker(&self, repo_name: &str) -> bool {
-        matches!(repo_name, "ml_dtypes" | "com_google_benchmark")
+        repo_name == "com_google_benchmark"
     }
 
     fn format_absolute_label(workspace_name: Option<&str>, package: &str, target: &str) -> String {
@@ -20650,6 +20650,73 @@ filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//co
             semantics_with_define(root, "//:root", "flavor", "main")?,
         ).await.expect_err("the default branch must load its broken configuration only when selected");
         assert!(format!("{error:#}").contains("broken/BUILD"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(target_os = "linux")]
+    async fn source_backed_external_include_prefix_reaches_compile_and_invalidates_on_header_removal() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"source_headers\")\nlocal_repository(name = \"ml_dtypes\", path = \"dtype_source\")\n")?;
+        write_file(&root.join("dtype_source/WORKSPACE"), "workspace(name = \"ml_dtypes\")\n")?;
+        // TensorFlow 2.17's XLA declaration pins ml_dtypes commit
+        // 24084d9ed2c3d45bf83b7a9bff833aa185bf9172, archive SHA256
+        // c916a3e6b3d9bdcb476f506fdbbecb6d5e9f21f82f221dfcb42b320b4e85e55a,
+        // stripping to the ml_dtypes package. Preserve its two C++ target
+        // declarations' header/include-prefix structure using test source.
+        write_file(&root.join("dtype_source/BUILD"), r#"
+package(default_visibility = ["//visibility:public"])
+cc_library(name = "float8", hdrs = ["include/float8.h"], include_prefix = "ml_dtypes", includes = [".", "ml_dtypes"])
+cc_library(name = "intn", hdrs = ["include/intn.h"], include_prefix = "ml_dtypes", includes = [".", "ml_dtypes"])
+"#)?;
+        let header = root.join("dtype_source/include/float8.h");
+        write_file(&header, "#pragma once\n#include \"include/intn.h\"\nnamespace fixture { constexpr int float8_value = 40; }\n")?;
+        write_file(&root.join("dtype_source/include/intn.h"), "#pragma once\nnamespace fixture { constexpr int intn_value = 2; }\n")?;
+        write_file(&root.join("BUILD"), r#"
+cc_library(name = "platform_types", hdrs = ["platform_types.h"], deps = ["@ml_dtypes//:float8", "@ml_dtypes//:intn"])
+cc_binary(name = "app", srcs = ["main.cc"], deps = [":platform_types"])
+"#)?;
+        write_file(&root.join("platform_types.h"), "#pragma once\n#include \"ml_dtypes/include/float8.h\"\n#include \"ml_dtypes/include/intn.h\"\n")?;
+        write_file(&root.join("main.cc"), r#"#include <stdio.h>
+#include "platform_types.h"
+int main() { printf("%d\n", fixture::float8_value + fixture::intn_value); return 0; }
+"#)?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
+        let targets = vec!["//:app".to_string()];
+        let semantics = semantics_with_define(root, "//:app", "header_fixture", "true")?;
+        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
+        orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        let snapshot = orchestrator.snapshot_cache.get(&key).expect("source-header snapshot");
+        let state = snapshot.retained_execution_state().expect("source-header outputs");
+        let outputs = state.artifact_forest.get("//:app").expect("app outputs").flatten();
+        let executable = outputs.iter().find(|artifact| artifact.artifact_type == ArtifactType::Executable)
+            .expect("app executable").path.clone();
+        drop(state);
+        let run = || -> Result<String> {
+            let output = std::process::Command::new(&executable).current_dir(root).output()?;
+            assert!(output.status.success(), "{:?}", output.status);
+            Ok(String::from_utf8(output.stdout)?)
+        };
+        assert_eq!(run()?, "42\n");
+        let virtual_header = repository_output_root(&cache_paths::workspace_output_root(root), Some("ml_dtypes"))
+            .join("_virtual_includes/float8/ml_dtypes/include/float8.h");
+        assert_eq!(std::fs::canonicalize(&virtual_header)?, std::fs::canonicalize(&header)?);
+        assert!(std::fs::symlink_metadata(&virtual_header)?.file_type().is_symlink());
+        let declared_build = std::fs::read(root.join("dtype_source/BUILD"))?;
+
+        std::fs::remove_file(&header)?;
+        let error = orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await
+            .expect_err("a missing declared source header must invalidate cached success");
+        assert!(format!("{error:#}").contains("float8.h"), "{error:#}");
+        assert!(!virtual_header.exists(), "the virtual header must remain source-backed");
+        assert_eq!(run()?, "42\n", "the failed rebuild must not count the old executable as success");
+        assert_eq!(std::fs::read(root.join("dtype_source/BUILD"))?, declared_build);
+
+        write_file(&header, "#pragma once\n#include \"include/intn.h\"\nnamespace fixture { constexpr int float8_value = 41; }\n")?;
+        orchestrator.build_with_dependencies_with_semantics(targets, semantics).await?;
+        assert_eq!(run()?, "43\n");
         Ok(())
     }
 

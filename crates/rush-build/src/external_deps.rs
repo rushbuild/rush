@@ -468,7 +468,6 @@ impl SystemPackageMapper {
                 | "local_config_nccl"
                 | "local_tsl"
                 | "local_xla"
-                | "ml_dtypes"
                 | "nsync"
                 | "org_brotli"
                 | "org_sqlite"
@@ -500,24 +499,6 @@ impl SystemPackageMapper {
         let mut include_dirs = Vec::new();
 
         match (repo, target) {
-            // ml_dtypes (machine learning data types - float8, bfloat16, int4)
-            ("ml_dtypes", _) => {
-                // Check workspace external directory first
-                let workspace_ml_dtypes = workspace_root.join("external");
-                if workspace_ml_dtypes
-                    .join("ml_dtypes/include/float8.h")
-                    .exists()
-                {
-                    eprintln!(
-                        "[SYSMAP] Mapped @{}//{} -> {:?} (workspace)",
-                        repo, target, workspace_ml_dtypes
-                    );
-                    include_dirs.push(workspace_ml_dtypes);
-                } else {
-                    eprintln!("[SYSMAP] ⚠️  ml_dtypes not found in workspace external/ directory");
-                    eprintln!("[SYSMAP]    Expected at: {:?}", workspace_ml_dtypes);
-                }
-            }
             // Protocol Buffers (includes Abseil as dependency)
             ("com_google_protobuf", "protobuf_headers") | ("com_google_protobuf", "protobuf") => {
                 // #32: prefer TF's PINNED protobuf 3.21.9 headers when the static
@@ -808,8 +789,8 @@ impl SystemPackageMapper {
         }
 
 
-        // Host-global clone cache: large external clones (ml_dtypes,
-        // eigen_archive, llvm-project, ducc, …) are shared across
+        // Host-global clone cache: large external clones (eigen_archive,
+        // llvm-project, ducc, …) are shared across
         // workspaces and live outside the workspace's `.cache/rush`.
         // `RUSH_GLOBAL_CLONE_CACHE` overrides the historical default of
         // `$XDG_CACHE_HOME/rush/external`. Stubs below use
@@ -822,8 +803,7 @@ impl SystemPackageMapper {
             .unwrap_or_else(|_| default_global_clone_cache_root());
         // AS (Pro K→H lane): also probe the workspace-external
         // directory `<workspace>/external/<name>` for vendored
-        // clones. Several repos (@nsync, @ml_dtypes, @eigen_archive
-        // when ml_dtypes carries its Eigen) are laid down by the TF
+        // clones. Several repos (@nsync and @eigen_archive) are laid down by the TF
         // checkout or a sibling tool into `tensorflow/external/`
         // rather than `.cache/rush/external/`. Without this probe,
         // the .cache generator emits an empty stub (e.g.
@@ -2851,8 +2831,7 @@ def config_googleapis():
         // (`includes = []`) unconditionally, which then SHADOWED
         // any workspace-external BUILD that did declare correct
         // includes (because register_cached_repo prefers .cache
-        // over workspace_external). Mirrors the @ml_dtypes
-        // pattern at the next block.
+        // over workspace_external).
         let nsync_clone = resolve_clone_path("nsync", "public/nsync_cv.h");
         if let Some(p) = &nsync_clone {
             let nsync_repo = external_cache.join("nsync");
@@ -3656,149 +3635,6 @@ def config_googleapis():
              def cc_grpc_library(**kwargs):\n    pass\n",
         )?;
         repo_paths.insert("com_github_grpc_grpc".to_string(), grpc_repo);
-
-        // FIX: ml_dtypes stub - JAX/TF's ML dtypes (float8, int4, etc.)
-        // ml_dtypes is not a Debian package; the source must be cloned once
-        // into the external cache. If a prior session populated it, register
-        // it as the @ml_dtypes repo so @ml_dtypes//:float8 and //:int4
-        // resolve with include_dirs pointing at the `ml_dtypes/include/`
-        // layout the TF headers expect (`#include "ml_dtypes/include/float8.h"`).
-        //
-        // `resolve_clone_path` checks the workspace cache first, then falls
-        // back to the host-global clone cache — so a checkout at either
-        // `<workspace>/.cache/rush/external/ml_dtypes` or
-        // `$XDG_CACHE_HOME/rush/external/ml_dtypes` (or whatever
-        // `RUSH_GLOBAL_CLONE_CACHE` points at) is usable without needing a
-        // workspace-local symlink.
-        let ml_dtypes_repo = external_cache.join("ml_dtypes");
-        // Probe BOTH ml_dtypes layouts. DIRECT (TF 2.17 pin 24084d9e via the
-        // bootstrap strip ".../ml_dtypes": headers at <clone>/include/float8.h) and
-        // the older NESTED layout (<clone>/ml_dtypes/include/float8.h, e.g. the
-        // TF-2.15 cache). Capturing which lets the two include roots be computed
-        // correctly for each — without it, the direct 2.17 layout fails the nested
-        // witness, the whole generator is skipped, and @ml_dtypes//:* fall back to
-        // empty stubs with no CcInfo, so no -I reaches consumers (Codex 019eebc6).
-        let ml_dtypes_layout = resolve_clone_path("ml_dtypes", "include/float8.h")
-            .map(|p| (p, true))
-            .or_else(|| {
-                resolve_clone_path("ml_dtypes", "ml_dtypes/include/float8.h")
-                    .map(|p| (p, false))
-            });
-        if let Some((ml_dtypes_clone, direct_layout)) = ml_dtypes_layout {
-            std::fs::create_dir_all(&ml_dtypes_repo)?;
-            // literal_root: the dir whose direct child `ml_dtypes/` holds include/, so
-            //   TF's `#include "ml_dtypes/include/float8.h"` resolves.
-            // sibling_root: the ml_dtypes PACKAGE dir holding include/, so ml_dtypes's
-            //   own `#include "include/intn.h"` sibling refs (int4.h/intn.h) resolve.
-            // DIRECT:  <clone> is the package dir (include/ inside) -> literal=parent,
-            //          sibling=<clone>. NESTED: <clone> wraps a ml_dtypes/ package ->
-            //          literal=<clone>, sibling=<clone>/ml_dtypes.
-            let (literal_root_pb, sibling_root_pb) = if direct_layout {
-                let parent = ml_dtypes_clone
-                    .parent()
-                    .unwrap_or(&ml_dtypes_clone)
-                    .to_path_buf();
-                (parent, ml_dtypes_clone.clone())
-            } else {
-                (ml_dtypes_clone.clone(), ml_dtypes_clone.join("ml_dtypes"))
-            };
-            let ml_dtypes_include = literal_root_pb.display().to_string();
-            let ml_dtypes_subdir = sibling_root_pb.display().to_string();
-            // Emit include-only adapter targets for every @ml_dtypes//:* label TF
-            // references across versions: the TF-2.17 split (:float8, :intn), the
-            // legacy single (:ml_dtypes), plus :int4/:mxfloat. All carry the same two
-            // include roots as CcInfo (so the -I propagates to consumers) and
-            // @eigen_archive (float8.h needs Eigen::NumTraits/get_integer_by_size).
-            // Headers are the REAL vendored ones via the include roots — no invented
-            // functionality (the prior generator emitted only float8/int4/mxfloat, so
-            // 2.17's @ml_dtypes//:intn + :float8 fell back to empty no-CcInfo stubs).
-            let mut ml_dtypes_build = String::from(
-                "# Stub BUILD for ml_dtypes - Rush uses the cloned source tree;\n\
-                 # include-only adapter targets carry the real vendored include roots.\n\
-                 package(default_visibility = [\"//visibility:public\"])\n\n",
-            );
-            for name in ["ml_dtypes", "float8", "intn", "int4", "mxfloat"] {
-                ml_dtypes_build.push_str(&format!(
-                    "cc_library(\n    \
-                     name = \"{name}\",\n    \
-                     srcs = [],\n    \
-                     hdrs = [],\n    \
-                     includes = [\"{root}\", \"{subdir}\"],\n    \
-                     deps = [\"@eigen_archive//:eigen3\"],\n    \
-                     visibility = [\"//visibility:public\"],\n)\n\n",
-                    name = name,
-                    root = ml_dtypes_include,
-                    subdir = ml_dtypes_subdir,
-                ));
-            }
-            std::fs::write(ml_dtypes_repo.join("BUILD"), ml_dtypes_build)?;
-            // Mirror the clone's top-level `ml_dtypes/` into the synthesized
-            // repo dir so the ALWAYS-added repo-root -I
-            // (`.cache/rush/external/ml_dtypes`) resolves
-            // `ml_dtypes/include/float8.h` even for targets whose dep chain
-            // (e.g. //tensorflow/core:framework_headers_lib via
-            // tsl/platform/ml_dtypes.h) does NOT propagate the float8
-            // cc_library's includes=[clone] transitively. Same belt-and-
-            // suspenders as @eigen_archive (5.C.5q); no argv change — only
-            // makes an already-present -I resolve more headers, so PASS-A/PASS-B
-            // stay identical. //tensorflow/core/profiler:tfprof_options failed
-            // "ml_dtypes/include/float8.h: No such file" without this.
-            // SELF-REFERENCE RECOVERY (see @eigen_archive): resolve_clone_path
-            // probes the synthesized repo FIRST, so once the `ml_dtypes` mirror
-            // below exists, a later run resolves clone == repo. The earlier
-            // `clone != repo` guard then skipped BOTH mirrors, which is the
-            // chicken-and-egg that left `<repo>/include` uncreated: the first
-            // run (no mirror yet) resolved clone = real source and made only
-            // the `ml_dtypes` mirror; every subsequent run resolved clone ==
-            // repo and skipped the `include` mirror forever. So int4.h's
-            // `#include "include/intn.h"` never resolved off the repo-root -I.
-            // Recover the REAL vendored source independent of the guard: when
-            // clone == repo, read the existing `ml_dtypes` mirror's link target
-            // (<real>/ml_dtypes) and take its parent (<real>). This is never the
-            // repo, so no cycle, and both mirrors are created idempotently.
-            #[cfg(unix)]
-            {
-                // Mirror the real ml_dtypes PACKAGE dir into the synthesized repo so the
-                // always-added repo-root -I resolves both `ml_dtypes/include/X` and the
-                // internal `include/X` sibling refs even for consumers whose dep chain
-                // doesn't propagate the cc_library CcInfo include dirs. Layout-agnostic:
-                // sibling_root_pb is the package dir (holding include/) for both layouts.
-                let real_pkg = if ml_dtypes_clone.as_path() != ml_dtypes_repo.as_path() {
-                    sibling_root_pb.clone()
-                } else {
-                    // self-reference recovery: resolve_clone_path found the synthesized
-                    // repo itself; recover the real package dir from the prior mirror.
-                    std::fs::read_link(ml_dtypes_repo.join("ml_dtypes"))
-                        .unwrap_or_else(|_| sibling_root_pb.clone())
-                };
-                //   ml_dtypes -> <pkg>          (so `ml_dtypes/include/float8.h` resolves)
-                //   include   -> <pkg>/include  (so the sibling `include/intn.h` resolves)
-                for (sub, mirror_target) in [
-                    ("ml_dtypes", real_pkg.clone()),
-                    ("include", real_pkg.join("include")),
-                ] {
-                    // Never point a mirror back into the repo (cycle guard).
-                    if mirror_target.starts_with(&ml_dtypes_repo) {
-                        continue;
-                    }
-                    if mirror_target.exists() {
-                        let link = ml_dtypes_repo.join(sub);
-                        if link.symlink_metadata().is_ok() {
-                            let _ = std::fs::remove_file(&link);
-                        }
-                        if let Err(e) = std::os::unix::fs::symlink(&mirror_target, &link) {
-                            eprintln!(
-                                "    ⚠️  @ml_dtypes: failed to mirror {} -> {}: {}",
-                                link.display(),
-                                mirror_target.display(),
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-            repo_paths.insert("ml_dtypes".to_string(), ml_dtypes_repo);
-        }
 
         // @com_googlesource_code_re2 must use the TF-pinned source when it is
         // materialized. The distro RE2 ABI is coupled to the distro Abseil;
@@ -4749,101 +4585,16 @@ cc_library(name = "host", srcs = [])
         assert_eq!(dirs[0], PathBuf::from("/usr/include/eigen3"));
     }
 
-    // ====================================================================
-    // AQ-2 / AQ-3: ml_dtypes stub layout regression tests
-    // ====================================================================
-
-    /// AQ-3: the generated @ml_dtypes stub BUILD content lists
-    /// BOTH the clone root and its `ml_dtypes/` subdir in
-    /// `includes`. This is the fix landed in commit 242 for the
-    /// `int4.h -> "include/intn.h"` resolution failure that
-    /// surfaced at scheduler execution time on
-    /// @local_tsl//tsl/platform/default:env_time.
-    ///
-    /// The test simulates the generator's format!() output to
-    /// verify the includes contract end-to-end. It does NOT
-    /// run the live generator (that requires a real
-    /// resolve_clone_path), but the format string under test is
-    /// the same one external_deps.rs emits at line ~1506.
     #[test]
-    fn aq3_ml_dtypes_stub_includes_root_and_vendor_subdir() {
-        // Synthesize the same content shape the generator emits.
-        let root = "/clone/ml_dtypes";
-        let subdir = "/clone/ml_dtypes/ml_dtypes";
-        let content = format!(
-            "# Stub BUILD for ml_dtypes - Rush uses cloned source tree.\n\
-             #\n\
-             # Two include roots:\n\
-             #   {root}             - so `ml_dtypes/include/X` resolves\n\
-             #   {subdir}  - so `include/X` resolves (int4.h sibling refs)\n\
-             package(default_visibility = [\"//visibility:public\"])\n\n\
-             cc_library(\n\
-                 name = \"int4\",\n\
-                 srcs = [],\n\
-                 hdrs = [],\n\
-                 includes = [\"{root}\", \"{subdir}\"],\n\
-                 deps = [\"@eigen_archive//:eigen3\"],\n\
-                 visibility = [\"//visibility:public\"],\n\
-             )\n",
-            root = root,
-            subdir = subdir,
-        );
-        assert!(
-            content.contains("/clone/ml_dtypes\""),
-            "stub BUILD must list the clone root in includes"
-        );
-        assert!(
-            content.contains("/clone/ml_dtypes/ml_dtypes\""),
-            "stub BUILD must list the vendored ml_dtypes/ subdir \
-             so `include/intn.h` resolves from int4.h"
-        );
-        // Defense against future regressions: a single-root
-        // includes form (only `{root}`) is wrong because it
-        // resolves `ml_dtypes/include/X` but not `include/X`.
-        // The combined `[root, subdir]` form is the canonical
-        // contract.
-        let single_root_form = format!("includes = [\"{}\"]", root);
-        assert!(
-            !content.contains(&single_root_form),
-            "stub BUILD must NOT use the single-root form — that \
-             was the broken state before commit 242. Found: {}",
-            single_root_form
-        );
-    }
-
-    /// AQ-3 paired test: confirms the `includes` list of the
-    /// workspace-external BUILD form (`includes = [".",
-    /// "ml_dtypes"]`) is structurally equivalent — both forms
-    /// emit two -I roots, the package root and its
-    /// `ml_dtypes/` subdir.
-    ///
-    /// This test asserts the contract a future reader needs to
-    /// preserve: ml_dtypes' int4.h does
-    /// `#include "include/intn.h"` and that include resolves
-    /// IFF the `-I` set contains the vendored `ml_dtypes/`
-    /// subdir as one of its members.
-    #[test]
-    fn aq3_ml_dtypes_workspace_external_form_lists_subdir() {
-        let workspace_external_build = "\
-            cc_library(\n\
-                name = \"int4\",\n\
-                hdrs = glob([\"ml_dtypes/include/int4.h\"]),\n\
-                includes = [\".\", \"ml_dtypes\"],\n\
-                visibility = [\"//visibility:public\"],\n\
-            )\n";
-        assert!(
-            workspace_external_build.contains("\"ml_dtypes\""),
-            "workspace-external @ml_dtypes BUILD must list the \
-             vendored `ml_dtypes` subdir in `includes` so \
-             `#include \"include/intn.h\"` resolves"
-        );
-        // Negative check: bare `["."]` was the broken state.
-        let bare_dot = "includes = [\".\"]";
-        assert!(
-            !workspace_external_build.contains(bare_dot),
-            "the bare `includes = [\".\"]` form is the pre-AQ-2 \
-             broken state and must not appear"
-        );
+    fn ml_dtypes_requires_a_declared_source_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let header = root.path().join("external/ml_dtypes/include/float8.h");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+        std::fs::write(header, b"// source witness\n").unwrap();
+        assert!(!SystemPackageMapper::is_system_repo("ml_dtypes"));
+        assert!(SystemPackageMapper::resolve_external_target(
+            "ml_dtypes", "float8", root.path(),
+        ).is_err(), "source headers must use their declared repository and CcInfo");
     }
 
     /// The gate must judge the protoc rush will actually run, and must stay

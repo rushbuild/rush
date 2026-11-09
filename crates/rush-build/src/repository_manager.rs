@@ -443,15 +443,8 @@ impl RepositoryManager {
 
         // Check for known system stubs.
         //
-        // NOTE: `@ml_dtypes` used to live on this list but was removed
-        // once `external_deps.rs` started writing a proper stub `BUILD`
-        // for it (with `cc_library(... includes = [<clone_root>])` so
-        // CcInfo propagates `-I<clone_root>` to downstream compiles
-        // via normal provider merging). A bare `register_system_stub`
-        // here would short-circuit that BUILD parse and drop the
-        // include_dirs, leaving consumers like
-        // `@local_tsl//tsl/platform:types` unable to find
-        // `ml_dtypes/include/float8.h`.
+        // Source-backed repositories enter through their WORKSPACE definition
+        // and normal configured package loader, preserving declared CcInfo.
         if missing_label_str.starts_with("@com_google_benchmark")
             || missing_label_str.starts_with("@llvm-project")
             || missing_label_str.starts_with("@llvm_terminfo")
@@ -545,12 +538,6 @@ impl RepositoryManager {
                 orchestrator.register_absl_stub(graph, missing_label)?;
                 return Ok(true);
             }
-
-            // @ml_dtypes is handled via its real stub BUILD (written by
-            // external_deps.rs) which carries the include_dirs CcInfo
-            // consumers need; fall through so the generic BUILD-parsing
-            // recovery picks it up instead of creating a bare
-            // SystemCcLibrary.
 
             if repo == "six_archive" {
                 eprintln!(
