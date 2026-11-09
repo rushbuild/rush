@@ -16222,6 +16222,252 @@ mod complete_directory_page_tests {
                 .is_none()
         );
     }
+
+    // Inputs to the post-eligibility mapper, not a synthetic capture/seal
+    // admission test. Raw receipt validation and lifetime proof construction
+    // have their own observer regressions; this fixture exercises the policy
+    // transition after those stages supply their private contracts.
+    fn mapping_fixture() -> (ExternalAction, KbuildMandatoryActionEligibilityContracts) {
+        let complete = proof(&[1, 2]);
+        let object =
+            kbuild_descriptor_input_object(&complete.identity, Some(complete.mount_id)).unwrap();
+        let rush_observe::CapturedDirectoryValue::Complete {
+            entries,
+            digest,
+            members,
+        } = &complete.directory_value
+        else {
+            unreachable!()
+        };
+        let value = KbuildObservedInputValue::Directory {
+            entries: *entries,
+            digest: *digest,
+            listing_digest: captured_directory_listing_digest(members).unwrap(),
+        };
+        let checkpoints = [10, 11]
+            .into_iter()
+            .map(|ordinal| KbuildGeneratedDirectoryCheckpoint {
+                consumer_action_index: 0,
+                observation_ordinal: ordinal,
+                path: obj_path(Vec::new()),
+                object,
+                value,
+                members: members.clone(),
+                anchor: KbuildDirectoryPathAnchor {
+                    process: complete.process,
+                    descriptor: complete.descriptor,
+                    path: bytes_path(&complete.identity.target),
+                    object,
+                    open_syscall_index: complete.open_syscall_index,
+                    open_stream_ordinal: 9,
+                },
+                before_actions: BTreeSet::new(),
+                after_actions: BTreeSet::new(),
+                unresolved_actions: BTreeSet::new(),
+                has_self_effect: false,
+                has_analyzer_effect: false,
+                has_unresolved_self_effect: false,
+                has_unresolved_analyzer_effect: false,
+                has_self_directory_object_effect: false,
+                has_self_retained_name_effect_before_observation: false,
+                has_self_retained_name_effect_after_observation: false,
+                has_analyzer_directory_object_effect: false,
+                has_analyzer_retained_name_effect: false,
+                first_self_directory_object_batch: None,
+                first_unresolved_self_batch: None,
+                first_unresolved_analyzer_batch: None,
+                first_unresolved_self_subject_batch_count: 0,
+                first_unresolved_self_subject_timeline: Vec::new(),
+                observation_process_chain: vec![1],
+                first_unresolved_self_branch: None,
+                candidate_action_boundary: false,
+            })
+            .collect::<Vec<_>>();
+        let mut properties = BTreeMap::from([(
+            MANDATORY_EXECUTION_PROPERTY.to_string(),
+            PROCFS_CLEAN_ENTRY_CACHEABLE_EXECUTION.to_string(),
+        )]);
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let (key, value) = encode_ordered_runtime_directory_checkpoint(
+                index,
+                &checkpoint.path,
+                &checkpoint.members,
+                checkpoint.observation_ordinal,
+                &[],
+                &[],
+            )
+            .unwrap();
+            properties.insert(key, value);
+        }
+        let action = ExternalAction {
+            logical_id: "directory-enumerator".to_string(),
+            mnemonic: "DirectoryEnumerationTest".to_string(),
+            commands: vec![ExternalCommand {
+                executable: ExternalPathKey {
+                    root: "host".to_string(),
+                    path: b"bin/true".to_vec(),
+                },
+                argv0: ExternalArgumentKey::Literal(b"true".to_vec()),
+                argv: Vec::new(),
+                environment: None,
+                working_directory: None,
+            }],
+            working_directory: obj_path(Vec::new()),
+            environment: BTreeMap::new(),
+            signal_state: Default::default(),
+            file_creation_mask: 0o022,
+            credentials: Default::default(),
+            normal_inputs: Vec::new(),
+            order_only_inputs: Vec::new(),
+            outputs: Vec::new(),
+            dependencies: Vec::new(),
+            config_deps: Vec::new(),
+            depfile: None,
+            restat: true,
+            always_run: false,
+            cacheable: true,
+            local_only: true,
+            sandbox: true,
+            resource: ManifestResourceClass::KernelCodegen,
+            execution_properties: properties,
+        };
+        let mandatory = KbuildMandatoryActionEligibilityContracts {
+            // This helper does not authorize eligibility; the mapper under test
+            // only consumes the already-created per-action proof partition.
+            seal: KbuildMandatoryActionEligibilitySeal {
+                graph_digest: [0; 32],
+                stream_digest: [0; 32],
+                assignment_digest: [0; 32],
+                procfs_policy_digest: [0; 32],
+                input_census_digest: [0; 32],
+                provenance_partition_digest: [0; 32],
+                mutation_attribution_digest: [0; 32],
+                generated_action_input_digest: [0; 32],
+                directory_member_retention_digest: [0; 32],
+                generated_directory_checkpoint_digest: [0; 32],
+                eligibility_digest: [0; 32],
+                actions: Vec::new(),
+            },
+            actions: vec![KbuildMandatoryActionExecutionContract {
+                action_index: 0,
+                procfs_filesystems_reads: Vec::new(),
+                procfs_directory_checkpoints: Vec::new(),
+                external_inputs: BTreeMap::new(),
+                generated_inputs: Vec::new(),
+                directory_checkpoints: checkpoints,
+                cache_policy: crate::action_manager::ActionCachePolicy::CACHEABLE,
+                isolation: rush_exec::local_isolation::LocalExecutionIsolation::new(vec![
+                    PathBuf::from("/obj"),
+                ])
+                .unwrap(),
+            }],
+            directory_enumerations: BTreeMap::from([(0, vec![complete])]),
+            directory_unproved_actions: BTreeSet::new(),
+            directory_page_ordinals: BTreeMap::from([((1, 1), 10), ((1, 2), 11)]),
+        };
+        (action, mandatory)
+    }
+
+    #[test]
+    fn complete_directory_mapping_promotes_content_keyed_policy_to_uncacheable_live_validation() {
+        use crate::external_analysis_snapshot::{
+            runtime_directory_checkpoints, COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE,
+            RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY,
+        };
+        for policy in [
+            PROCFS_CLEAN_ENTRY_CACHEABLE_EXECUTION,
+            PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION,
+        ] {
+            let (mut action, mandatory) = mapping_fixture();
+            action
+                .execution_properties
+                .insert(MANDATORY_EXECUTION_PROPERTY.to_string(), policy.to_string());
+            action.cacheable = policy == PROCFS_CLEAN_ENTRY_CACHEABLE_EXECUTION;
+            let mut actions = vec![action];
+            kbuild_use_complete_directory_enumerations(
+                &mut actions,
+                &[Some("directory-enumerator".to_string())],
+                &mandatory,
+            )
+            .unwrap();
+            let action = &actions[0];
+            assert_eq!(
+                action
+                    .execution_properties
+                    .get(MANDATORY_EXECUTION_PROPERTY)
+                    .map(String::as_str),
+                Some(PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION)
+            );
+            assert_eq!(
+                action
+                    .execution_properties
+                    .get(RUNTIME_DIRECTORY_OBSERVATION_PROFILE_PROPERTY)
+                    .map(String::as_str),
+                Some(COMPLETE_PRIVATE_DIRECTORY_ENUMERATION_PROFILE)
+            );
+            assert!(!action.cacheable && !action.always_run && action.local_only && action.sandbox);
+            assert_eq!(
+                runtime_directory_checkpoints(&action.execution_properties)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_or_ineligible_directory_mapping_leaves_original_policy_and_pages_untouched() {
+        for variant in 0..6 {
+            let (mut action, mut mandatory) = mapping_fixture();
+            match variant {
+                0 => {
+                    mandatory.directory_unproved_actions.insert(0);
+                }
+                1 => {
+                    mandatory.directory_page_ordinals.remove(&(1, 2));
+                }
+                2 => {
+                    let proof = &mut mandatory.directory_enumerations.get_mut(&0).unwrap()[0];
+                    let rush_observe::CapturedDirectoryValue::Complete { digest, .. } =
+                        &mut proof.directory_value
+                    else {
+                        unreachable!()
+                    };
+                    digest[0] ^= 1;
+                }
+                3 => {
+                    let (key, value) = encode_ordered_runtime_directory_checkpoint(
+                        1,
+                        &obj_path(Vec::new()),
+                        &[b"changed".to_vec()],
+                        11,
+                        &[],
+                        &[],
+                    )
+                    .unwrap();
+                    action.execution_properties.insert(key, value);
+                }
+                4 => {
+                    action.execution_properties.insert(
+                        MANDATORY_EXECUTION_PROPERTY.to_string(),
+                        "unknown-policy".to_string(),
+                    );
+                }
+                _ => {
+                    mandatory.directory_enumerations.get_mut(&0).unwrap()[0].descriptor += 1;
+                }
+            }
+            let before = action.clone();
+            let mut actions = vec![action];
+            kbuild_use_complete_directory_enumerations(
+                &mut actions,
+                &[Some("directory-enumerator".to_string())],
+                &mandatory,
+            )
+            .unwrap();
+            assert_eq!(actions[0], before, "variant {variant}");
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -16281,12 +16527,13 @@ fn kbuild_use_complete_directory_enumerations(
             .get(logical_id)
             .context("Kbuild completed directory observer lost its replay action")?;
         let action = &mut actions[action_index];
-        if action
-            .execution_properties
-            .get(MANDATORY_EXECUTION_PROPERTY)
-            .map(String::as_str)
-            != Some(PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION)
-        {
+        if !matches!(
+            action
+                .execution_properties
+                .get(MANDATORY_EXECUTION_PROPERTY)
+                .map(String::as_str),
+            Some(PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION | PROCFS_CLEAN_ENTRY_CACHEABLE_EXECUTION)
+        ) {
             continue;
         }
         let raw = runtime_directory_checkpoints(&action.execution_properties)?;
@@ -16362,6 +16609,17 @@ fn kbuild_use_complete_directory_enumerations(
                 &checkpoint.after_actions,
             )?);
         }
+        // Pagination-independent live validation is never a content-keyed
+        // reuse contract. Promote only after every proof, coverage, anchor,
+        // value and uniform-ordering check above has succeeded.
+        action.always_run = false;
+        action.cacheable = false;
+        action.local_only = true;
+        action.sandbox = true;
+        action.execution_properties.insert(
+            MANDATORY_EXECUTION_PROPERTY.to_string(),
+            PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.to_string(),
+        );
         action
             .execution_properties
             .retain(|key, _| !key.starts_with(RUNTIME_DIRECTORY_CHECKPOINT_PREFIX));
