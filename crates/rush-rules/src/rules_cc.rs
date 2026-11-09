@@ -683,6 +683,7 @@ struct SinkCompileHeaderInputs {
     generated: Vec<PathBuf>,
     source: Vec<PathBuf>,
     source_by_basename: HashMap<String, Vec<PathBuf>>,
+    include_roots: Vec<PathBuf>,
 }
 
 impl SinkCompileHeaderInputs {
@@ -714,6 +715,8 @@ async fn collect_sink_compile_header_inputs(context: &BuildContext) -> SinkCompi
             .collect();
         inputs.generated = crate::providers::collect_generated_header_paths(&reg, &cc_infos);
         for cc_info in &cc_infos {
+            inputs.include_roots.extend(cc_info.compilation.include_dirs.iter()
+                .map(|path| reg.paths().path(path).to_path_buf()));
             for h_aid in cc_info
                 .compilation
                 .headers
@@ -730,6 +733,8 @@ async fn collect_sink_compile_header_inputs(context: &BuildContext) -> SinkCompi
     inputs.generated.dedup();
     inputs.source.sort();
     inputs.source.dedup();
+    inputs.include_roots.sort();
+    inputs.include_roots.dedup();
     inputs.rebuild_source_index();
     inputs
 }
@@ -863,6 +868,50 @@ mod sink_header_cache_tests {
         assert!(!Arc::ptr_eq(&changed, &remapped_inputs));
         assert_eq!(remapped_inputs.source, vec![remapped]);
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_include_layout_rechecks_virtual_farm_retargets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("main.cc");
+        let first = root.join("headers/first.h");
+        let second = root.join("headers/second.h");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::write(&source, "#include \"api/first.h\"\n").unwrap();
+        // Equal bytes preserve content-based early cutoff after a retarget.
+        std::fs::write(&first, "#define VALUE 1\n").unwrap();
+        std::fs::write(&second, "#define VALUE 1\n").unwrap();
+        let virtual_root = stage_virtual_includes(root, &root.join("out"), "", "api",
+            &["headers/first.h".to_string()], "api", Some("headers")).unwrap();
+        let virtual_header = virtual_root.join("api/first.h");
+        let mut registry = ArtifactRegistry::new();
+        let first_id = header(&mut registry, &first);
+        let second_id = header(&mut registry, &second);
+        let include_root = registry.intern_path(&virtual_root);
+        let cc = CcInfo::from_direct_and_deps(DirectCcInfo {
+            headers: vec![first_id, second_id], include_dirs: vec![include_root],
+            ..Default::default()
+        }, std::iter::empty());
+        let mut context = BuildContext::new(root.to_path_buf(), root.join("out"));
+        context.artifact_registry = Some(Arc::new(tokio::sync::Mutex::new(registry)));
+        context.dependency_providers.insert("//:headers".into(), ProviderSet::empty().with_cc_info(cc));
+        let cache = tokio::sync::Mutex::new(None);
+        let original = cached_sink_compile_header_inputs(&context, &cache).await;
+        assert_eq!(original.include_roots, vec![virtual_root]);
+        assert_eq!(reachable_source_headers_for_sink_source(&source, &original), vec![first]);
+        let original_id = super::sink_header_input_tests::closure_action_id(&source, &original);
+        std::fs::remove_file(&virtual_header).unwrap();
+        std::os::unix::fs::symlink(&second, &virtual_header).unwrap();
+        let retargeted = cached_sink_compile_header_inputs(&context, &cache).await;
+        assert!(Arc::ptr_eq(&original, &retargeted), "only immutable provider layout is retained");
+        assert_eq!(reachable_source_headers_for_sink_source(&source, &retargeted), vec![second.clone()]);
+        let retargeted_id = super::sink_header_input_tests::closure_action_id(&source, &retargeted);
+        assert_eq!(retargeted_id, original_id, "equal header values preserve early cutoff");
+        std::fs::write(&second, "#define VALUE 2\n").unwrap();
+        assert_ne!(super::sink_header_input_tests::closure_action_id(&source, &retargeted), retargeted_id);
+    }
+
 }
 
 fn include_tokens_from_file(path: &Path) -> Option<Vec<String>> {
@@ -901,22 +950,40 @@ fn include_tokens_from_file(path: &Path) -> Option<Vec<String>> {
 fn matching_source_headers_for_include_token(
     token: &str,
     header_inputs: &SinkCompileHeaderInputs,
+    source_identities: &mut Option<HashMap<PathBuf, Vec<PathBuf>>>,
 ) -> Vec<PathBuf> {
-    if !token.contains('/') {
-        return header_inputs
-            .source_by_basename
-            .get(token)
-            .cloned()
-            .unwrap_or_default();
-    }
-
     let token_path = Path::new(token);
-    header_inputs
-        .source
-        .iter()
-        .filter(|header| header.ends_with(token_path))
-        .cloned()
-        .collect()
+    let mut matching = if !token.contains('/') {
+        header_inputs.source_by_basename.get(token).cloned().unwrap_or_default()
+    } else {
+        header_inputs.source.iter().filter(|header| header.ends_with(token_path))
+            .cloned().collect()
+    };
+    if !header_inputs.include_roots.is_empty() {
+        // Only the include-root layout is cached. Both the staged symlinks and
+        // declared source-header identities are resolved anew for this walk;
+        // a farm retarget must not reuse a previous physical-header decision.
+        for root in &header_inputs.include_roots {
+            let Ok(resolved) = std::fs::canonicalize(root.join(token_path)) else {
+                continue;
+            };
+            let identities = source_identities.get_or_insert_with(|| {
+                let mut identities: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+                for header in &header_inputs.source {
+                    if let Ok(identity) = std::fs::canonicalize(header) {
+                        identities.entry(identity).or_default().push(header.clone());
+                    }
+                }
+                identities
+            });
+            if let Some(headers) = identities.get(&resolved) {
+                matching.extend(headers.iter().cloned());
+            }
+        }
+    }
+    matching.sort();
+    matching.dedup();
+    matching
 }
 
 fn reachable_source_headers_for_sink_source(
@@ -931,6 +998,7 @@ fn reachable_source_headers_for_sink_source(
     let mut selected_set = HashSet::new();
     let mut visited_files = HashSet::new();
     let mut queue = vec![src_path.to_path_buf()];
+    let mut source_identities = None;
 
     while let Some(path) = queue.pop() {
         if !visited_files.insert(path.clone()) {
@@ -940,7 +1008,7 @@ fn reachable_source_headers_for_sink_source(
             return header_inputs.source.clone();
         };
         for token in &tokens {
-            for header in matching_source_headers_for_include_token(token, header_inputs) {
+            for header in matching_source_headers_for_include_token(token, header_inputs, &mut source_identities) {
                 if selected_set.contains(&header) {
                     continue;
                 }
@@ -965,6 +1033,7 @@ mod sink_header_input_tests {
             generated: Vec::new(),
             source,
             source_by_basename: HashMap::new(),
+            include_roots: Vec::new(),
         };
         inputs.source.sort();
         inputs.source.dedup();
@@ -1022,6 +1091,61 @@ mod sink_header_input_tests {
         );
         assert_eq!(selected, vec![a, b]);
     }
+
+    pub(super) fn closure_action_id(source: &Path, headers: &SinkCompileHeaderInputs) -> rush_action::ActionId {
+        let mut inputs = vec![ActionArtifact::Source(source.to_path_buf())];
+        inputs.extend(reachable_source_headers_for_sink_source(source, headers)
+            .into_iter().map(ActionArtifact::Source));
+        Action::compute_id(&inputs, &Command {
+            executable: PathBuf::from("c++"),
+            args: vec!["-c".to_string(), source.display().to_string()],
+            working_dir: None,
+            execution_info: ExecutionInfo::default(),
+        }, &HashMap::new()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remapped_source_headers_key_content_without_keying_unreachable_private_headers() {
+        for (header_name, strip_prefix, include_token) in [
+            ("include/mapped.h", None, "api/include/mapped.h"),
+            ("private/mapped.h", Some("private"), "api/mapped.h"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("source");
+            let output = temp.path().join("out");
+            let source = temp.path().join("main.cc");
+            let mapped = root.join(header_name);
+            let next = root.join("next.h");
+            let private = root.join("unrelated.h");
+            std::fs::create_dir_all(mapped.parent().unwrap()).unwrap();
+            std::fs::write(&source, format!("#include \"{include_token}\"\n")).unwrap();
+            std::fs::write(&mapped, "#include \"next.h\"\n#define VALUE 40\n").unwrap();
+            std::fs::write(&next, "#define NEXT 2\n").unwrap();
+            std::fs::write(&private, "#define PRIVATE 1\n").unwrap();
+            let virtual_root = stage_virtual_includes(&root, &output, "", "mapped",
+                &[header_name.to_string()], "api", strip_prefix).unwrap();
+            let virtual_header = virtual_root.join(include_token);
+            assert!(std::fs::symlink_metadata(&virtual_header).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::canonicalize(&virtual_header).unwrap(), std::fs::canonicalize(&mapped).unwrap());
+            let mut inputs = source_inputs(vec![mapped.clone(), next.clone(), private.clone()]);
+            inputs.include_roots.push(virtual_root);
+            let reachable = reachable_source_headers_for_sink_source(&source, &inputs);
+            assert!(reachable.contains(&mapped) && reachable.contains(&next));
+            assert!(!reachable.contains(&private));
+            let original = closure_action_id(&source, &inputs);
+            assert_eq!(closure_action_id(&source, &inputs), original);
+            std::fs::write(&private, "#define PRIVATE 999\n").unwrap();
+            assert_eq!(closure_action_id(&source, &inputs), original);
+            std::fs::write(&mapped, "#include \"next.h\"\n#define VALUE 41\n").unwrap();
+            let edited = closure_action_id(&source, &inputs);
+            assert_ne!(edited, original);
+            std::fs::remove_file(&mapped).unwrap();
+            std::fs::write(&mapped, "#include \"next.h\"\n#define VALUE 42\n").unwrap();
+            assert_ne!(closure_action_id(&source, &inputs), edited);
+        }
+    }
+
 }
 
 /// Stage Bazel's `include_prefix` virtual-include farm for a cc_library and
