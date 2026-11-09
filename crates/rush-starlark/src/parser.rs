@@ -832,16 +832,32 @@ impl Parser {
     }
 
     /// `|` (bitwise-or for ints; dict-union for dicts). Precedence sits between
-    /// comparison (looser) and additive (tighter), matching Python/Starlark.
+    /// comparison (looser) and bitwise XOR (tighter).
     fn parse_bitor_expression(&mut self) -> Result<Expr> {
-        let mut left = self.parse_additive_expression()?;
+        let mut left = self.parse_bitxor_expression()?;
 
         while matches!(self.current.token_type, TokenType::Pipe) {
+            self.advance();
+            let right = self.parse_bitxor_expression()?;
+            left = Expr::BinOp {
+                left: Box::new(left),
+                op: BinOp::BitOr,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_bitxor_expression(&mut self) -> Result<Expr> {
+        let mut left = self.parse_additive_expression()?;
+
+        while matches!(self.current.token_type, TokenType::Caret) {
             self.advance();
             let right = self.parse_additive_expression()?;
             left = Expr::BinOp {
                 left: Box::new(left),
-                op: BinOp::BitOr,
+                op: BinOp::BitXor,
                 right: Box::new(right),
             };
         }

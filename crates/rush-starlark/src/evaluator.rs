@@ -7338,27 +7338,12 @@ impl Evaluator {
                 }
             },
             BinOp::BitXor => match (left, right) {
-                // Set symmetric difference on the List-backed set()
-                // representation.
-                (Value::List(a), Value::List(b)) => {
-                    let mut r: Vec<Value> = Vec::new();
-                    for x in a {
-                        if !b.contains(x) && !r.contains(x) {
-                            r.push(x.clone());
-                        }
-                    }
-                    for x in b {
-                        if !a.contains(x) && !r.contains(x) {
-                            r.push(x.clone());
-                        }
-                    }
-                    Ok(Value::List(r))
-                }
-                _ => {
-                    let a = left.to_int()?;
-                    let b = right.to_int()?;
-                    Ok(Value::Int(a ^ b))
-                }
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+                _ => Err(anyhow!(
+                    "Operator ^ requires integer operands, got {} and {}",
+                    starlark_type_name(left)?,
+                    starlark_type_name(right)?,
+                )),
             },
             BinOp::LeftShift => {
                 let a = left.to_int()?;

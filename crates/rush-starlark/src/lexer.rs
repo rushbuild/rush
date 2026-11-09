@@ -166,6 +166,10 @@ impl Lexer {
                     TokenType::Pipe
                 }
             }
+            '^' => {
+                self.advance();
+                TokenType::Caret
+            }
             '=' => {
                 self.advance();
                 if self.current_char() == '=' {
@@ -576,6 +580,14 @@ mod tests {
         for (i, expected_type) in expected.iter().enumerate() {
             assert_eq!(&tokens[i].token_type, expected_type);
         }
+    }
+
+    #[test]
+    fn test_xor_token_at_end_of_input() {
+        let tokens = tokenize("^");
+        assert_eq!(tokens[0].token_type, TokenType::Caret);
+        assert_eq!((tokens[0].line, tokens[0].column), (1, 1));
+        assert_eq!(tokens[1].token_type, TokenType::Eof);
     }
 
     #[test]

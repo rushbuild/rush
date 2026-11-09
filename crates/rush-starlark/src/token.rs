@@ -46,6 +46,7 @@ pub enum TokenType {
     DoubleStar,  // **
     Pipe,        // |  (bitwise-or / dict-union)
     PipeAssign,  // |=
+    Caret,       // ^  (bitwise-xor)
 
     // Comparison
     Equal,        // ==
