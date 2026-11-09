@@ -20360,6 +20360,67 @@ proto_library(
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn imported_label_condition_uses_its_defining_repository_in_the_selected_closure() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(
+            &root.join("WORKSPACE"),
+            "workspace(name = \"main\")\nlocal_repository(name = \"owner\", path = \"owner\")\n",
+        )?;
+        write_file(&root.join("owner/WORKSPACE"), "workspace(name = \"owner\")\n")?;
+        write_file(&root.join("owner/defs/BUILD"), "")?;
+        write_file(
+            &root.join("owner/defs/module.bzl"),
+            r#"
+def clean_dep(target):
+    return str(Label(target))
+
+def configured(name):
+    native.filegroup(
+        name = name,
+        srcs = select({
+            clean_dep("//cfg:mode"): ["@//:chosen"],
+            "//conditions:default": ["@//:broken_branch"],
+        }),
+    )
+"#,
+        )?;
+        write_file(
+            &root.join("owner/cfg/BUILD"),
+            "config_setting(name = \"mode\", define_values = {\"flavor\": \"owner\"}, visibility = [\"//visibility:public\"])\n",
+        )?;
+        write_file(
+            &root.join("cfg/BUILD"),
+            "config_setting(name = \"mode\", define_values = {\"flavor\": \"main\"}, visibility = [\"//visibility:public\"])\n",
+        )?;
+        write_file(
+            &root.join("BUILD"),
+            r#"
+load("@owner//defs:module.bzl", "configured")
+configured(name = "root")
+filegroup(name = "chosen")
+filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//conditions:default": []}))
+"#,
+        )?;
+        write_file(&root.join("broken/BUILD"), "config_setting(name =\n")?;
+
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
+        for _ in 0..2 {
+            orchestrator.build_with_dependencies_with_semantics(
+                vec!["//:root".to_string()],
+                semantics_with_define(root, "//:root", "flavor", "owner")?,
+            ).await?;
+        }
+        let error = orchestrator.build_with_dependencies_with_semantics(
+            vec!["//:root".to_string()],
+            semantics_with_define(root, "//:root", "flavor", "main")?,
+        ).await.expect_err("the default branch must load its broken configuration only when selected");
+        assert!(format!("{error:#}").contains("broken/BUILD"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn semantic_config_setting_errors_are_deferred_to_the_configured_closure() -> Result<()> {
         once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
         let temp = TempDir::new()?;

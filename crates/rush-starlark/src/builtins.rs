@@ -86,8 +86,6 @@ pub fn get_builtins() -> HashMap<String, BuiltinFn> {
     builtins.insert("objc_library".to_string(), builtin_objc_library);
     builtins.insert("if_portable".to_string(), builtin_if_portable);
     builtins.insert("_if_portable".to_string(), builtin_if_portable);
-    builtins.insert("clean_dep".to_string(), builtin_clean_dep);
-    builtins.insert("_clean_dep".to_string(), builtin_clean_dep);
     builtins.insert(
         "tf_lib_proto_parsing_deps".to_string(),
         builtin_tf_lib_proto_parsing_deps,
@@ -1511,19 +1509,6 @@ fn builtin_label(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
         }
         _ => Err(anyhow!("Label() argument must be a string")),
     }
-}
-
-fn builtin_clean_dep(args: &[Value], kwargs: &[(String, Value)]) -> Result<Value> {
-    // clean_dep() is a TensorFlow utility that wraps Label()
-    // It converts a target string to a Label and returns its string representation
-    // This is used to resolve repo-relative labels correctly
-    builtin_label(args, kwargs).map(|label_value| {
-        // Convert Label value back to string
-        match label_value {
-            Value::Label { label, .. } => Value::String(label),
-            _ => label_value,
-        }
-    })
 }
 
 /// struct(**kwargs) - Create a struct with named fields

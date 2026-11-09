@@ -2,7 +2,7 @@
 ///
 /// Loads, parses, and evaluates .bzl files to make their exported symbols
 /// available to BUILD files.
-use crate::{evaluator::Environment, Evaluator, Program, Value};
+use crate::{evaluator::{DefinitionLabelContext, Environment}, Evaluator, Program, Value};
 use anyhow::{anyhow, Context, Result};
 use dashmap::{DashMap, DashSet};
 use lru::LruCache;
@@ -1307,6 +1307,34 @@ pub fn is_skip_require_manifest() -> bool {
         .unwrap_or(false)
 }
 
+/// Evaluated module identity is distinct from its filesystem dependencies.
+/// `None` is reserved for legacy/test cache entries and is never admitted by a
+/// real module load. This also makes pre-context entries a guaranteed miss.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModuleCacheKey {
+    path: PathBuf,
+    workspace: PathBuf,
+    context: Option<DefinitionLabelContext>,
+    label: Option<String>,
+    mappings: Vec<(String, Vec<(String, String)>)>,
+    repository_roots: Vec<(String, PathBuf, PathBuf)>,
+    aliases: Vec<(String, String)>,
+}
+
+impl ModuleCacheKey {
+    fn unqualified(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), workspace: PathBuf::new(), context: None, label: None, mappings: Vec::new(), repository_roots: Vec::new(), aliases: Vec::new() }
+    }
+
+    fn display(&self) -> std::path::Display<'_> { self.path.display() }
+
+    fn inflight_key(&self) -> String {
+        // Debug preserves the entire identity, including sorted mapping entries;
+        // this key is only process-local and is never used as a filesystem path.
+        format!("{:?}", self)
+    }
+}
+
 /// Global shared cache for .bzl files across all BzlLoader instances
 ///
 /// This cache ONLY stores evaluated symbols (not ASTs/Programs).
@@ -1317,7 +1345,7 @@ pub fn is_skip_require_manifest() -> bool {
 pub struct GlobalBzlCache {
     /// Shared concurrent cache of evaluated .bzl symbols (path -> HashMap<symbol, Value>)
     /// Uses DashMap for lock-free concurrent reads and fine-grained write locking
-    symbol_cache: Arc<DashMap<PathBuf, CacheEntry>>,
+    symbol_cache: Arc<DashMap<ModuleCacheKey, CacheEntry>>,
     /// Maximum number of cached entries before evicting
     max_entries: usize,
     /// Maximum total estimated memory usage before evicting (bytes)
@@ -1929,10 +1957,10 @@ impl GlobalBzlCache {
     /// manifest because validation may hash files or rerun process probes. A
     /// concurrent cold loader can replace the path during that work, so an
     /// unconditional `remove(path)` would be allowed to delete the fresh value.
-    fn remove_generation(&self, path: &Path, generation: u64) -> Option<CacheEntry> {
+    fn remove_generation(&self, key: &ModuleCacheKey, generation: u64) -> Option<CacheEntry> {
         use dashmap::mapref::entry::Entry;
 
-        match self.symbol_cache.entry(path.to_path_buf()) {
+        match self.symbol_cache.entry(key.clone()) {
             Entry::Occupied(entry) if entry.get().generation == generation => {
                 Some(entry.remove())
             }
@@ -1951,12 +1979,12 @@ impl GlobalBzlCache {
     /// tracked analysis retain legacy cache behavior.
     fn with_admitted_entry<R>(
         &self,
-        path: &Path,
+        key: &ModuleCacheKey,
         mut use_entry: impl FnMut(&mut CacheEntry) -> R,
     ) -> Option<R> {
         loop {
             let (generation, admission) = {
-                let entry = self.symbol_cache.get(path)?;
+                let entry = self.symbol_cache.get(key)?;
                 (entry.generation, Arc::clone(&entry.admission))
             };
             let mut admission_guard = admission
@@ -2001,7 +2029,7 @@ impl GlobalBzlCache {
 
             if let Some(reason) = stale_reason {
                 drop(admission_guard);
-                if let Some(removed) = self.remove_generation(path, generation) {
+                if let Some(removed) = self.remove_generation(key, generation) {
                     {
                         let mut metrics = self.metrics.lock().unwrap();
                         metrics.total_size_bytes = metrics
@@ -2010,7 +2038,7 @@ impl GlobalBzlCache {
                     }
                     debug_log!(
                         "[CACHE STALE] {} ({}), reloading",
-                        path.display(),
+                        key.path.display(),
                         reason
                     );
                     return None;
@@ -2021,7 +2049,7 @@ impl GlobalBzlCache {
                 continue;
             }
 
-            let Some(mut entry) = self.symbol_cache.get_mut(path) else {
+            let Some(mut entry) = self.symbol_cache.get_mut(key) else {
                 return None;
             };
             if entry.generation != generation {
@@ -2057,7 +2085,12 @@ impl GlobalBzlCache {
     /// Get symbols from the cache (lock-free concurrent reads with DashMap).
     #[allow(dead_code)]
     fn get_symbols(&self, path: &Path) -> Option<HashMap<String, Value>> {
-        if let Some(symbols) = self.with_admitted_entry(path, |entry| {
+        self.get_symbols_key(&ModuleCacheKey::unqualified(path))
+    }
+
+    fn get_symbols_key(&self, key: &ModuleCacheKey) -> Option<HashMap<String, Value>> {
+        let path = &key.path;
+        if let Some(symbols) = self.with_admitted_entry(key, |entry| {
             entry.access_count = entry.access_count.saturating_add(1);
 
             {
@@ -2091,12 +2124,17 @@ impl GlobalBzlCache {
     }
 
     /// Get only the requested symbols from cache without cloning the full map.
-    fn get_symbols_subset(
+    fn get_symbols_subset(&self, path: &Path, requested: &[(String, String)]) -> Option<HashMap<String, Value>> {
+        self.get_symbols_subset_key(&ModuleCacheKey::unqualified(path), requested)
+    }
+
+    fn get_symbols_subset_key(
         &self,
-        path: &Path,
+        key: &ModuleCacheKey,
         requested: &[(String, String)],
     ) -> Option<HashMap<String, Value>> {
-        if let Some(symbols) = self.with_admitted_entry(path, |entry| {
+        let path = &key.path;
+        if let Some(symbols) = self.with_admitted_entry(key, |entry| {
             entry.access_count = entry.access_count.saturating_add(1);
 
             {
@@ -2108,7 +2146,7 @@ impl GlobalBzlCache {
                 per.hits += 1;
             }
 
-            let path_display = path.display().to_string();
+            let path_display = key.label.clone().unwrap_or_else(|| path.display().to_string());
             cached_symbols_with_fallback(&entry.symbols, &path_display, requested)
         }) {
             symbols
@@ -2119,13 +2157,18 @@ impl GlobalBzlCache {
     }
 
     /// Get requested symbols without hit/miss accounting.
-    fn get_symbols_subset_no_stats(
+    fn get_symbols_subset_no_stats(&self, path: &Path, requested: &[(String, String)]) -> Option<HashMap<String, Value>> {
+        self.get_symbols_subset_no_stats_key(&ModuleCacheKey::unqualified(path), requested)
+    }
+
+    fn get_symbols_subset_no_stats_key(
         &self,
-        path: &Path,
+        key: &ModuleCacheKey,
         requested: &[(String, String)],
     ) -> Option<HashMap<String, Value>> {
-        self.with_admitted_entry(path, |entry| {
-            let path_display = path.display().to_string();
+        let path = &key.path;
+        self.with_admitted_entry(key, |entry| {
+            let path_display = key.label.clone().unwrap_or_else(|| path.display().to_string());
             cached_symbols_with_fallback(&entry.symbols, &path_display, requested)
         })
         .flatten()
@@ -2177,8 +2220,12 @@ impl GlobalBzlCache {
     /// separate from [`Self::put_symbols`]. The generation token prevents a slow
     /// finalizer from attaching an old manifest to a concurrent replacement.
     fn set_dep_set(&self, path: &Path, generation: u64, dep_set: Vec<Dependency>) {
+        self.set_dep_set_key(&ModuleCacheKey::unqualified(path), generation, dep_set);
+    }
+
+    fn set_dep_set_key(&self, key: &ModuleCacheKey, generation: u64, dep_set: Vec<Dependency>) {
         let admission = {
-            let entry = match self.symbol_cache.get(path) {
+            let entry = match self.symbol_cache.get(key) {
                 Some(entry) if entry.generation == generation => entry,
                 _ => return,
             };
@@ -2189,7 +2236,7 @@ impl GlobalBzlCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Follow the same admission -> DashMap lock order as cache lookup. Holding
         // this short-lived guard pins the checked generation through the update.
-        let entry = match self.symbol_cache.get(path) {
+        let entry = match self.symbol_cache.get(key) {
             Some(entry) if entry.generation == generation => entry,
             _ => return,
         };
@@ -2213,6 +2260,21 @@ impl GlobalBzlCache {
         symbols: HashMap<String, Value>,
         canonical_label: Option<String>,
     ) -> Option<u64> {
+        self.put_symbols_key(ModuleCacheKey::unqualified(&path), symbols, canonical_label)
+    }
+
+    fn put_symbols_key(
+        &self,
+        key: ModuleCacheKey,
+        symbols: HashMap<String, Value>,
+        canonical_label: Option<String>,
+    ) -> Option<u64> {
+        let path = key.path.clone();
+        let canonical_label = if key.context.is_some() {
+            Some(key.inflight_key())
+        } else {
+            canonical_label
+        };
         // Phase 5.C.4 commit 118 / 120: detect
         // repeat-miss reload and optionally reuse a
         // prior estimate_symbols_size result.
@@ -2374,7 +2436,7 @@ impl GlobalBzlCache {
         // Insert into DashMap (lock-free for different keys!)
         let replaced_size = self
             .symbol_cache
-            .insert(path.clone(), entry)
+            .insert(key, entry)
             .map(|replaced| replaced.size_estimate)
             .unwrap_or(0);
 
@@ -3337,7 +3399,7 @@ impl GlobalBzlCache {
             return 0;
         }
 
-        let mut entries: Vec<(PathBuf, usize, usize)> = self
+        let mut entries: Vec<(ModuleCacheKey, usize, usize)> = self
             .symbol_cache
             .iter()
             .map(|r| (r.key().clone(), r.value().access_count, r.value().size_estimate))
@@ -3356,7 +3418,7 @@ impl GlobalBzlCache {
             self.symbol_cache.remove(path);
             freed_bytes += size_estimate;
             evicted += 1;
-            evicted_paths.push(path.clone());
+            evicted_paths.push(path.path.clone());
         }
 
         if evicted > 0 {
@@ -3401,7 +3463,7 @@ impl GlobalBzlCache {
             return 0;
         }
 
-        let mut entries: Vec<(PathBuf, usize, usize)> = self
+        let mut entries: Vec<(ModuleCacheKey, usize, usize)> = self
             .symbol_cache
             .iter()
             .map(|r| (r.key().clone(), r.value().access_count, r.value().size_estimate))
@@ -3416,7 +3478,7 @@ impl GlobalBzlCache {
             self.symbol_cache.remove(path);
             freed_bytes += size_estimate;
             evicted += 1;
-            evicted_paths.push(path.clone());
+            evicted_paths.push(path.path.clone());
         }
 
         if evicted > 0 {
@@ -4323,14 +4385,14 @@ pub struct BzlLoader {
     /// Local LRU cache of evaluated .bzl symbols (path -> HashMap<symbol, Value>)
     /// Only used when global_cache is None
     /// Limited to 50 entries (was 1000, caused massive memory consumption)
-    symbol_cache: LruCache<PathBuf, HashMap<String, Value>>,
+    symbol_cache: LruCache<ModuleCacheKey, HashMap<String, Value>>,
 
     /// Cache of previously scanned load() dependencies keyed by file fingerprint.
     /// Enables incremental dependency graph construction without reparsing unchanged files.
     load_dep_cache: Arc<DashMap<PathBuf, LoadDepCacheEntry>>,
 
     /// Set of .bzl files currently being evaluated (for cycle detection)
-    evaluating_paths: HashSet<PathBuf>,
+    evaluating_paths: HashSet<ModuleCacheKey>,
 
     /// External repository paths (@repo -> path)
     /// Uses DashMap for lock-free concurrent reads during parallel BUILD parsing
@@ -4373,6 +4435,7 @@ pub struct BzlContextFrame {
     pub repo_root: PathBuf,
     pub package_dir: PathBuf,
     pub load_stack: Vec<String>,
+    pub repository: Option<String>,
 }
 
 thread_local! {
@@ -4536,6 +4599,7 @@ impl BzlLoader {
             repo_root,
             package_dir,
             load_stack: Vec::new(),
+            repository: None,
         });
     }
 
@@ -4779,98 +4843,96 @@ impl BzlLoader {
     /// Get symbols from cache (global if available, otherwise local)
     /// DISABLED FOR MEMORY: Returns None to force re-evaluation every time
     /// Trading CPU (re-evaluation) for RAM (no caching = no 900 MB per .bzl file)
-    #[allow(dead_code)]
-    fn get_symbols_cache(&mut self, path: &PathBuf) -> Option<HashMap<String, Value>> {
-        #[cfg(feature = "bzl-debug")]
-        debug_log!("[CACHE LOOKUP] path={}", path.display());
-        let result = if let Some(ref global) = self.global_cache {
-            global.get_symbols(path)
+    fn get_symbols_cache(&mut self, key: &ModuleCacheKey) -> Option<HashMap<String, Value>> {
+        if let Some(ref global) = self.global_cache {
+            global.get_symbols_key(key)
         } else {
-            self.symbol_cache.get(path).cloned()
-        };
-
-        #[cfg(feature = "bzl-debug")]
-        {
-            if result.is_some() {
-                debug_log!("[CACHE HIT] {}", path.display());
-            } else {
-                debug_log!("[CACHE MISS] {}", path.display());
-            }
+            self.symbol_cache.get(key).cloned()
         }
-
-        result
     }
 
+    // Path-only callers cannot prove a module owner. Never admit a qualified
+    // module through this legacy API.
     pub fn get_symbols_cache_subset(
-        &mut self,
-        path: &PathBuf,
-        requested: &[(String, String)],
+        &mut self, path: &PathBuf, requested: &[(String, String)],
+    ) -> Option<HashMap<String, Value>> {
+        self.get_symbols_cache_subset_key(&ModuleCacheKey::unqualified(path), requested)
+    }
+
+    fn get_symbols_cache_subset_key(
+        &mut self, key: &ModuleCacheKey, requested: &[(String, String)],
     ) -> Option<HashMap<String, Value>> {
         if let Some(ref global) = self.global_cache {
-            return global.get_symbols_subset(path, requested);
+            return global.get_symbols_subset_key(key, requested);
         }
-
-        if let Some(symbols) = self.symbol_cache.get(path) {
-            let path_display = path.display().to_string();
-            return cached_symbols_with_fallback(&symbols, &path_display, requested);
-        }
-
-        None
+        self.symbol_cache.get(key).and_then(|symbols| {
+            cached_symbols_with_fallback(symbols, key.label.as_deref().unwrap_or(""), requested)
+        })
     }
 
     pub(crate) fn get_symbols_cache_subset_no_stats(
-        &mut self,
-        path: &PathBuf,
-        requested: &[(String, String)],
+        &mut self, path: &PathBuf, requested: &[(String, String)],
+    ) -> Option<HashMap<String, Value>> {
+        self.get_symbols_cache_subset_key_no_stats(&ModuleCacheKey::unqualified(path), requested)
+    }
+
+    fn get_symbols_cache_subset_key_no_stats(
+        &mut self, key: &ModuleCacheKey, requested: &[(String, String)],
     ) -> Option<HashMap<String, Value>> {
         if let Some(ref global) = self.global_cache {
-            return global.get_symbols_subset_no_stats(path, requested);
+            return global.get_symbols_subset_no_stats_key(key, requested);
         }
-
-        if let Some(symbols) = self.symbol_cache.get(path) {
-            let path_display = path.display().to_string();
-            return cached_symbols_with_fallback(&symbols, &path_display, requested);
-        } else {
-            None
-        }
+        self.symbol_cache.get(key).and_then(|symbols| {
+            cached_symbols_with_fallback(symbols, key.label.as_deref().unwrap_or(""), requested)
+        })
     }
 
-    /// Put symbols into cache (global if available, otherwise local)
+    pub(crate) fn get_symbols_cache_subset_for_label_no_stats(
+        &mut self, path: &PathBuf, label: &str, requested: &[(String, String)],
+    ) -> Result<Option<HashMap<String, Value>>> {
+        let (key, _, _) = self.module_cache_key(label, path)?;
+        Ok(self.get_symbols_cache_subset_key_no_stats(&key, requested))
+    }
+
     fn put_symbols_cache(
-        &mut self,
-        path: PathBuf,
-        symbols: HashMap<String, Value>,
+        &mut self, key: ModuleCacheKey, symbols: HashMap<String, Value>,
     ) -> Option<u64> {
-        #[cfg(feature = "bzl-debug")]
-        debug_log!(
-            "[CACHE STORE] path={}, symbols={}",
-            path.display(),
-            symbols.len()
-        );
+        // Repository discovery can extend maps, roots and aliases during nested loads.
+        // Never publish those exports under the parent's pre-discovery key:
+        // another loader may still have precisely that earlier map snapshot.
+        if key.context.is_some() && (
+            key.mappings != self.repository_mapping_cache_identity()
+                || key.repository_roots != self.repository_root_cache_identity()
+                || key.aliases != self.repository_alias_cache_identity()
+        ) {
+            if let Some(ref global) = self.global_cache {
+                let generation = global.symbol_cache.get(&key).map(|entry| entry.generation);
+                if let Some(removed) = generation.and_then(|generation| global.remove_generation(&key, generation)) {
+                    let mut metrics = global.metrics.lock().unwrap();
+                    metrics.total_size_bytes = metrics.total_size_bytes.saturating_sub(removed.size_estimate);
+                }
+            } else {
+                self.symbol_cache.pop(&key);
+            }
+            return None;
+        }
         if let Some(ref global) = self.global_cache {
-            global.put_symbols_with_generation(path, symbols)
+            global.put_symbols_key(key, symbols, None)
         } else {
-            self.symbol_cache.put(path, symbols);
+            self.symbol_cache.put(key, symbols);
             None
         }
     }
 
-    /// Persistent-daemon Run-wiring (blocker #1): store the tracked dependency set
-    /// for the exact generation just inserted into the global cache. Captured on
-    /// the cold (miss) load path. No-op if the entry was replaced or evicted.
-    fn set_dep_set_cache(&self, path: &Path, generation: u64, dep_set: Vec<Dependency>) {
+    fn set_dep_set_cache(&self, key: &ModuleCacheKey, generation: u64, dep_set: Vec<Dependency>) {
         if let Some(ref global) = self.global_cache {
-            global.set_dep_set(path, generation, dep_set);
+            global.set_dep_set_key(key, generation, dep_set);
         }
     }
 
-    /// Public API to cache symbols (for LazyLoad placeholder caching from evaluator)
+    /// Legacy path-only insertion stays unqualified and cannot satisfy a load.
     pub fn cache_symbols(&mut self, path: PathBuf, symbols: &HashMap<String, Value>) {
-        if let Some(ref global) = self.global_cache {
-            global.put_symbols(path.clone(), symbols.clone());
-        } else {
-            self.symbol_cache.put(path, symbols.clone());
-        }
+        let _ = self.put_symbols_cache(ModuleCacheKey::unqualified(&path), symbols.clone());
     }
 
     /// Evict a fraction of cached symbols (Phase 3: Adaptive behavior).
@@ -5027,20 +5089,6 @@ impl BzlLoader {
         // to attribute parse+eval cost per .bzl file.
         let cold_load_start = std::time::Instant::now();
 
-        // Extract repository name if present
-        let repo_name = if bzl_label.starts_with("@") {
-            // @repo//pkg:file.bzl -> repo; '@@canonical//pkg' (Bzlmod
-            // canonical form) strips both '@'s — '@@//' and '@//' both
-            // yield the empty name (main workspace).
-            bzl_label
-                .split("//")
-                .next()
-                .map(|s| s.trim_start_matches('@').to_string())
-        } else {
-            None
-        };
-        let repo_name_clone = repo_name.clone();
-
         // Persistent-daemon Run-wiring (blocker #1): mark the current command's
         // tracked manifest BEFORE this load so the cold (miss) path can capture
         // exactly this `.bzl`'s full transitive dependency set (own source read +
@@ -5054,32 +5102,36 @@ impl BzlLoader {
         // fast path. This prevents repeated in-flight waiters from being counted
         // as misses just because they arrive before the original evaluation
         // stores the symbols.
-        let bzl_path = {
-            let mut loader = lock_loader_timed(&loader_arc)?;
-            loader.resolve_bzl_path(bzl_label)?
+        let (bzl_path, module_key, repo_root, package_dir) = {
+            let loader = lock_loader_timed(&loader_arc)?;
+            let path = loader.resolve_bzl_path(bzl_label)?;
+            let (key, root, package) = loader.module_cache_key(bzl_label, &path)?;
+            (path, key, root, package)
         };
-        let bzl_path_key = bzl_path.to_string_lossy().to_string();
+        let bzl_path_key = module_key.inflight_key();
+        let module_label = module_key.label.clone().expect("qualified module label");
+        let module_context = module_key.context.clone().expect("qualified module context");
 
         // Phase 1a: cache hit without accounting (fast path).
         {
             let mut loader = lock_loader_timed(&loader_arc)?;
-            if let Some(symbols_map) = loader.get_symbols_cache_subset_no_stats(&bzl_path, symbols) {
+            if let Some(symbols_map) = loader.get_symbols_cache_subset_key_no_stats(&module_key, symbols) {
                 debug_log!("[DEBUG BzlLoader] Cache hit for: {}", bzl_label);
                 return Ok(symbols_map);
             }
 
             // If this file is being evaluated by another loader right now,
             // wait for the result instead of double-loading it.
-            if loader.evaluating_paths.contains(&bzl_path)
-                || IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key)
-                || IN_FLIGHT_BZL_LOADS.contains_key(bzl_label)
+            if loader.evaluating_paths.contains(&module_key)
+                || (IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key) || BZL_LOADING_SET.contains(&bzl_path_key))
+                || IN_FLIGHT_BZL_LOADS.contains_key(&bzl_path_key)
             {
                 // Recursive loads run synchronously on the evaluator thread. Waiting
                 // for that same thread can never make progress; the old polling path
                 // discovered this after five seconds and returned these same stubs.
-                if inflight_owned_by_current_thread(bzl_label) {
-                    let stubs = make_stub_exports(bzl_label, symbols);
-                    let _ = loader.put_symbols_cache(bzl_path.clone(), stubs.clone());
+                if inflight_owned_by_current_thread(&bzl_path_key) {
+                    let stubs = make_stub_exports(&module_label, symbols);
+                    let _ = loader.put_symbols_cache(module_key.clone(), stubs.clone());
                     return Ok(stubs);
                 }
 
@@ -5092,7 +5144,7 @@ impl BzlLoader {
                     let mut loader = lock_loader_timed(&loader_arc)?;
 
                     if let Some(cached_symbols) =
-                        loader.get_symbols_cache_subset_no_stats(&bzl_path, symbols)
+                        loader.get_symbols_cache_subset_key_no_stats(&module_key, symbols)
                     {
                         if let Some(ref g) = loader.global_cache {
                             g.record_concurrent_eval_wait(concurrent_wait_start.elapsed());
@@ -5100,9 +5152,9 @@ impl BzlLoader {
                         return Ok(cached_symbols);
                     }
 
-                    if !loader.evaluating_paths.contains(&bzl_path)
-                        && !IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key)
-                        && !IN_FLIGHT_BZL_LOADS.contains_key(bzl_label)
+                    if !loader.evaluating_paths.contains(&module_key)
+                        && !(IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key) || BZL_LOADING_SET.contains(&bzl_path_key))
+                        && !IN_FLIGHT_BZL_LOADS.contains_key(&bzl_path_key)
                     {
                         if let Some(ref g) = loader.global_cache {
                             g.record_concurrent_eval_wait(concurrent_wait_start.elapsed());
@@ -5118,7 +5170,7 @@ impl BzlLoader {
                         );
                         log_wait_diagnostics(bzl_label, (attempt / 10) as u64, 60);
                         if let Some((owning_thread, summary)) =
-                            detect_single_thread_deadlock(bzl_label)
+                            detect_single_thread_deadlock(&bzl_path_key)
                         {
                             eprintln!(
                                 "🚫 Deadlock detected while waiting for {} on worker {:?}:\n      {}",
@@ -5132,10 +5184,10 @@ impl BzlLoader {
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             );
-                            let stubs = make_stub_exports(bzl_label, symbols);
+                            let stubs = make_stub_exports(&module_label, symbols);
                             {
                                 let mut loader = lock_loader_timed(&loader_arc)?;
-                                let _ = loader.put_symbols_cache(bzl_path.clone(), stubs.clone());
+                                let _ = loader.put_symbols_cache(module_key.clone(), stubs.clone());
                             }
                             return Ok(stubs);
                         }
@@ -5143,9 +5195,9 @@ impl BzlLoader {
                 }
 
                 let mut loader = lock_loader_timed(&loader_arc)?;
-                if IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key)
-                    || IN_FLIGHT_BZL_LOADS.contains_key(bzl_label)
-                    || loader.evaluating_paths.contains(&bzl_path)
+                if (IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key) || BZL_LOADING_SET.contains(&bzl_path_key))
+                    || IN_FLIGHT_BZL_LOADS.contains_key(&bzl_path_key)
+                    || loader.evaluating_paths.contains(&module_key)
                 {
                     if let Some(ref g) = loader.global_cache {
                         g.record_concurrent_eval_wait(concurrent_wait_start.elapsed());
@@ -5164,9 +5216,9 @@ impl BzlLoader {
         // Phase 1b: cache lookup with accounting (used for canonical cache misses/hits)
         let (cached_symbols, cached_file_empty) = {
             let mut loader = lock_loader_timed(&loader_arc)?;
-            let cached_full = loader.get_symbols_cache(&bzl_path);
+            let cached_full = loader.get_symbols_cache(&module_key);
             let cached_symbols = cached_full.as_ref().and_then(|all| {
-                let bzl_label_display = bzl_path.display().to_string();
+                let bzl_label_display = module_label.clone();
                 cached_symbols_with_fallback(all, &bzl_label_display, symbols)
             });
             let cached_file_empty = cached_full.as_ref().is_some_and(|entries| entries.is_empty());
@@ -5198,15 +5250,13 @@ impl BzlLoader {
         let mut _loading_guards: Option<LoadingGuards> = None;
 
         // Don't add to loading set if already being loaded (circular dependency!)
-        if IN_FLIGHT_BZL_LOADS.contains_key(bzl_label) {
-            // File is already in-flight, will be detected by circular dependency check below
-        } else {
-            _loading_guards = Some(LoadingGuards::new(bzl_label, &bzl_path_key));
+        if BZL_LOADING_SET.insert(bzl_path_key.clone()) {
+            _loading_guards = Some(LoadingGuards::new(&bzl_path_key, &bzl_path_key));
         }
 
         // PHASE 2: Check for circular dependency AFTER adding to IN_FLIGHT
         // Now detect_inflight_cycle() can see this file in IN_FLIGHT
-        if let Some(cycle_path) = detect_inflight_cycle(bzl_label) {
+        if let Some(cycle_path) = _loading_guards.is_none().then(|| detect_inflight_cycle(&bzl_path_key)).flatten() {
             eprintln!(
                 "🔄 LOADER: Circular dependency detected for {}\n   Cycle: {}",
                 bzl_label, cycle_path
@@ -5220,7 +5270,7 @@ impl BzlLoader {
                     (
                         local_name.clone(),
                         Value::LazyLoad {
-                            bzl_label: bzl_label.to_string(),
+                            bzl_label: module_label.clone(),
                             symbol_name: original_name.clone(),
                         },
                     )
@@ -5238,13 +5288,13 @@ impl BzlLoader {
                         (
                             original_name.clone(),
                             Value::LazyLoad {
-                                bzl_label: bzl_label.to_string(),
+                                bzl_label: module_label.clone(),
                                 symbol_name: original_name.clone(),
                             },
                         )
                     })
                     .collect();
-                let _ = loader.put_symbols_cache(bzl_path.clone(), cache_map);
+                let _ = loader.put_symbols_cache(module_key.clone(), cache_map);
                 eprintln!("   ↪ Cached LazyLoad placeholders for {}", bzl_label);
             }
 
@@ -5254,7 +5304,7 @@ impl BzlLoader {
         // PHASE 3: File not cached, not circular - proceed with loading
 
         // FAST PATH: If file already failed/timed out, don't wait again
-        if BZL_FAILED_SET.contains(bzl_label) {
+        if BZL_FAILED_SET.contains(&bzl_path_key) {
             eprintln!(
                 "❌ SKIP: {} already failed/timed out in another thread, failing immediately",
                 bzl_label
@@ -5266,7 +5316,7 @@ impl BzlLoader {
             ));
         }
 
-        if let Some(cycle_path) = detect_local_cycle_path(bzl_label) {
+        if let Some(cycle_path) = detect_local_cycle_path(&bzl_path_key) {
             eprintln!(
                 "🔄 LOCAL CIRCULAR DEPENDENCY detected while loading {}.\n   Cycle: {}",
                 bzl_label, cycle_path
@@ -5281,7 +5331,7 @@ impl BzlLoader {
                     (
                         original_name.clone(),
                         Value::LazyLoad {
-                            bzl_label: bzl_label.to_string(),
+                            bzl_label: module_label.clone(),
                             symbol_name: original_name.clone(),
                         },
                     )
@@ -5302,9 +5352,8 @@ impl BzlLoader {
             eprintln!("   ↪ Caching LazyLoad placeholders to prevent repeated cycles");
             let bzl_path = {
                 let mut loader = lock_loader_timed(&loader_arc)?;
-                let path = loader.resolve_bzl_path(bzl_label)?;
-                let _ = loader.put_symbols_cache(path.clone(), lazy_loads.clone());
-                path
+                let _ = loader.put_symbols_cache(module_key.clone(), lazy_loads.clone());
+                bzl_path.clone()
             };
 
             // Extract requested symbols with local names
@@ -5365,10 +5414,10 @@ impl BzlLoader {
         if _loading_guards.is_none() {
             // Phase 1 normally catches this case. Keep the same guard here for
             // ownership races between the initial probe and loading-guard setup.
-            if inflight_owned_by_current_thread(bzl_label) {
-                let stubs = make_stub_exports(bzl_label, symbols);
+            if inflight_owned_by_current_thread(&bzl_path_key) {
+                let stubs = make_stub_exports(&module_label, symbols);
                 let mut loader = lock_loader_timed(&loader_arc)?;
-                let _ = loader.put_symbols_cache(bzl_path.clone(), stubs.clone());
+                let _ = loader.put_symbols_cache(module_key.clone(), stubs.clone());
                 return Ok(stubs);
             }
 
@@ -5378,9 +5427,9 @@ impl BzlLoader {
             // ownership is claimed before evaluation starts.
             let is_being_evaluated = {
                 let loader = lock_loader_timed(&loader_arc)?;
-                loader.evaluating_paths.contains(&bzl_path)
-                    || IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key)
-                    || IN_FLIGHT_BZL_LOADS.contains_key(bzl_label)
+                loader.evaluating_paths.contains(&module_key)
+                    || (IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key) || BZL_LOADING_SET.contains(&bzl_path_key))
+                    || IN_FLIGHT_BZL_LOADS.contains_key(&bzl_path_key)
             }; // Lock released here
 
             if is_being_evaluated {
@@ -5405,10 +5454,10 @@ impl BzlLoader {
 
                     // Check if result was cached
                     let maybe_cached_symbols =
-                        loader.get_symbols_cache_subset_no_stats(&bzl_path, symbols);
+                        loader.get_symbols_cache_subset_key_no_stats(&module_key, symbols);
                     if let Some(cached_symbols) = maybe_cached_symbols {
                         let cached_symbols = loader
-                            .get_symbols_cache_subset(&bzl_path, symbols)
+                            .get_symbols_cache_subset_key(&module_key, symbols)
                             .unwrap_or(cached_symbols);
                         debug_log!("[DEBUG BzlLoader] Concurrent evaluation cached after {}s, returning: {}", attempt / 10, bzl_label);
                         // commit 133: record wait
@@ -5423,9 +5472,9 @@ impl BzlLoader {
 
                     // Check if it's no longer being evaluated or in-flight (failed or
                     // completed without cache).
-                    if !loader.evaluating_paths.contains(&bzl_path)
-                        && !IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key)
-                        && !IN_FLIGHT_BZL_LOADS.contains_key(bzl_label)
+                    if !loader.evaluating_paths.contains(&module_key)
+                        && !(IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key) || BZL_LOADING_SET.contains(&bzl_path_key))
+                        && !IN_FLIGHT_BZL_LOADS.contains_key(&bzl_path_key)
                     {
                         debug_log!("[DEBUG BzlLoader] File no longer being evaluated (likely failed), will retry: {}", bzl_label);
                         // commit 133: record wait
@@ -5447,7 +5496,7 @@ impl BzlLoader {
                         );
                         log_wait_diagnostics(bzl_label, (attempt / 10) as u64, 60);
                         if let Some((owning_thread, summary)) =
-                            detect_single_thread_deadlock(bzl_label)
+                            detect_single_thread_deadlock(&bzl_path_key)
                         {
                             eprintln!(
                                 "🚫 Deadlock detected while waiting for {} on worker {:?}:\n      {}",
@@ -5461,10 +5510,10 @@ impl BzlLoader {
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             );
-                            let stubs = make_stub_exports(bzl_label, symbols);
+                            let stubs = make_stub_exports(&module_label, symbols);
                             {
                                 let mut loader = lock_loader_timed(&loader_arc)?;
-                                let _ = loader.put_symbols_cache(bzl_path.clone(), stubs.clone());
+                                let _ = loader.put_symbols_cache(module_key.clone(), stubs.clone());
                             }
                             return Ok(stubs);
                         }
@@ -5484,9 +5533,9 @@ impl BzlLoader {
                 }
 
                 // If still being evaluated after 60s, it's a deadlock
-                if loader.evaluating_paths.contains(&bzl_path)
-                    || IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key)
-                    || IN_FLIGHT_BZL_LOADS.contains_key(bzl_label)
+                if loader.evaluating_paths.contains(&module_key)
+                    || (IN_FLIGHT_BZL_PATHS.contains(&bzl_path_key) || BZL_LOADING_SET.contains(&bzl_path_key))
+                    || IN_FLIGHT_BZL_LOADS.contains_key(&bzl_path_key)
                 {
                     debug_log!(
                         "[ERROR BzlLoader] Timeout waiting for concurrent evaluation (60s): {}",
@@ -5509,13 +5558,13 @@ impl BzlLoader {
         // Mark file as being evaluated (acquire lock, mark, release)
         {
             let mut loader = lock_loader_timed(&loader_arc)?;
-            loader.evaluating_paths.insert(bzl_path.clone());
+            loader.evaluating_paths.insert(module_key.clone());
         } // Lock released here
 
         // RAII guard to ensure evaluating_paths cleanup on ANY exit (success/error/panic)
         struct EvaluatingGuard {
             loader: Arc<Mutex<BzlLoader>>,
-            path: PathBuf,
+            path: ModuleCacheKey,
         }
         impl Drop for EvaluatingGuard {
             fn drop(&mut self) {
@@ -5530,7 +5579,7 @@ impl BzlLoader {
         }
         let _evaluating_guard = EvaluatingGuard {
             loader: Arc::clone(&loader_arc),
-            path: bzl_path.clone(),
+            path: module_key.clone(),
         };
 
         // Phase 5.C.4 commit 104 + 105: push thread-
@@ -5588,91 +5637,11 @@ impl BzlLoader {
         // at end of scope (post-eval / post-cache-insert).
         let _live_program_guard = track_live_program(&program, source_bytes);
 
-        // Phase 2.5: Compute repo/package context for this .bzl and push a thread-local frame
-        let (package_dir, repo_root, current_repository) = {
-            let loader = lock_loader_timed(&loader_arc)?;
-
-            let file_parent = bzl_path
-                .parent()
-                .ok_or_else(|| {
-                    anyhow!("No parent directory for .bzl file: {}", bzl_path.display())
-                })?
-                .to_path_buf();
-
-            // Determine repo by matching path against known external roots
-            let mut current_repository = repo_name.clone();
-            let repo_root = {
-                let mut root = loader.workspace_root.clone();
-                for entry in loader.external_repos.iter() {
-                    // Bazel's output-base entries are commonly symlinks into
-                    // its content-addressed repository cache, while bzl_path
-                    // has already been canonicalized. Compare canonical roots
-                    // so nested relative loads retain their repository.
-                    let path = std::fs::canonicalize(entry.value())
-                        .unwrap_or_else(|_| entry.value().clone());
-                    if bzl_path.starts_with(&path) {
-                        root = path;
-                        current_repository = Some(entry.key().clone());
-                        debug_log!(
-                            "[DEBUG BzlLoader] Detected .bzl file {} in external repo {}: {}",
-                            bzl_path.display(),
-                            entry.key(),
-                            root.display()
-                        );
-                        break;
-                    }
-                }
-                root
-            };
-
-            // package_dir is the Bazel PACKAGE boundary — the nearest ancestor
-            // containing a BUILD/BUILD.bazel — NOT merely the .bzl file's parent
-            // dir. This matters for a .bzl addressed as //pkg:subdir/file.bzl
-            // (e.g. protobuf's upb upb/bazel/private:upb_proto_library_internal/
-            // aspect.bzl): its package is `pkg`, so a relative `:x.bzl` load
-            // resolves against pkg, not pkg/subdir. Using the file's parent dir
-            // doubled the subdir and mis-resolved the load. For the common case
-            // (file directly in its package) the parent IS the package, so this
-            // is a no-op. Gated under RUSH_ENABLE_BZLMOD to keep the certified
-            // path byte-identical.
-            let package_dir = if rush_incremental::tracked::getenv_str("RUSH_ENABLE_BZLMOD")
-                .as_deref()
-                == Some("1")
-            {
-                let mut cur = file_parent.clone();
-                loop {
-                    if cur.join("BUILD.bazel").is_file() || cur.join("BUILD").is_file() {
-                        break cur;
-                    }
-                    if cur == repo_root {
-                        break file_parent.clone();
-                    }
-                    match cur.parent() {
-                        Some(p) if p.starts_with(&repo_root) => cur = p.to_path_buf(),
-                        _ => break file_parent.clone(),
-                    }
-                }
-            } else {
-                file_parent.clone()
-            };
-
-            (package_dir, repo_root, current_repository)
-        }; // Lock released here
-
-        debug_log!(
-            "[DEBUG BzlLoader] Set current_package to: {}, repo_root: {}, repository: {:?}",
-            package_dir.display(),
-            repo_root.display(),
-            current_repository
-        );
-        BzlLoader::push_thread_context(repo_root.clone(), package_dir.clone());
-        struct CtxGuard;
-        impl Drop for CtxGuard {
-            fn drop(&mut self) {
-                BzlLoader::pop_thread_context();
-            }
-        }
-        let _ctx_guard = CtxGuard;
+        // Install the requested logical owner, even when roots share bytes.
+        let frame = BzlContextFrame {
+            repo_root, package_dir, repository: Some(module_context.repository.clone().unwrap_or_default()),
+            load_stack: current_stack_snapshot(),
+        };
 
         // Phase 2.75: Acquire resources before evaluation (OOM prevention)
         // Each .bzl file evaluation requires 512MB to prevent memory exhaustion
@@ -5703,7 +5672,8 @@ impl BzlLoader {
         // (includes time spent in transitive child .bzl
         // loads triggered from Starlark `load()`).
         let subphase_eval_start = std::time::Instant::now();
-        let repo_name_clone = current_repository.clone();
+        let context_clone = module_context.clone();
+        let frame_clone = frame.clone();
         let eval_result = if tokio::runtime::Handle::try_current().is_ok() {
             // We're in a tokio context (likely from parallel scheduler)
             // Call evaluate_bzl_static directly to avoid nested runtime deadlock
@@ -5713,7 +5683,8 @@ impl BzlLoader {
             Self::evaluate_bzl_static(
                 &program,
                 Some(loader_arc.clone()),
-                current_repository.clone(),
+                module_context.clone(),
+                frame.clone(),
             )
         } else {
             // Not in tokio context, use timeout thread with runtime creation
@@ -5763,7 +5734,8 @@ impl BzlLoader {
                         Self::evaluate_bzl_static(
                             &program_clone,
                             Some(loader_clone),
-                            repo_name_clone,
+                            context_clone,
+                            frame_clone,
                         )
                     }
                     Err(e) => {
@@ -5771,7 +5743,8 @@ impl BzlLoader {
                         Self::evaluate_bzl_static(
                             &program_clone,
                             Some(loader_clone),
-                            repo_name_clone,
+                            context_clone,
+                            frame_clone,
                         )
                     }
                 };
@@ -5921,7 +5894,7 @@ impl BzlLoader {
         };
             // MOVE — no clone. The original symbols_map
             // is consumed here.
-            let inserted_generation = loader.put_symbols_cache(bzl_path, symbols_map);
+            let inserted_generation = loader.put_symbols_cache(module_key.clone(), symbols_map);
             // Persistent-daemon Run-wiring (blocker #1): capture this `.bzl`'s
             // FULL TRANSITIVE tracked dependency set (everything recorded since
             // `dep_mark` at function entry — its own source read plus every nested
@@ -5930,7 +5903,7 @@ impl BzlLoader {
             // scope (`dep_mark` is None) or when nothing was recorded.
             if let (Some(mark), Some(generation)) = (dep_mark, inserted_generation) {
                 let captured = rush_incremental::tracked::captured_since(mark);
-                loader.set_dep_set_cache(&bzl_path_for_timing, generation, captured);
+                loader.set_dep_set_cache(&module_key, generation, captured);
             }
         } // Lock released here
         let subphase_put_symbols_cache_dur =
@@ -6483,7 +6456,8 @@ impl BzlLoader {
         owner_repo_root: &Path,
     ) -> HashMap<String, String> {
         let owner = if owner_repository.is_none() && owner_repo_root == self.workspace_root {
-            Some(String::new())
+            Some(if self.repo_mappings.contains_key("") { String::new() }
+                else { self.main_workspace_name().unwrap_or_default() })
         } else {
             owner_repository
                 .map(str::to_owned)
@@ -6511,11 +6485,13 @@ impl BzlLoader {
     /// Try to map an apparent repo name to canonical based on current context
     fn map_repo_for_current_context(&self, apparent: &str) -> Option<String> {
         let ctx = self.current_thread_context()?;
-        let current_repo_name = self
-            .repo_name_for_root(&ctx.repo_root)
-            .or_else(|| self.main_workspace_name.clone())?;
-        let repo_map = self.repo_mappings.get(&current_repo_name)?;
-        repo_map.get(apparent).cloned()
+        let current_repo_name = ctx.repository.clone()
+            .or_else(|| self.current_repo_name.clone())
+            .or_else(|| (ctx.repo_root != self.workspace_root).then(|| self.repo_name_for_root(&ctx.repo_root)).flatten())
+            .unwrap_or_default();
+        self.repository_mapping_for_owner(
+            (!current_repo_name.is_empty()).then_some(current_repo_name.as_str()), &ctx.repo_root,
+        ).get(apparent).cloned()
     }
 
     /// Is `name` this workspace's own declared name (`workspace(name = ...)`)?
@@ -6526,6 +6502,189 @@ impl BzlLoader {
     /// had not run, a self-referential label went unresolved.
     fn is_main_workspace_name(&self, name: &str) -> bool {
         self.main_workspace_name().as_deref() == Some(name)
+    }
+
+    pub(crate) fn definition_label_context_for_owner(
+        &self,
+        repository: Option<&str>,
+        package: &str,
+    ) -> Result<DefinitionLabelContext> {
+        let repository = repository.map(|name| name.trim_start_matches('@'))
+            .filter(|name| !name.is_empty());
+        let root = match repository {
+            Some(owner) => self.external_repos.get(owner).map(|entry| entry.value().clone())
+                .ok_or_else(|| anyhow!("Unknown repository owner {:?} for Label()", owner))?,
+            None => self.workspace_root.clone(),
+        };
+        let mapping_is_complete = self.workspace_root.join("MODULE.bazel").is_file()
+            && !self.workspace_root.join("WORKSPACE").exists()
+            && !self.workspace_root.join("WORKSPACE.bazel").exists();
+        let mut mapping: std::collections::BTreeMap<String, String> =
+            self.repository_mapping_for_owner(repository, &root).into_iter().collect();
+        if mapping_is_complete {
+            mapping = self.module_repository_mapping(repository.unwrap_or(""), &root)?;
+        } else if let Some(name) = self.main_workspace_name() {
+            mapping.entry(name).or_default();
+        }
+        Ok(DefinitionLabelContext {
+            repository: repository.map(str::to_owned),
+            package: package.to_string(),
+            repository_mapping: mapping,
+            mapping_is_complete,
+        })
+    }
+
+    fn repository_mapping_cache_identity(&self) -> Vec<(String, Vec<(String, String)>)> {
+        let mut mappings: Vec<_> = self.repo_mappings.iter().map(|entry| {
+            let mut mapping: Vec<_> = entry.value().iter()
+                .map(|(apparent, canonical)| (apparent.clone(), canonical.clone())).collect();
+            mapping.sort();
+            (entry.key().clone(), mapping)
+        }).collect();
+        mappings.sort();
+        mappings
+    }
+
+    fn repository_root_cache_identity(&self) -> Vec<(String, PathBuf, PathBuf)> {
+        let registered: Vec<_> = self.external_repos.iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone())).collect();
+        let mut roots: Vec<_> = registered.into_iter().map(|(owner, root)| {
+            // Keep logical registration and physical ownership distinct. A
+            // symlink may be repointed without changing the registered path.
+            let physical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            (owner, root, physical)
+        }).collect();
+        roots.sort();
+        roots
+    }
+
+    fn repository_alias_cache_identity(&self) -> Vec<(String, String)> {
+        let mut aliases: Vec<_> = self.repo_aliases.iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone())).collect();
+        aliases.sort();
+        aliases
+    }
+
+    fn module_repository_mapping(
+        &self, owner: &str, root: &Path,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let cache_root = tracked_command_environment("RUSH_WORKSPACE_CACHE_ROOT")?
+            .map(PathBuf::from).unwrap_or_else(|| self.workspace_root.join(".cache/rush"));
+        let binary = resolve_bazel_binary_for_fetch(&self.workspace_root)?;
+        for input in [self.workspace_root.join("MODULE.bazel"), self.workspace_root.join("MODULE.bazel.lock"), root.join("MODULE.bazel"), root.join("MODULE.bazel.lock")] {
+            track_optional_repository_mapping_input(&input)?;
+        }
+        let args = vec![b"--output_base".to_vec(), path_command_argument(&cache_root.join("bazel_output_base")),
+            b"mod".to_vec(), b"dump_repo_mapping".to_vec(), owner.as_bytes().to_vec()];
+        let output = rush_incremental::tracked::probe_process_stdout(&binary, &args,
+            &bazel_repository_mapping_probe_environment(), &self.workspace_root)?;
+        if output.status != 0 {
+            return Err(anyhow!("Failed to read repository mapping for .bzl owner {:?}: {}", owner, String::from_utf8_lossy(&output.stderr)));
+        }
+        serde_json::from_slice(&output.stdout).context("Invalid .bzl owner repository mapping")
+    }
+
+    /// Resolve the logical module owner before consulting any symbol cache.
+    /// An explicit label wins over reverse path lookup: several repositories
+    /// may intentionally expose the same canonical source directory.
+    fn module_cache_key(&self, label: &str, path: &Path) -> Result<(ModuleCacheKey, PathBuf, PathBuf)> {
+        let mapping_is_complete = self.workspace_root.join("MODULE.bazel").is_file()
+            && !self.workspace_root.join("WORKSPACE").exists()
+            && !self.workspace_root.join("WORKSPACE.bazel").exists();
+        let caller = self.current_thread_context();
+        let caller_owner = caller.as_ref().and_then(|ctx| ctx.repository.clone())
+            .or_else(|| self.current_repo_name.clone())
+            .or_else(|| caller.as_ref().filter(|ctx| ctx.repo_root != self.workspace_root)
+                .and_then(|ctx| self.repo_name_for_root(&ctx.repo_root)));
+        let caller_root = caller.as_ref().map(|ctx| ctx.repo_root.clone())
+            .unwrap_or_else(|| self.current_repo_root.clone());
+        let caller_owner = caller_owner.or_else(|| (caller_root != self.workspace_root)
+            .then(|| self.repo_name_for_root(&caller_root)).flatten());
+        let mut owner = if label.starts_with('@') {
+            let apparent = label.split("//").next().unwrap_or(label).trim_start_matches('@');
+            if label.starts_with("@@") || apparent.is_empty() {
+                Some(apparent.to_string())
+            } else {
+                if mapping_is_complete {
+                    let mapping = self.module_repository_mapping(caller_owner.as_deref().unwrap_or(""), &caller_root)?;
+                    Some(mapping.get(apparent).cloned().ok_or_else(|| anyhow!(
+                        "No apparent repository {:?} in mapping for .bzl caller {:?}", apparent, caller_owner
+                    ))?)
+                } else {
+                    let mapping = self.repository_mapping_for_owner(caller_owner.as_deref(), &caller_root);
+                    Some(mapping.get(apparent).cloned().unwrap_or_else(|| {
+                        if self.is_main_workspace_name(apparent) { String::new() } else { apparent.to_string() }
+                    }))
+                }
+            }
+        } else {
+            caller_owner
+        };
+        if label.starts_with("//") && owner.as_deref().unwrap_or("").is_empty() {
+            let package = label[2..].split(':').next().unwrap_or("");
+            if package.starts_with("third_party/googleapis") {
+                owner = Some("com_google_googleapis".to_string());
+            } else if let Some(alias) = package.split('/').next().and_then(|first| self.repo_aliases.get(first)) {
+                owner = Some(alias.value().clone());
+            }
+        }
+        // Retain the existing legacy split-repository load route.
+        if label.starts_with("@local_xla//tsl/") && self.external_repos.contains_key("local_tsl") {
+            owner = Some("local_tsl".to_string());
+        }
+        let root = match owner.as_deref().filter(|owner| !owner.is_empty()) {
+            Some(owner) => self.external_repos.get(owner).map(|entry| entry.value().clone())
+                .or_else(|| label.strip_prefix('@').filter(|label| !label.starts_with('@'))
+                    .and_then(|label| label.split("//").next())
+                    .and_then(|apparent| self.external_repos.get(apparent).map(|entry| entry.value().clone())))
+                .unwrap_or_else(|| caller_root.clone()),
+            None => self.workspace_root.clone(),
+        };
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let file_parent = path.parent().ok_or_else(|| anyhow!("No parent for .bzl file {}", path.display()))?.to_path_buf();
+        let package_dir = if let Some((_, target)) = label.split_once("//") {
+            target.split_once(':').map(|(package, _)| {
+                let package = if label.starts_with("//third_party/googleapis") {
+                    package.strip_prefix("third_party/googleapis").unwrap_or(package).trim_start_matches('/')
+                } else { package };
+                root.join(package)
+            })
+                .unwrap_or_else(|| file_parent.clone())
+        } else if label.starts_with('@') {
+            root.clone()
+        } else {
+            caller.as_ref().map(|ctx| ctx.package_dir.clone())
+                .or_else(|| self.current_package.clone()).unwrap_or_else(|| file_parent.clone())
+        };
+
+        let owner = owner.filter(|name| !name.is_empty());
+        let mut mapping: std::collections::BTreeMap<String, String> =
+            self.repository_mapping_for_owner(owner.as_deref(), &root).into_iter().collect();
+        if mapping_is_complete {
+            mapping = self.module_repository_mapping(owner.as_deref().unwrap_or(""), &root)?;
+        } else if let Some(name) = self.main_workspace_name() {
+            mapping.entry(name).or_default();
+        }
+        let package = package_dir.strip_prefix(&root).with_context(|| format!("Module {} is outside its repository root", path.display()))?
+            .to_string_lossy().replace('\\', "/");
+        // The source may be an individual symlink outside the logical root.
+        // Derive the load target from its address, never from the physical IO key.
+        let filename = if let Some((_, target)) = label.split_once("//") {
+            target.split_once(':').map(|(_, filename)| filename.to_string())
+                .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        } else if label.starts_with('@') {
+            label.trim_start_matches('@').to_string()
+        } else {
+            label.trim_start_matches(':').to_string()
+        };
+        let label = format!("@@{}//{}:{}", owner.as_deref().unwrap_or(""), package, filename);
+        let context = DefinitionLabelContext { repository: owner, package, repository_mapping: mapping, mapping_is_complete };
+        // A cached re-export may retain closures from another owner. Include
+        // the installed mapping set so changing that owner's map also retires
+        // the parent module's exports, even without a physical source edit.
+        let mappings = self.repository_mapping_cache_identity();
+        Ok((ModuleCacheKey { path: path.to_path_buf(), workspace: self.workspace_root.clone(), context: Some(context), label: Some(label), mappings,
+            repository_roots: self.repository_root_cache_identity(), aliases: self.repository_alias_cache_identity() }, root, package_dir))
     }
 
     /// Reverse lookup: find repo name by its root path
@@ -6568,19 +6727,6 @@ impl BzlLoader {
         // `.bzl`'s full transitive dependency set; a later cache HIT replays it.
         // `None` outside a command scope (capture/replay then no-op).
         let dep_mark = rush_incremental::tracked::mark();
-        // Extract repository name if present
-        let repo_name = if bzl_label.starts_with("@") {
-            // @repo//pkg:file.bzl -> repo; '@@canonical//pkg' (Bzlmod
-            // canonical form) strips both '@'s — '@@//' and '@//' both
-            // yield the empty name (main workspace).
-            bzl_label
-                .split("//")
-                .next()
-                .map(|s| s.trim_start_matches('@').to_string())
-        } else {
-            None
-        };
-
         let normalized_label = Self::normalize_load_label(bzl_label);
         if let Some(cycle_path) = detect_local_cycle_path(&normalized_label) {
             return Err(anyhow!(
@@ -6595,7 +6741,8 @@ impl BzlLoader {
         let mut _loading_guards: Option<LoadingGuards> = None;
 
         let canonical_path = self.resolve_bzl_path(&normalized_label)?;
-        let canonical_key = canonical_path.display().to_string();
+        let (module_key, repo_root, package_dir) = self.module_cache_key(&normalized_label, &canonical_path)?;
+        let canonical_key = module_key.inflight_key();
 
         if !BZL_LOADING_SET.insert(canonical_key.clone()) {
             eprintln!(
@@ -6655,7 +6802,7 @@ impl BzlLoader {
         let bzl_path = canonical_path.clone();
         debug_log!("[DEBUG BzlLoader] Resolved to: {}", bzl_path.display());
 
-        if let Some(cached_symbols) = self.get_symbols_cache_subset(&bzl_path, symbols) {
+        if let Some(cached_symbols) = self.get_symbols_cache_subset_key(&module_key, symbols) {
             debug_log!("[DEBUG BzlLoader] Cache hit for: {}", bzl_label);
             return Ok(cached_symbols);
         }
@@ -6732,7 +6879,9 @@ impl BzlLoader {
         // We pass the loader_arc so nested loads can happen
         // CRITICAL: Pass &program by reference, NO CLONING (ASTs are huge!)
         let subphase_eval_start = std::time::Instant::now();
-        let symbols_map = match Self::evaluate_bzl_static(&program, loader_arc, repo_name) {
+        let symbols_map = match Self::evaluate_bzl_static(&program, loader_arc,
+            module_key.context.clone().expect("qualified module context"),
+            BzlContextFrame { repo_root, package_dir, repository: Some(module_key.context.as_ref().and_then(|ctx| ctx.repository.clone()).unwrap_or_default()), load_stack: current_stack_snapshot() }) {
             Ok(m) => m,
             Err(e) => {
                 let _ = pop_cold_load_frame(cold_load_start.elapsed().as_nanos() as u64);
@@ -6773,14 +6922,14 @@ impl BzlLoader {
         let symbols_count = symbols_map.len() as u64;
         let subphase_finalize_start = std::time::Instant::now();
         let subphase_put_symbols_cache_start = std::time::Instant::now();
-        let inserted_generation = self.put_symbols_cache(bzl_path.clone(), symbols_map);
+        let inserted_generation = self.put_symbols_cache(module_key.clone(), symbols_map);
         // Persistent-daemon Run-wiring (blocker #1): capture this `.bzl`'s full
         // transitive tracked dependency set (everything recorded since entry) and
         // store it on the just-inserted cache entry so a cross-command HIT replays
         // it. No-op outside a command scope or when nothing was recorded.
         if let (Some(mark), Some(generation)) = (dep_mark, inserted_generation) {
             let captured = rush_incremental::tracked::captured_since(mark);
-            self.set_dep_set_cache(&bzl_path, generation, captured);
+            self.set_dep_set_cache(&module_key, generation, captured);
         }
         let subphase_put_symbols_cache_dur =
             subphase_put_symbols_cache_start.elapsed();
@@ -6843,10 +6992,17 @@ impl BzlLoader {
     fn evaluate_bzl_static(
         program: &Program,
         loader_arc: Option<std::sync::Arc<std::sync::Mutex<BzlLoader>>>,
-        current_repository: Option<String>,
+        context: DefinitionLabelContext,
+        frame: BzlContextFrame,
     ) -> Result<HashMap<String, Value>> {
+        Self::push_thread_context_frame(frame);
+        struct ContextGuard;
+        impl Drop for ContextGuard {
+            fn drop(&mut self) { BzlLoader::pop_thread_context(); }
+        }
+        let _context_guard = ContextGuard;
         let mut evaluator = Evaluator::new();
-        evaluator.set_current_repository(current_repository);
+        evaluator.set_current_repository(context.repository.clone());
 
         // Register native namespace for macros (native.cc_library, etc.)
         evaluator.register_native_namespace();
@@ -6855,6 +7011,7 @@ impl BzlLoader {
         if let Some(loader) = loader_arc {
             evaluator.set_bzl_loader(loader);
         }
+        evaluator.set_definition_label_context(context);
 
         // Evaluate the program
         evaluator
@@ -9864,7 +10021,7 @@ mod tests {
         assert!(!cached.contains_key("old"));
         let fresh_size = cache
             .symbol_cache
-            .get(&path)
+            .get(&ModuleCacheKey::unqualified(&path))
             .expect("fresh cache generation")
             .size_estimate;
         assert_eq!(cache.estimated_memory_bytes(), fresh_size);
@@ -9899,7 +10056,7 @@ mod tests {
         let admission = {
             let entry = cache
                 .symbol_cache
-                .get(&canonical)
+                .get(&loader.module_cache_key("//:defs.bzl", &canonical).expect("module key").0)
                 .expect("cached direct .bzl value");
             Arc::clone(&entry.admission)
         };

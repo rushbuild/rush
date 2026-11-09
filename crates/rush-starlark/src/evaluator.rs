@@ -3,7 +3,7 @@ use crate::builtins::{get_builtins, starlark_repr, starlark_type_name, BuiltinFn
 use crate::lexer::Lexer;
 use crate::platform::PlatformConfig;
 use crate::token::TokenType;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::stream::{self, StreamExt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -981,6 +981,15 @@ impl ValueCensus {
             return; // shared module env already counted
         }
         self.unique_closure_envs += 1;
+        if let Some(context) = &env.definition_label_context {
+            if seen_envs.insert(Arc::as_ptr(context) as usize) {
+                self.string_bytes += context.repository.as_ref().map_or(0, String::len)
+                    + context.package.len()
+                    + context.repository_mapping.iter()
+                        .map(|(apparent, canonical)| apparent.len() + canonical.len())
+                        .sum::<usize>();
+            }
+        }
         // Hold the read guard during recursion: distinct envs have distinct
         // locks, and the seen_envs short-circuit fires before any re-lock of
         // this same env, so there is no deadlock.
@@ -1003,6 +1012,16 @@ pub struct Environment {
     // (e.g., _with_or at line 17 calling _with_or_dict defined at line 54)
     vars: Arc<std::sync::RwLock<HashMap<String, Value>>>,
     parent: Option<Arc<Environment>>,
+    definition_label_context: Option<Arc<DefinitionLabelContext>>,
+}
+
+/// Retain the module namespace used by Label() inside a Starlark closure.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DefinitionLabelContext {
+    pub repository: Option<String>,
+    pub package: String,
+    pub repository_mapping: std::collections::BTreeMap<String, String>,
+    pub mapping_is_complete: bool,
 }
 
 impl Environment {
@@ -1010,12 +1029,14 @@ impl Environment {
         Self {
             vars: Arc::new(std::sync::RwLock::new(HashMap::new())),
             parent: None,
+            definition_label_context: None,
         }
     }
 
     pub fn with_parent(parent: Arc<Environment>) -> Self {
         Self {
             vars: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            definition_label_context: parent.definition_label_context.clone(),
             parent: Some(parent),
         }
     }
@@ -1075,6 +1096,16 @@ impl Environment {
 
         // Base size of Environment struct
         let mut size = size_of::<Environment>();
+        if let Some(context) = &self.definition_label_context {
+            if visited.insert(Arc::as_ptr(context) as usize) {
+                size += size_of::<DefinitionLabelContext>()
+                    + context.repository.as_ref().map_or(0, String::capacity)
+                    + context.package.capacity()
+                    + context.repository_mapping.iter()
+                        .map(|(apparent, canonical)| apparent.capacity() + canonical.capacity())
+                        .sum::<usize>();
+            }
+        }
 
         // Size of vars HashMap (behind Arc<RwLock>)
         let vars_guard = self.vars.read().unwrap();
@@ -1106,7 +1137,9 @@ impl Environment {
 impl PartialEq for Environment {
     fn eq(&self, other: &Self) -> bool {
         // Compare by Arc pointer equality for vars (same shared HashMap)
-        Arc::ptr_eq(&self.vars, &other.vars) && self.parent == other.parent
+        Arc::ptr_eq(&self.vars, &other.vars)
+            && self.parent == other.parent
+            && self.definition_label_context == other.definition_label_context
     }
 }
 
@@ -3207,6 +3240,74 @@ impl Evaluator {
     pub fn set_current_repository(&mut self, repo: Option<String>) {
         debug_log!("[DEBUG Evaluator] set_current_repository: {:?}", repo);
         self.current_repository = repo;
+        self.env.definition_label_context = None;
+    }
+
+    pub(crate) fn set_definition_label_context(&mut self, context: DefinitionLabelContext) {
+        self.env.definition_label_context = Some(Arc::new(context));
+    }
+
+    fn definition_label_context(&mut self) -> Result<Arc<DefinitionLabelContext>> {
+        if let Some(context) = &self.env.definition_label_context {
+            return Ok(context.clone());
+        }
+        let context = if let Some(loader) = &self.bzl_loader {
+            loader.lock().map_err(|error| anyhow!("Failed to lock label context: {error}"))?
+                .definition_label_context_for_owner(
+                    self.current_repository.as_deref(), &self.current_package,
+                )?
+        } else {
+            DefinitionLabelContext {
+                repository: self.current_repository.clone(),
+                package: self.current_package.clone(),
+                repository_mapping: std::collections::BTreeMap::new(),
+                mapping_is_complete: false,
+            }
+        };
+        let context = Arc::new(context);
+        self.env.definition_label_context = Some(context.clone());
+        Ok(context)
+    }
+
+    fn closure_environment(&mut self) -> Result<Arc<Environment>> {
+        let context = self.definition_label_context()?;
+        let mut environment = self.env.clone();
+        environment.definition_label_context = Some(context);
+        Ok(Arc::new(environment))
+    }
+
+    fn qualify_label_argument(&mut self, arguments: &mut [Value]) -> Result<()> {
+        let Some(Value::String(label)) = arguments.first_mut() else {
+            return Ok(());
+        };
+        if label.starts_with("@@") {
+            return Ok(());
+        }
+        let context = self.definition_label_context()?;
+        let owner = context.repository.as_deref().unwrap_or("");
+        if let Some(explicit) = label.strip_prefix('@') {
+            let Some((repository, target)) = explicit.split_once("//") else {
+                anyhow::bail!("Label repository reference must contain //: {}", label);
+            };
+            let canonical = if repository.is_empty() {
+                ""
+            } else if let Some(mapped) = context.repository_mapping.get(repository) {
+                mapped.as_str()
+            } else if context.mapping_is_complete {
+                anyhow::bail!(
+                    "Label repository '@{}' is not visible from defining repository '{}'",
+                    repository, owner,
+                );
+            } else {
+                repository
+            };
+            *label = format!("@@{canonical}//{target}");
+        } else if label.starts_with("//") {
+            *label = format!("@@{owner}{label}");
+        } else if label.starts_with(':') {
+            *label = format!("@@{owner}//{}{label}", context.package);
+        }
+        Ok(())
     }
 
     pub fn get_var(&self, name: &str) -> Option<Value> {
@@ -3754,6 +3855,7 @@ impl Evaluator {
         loader: std::sync::Arc<std::sync::Mutex<crate::bzl_loader::BzlLoader>>,
     ) {
         self.bzl_loader = Some(loader);
+        self.env.definition_label_context = None;
     }
 
     pub fn get_rule_calls(&self) -> &Vec<RuleCall> {
@@ -3791,6 +3893,7 @@ impl Evaluator {
     pub fn set_current_package(&mut self, package: String) {
         crate::builtins::clear_package_glob_cache();
         self.current_package = package;
+        self.env.definition_label_context = None;
     }
 
     /// Activate configuration rules and aliases used by `select()`.
@@ -4084,7 +4187,7 @@ impl Evaluator {
                     // Rewrite label if we are in an external repository
                     let file_to_load = if let Some(repo) = &self.current_repository {
                         if file.starts_with("//") {
-                            format!("@{}//{}", repo, &file[2..])
+                            format!("@@{}//{}", repo, &file[2..])
                         } else {
                             file.clone()
                         }
@@ -4246,7 +4349,7 @@ impl Evaluator {
                     // e.g. inside @org_tensorflow, //foo:bar.bzl -> @org_tensorflow//foo:bar.bzl
                     let file_to_load = if let Some(repo) = &self.current_repository {
                         if file.starts_with("//") {
-                            let rewritten = format!("@{}//{}", repo, &file[2..]);
+                            let rewritten = format!("@@{}//{}", repo, &file[2..]);
                             debug_log!(
                                 "[DEBUG Evaluator] Rewriting load label in @{}: {} -> {}",
                                 repo,
@@ -6021,7 +6124,7 @@ impl Evaluator {
                     varargs_param: varargs_param.clone(),
                     kwargs_param: kwargs_param.clone(),
                     body: body.clone(),
-                    closure: Arc::new(self.env.clone()),
+                    closure: self.closure_environment()?,
                 };
                 self.env.define(name.clone(), func);
                 Ok(())
@@ -6289,7 +6392,7 @@ impl Evaluator {
                 // Rewrite label if we are in an external repository
                 let file_to_load = if let Some(repo) = &self.current_repository {
                     if file.starts_with("//") {
-                        format!("@{}//{}", repo, &file[2..])
+                        format!("@@{}//{}", repo, &file[2..])
                     } else {
                         file.clone()
                     }
@@ -6307,7 +6410,9 @@ impl Evaluator {
                             .lock()
                             .map_err(|e| anyhow!("Failed to lock .bzl loader: {}", e))?;
                         let path = loader_guard.resolve_bzl_path(&file_to_load)?;
-                        let cached = loader_guard.get_symbols_cache_subset_no_stats(&path, symbols);
+                        let cached = loader_guard.get_symbols_cache_subset_for_label_no_stats(
+                            &path, &file_to_load, symbols,
+                        )?;
                         (path, cached)
                     }; // Lock released
 
@@ -7092,7 +7197,7 @@ impl Evaluator {
                     varargs_param: varargs_param.clone(),
                     kwargs_param: kwargs_param.clone(),
                     body: body.clone(),
-                    closure: Arc::new(self.env.clone()),
+                    closure: self.closure_environment()?,
                 })
             }
         }
@@ -7518,32 +7623,8 @@ impl Evaluator {
                 // Merge args and args_unpack
                 let mut eval_args = merge_args(args, args_unpack, self)?;
 
-                // Label() resolves repository-absolute and package-relative
-                // strings in the caller's .bzl context. Under Bzlmod, labels
-                // in an external repository stringify with the canonical
-                // double-@ repository prefix.
                 if name == "Label" {
-                    if let Some(Value::String(label)) = eval_args.first_mut() {
-                        if !label.starts_with('@') {
-                            let repository = self
-                                .current_repository
-                                .as_deref()
-                                .map(|repo| repo.trim_start_matches('@'));
-                            if label.starts_with("//") {
-                                if let Some(repository) = repository {
-                                    *label = format!("@@{}{}", repository, label);
-                                }
-                            } else if label.starts_with(':') {
-                                let prefix = repository
-                                    .map(|repo| format!("@@{}", repo))
-                                    .unwrap_or_default();
-                                *label = format!(
-                                    "{}//{}{}",
-                                    prefix, self.current_package, label
-                                );
-                            }
-                        }
-                    }
+                    self.qualify_label_argument(&mut eval_args)?;
                 }
 
                 // Merge kwargs and kwargs_unpack
@@ -7974,17 +8055,18 @@ impl Evaluator {
                 // Save current environment
                 let saved_env = std::mem::replace(&mut self.env, func_env);
 
-                // Execute function body
-                for stmt in body.iter() {
-                    self.eval_statement(stmt)?;
-                    if self.return_value.is_some() {
-                        break;
+                let result = (|| -> Result<Value> {
+                    for stmt in body.iter() {
+                        self.eval_statement(stmt)?;
+                        if self.return_value.is_some() {
+                            break;
+                        }
                     }
-                }
-
-                let result = self.return_value.take().unwrap_or(Value::None);
+                    Ok(self.return_value.take().unwrap_or(Value::None))
+                })();
                 let alias_updates: Vec<_> = mutable_aliases
                     .into_iter()
+                    .filter(|_| result.is_ok())
                     .filter_map(|(param_name, caller_name, original)| {
                         self.env.get(&param_name).and_then(|updated| {
                             (updated != original).then_some((caller_name, updated))
@@ -7998,7 +8080,7 @@ impl Evaluator {
                     self.env.set(&caller_name, updated)?;
                 }
 
-                Ok(result)
+                result
             }
             Value::RuleFunction(rule_type) => {
                 // This is a rule function call (like native.cc_library)
@@ -8051,6 +8133,14 @@ impl Evaluator {
                 Ok(Value::None)
             }
             Value::NativeFunction(func_name) => {
+                if func_name == "Label" {
+                    let mut eval_args = merge_args(args, args_unpack, self)?;
+                    self.qualify_label_argument(&mut eval_args)?;
+                    let eval_kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?
+                        .into_iter().collect::<Vec<_>>();
+                    return self.builtins.get("Label")
+                        .context("Label builtin is unavailable")?(&eval_args, &eval_kwargs);
+                }
                 // This is a native function call (like native.glob, native.existing_rules)
                 // Evaluate arguments
                 let mut eval_args = Vec::new();
@@ -8240,12 +8330,11 @@ impl Evaluator {
                         Ok(Value::String(self.current_package.clone()))
                     }
                     "package_relative_label" => {
-                        // Bazel 6.3+: convert a label string into a Label
-                        // relative to the current package. Absolute labels
-                        // (//... or @...) pass through unchanged.
+                        // This native operation uses the current BUILD caller,
+                        // independently of a function's defining Label context.
                         let input = match eval_args.first() {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(Value::Label { label, .. }) => label.clone(),
+                            Some(Value::String(input)) => input.clone(),
+                            Some(label @ Value::Label { .. }) => return Ok(label.clone()),
                             other => {
                                 return Err(anyhow!(
                                     "package_relative_label() requires a label string, got {:?}",
@@ -8253,40 +8342,42 @@ impl Evaluator {
                                 ))
                             }
                         };
-                        let full = if input.starts_with("//") || input.starts_with('@') {
+                        let owner = self.current_repository.as_deref()
+                            .unwrap_or("").trim_start_matches('@');
+                        let full = if input.starts_with("@@") {
                             input
+                        } else if let Some(external) = input.strip_prefix('@') {
+                            let (repository, target) = external.split_once("//").ok_or_else(|| {
+                                anyhow!("package_relative_label() repository reference must contain //: {}", input)
+                            })?;
+                            let canonical = if repository.is_empty() {
+                                String::new()
+                            } else if let Some(loader) = &self.bzl_loader {
+                                let context = loader.lock()
+                                    .map_err(|error| anyhow!("Failed to lock package label context: {error}"))?
+                                    .definition_label_context_for_owner(
+                                        self.current_repository.as_deref(), &self.current_package,
+                                    )?;
+                                match context.repository_mapping.get(repository) {
+                                    Some(mapped) => mapped.clone(),
+                                    None if context.mapping_is_complete => {
+                                        anyhow::bail!("Repository '@{}' is not visible from BUILD repository '{}'", repository, owner);
+                                    }
+                                    None => repository.to_string(),
+                                }
+                            } else {
+                                repository.to_string()
+                            };
+                            format!("@@{canonical}//{target}")
+                        } else if input.starts_with("//") {
+                            format!("@@{owner}{input}")
                         } else {
                             let name = input.strip_prefix(':').unwrap_or(&input);
-                            format!("//{}:{}", self.current_package, name)
+                            format!("@@{owner}//{}:{}", self.current_package, name)
                         };
-                        let body = full
-                            .splitn(2, "//")
-                            .nth(1)
-                            .unwrap_or(full.as_str())
-                            .to_string();
-                        let (package, name) = match body.split_once(':') {
-                            Some((p, n)) => (p.to_string(), n.to_string()),
-                            None => (
-                                body.clone(),
-                                body.rsplit('/').next().unwrap_or(&body).to_string(),
-                            ),
-                        };
-                        let workspace_name = if full.starts_with('@') {
-                            full.trim_start_matches('@')
-                                .split("//")
-                                .next()
-                                .unwrap_or("")
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
-                        Ok(Value::Label {
-                            label: full,
-                            package,
-                            name,
-                            workspace_name,
-                            workspace_root: String::new(),
-                        })
+                        self.builtins.get("Label").context("Label builtin is unavailable")?(
+                            &[Value::String(full)], &[],
+                        )
                     }
                     "dir" => {
                         // Starlark dir(): the value's field names, sorted.
@@ -9183,7 +9274,10 @@ impl Evaluator {
                 for (param_name, default_expr) in &params {
                     if !bound_params.contains(param_name) {
                         if let Some(default) = default_expr {
-                            let default_val = self.eval_expression(default)?;
+                            let saved_env = std::mem::replace(&mut self.env, (*closure).clone());
+                            let default_value = self.eval_expression(default);
+                            self.env = saved_env;
+                            let default_val = default_value?;
                             func_env.define(param_name.clone(), default_val);
                         } else {
                             return Err(anyhow!("Missing required parameter: {}", param_name));
@@ -10301,7 +10395,7 @@ rendered = repr(d)
         let Some(Value::String(rendered)) = evaluator.get_var("rendered") else {
             panic!("repr(dict) must return a string")
         };
-        assert!(rendered.contains("Label(\"//pkg:target\")"), "{rendered}");
+        assert!(rendered.contains("Label(\"@@//pkg:target\")"), "{rendered}");
         assert!(!rendered.contains("rush-non-string-dict-key"), "{rendered}");
         assert_eq!(
             evaluator.get_var("items"),
@@ -10327,7 +10421,7 @@ selected = select({
             panic!("select() must remain configurable")
         };
         assert_eq!(conditions.len(), 2);
-        assert!(conditions.contains_key("//:config"));
+        assert!(conditions.contains_key("@@//:config"));
         assert!(conditions.contains_key("@@//:root_config"));
         assert!(
             conditions
@@ -10343,12 +10437,25 @@ a = Label("@repo//pkg:target")
 b = package_relative_label("@@repo//pkg:target")
 d = {a: "value"}
 lookup = d[b]
+main = Label("//pkg:target")
+main_relative = package_relative_label("//pkg:target")
+main_explicit = package_relative_label("@//pkg:target")
+main_canonical = package_relative_label("@@//pkg:target")
+main_passthrough = package_relative_label(main)
+main_dictionary = {main: "main value"}
+main_lookups = [main_dictionary[main_relative], main_dictionary[main_explicit], main_dictionary[main_canonical], main_dictionary[main_passthrough]]
 "#;
         let evaluator = eval_build(source, false).unwrap();
         assert_eq!(
             evaluator.get_var("lookup"),
             Some(Value::String("value".to_string()))
         );
+        for variable in ["main_relative", "main_explicit", "main_canonical", "main_passthrough"] {
+            assert_eq!(evaluator.get_var(variable), evaluator.get_var("main"), "{variable}");
+        }
+        assert_eq!(evaluator.get_var("main_lookups"), Some(Value::List(vec![
+            Value::String("main value".to_string()); 4
+        ])));
 
         for source in [
             r#"label = Label("//pkg:target")
