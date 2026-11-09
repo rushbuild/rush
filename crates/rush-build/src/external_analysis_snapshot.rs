@@ -41,6 +41,13 @@ const GNU_MAKE_JOBSERVER_ENVIRONMENTS: [&[u8]; 2] = [b"MAKEFLAGS", b"MFLAGS"];
 const GNU_MAKE_JOBSERVER_AUTH_OPTION: &[u8] = b"--jobserver-auth=";
 const GNU_MAKE_JOBSERVER_FDS_OPTION: &[u8] = b"--jobserver-fds=";
 const CANONICAL_CLOSED_GNU_MAKE_JOBSERVER: &[u8] = b"3,4";
+const CANONICAL_DISABLED_GNU_MAKE_JOBSERVER: &[u8] = b"-2,-2";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StandardDescriptorMakeAuth {
+    ClosedPair,
+    DisabledPair,
+}
 
 const KEY_DOMAIN: &[u8] = b"rush.external-analysis-key.v1\n";
 
@@ -878,6 +885,7 @@ fn validate_graph(graph: &ExternalActionGraph) -> Result<()> {
             validate_standard_descriptor_environment(
                 &action.environment,
                 &action.logical_id,
+                &graph.roots,
             )?;
         }
         for command in &action.commands {
@@ -892,7 +900,7 @@ fn validate_graph(graph: &ExternalActionGraph) -> Result<()> {
                     .execution_properties
                     .contains_key(MANDATORY_EXECUTION_PROPERTY)
                 {
-                    validate_standard_descriptor_environment(environment, &action.logical_id)?;
+                    validate_standard_descriptor_environment(environment, &action.logical_id, &graph.roots)?;
                 }
             }
             if let Some(working_directory) = &command.working_directory {
@@ -1378,10 +1386,11 @@ fn validate_environment(
 fn validate_standard_descriptor_environment(
     environment: &BTreeMap<Vec<u8>, ExternalArgumentKey>,
     logical_id: &str,
+    roots: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     for name in GNU_MAKE_JOBSERVER_ENVIRONMENTS {
         if let Some(argument) = environment.get(name) {
-            validate_standard_descriptor_make_flags(argument).with_context(|| {
+            validate_standard_descriptor_make_flags(argument, roots).with_context(|| {
                 format!(
                     "action {logical_id:?} has unsupported {} under standard-only mandatory execution",
                     String::from_utf8_lossy(name)
@@ -1392,44 +1401,147 @@ fn validate_standard_descriptor_environment(
     Ok(())
 }
 
-fn validate_standard_descriptor_make_flags(argument: &ExternalArgumentKey) -> Result<()> {
-    let value = match argument {
-        ExternalArgumentKey::Literal(value) => value.clone(),
-        ExternalArgumentKey::Path(_) => {
-            anyhow::bail!("path-bearing GNU Make flags cannot prove descriptor topology")
-        }
-        ExternalArgumentKey::Joined(parts) => {
-            let mut value = Vec::new();
-            for part in parts {
-                match part {
-                    ExternalArgumentPart::Literal(bytes) => value.extend(bytes),
-                    ExternalArgumentPart::Path(_) => {
-                        anyhow::bail!(
-                            "path-bearing GNU Make flags cannot prove descriptor topology"
-                        )
+fn validate_standard_descriptor_make_flags(
+    argument: &ExternalArgumentKey,
+    roots: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    // Support an intentionally small Make flag grammar. A rooted
+    // value may occur in a variable assignment after `--`, never in a flag or
+    // descriptor field. Reject ambiguous substitutions rather than parsing a
+    // second GNU Make dialect or interpreting paths as authentication bytes.
+    let parts = match argument {
+        ExternalArgumentKey::Literal(value) => vec![ExternalArgumentPart::Literal(value.clone())],
+        ExternalArgumentKey::Path(path) => vec![ExternalArgumentPart::Path(path.clone())],
+        ExternalArgumentKey::Joined(parts) => parts.clone(),
+    };
+    let mut tokens = Vec::new();
+    let mut literal = Vec::new();
+    let mut first_path = None;
+    let mut lex_assignments = false;
+    let mut escaping = false;
+    for part in parts {
+        match part {
+            ExternalArgumentPart::Literal(bytes) => {
+                for byte in bytes {
+                    if escaping {
+                        if !matches!(byte, b' ' | b'\t' | b'\\') {
+                            anyhow::bail!("GNU Make assignment has an unsupported escape");
+                        }
+                        literal.push(byte);
+                        escaping = false;
+                        continue;
+                    }
+                    if byte == b'\\' {
+                        if !lex_assignments || !literal.contains(&b'=') {
+                            anyhow::bail!("GNU Make escaping is supported only in assignment values");
+                        }
+                        escaping = true;
+                        continue;
+                    }
+                    if byte == 0 || (byte.is_ascii_control() && !byte.is_ascii_whitespace()) {
+                        anyhow::bail!("control-bearing GNU Make flags are unsupported");
+                    }
+                    if byte.is_ascii_whitespace() {
+                        if !literal.is_empty() || first_path.is_some() {
+                            if literal == b"--" && first_path.is_none() {
+                                lex_assignments = true;
+                            }
+                            tokens.push((std::mem::take(&mut literal), first_path.take()));
+                        }
+                    } else {
+                        literal.push(byte);
                     }
                 }
             }
-            value
-        }
-    };
-
-    let mut canonical_auth_count = 0usize;
-    for token in value.split(|byte| byte.is_ascii_whitespace()) {
-        if let Some(auth) = token.strip_prefix(GNU_MAKE_JOBSERVER_AUTH_OPTION) {
-            if auth != CANONICAL_CLOSED_GNU_MAKE_JOBSERVER {
-                anyhow::bail!(
-                    "GNU Make jobserver authentication is not the canonical closed 3,4 pair"
-                );
+            ExternalArgumentPart::Path(path) => {
+                if escaping {
+                    anyhow::bail!("GNU Make escape cannot cross a rooted path boundary");
+                }
+                let root = roots.get(&path.root).context("GNU Make variable path has an unknown root")?;
+                if root.as_os_str().as_encoded_bytes().iter().chain(path.path.iter())
+                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || *byte == b'\\')
+                {
+                    anyhow::bail!("GNU Make variable path cannot preserve unescaped token boundaries");
+                }
+                first_path.get_or_insert(literal.len());
             }
-            canonical_auth_count += 1;
+        }
+    }
+    if escaping {
+        anyhow::bail!("GNU Make assignment has an unterminated escape");
+    }
+    if !literal.is_empty() || first_path.is_some() {
+        tokens.push((literal, first_path));
+    }
+    let mut auth_profile = Vec::new();
+    let mut style_count = 0usize;
+    let mut assignments = false;
+    for (token, first_path) in tokens {
+        if token == b"--" && first_path.is_none() && !assignments {
+            assignments = true;
+            continue;
+        }
+        if assignments {
+            let equals = token.iter().position(|byte| *byte == b'=')
+                .context("GNU Make flags after -- must be variable assignments")?;
+            let name = &token[..equals];
+            if name.is_empty()
+                || !(name[0].is_ascii_alphabetic() || name[0] == b'_')
+                || !name.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+                || first_path.is_some_and(|offset| offset <= equals)
+                || matches!(name, b"MAKEFLAGS" | b"MFLAGS" | b"GNUMAKEFLAGS")
+            {
+                anyhow::bail!("GNU Make variable assignment has an ambiguous name or rooted prefix");
+            }
+            if token[equals + 1..].split(|byte| byte.is_ascii_whitespace())
+                .any(|word| word.starts_with(b"--jobserver"))
+            {
+                anyhow::bail!("GNU Make variable value contains ambiguous jobserver options");
+            }
+            continue;
+        }
+        if token.contains(&b'=') && !token.starts_with(b"-") {
+            anyhow::bail!("GNU Make variable assignments must follow the -- separator");
+        }
+        if first_path.is_some() {
+            anyhow::bail!("path-bearing GNU Make options cannot prove descriptor topology");
+        }
+        if let Some(auth) = token.strip_prefix(GNU_MAKE_JOBSERVER_AUTH_OPTION) {
+            let auth = if auth == CANONICAL_CLOSED_GNU_MAKE_JOBSERVER {
+                StandardDescriptorMakeAuth::ClosedPair
+            } else if auth == CANONICAL_DISABLED_GNU_MAKE_JOBSERVER {
+                StandardDescriptorMakeAuth::DisabledPair
+            } else {
+                anyhow::bail!(
+                    "GNU Make jobserver authentication is not a supported literal closed or disabled pair"
+                );
+            };
+            if auth_profile.len() == 2 {
+                anyhow::bail!("GNU Make jobserver authentication has too many occurrences");
+            }
+            auth_profile.push(auth);
         } else if token.starts_with(GNU_MAKE_JOBSERVER_FDS_OPTION) {
             anyhow::bail!("legacy GNU Make jobserver descriptors are unsupported");
+        } else if let Some(style) = token.strip_prefix(b"--jobserver-style=") {
+            if style != b"pipe" {
+                anyhow::bail!("GNU Make jobserver style is not the supported pipe transport");
+            }
+            style_count += 1;
+        } else if token.starts_with(b"--jobserver") {
+            anyhow::bail!("GNU Make jobserver option is malformed or unsupported");
         }
     }
 
-    if canonical_auth_count > 1 {
-        anyhow::bail!("GNU Make jobserver authentication is duplicated");
+    // GNU Make's nonrecursive pipe recipe keeps 3,4 and appends -2,-2.
+    // The final option disables jobserver participation. Support that exact
+    // sequence, not arbitrary duplicate authentication or descriptor handoff;
+    // StandardOnly execution still closes every descriptor above stderr.
+    use StandardDescriptorMakeAuth::{ClosedPair, DisabledPair};
+    if !matches!(auth_profile.as_slice(), [] | [ClosedPair] | [DisabledPair] | [ClosedPair, DisabledPair]) {
+        anyhow::bail!("GNU Make jobserver authentication has an unsupported closed/disabled sequence");
+    }
+    if style_count > 1 {
+        anyhow::bail!("GNU Make jobserver style is duplicated");
     }
     Ok(())
 }
@@ -1678,6 +1790,29 @@ mod tests {
                     b"-j96 --jobserver-auth=3,4 --jobserver-auth=3,4".to_vec(),
                 ),
             ),
+            (
+                false,
+                b"MAKEFLAGS".as_slice(),
+                ExternalArgumentKey::Literal(b"--jobserver-auth=-2,-2 --jobserver-auth=3,4".to_vec()),
+            ),
+            (
+                true,
+                b"MFLAGS".as_slice(),
+                ExternalArgumentKey::Literal(b"--jobserver-auth=-2,-2 --jobserver-auth=-2,-2".to_vec()),
+            ),
+            (
+                false,
+                b"MFLAGS".as_slice(),
+                ExternalArgumentKey::Literal(b"--jobserver-auth=3,-2".to_vec()),
+            ),
+            (
+                true,
+                b"MAKEFLAGS".as_slice(),
+                ExternalArgumentKey::Joined(vec![
+                    ExternalArgumentPart::Literal(b"--jobserver-auth=fifo:".to_vec()),
+                    ExternalArgumentPart::Path(rooted("obj", ".rush-tmp/GMfifo12345")),
+                ]),
+            ),
         ] {
             let mut snapshot = snapshot(temp.path(), &analysis_input);
             let action = &mut snapshot.graph.actions[0];
@@ -1715,6 +1850,8 @@ mod tests {
             ExternalArgumentKey::Joined(vec![
                 ExternalArgumentPart::Literal(b"rRs -j96 --jobserver-".to_vec()),
                 ExternalArgumentPart::Literal(b"auth=3,4 --no-print-directory".to_vec()),
+                ExternalArgumentPart::Literal(b" -- obj=scripts/basic O=".to_vec()),
+                ExternalArgumentPart::Path(rooted("obj", ".")),
             ]),
         );
         action.environment.insert(
@@ -1722,6 +1859,163 @@ mod tests {
             ExternalArgumentKey::Literal(b"-j96 --jobserver-auth=3,4".to_vec()),
         );
         snapshot.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn standard_descriptor_make_flags_accept_only_rooted_variable_values() {
+        let roots = BTreeMap::from([
+            ("src".to_string(), PathBuf::from("/workspace/source")),
+            ("obj".to_string(), PathBuf::from("/workspace/output")),
+        ]);
+        let flags = ExternalArgumentKey::Joined(vec![
+            ExternalArgumentPart::Literal(b"rRs -j8 --jobserver-".to_vec()),
+            ExternalArgumentPart::Literal(b"auth=3,4 --jobserver-style=pipe --no-print-directory -- obj=scripts/basic O=".to_vec()),
+            ExternalArgumentPart::Path(rooted("obj", ".")),
+            ExternalArgumentPart::Literal(b" KBUILD_SRC=".to_vec()),
+            ExternalArgumentPart::Path(rooted("src", ".")),
+            ExternalArgumentPart::Literal(b"/literal-suffix".to_vec()),
+        ]);
+        validate_standard_descriptor_make_flags(&flags, &roots).unwrap();
+        // Kbuild recursive variables include hyphens. The objtool/libsubcmd
+        // lane also carries escaped spaces within compiler/linker values.
+        let tool_flags = ExternalArgumentKey::Joined(vec![
+            ExternalArgumentPart::Literal(b"rRs -j8 --jobserver-auth=3,4 -- need-builtin=1 need-modorder=1 modfinal-first=1 HOSTCFLAGS=-Wall\\ -Wmissing-prototypes\\ -std=gnu11\\ -O2\\ -I\\ ".to_vec()),
+            ExternalArgumentPart::Path(rooted("src", "scripts/include")),
+            ExternalArgumentPart::Literal(b"\\ -Werror EXTRA_CFLAGS=-I".to_vec()),
+            ExternalArgumentPart::Path(rooted("src", "tools/include")),
+            ExternalArgumentPart::Literal(b"\\ -Wextra LDFLAGS=".to_vec()),
+            ExternalArgumentPart::Path(rooted("obj", "tools/objtool/libsubcmd/libsubcmd.a")),
+            ExternalArgumentPart::Literal(b"\\ -lelf\\ -lpthread CFLAGS=-Wall\\".to_vec()),
+            ExternalArgumentPart::Literal(b" -g\\ -O2\\\\literal AR=ar CC=gcc LD=ld dir=./arch/x86 generic=include/asm-generic prefix= subdir=tools DESTDIR=".to_vec()),
+            ExternalArgumentPart::Path(rooted("obj", "tools/objtool/libsubcmd")),
+            ExternalArgumentPart::Literal(b" O=".to_vec()),
+            ExternalArgumentPart::Path(rooted("obj", ".")),
+        ]);
+        validate_standard_descriptor_make_flags(&tool_flags, &roots).unwrap();
+        validate_standard_descriptor_make_flags(
+            &ExternalArgumentKey::Literal(b"-rRs -j8 --jobserver-auth=3,4 --no-print-directory".to_vec()),
+            &roots,
+        ).unwrap();
+        for options in [
+            b"".as_slice(),
+            b"--jobserver-auth=3,4",
+            b"--jobserver-auth=-2,-2",
+            b"--jobserver-auth=3,4 --no-print-directory --jobserver-auth=-2,-2",
+        ] {
+            for prefix in [b"s -j2 ".as_slice(), b"-s -j2 "] {
+                validate_standard_descriptor_make_flags(
+                    &ExternalArgumentKey::Literal([prefix, options].concat()), &roots,
+                ).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn mandatory_execution_accepts_closed_and_disabled_make_pipe_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        for options in [
+            b"".as_slice(),
+            b"--jobserver-auth=3,4",
+            b"--jobserver-auth=-2,-2",
+            // Exact option order observed from GNU Make's nonrecursive pipe
+            // recipe, preserving the effective disabled authentication.
+            b"--jobserver-auth=3,4 --no-print-directory --jobserver-auth=-2,-2",
+        ] {
+            for command_override in [false, true] {
+                let mut snapshot = snapshot(temp.path(), &analysis_input);
+                let action = &mut snapshot.graph.actions[0];
+                action.cacheable = false;
+                action.local_only = true;
+                action.execution_properties.insert(
+                    MANDATORY_EXECUTION_PROPERTY.to_string(),
+                    PROCFS_CLEAN_ENTRY_MANDATORY_EXECUTION.to_string(),
+                );
+                let environment = BTreeMap::from([
+                    (b"MAKEFLAGS".to_vec(), ExternalArgumentKey::Joined(vec![
+                        ExternalArgumentPart::Literal([b"s -j2 ".as_slice(), options, b" -- O="].concat()),
+                        ExternalArgumentPart::Path(rooted("obj", ".")),
+                    ])),
+                    (b"MFLAGS".to_vec(), ExternalArgumentKey::Literal([b"-s -j2 ".as_slice(), options].concat())),
+                ]);
+                if command_override {
+                    action.commands[0].environment = Some(environment);
+                } else {
+                    action.environment = environment;
+                }
+                snapshot.validate_structure().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn standard_descriptor_make_flags_reject_ambiguous_transport_and_path_injection() {
+        let roots = BTreeMap::from([("obj".to_string(), PathBuf::from("/workspace/output"))]);
+        let joined = |prefix: &[u8], suffix: &[u8]| ExternalArgumentKey::Joined(vec![
+            ExternalArgumentPart::Literal(prefix.to_vec()),
+            ExternalArgumentPart::Path(rooted("obj", ".rush-tmp/GMfifo12345")),
+            ExternalArgumentPart::Literal(suffix.to_vec()),
+        ]);
+        let mut invalid = vec![
+            // Byte shape of the actual GNU Make 4.4 FIFO capture: the rooted
+            // transport must remain refused, not silently rewritten to pipe.
+            joined(b"rRs -j8 --jobserver-auth=fifo:", b" --no-print-directory -- O=/literal-output"),
+            joined(b"--jobserver-auth=", b""),
+            joined(b"--jobserver-auth=3,4 O=", b""),
+            joined(b"--jobserver-auth=3,4 -- O", b"=value"),
+            joined(b"--jobserver-auth=3,4 -- ", b""),
+            joined(b"--jobserver-auth=3,4 -- O=", b" --jobserver-auth=3,5"),
+            joined(b"--jobserver-auth=3,4 -- O=prefix\\", b""),
+            ExternalArgumentKey::Path(rooted("obj", ".")),
+            ExternalArgumentKey::Joined(vec![
+                ExternalArgumentPart::Literal(b"--jobserver-auth=3,4 -- O=".to_vec()),
+                ExternalArgumentPart::Path(rooted("obj", "path --jobserver-auth=3,5")),
+            ]),
+        ];
+        invalid.extend([
+            b"--jobserver-auth=fifo:/tmp/jobserver".as_slice(),
+            b"--jobserver-auth=3,5",
+            b"--jobserver-auth=3,4 --jobserver-auth=3,4",
+            b"--jobserver-auth=-2,-2 --jobserver-auth=3,4",
+            b"--jobserver-auth=-2,-2 --jobserver-auth=-2,-2",
+            b"--jobserver-auth=3,4 --jobserver-auth=-2,-2 --jobserver-auth=-2,-2",
+            b"--jobserver-auth=3,5 --jobserver-auth=-2,-2",
+            b"--jobserver-auth=-1,-1",
+            b"--jobserver-auth=-2,-3",
+            b"--jobserver-auth=-2,4",
+            b"--jobserver-auth=3,-2",
+            b"--jobserver-auth 3,4",
+            b"--jobserver-auth=",
+            b"--jobserver-fds=3,4",
+            b"--jobserver-style=fifo",
+            b"--jobserver-style=sem",
+            b"--jobserver-style=pipe --jobserver-style=pipe",
+            b"--jobserver-unknown=3,4",
+            b"--jobserver-auth\\=3,5",
+            b"--jobserver-auth=3,4 -- O=value --",
+            b"--jobserver-auth=3,4 -- MAKEFLAGS=--jobserver-auth=3,5",
+            b"--jobserver-auth=3,4 -- MFLAGS=--jobserver-auth=3,5",
+            b"--jobserver-auth=3,4 -- GNUMAKEFLAGS=--jobserver-style=fifo",
+            b"--jobserver-auth=3,4 MAKEFLAGS=--jobserver-auth=3,5",
+            b"--jobserver-auth=3,4 MFLAGS=--jobserver-auth=3,5",
+            b"--jobserver-auth=3,4 GNUMAKEFLAGS=--jobserver-style=fifo",
+            b"--jobserver-auth=3,4 O=/literal-output",
+            b"--jobserver-auth=3,4 -- need\\-builtin=1",
+            b"--jobserver-auth=3,4 -- CFLAGS=-Wall\\ --jobserver-auth=3,5",
+            b"--jobserver-auth=3,4 -- O=bad\\x",
+            b"--jobserver-auth=3,4 -- O=bad\\",
+            b"--jobserver-auth=3,4\0",
+        ].into_iter().map(|bytes| ExternalArgumentKey::Literal(bytes.to_vec())));
+        for flags in invalid {
+            assert!(validate_standard_descriptor_make_flags(&flags, &roots).is_err(), "accepted {flags:?}");
+        }
+        for root in ["/workspace/output --jobserver-auth=3,5", "/workspace/output\\escaped", "/workspace/output\u{1b}"] {
+            let roots = BTreeMap::from([("obj".to_string(), PathBuf::from(root))]);
+            assert!(validate_standard_descriptor_make_flags(
+                &joined(b"--jobserver-auth=3,4 -- O=", b""), &roots,
+            ).is_err(), "accepted ambiguous root {root:?}");
+        }
     }
 
     #[test]
