@@ -169,9 +169,49 @@ impl ExecutionArtifacts<'_> {
     }
 }
 
+fn current_identity_artifacts(
+    built: &ExecutionArtifacts<'_>,
+    actual: &Label,
+) -> Result<ArtifactRoot> {
+    built
+        .updates
+        .get(&actual.to_string())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("identity forwarder actual has no current exact artifact forest: {actual}")
+        })
+}
+
 #[cfg(test)]
 mod execution_artifacts_tests {
     use super::*;
+
+    #[test]
+    fn identity_forwarding_requires_current_exact_repository_key() -> Result<()> {
+        let actual = Label::parse("@@actual//pkg:producer", None, None)?;
+        let foreign = Label::parse("@@foreign//pkg:producer", None, None)?;
+        let root = rush_rules::nested_set::NestedSet::new(Vec::<Artifact>::new(), vec![]);
+        let base = HashMap::from([(actual.to_string(), root.clone())]);
+        let mut built = ExecutionArtifacts {
+            base: Some(&base),
+            updates: HashMap::new(),
+        };
+        assert!(
+            current_identity_artifacts(&built, &actual).is_err(),
+            "retained state must not stand in for this invocation's real producer"
+        );
+        built.insert(foreign.to_string(), root.clone());
+        assert!(
+            current_identity_artifacts(&built, &actual).is_err(),
+            "same-basename foreign repository must never satisfy the actual key"
+        );
+        built.insert(actual.to_string(), root.clone());
+        assert!(Arc::ptr_eq(
+            &current_identity_artifacts(&built, &actual)?,
+            &root
+        ));
+        Ok(())
+    }
 
     #[test]
     fn overlay_shadows_once_and_preserves_base_and_compatibility_lookup() {
@@ -5563,7 +5603,15 @@ impl BuildOrchestrator {
                 if native_execroot.is_some() { self.with_tracked_scope(analyze)? } else { analyze()? }
             };
             let rule_type = node.rule_instance.rule_type();
-            if provider_forwarding_alias_rule_kind(rule_type) {
+            if let Some(actual) = crate::native_identity_forwarder::resolve_actual(
+                &graph, label, node.rule_instance.as_ref(),
+            )? {
+                anyhow::ensure!(providers.is_empty(),
+                    "identity forwarder declared providers of its own: {label}");
+                providers = built_providers.get(&actual.to_string())
+                    .ok_or_else(|| anyhow!("identity forwarder actual has no exact analyzed providers: {actual}"))?
+                    .clone_forwarded();
+            } else if provider_forwarding_alias_rule_kind(rule_type) {
                 // Aliases have no providers of their own; they forward
                 // every provider (CcInfo, CcSharedLibraryInfo, FilesInfo,
                 // …) from the aliased target so consumers querying the
@@ -7106,16 +7154,32 @@ impl BuildOrchestrator {
         // Audit every target that this command can actually execute. Pure
         // projection prerequisites remain analysis-only; demanded generators
         // and complete ordinary roots still require their real writer lifecycle.
+        let mut identity_forwarders = HashMap::new();
+        let pending_forwarder_targets: HashSet<_> = diagnostic.as_ref()
+            .map(|build| build.declarations.iter().map(|pending| pending.target()).collect())
+            .unwrap_or_default();
         if let Some(build) = &diagnostic {
             let registry = snapshot.artifact_registry.lock().await;
             for (index, label) in build_order.iter().enumerate() {
                 if execution_demand.as_ref().is_some_and(|plan| !plan.active[index]) { continue; }
                 let node = graph.get(label).ok_or_else(||anyhow!("diagnostic node missing: {label}"))?;
+                if let Some(actual) = crate::native_identity_forwarder::admit(
+                    snapshot, label, &registry, &pending_forwarder_targets,
+                    rush_action::ids::ConfigId::DEFAULT,
+                )? {
+                    if let Some(plan) = &execution_demand {
+                        let actual_index = build_order.iter().position(|entry| entry == &actual)
+                            .ok_or_else(|| anyhow!("identity actual is outside execution order"))?;
+                        anyhow::ensure!(plan.active[actual_index],
+                            "identity forwarder actual is inactive: {actual}");
+                    }
+                    identity_forwarders.insert(index, actual);
+                }
                 let kind = node.rule_instance.rule_type();
                 let inline_options = kind == "tf_gen_options_header"
                     && snapshot.options_header_inputs.contains_key(&label.to_string());
                 let writer = inline_options || matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
-                anyhow::ensure!(writer || node.rule_instance.cc_projection_kind().is_some() || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
+                anyhow::ensure!(writer || identity_forwarders.contains_key(&index) || node.rule_instance.cc_projection_kind().is_some() || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
                     |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
                     "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
                 let target = *snapshot.target_id_by_label.get(&label.to_string()).ok_or_else(||anyhow!("diagnostic target identity missing: {label}"))?;
@@ -8382,9 +8446,15 @@ impl BuildOrchestrator {
                 };
 
                 let execution_io = if snapshot.native_execroot.is_some() { self.tracked_io_shared() } else { None };
+                let identity_forwarder = identity_forwarders.contains_key(&cur);
                 running.push(crate::native_execroot::scope_future(execution_io.clone(), async move {
                     let _target_span = profiler_target.scope_on_lane(&label_s, "target");
-                    let artifacts = if use_scheduler {
+                    let artifacts = if identity_forwarder {
+                        // A structurally admitted identity alias never invokes
+                        // a rule body or the action scheduler. Commit the real
+                        // actual target's current state below, after rechecking.
+                        Vec::new()
+                    } else if use_scheduler {
                         let target_id =
                             target_id_for_dispatch.expect("use_scheduler ⇒ Some");
                         if build_chatter {
@@ -8643,17 +8713,28 @@ impl BuildOrchestrator {
             };
 
             // Store artifacts as a depset DAG node (identity aliases forward by Arc).
-            let nested = build_committed_target_artifacts(
-                &label,
-                &node,
-                artifacts,
-                &built_artifacts,
-            )?;
-            built_artifacts.insert(label.to_string(), nested);
-
-            // Post-build provider refresh (cc_shared_library's CcSharedLibraryInfo
-            // is only knowable after the link; Mutex-guarded so safe under Arc).
-            refresh_built_providers_for_target(&label, &node, &mut built_providers);
+            if let Some(actual) = identity_forwarders.get(&cur) {
+                anyhow::ensure!(artifacts.is_empty(), "identity forwarder returned own artifacts");
+                let registry = artifact_registry.lock().await;
+                anyhow::ensure!(crate::native_identity_forwarder::admit(
+                    snapshot, &label, &registry, &pending_forwarder_targets,
+                    rush_action::ids::ConfigId::DEFAULT,
+                )?.as_ref() == Some(actual), "identity forwarder changed before commit");
+                let actual_key = actual.to_string();
+                let nested = current_identity_artifacts(&built_artifacts, actual)?;
+                let providers = built_providers.get(&actual_key)
+                    .ok_or_else(|| anyhow!("identity forwarder actual has no current exact providers: {actual}"))?
+                    .clone_forwarded();
+                built_artifacts.insert(label.to_string(), nested);
+                built_providers.insert(label.to_string(), providers);
+            } else {
+                let nested = build_committed_target_artifacts(
+                    &label, &node, artifacts, &built_artifacts,
+                )?;
+                built_artifacts.insert(label.to_string(), nested);
+                // cc_shared_library learns its provider after the real link.
+                refresh_built_providers_for_target(&label, &node, &mut built_providers);
+            }
             if build_chatter {
                 eprintln!();
             }
@@ -21603,6 +21684,313 @@ filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//co
         );
         Ok(())
     }
+    mod identity_forwarder_driver_controls {
+        use super::*;
+        use rush_rules::providers::{FilesInfo, ProviderSet};
+        use rush_rules::{BuildRule, RuleInstance, Value as RuleAttr};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Shape {
+            Pure,
+            NameOnly,
+            WrongActual,
+            ExtraDependency,
+            OwnIncompleteAction,
+            OwnArtifact,
+            OwnProvider,
+        }
+
+        struct FixtureLibrary {
+            root: PathBuf,
+            shape: Shape,
+        }
+
+        struct FixtureForwarder {
+            root: PathBuf,
+            shape: Shape,
+        }
+
+        impl BuildRule for FixtureLibrary {
+            fn name(&self) -> &str {
+                "cc_library"
+            }
+
+            fn parse_attributes(
+                &self,
+                attributes: &HashMap<String, RuleAttr>,
+            ) -> Result<Box<dyn RuleInstance>> {
+                if matches!(attributes.get("name"), Some(RuleAttr::String(name)) if name == "forward")
+                {
+                    Ok(Box::new(FixtureForwarder {
+                        root: self.root.clone(),
+                        shape: self.shape,
+                    }))
+                } else {
+                    rush_rules::rules_cc::CcLibraryRule.parse_attributes(attributes)
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RuleInstance for FixtureForwarder {
+            fn target_name(&self) -> &str {
+                "forward"
+            }
+
+            fn rule_type(&self) -> &str {
+                if self.shape == Shape::NameOnly {
+                    "proto_alias"
+                } else {
+                    "fixture_identity"
+                }
+            }
+
+            fn dependencies(&self) -> Vec<String> {
+                if self.shape == Shape::ExtraDependency {
+                    vec![":generated".into(), ":other".into()]
+                } else {
+                    vec![":generated".into()]
+                }
+            }
+
+            fn identity_artifact_forwarder(&self) -> Option<&str> {
+                match self.shape {
+                    Shape::NameOnly => None,
+                    Shape::WrongActual => Some(":other"),
+                    _ => Some(":generated"),
+                }
+            }
+
+            fn providers(&self) -> ProviderSet {
+                if self.shape == Shape::OwnProvider {
+                    // Deliberately invalid OWN provider on a negative fixture.
+                    // The real file exists; this provider must never reach a
+                    // successful consumer or act as a C++ provider substitute.
+                    ProviderSet::empty().with_files(FilesInfo::new(vec![self
+                        .root
+                        .join("forwarder-owned-source.h")]))
+                } else {
+                    ProviderSet::empty()
+                }
+            }
+
+            fn analyze(
+                &self,
+                ctx: &mut rush_rules::analysis_context::AnalysisContext,
+                _dependencies: &[Arc<ProviderSet>],
+            ) -> ProviderSet {
+                match self.shape {
+                    Shape::OwnArtifact => {
+                        ctx.register_source_artifact(
+                            &self.root.join("forwarder-owned-source.h"),
+                            rush_action::ids::ArtifactKind::Header,
+                        );
+                    }
+                    Shape::OwnIncompleteAction => {
+                        let object = ctx.register_generated_artifact(
+                            Path::new("forwarder-must-not-produce.o"),
+                            rush_action::ids::ArtifactKind::Object,
+                            None,
+                        );
+                        if let Err(error) = ctx.declare_incomplete_action(
+                            "GenRule",
+                            Vec::new(),
+                            vec![object],
+                            "negative fixture owns an incomplete action",
+                        ) {
+                            ctx.fail_native_namespace_analysis(error.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                self.providers()
+            }
+
+            async fn build(
+                &self,
+                _context: &rush_rules::context::BuildContext,
+            ) -> Result<Vec<Artifact>> {
+                // This is intentionally observable. Even successful forwarding
+                // must skip the implementation, not merely tolerate Vec::new.
+                std::fs::write(self.root.join("FORWARDER_BUILD_MUST_NEVER_RUN"), b"called")?;
+                anyhow::bail!("fixture forwarder build body was invoked")
+            }
+        }
+
+        fn fixture(root: &Path, shape: Shape) -> Result<BuildOrchestrator> {
+            once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+            write_file(
+                &root.join("WORKSPACE"),
+                "workspace(name='identity_forwarder_driver')\n",
+            )?;
+            write_file(
+                &root.join("BUILD"),
+                r#"
+genrule(name="generated",srcs=["value.h.in"],outs=["value.h"],cmd="cp $(SRCS) $@")
+filegroup(name="other",srcs=["other.h"])
+cc_library(name="forward",deps=[":generated"])
+cc_library(name="consumer",srcs=["consumer.cc"],hdrs=[":forward"])
+cc_binary(name="app",srcs=["main.cc"],deps=[":consumer"])
+"#,
+            )?;
+            write_file(&root.join("value.h.in"), "#define FORWARDED_VALUE 42\n")?;
+            write_file(&root.join("other.h"), "#pragma once\n")?;
+            write_file(&root.join("forwarder-owned-source.h"), "#pragma once\n")?;
+            write_file(
+                &root.join("consumer.cc"),
+                "#include \"value.h\"\nint forwarded_result(){return FORWARDED_VALUE;}\n",
+            )?;
+            write_file(
+                &root.join("main.cc"),
+                "#include <stdio.h>\nint forwarded_result();\nint main(){printf(\"%d\\n\",forwarded_result());return 0;}\n",
+            )?;
+            let mut orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+            Arc::get_mut(&mut orchestrator.rule_registry)
+                .context("fixture registry is shared")?
+                .register(Box::new(FixtureLibrary {
+                    root: root.to_owned(),
+                    shape,
+                }));
+            Ok(orchestrator)
+        }
+
+        fn command(root: &Path) -> Result<rush_command_core::CommandSemantics> {
+            let expanded = rush_command_core::build_arguments::encode(&[
+                "--define=fixture=identity_forwarder".into(),
+            ]);
+            semantics_with_define_and_environment(
+                root,
+                "//:app",
+                "fixture",
+                "identity_forwarder",
+                &[
+                    ("RUSH_CPP_DISCOVERY", "uncached-diagnostic-v1"),
+                    ("PATH", "/usr/bin:/bin"),
+                    (
+                        rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV,
+                        expanded.as_str(),
+                    ),
+                ],
+            )
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn identity_forwarder_driver_skips_body_and_forwards_real_generated_header(
+        ) -> Result<()> {
+            let temporary = TempDir::new()?;
+            let root = temporary.path();
+            let orchestrator = fixture(root, Shape::Pure)?;
+            let semantics = command(root)?;
+            let targets = vec!["//:app".to_owned()];
+            let output = cache_paths::workspace_output_root(root);
+            let executable = output.join("app");
+            let run = || -> Result<Vec<u8>> {
+                let result = std::process::Command::new(&executable)
+                    .current_dir(root)
+                    .output()?;
+                anyhow::ensure!(result.status.success(), "fixture executable failed");
+                Ok(result.stdout)
+            };
+            for expected in [42, 42, 43] {
+                if expected == 43 {
+                    write_file(&root.join("value.h.in"), "#define FORWARDED_VALUE 43\n")?;
+                }
+                orchestrator
+                    .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
+                    .await?;
+                assert_eq!(run()?, format!("{expected}\n").as_bytes());
+                assert!(!root.join("FORWARDER_BUILD_MUST_NEVER_RUN").exists());
+                assert_eq!(
+                    std::fs::read(output.join("genfiles/value.h"))?,
+                    std::fs::read(root.join("value.h.in"))?,
+                    "the real generator, not the forwarder, owns header bytes"
+                );
+                let mut counts = std::collections::BTreeMap::new();
+                for (mnemonic, _) in
+                    crate::compiler_discovery::take_completed_diagnostic_processes(root)
+                {
+                    *counts.entry(mnemonic).or_insert(0usize) += 1;
+                }
+                assert_eq!(
+                    counts,
+                    std::collections::BTreeMap::from([
+                        ("GenRule".to_owned(), 1),
+                        ("CppCompile".to_owned(), 2),
+                        ("CppArchive".to_owned(), 1),
+                        ("CppLink".to_owned(), 1),
+                    ]),
+                    "every diagnostic request must execute exactly the real chain"
+                );
+                let key = crate::analysis_snapshot::AnalysisKey::new(
+                    &semantics,
+                    root.canonicalize()?,
+                    targets.clone(),
+                );
+                assert!(orchestrator.snapshot_cache.get(&key).is_none());
+                assert!(crate::cold_noop_cache::load(root, &key).is_none());
+            }
+            // Retain an actual good ELF. Missing producer input must refuse,
+            // rather than use the prior executable as current success.
+            assert!(executable.is_file());
+            std::fs::remove_file(root.join("value.h.in"))?;
+            let error = orchestrator
+                .build_with_dependencies_with_semantics(targets, semantics)
+                .await
+                .expect_err("deleted real generator input must fail despite the old ELF");
+            assert!(format!("{error:#}").contains("value.h.in"), "{error:#}");
+            assert!(!root.join("FORWARDER_BUILD_MUST_NEVER_RUN").exists());
+            assert_eq!(run()?, b"43\n");
+            let _ = crate::compiler_discovery::take_completed_diagnostic_processes(root);
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn identity_forwarder_driver_refuses_unaudited_shapes_before_any_writer() -> Result<()>
+        {
+            for (shape, expected) in [
+                (Shape::NameOnly, "does not audit rule proto_alias"),
+                (Shape::WrongActual, "exactly its literal actual dependency"),
+                (
+                    Shape::ExtraDependency,
+                    "exactly its literal actual dependency",
+                ),
+                (Shape::OwnIncompleteAction, "owns actions or artifacts"),
+                (Shape::OwnArtifact, "owns actions or artifacts"),
+                (Shape::OwnProvider, "providers of its own"),
+            ] {
+                let temporary = TempDir::new()?;
+                let root = temporary.path();
+                let orchestrator = fixture(root, shape)?;
+                let output = cache_paths::workspace_output_root(root);
+                let error = orchestrator
+                    .build_with_dependencies_with_semantics(
+                        vec!["//:app".to_owned()],
+                        command(root)?,
+                    )
+                    .await
+                    .expect_err("invalid forwarding declaration must not reach runtime");
+                let message = format!("{error:#}");
+                assert!(message.contains(expected), "{shape:?}: {message}");
+                assert!(
+                    !root.join("FORWARDER_BUILD_MUST_NEVER_RUN").exists(),
+                    "{shape:?}"
+                );
+                assert!(
+                    !output.join("genfiles/value.h").exists(),
+                    "{shape:?}: generator wrote before admission"
+                );
+                assert!(!output.join("app").exists(), "{shape:?}");
+                assert!(
+                    crate::compiler_discovery::take_completed_diagnostic_processes(root).is_empty(),
+                    "{shape:?}: no real process may complete before structural refusal"
+                );
+            }
+            Ok(())
+        }
+    }
+
     /// Whole-driver runtime control. The test registry injects the already
     /// qualified backend factories; genuine frontend qualification has separate
     /// source-backed controls. No production registry name admits projections.

@@ -86,6 +86,7 @@ pub mod optimization;
 pub mod output_tree;
 pub(crate) mod native_execroot;
 mod native_execution_demand;
+mod native_identity_forwarder;
 pub mod persistent_workers;
 pub mod profile;
 pub mod profiling;

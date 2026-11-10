@@ -2544,12 +2544,14 @@ impl RuleInstance for ProtoAliasInstance {
         vec![self.actual_target.clone()]
     }
 
+    fn identity_artifact_forwarder(&self) -> Option<&str> {
+        Some(&self.actual_target)
+    }
+
     async fn build(&self, _context: &rush_rules::context::BuildContext) -> Result<Vec<Artifact>> {
-        // This is correct behavior: aliases produce nothing of
-        // their own. The orchestrator forwards built_artifacts via
-        // Arc::clone for rule_type == "proto_alias" so consumers
-        // querying this label get the actual target's NestedSet
-        // identity (patch set 2b).
+        // This instance produces nothing. A driver that admits its identity
+        // forwarding request must skip this method AND scheduler dispatch,
+        // after independently validating the singleton actual identity.
         Ok(Vec::new())
     }
 
@@ -2571,6 +2573,142 @@ mod tests {
     use rush_rules::providers::{CcInfo, DirectCcInfo, ProviderSet};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn proto_alias_identity_request_survives_metadata_without_own_work() -> Result<()> {
+        use rush_rules::context::{BuildContext, NativeCompileMode, PendingCompileDeclarations};
+        use rush_rules::{with_visibility, BuildRule};
+        use std::path::{Path, PathBuf};
+
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source");
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(source.join("pkg"))?;
+        let header = source.join("pkg/public.h");
+        std::fs::write(&header, "#pragma once\n#define PUBLIC_VALUE 42\n")?;
+        let config = ConfigId(7);
+        let mut registry = ArtifactRegistry::new();
+        let resolver = StubIncludeResolver::new(source.clone());
+        let toolchain = Toolchain::default();
+        // A genuine native header-library analysis supplies real nonempty
+        // dependency metadata. The alias must not recreate or claim any of it.
+        let actual = rush_rules::rules_cc::CcLibraryRule.parse_attributes(&HashMap::from([
+            ("name".into(), Value::String("messages".into())),
+            (
+                "hdrs".into(),
+                Value::List(vec![Value::String("public.h".into())]),
+            ),
+        ]))?;
+        assert_eq!(actual.identity_artifact_forwarder(), None);
+        let actual_provider = Arc::new({
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                config,
+                "pkg",
+                Some("actual_owner"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &source,
+                &[],
+            );
+            actual.analyze(&mut ctx, &[])
+        });
+        let actual_cc = actual_provider
+            .get_cc_info()
+            .context("actual library lost CcInfo")?;
+        let header_id = actual_cc
+            .compilation
+            .headers
+            .iter()
+            .next()
+            .context("actual library lost header")?;
+        assert_eq!(
+            registry.find_artifact_by_path(&header, config),
+            Some(header_id)
+        );
+        assert_eq!(
+            registry.find_artifact_by_path(&header, ConfigId::DEFAULT),
+            None
+        );
+        let actual_label = "@@actual_owner//pkg:messages";
+        let visibility = vec!["//visibility:public".to_owned()];
+        let alias = with_visibility(
+            ProtoAliasInstance::new("messages_cc".into(), actual_label.into()),
+            Some(visibility.clone()),
+        );
+        assert_eq!(alias.target_name(), "messages_cc");
+        assert_eq!(alias.visibility(), Some(visibility.as_slice()));
+        assert_eq!(alias.identity_artifact_forwarder(), Some(actual_label));
+        assert_eq!(alias.dependencies(), vec![actual_label.to_owned()]);
+        assert!(alias.declared_outputs().is_empty());
+        assert!(alias.providers().is_empty());
+        let labeled = vec![(actual_label.to_owned(), actual_provider.clone())];
+        for mode in [
+            NativeCompileMode::Literal,
+            NativeCompileMode::UncachedDiagnosticV1,
+        ] {
+            let artifact_count = registry.artifact_count();
+            let action_count = registry.declared_action_count();
+            let mut pending = PendingCompileDeclarations::default();
+            {
+                let mut ctx = AnalysisContext::new(
+                    TargetId(2),
+                    config,
+                    "pkg",
+                    Some("actual_owner"),
+                    &output,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    &source,
+                    &[],
+                )
+                .with_labeled_dep_providers(&labeled)
+                .with_native_compile_discovery(mode, &mut pending);
+                alias.validate_analysis_dependencies(&ctx)?;
+                assert!(alias
+                    .analyze(&mut ctx, &[actual_provider.clone()])
+                    .is_empty());
+                assert!(ctx.native_namespace_analysis_error().is_none());
+            }
+            assert_eq!(registry.artifact_count(), artifact_count);
+            assert_eq!(registry.declared_action_count(), action_count);
+            assert!(registry.actions_of(TargetId(2)).is_empty());
+            assert_eq!(pending.iter().count(), 0);
+            let context = BuildContext::new(source.clone(), output.clone())
+                .with_package(PathBuf::from("pkg"))
+                .with_dependencies(
+                    HashMap::new(),
+                    vec![(actual_label.into(), actual_provider.as_ref().clone())],
+                )
+                .with_native_compile_discovery(mode, Arc::new(pending));
+            assert!(alias.build_legacy_command_specs(&context).await.is_empty());
+            assert!(alias.build(&context).await?.is_empty());
+            assert_eq!(
+                registry.find_artifact_by_path(Path::new(&header), config),
+                Some(header_id)
+            );
+        }
+        // The ordinary alias implementation, even with the same target name
+        // and an unrecognized declaration-looking attribute, cannot grant this
+        // separate native hook through a name/kwargs convention.
+        let ordinary = crate::alias::AliasRule.parse_attributes(&HashMap::from([
+            ("name".into(), Value::String("messages_cc".into())),
+            ("actual".into(), Value::String(actual_label.into())),
+            (
+                "identity_artifact_forwarder".into(),
+                Value::String(actual_label.into()),
+            ),
+        ]))?;
+        assert_eq!(ordinary.identity_artifact_forwarder(), None);
+        assert_eq!(
+            with_visibility(ordinary, Some(visibility)).identity_artifact_forwarder(),
+            None
+        );
+        Ok(())
+    }
 
     #[test]
     fn declared_proto_rejects_malformed_inputs_instead_of_empty_aggregation() -> Result<()> {

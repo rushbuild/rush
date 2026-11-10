@@ -144,6 +144,19 @@ pub trait RuleInstance: Send + Sync {
         None
     }
 
+    /// Request identity forwarding from this literal actual dependency.
+    ///
+    /// This out-of-band declaration is NOT execution admission. A driver must
+    /// resolve the exact singleton runtime dependency in the current
+    /// configuration and verify its provider/artifact identity. It must require
+    /// no own providers, actions, artifacts, or pending declarations, then skip
+    /// BOTH build and scheduler dispatch and forward the actual identity
+    /// unchanged. Rule names or user attributes do not grant this request or
+    /// discharge those checks. Ordinary rules default to no forwarding request.
+    fn identity_artifact_forwarder(&self) -> Option<&str> {
+        None
+    }
+
     /// Literal options-consumer declaration, when implemented by this rule.
     /// The orchestrator separately qualifies source and configured providers.
     fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {
@@ -541,6 +554,10 @@ impl RuleInstance for RuleMetadataInstance {
 
     fn cc_projection_kind(&self) -> Option<rules_cc_projection::CcProjectionKind> {
         self.inner.cc_projection_kind()
+    }
+
+    fn identity_artifact_forwarder(&self) -> Option<&str> {
+        self.inner.identity_artifact_forwarder()
     }
 
     fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {
