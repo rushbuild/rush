@@ -4939,10 +4939,16 @@ fn load_kbuild_graph_capture(
     let read_limit = max_graph_bytes
         .checked_add(1)
         .context("Kbuild graph byte budget overflowed")?;
-    let mut reader = DigestingReader::new(file.take(read_limit));
+    // serde_json's IO reader requests bytes individually. Buffer above the
+    // digesting/budget reader so both filesystem reads and digest updates are
+    // batched while the same validated descriptor and exact byte limit remain.
+    let mut reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        DigestingReader::new(file.take(read_limit)),
+    );
     let capture: KbuildActionGraphCapture =
         serde_json::from_reader(&mut reader).context("decode observed Kbuild action graph")?;
-    let (limited, digest, bytes) = reader.finish();
+    let (limited, digest, bytes) = reader.into_inner().finish();
     let file = limited.into_inner();
     let after = file
         .metadata()
@@ -25345,6 +25351,182 @@ mod tests {
         std::fs::create_dir(&private).unwrap();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
         private
+    }
+
+    #[cfg(unix)]
+    fn test_graph_reader_capture() -> KbuildActionGraphCapture {
+        let invocation = CapturedInvocation {
+            executable: PathBuf::from("/usr/bin/make"),
+            argv: vec![b"make".to_vec(), b"all".to_vec()],
+            environment: vec![CapturedEnvironmentVariable {
+                name: b"CAPTURED_TEST_VALUE".to_vec(),
+                value: vec![b'x'; 20_000],
+            }],
+            working_directory: PathBuf::from("/output"),
+        };
+        KbuildActionGraphCapture {
+            schema: KBUILD_GRAPH_CAPTURE_SCHEMA.to_string(),
+            actions: (0..2)
+                .map(|action| KbuildActionCapture {
+                    schema: KBUILD_CAPTURE_SCHEMA.to_string(),
+                    analyzer: invocation.clone(),
+                    commands: vec![invocation.clone()],
+                    receipt_path: None,
+                    action_inputs: Vec::new(),
+                    analysis_inputs: Vec::new(),
+                    persistent_outputs: vec![
+                        PathBuf::from(format!("/output/action-{action}-z")),
+                        PathBuf::from(format!("/output/action-{action}-a")),
+                    ],
+                    requested_goals: vec![b"all".to_vec()],
+                })
+                .collect(),
+            requested_outputs: vec![PathBuf::from("/output/action-1-z")],
+            initial_inputs: Vec::new(),
+            empty_output_directory_listings: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_json_buffer_preserves_real_file_bytes_digest_and_reduces_reads() {
+        struct CountingRead<R> {
+            inner: R,
+            calls: u64,
+            bytes: u64,
+            max_request: usize,
+        }
+        impl<R: Read> Read for CountingRead<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.max_request = self.max_request.max(buffer.len());
+                let count = self.inner.read(buffer)?;
+                self.bytes += count as u64;
+                Ok(count)
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let private = private_capture_directory(temp.path());
+        let path = private.join("graph.json");
+        let expected = test_graph_reader_capture();
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        assert!(bytes.len() > 64 * 1024);
+        std::fs::write(&path, &bytes).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let open = || CountingRead {
+            inner: File::open(&path).unwrap(),
+            calls: 0,
+            bytes: 0,
+            max_request: 0,
+        };
+        let limit = bytes.len() as u64 + 1;
+        let mut plain = DigestingReader::new(open().take(limit));
+        let plain_value: KbuildActionGraphCapture = serde_json::from_reader(&mut plain).unwrap();
+        let (plain, plain_digest, plain_bytes) = plain.finish();
+        let plain = plain.into_inner();
+        let mut buffered =
+            std::io::BufReader::with_capacity(64 * 1024, DigestingReader::new(open().take(limit)));
+        let buffered_value: KbuildActionGraphCapture =
+            serde_json::from_reader(&mut buffered).unwrap();
+        let (buffered, buffered_digest, buffered_bytes) = buffered.into_inner().finish();
+        let buffered = buffered.into_inner();
+        assert_eq!(plain_value, expected);
+        assert_eq!(buffered_value, expected);
+        assert_eq!(plain_digest, *blake3::hash(&bytes).as_bytes());
+        assert_eq!(buffered_digest, plain_digest);
+        assert_eq!(plain_bytes, bytes.len() as u64);
+        assert_eq!(buffered_bytes, plain_bytes);
+        assert_eq!(plain.bytes, buffered.bytes);
+        assert_eq!(plain.max_request, 1);
+        assert_eq!(buffered.max_request, 64 * 1024);
+        assert!(
+            buffered.calls < plain.calls / 32,
+            "buffered{} vs bytewise{} actual underlying Read calls",
+            buffered.calls,
+            plain.calls
+        );
+        assert_eq!(
+            load_kbuild_graph_capture(&path, plain_digest, bytes.len() as u64).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_json_buffer_rejects_prefetched_trailing_corruption_and_budgets() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let private = private_capture_directory(temp.path());
+        let path = private.join("graph.json");
+        let mut graph = test_graph_reader_capture();
+        for action in &mut graph.actions {
+            action.analyzer.environment.clear();
+            action.commands[0].environment.clear();
+        }
+        let valid = serde_json::to_vec(&graph).unwrap();
+        assert!(valid.len() + 5 < 64 * 1024);
+        let write = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let mut whitespace = valid.clone();
+        whitespace.extend_from_slice(b" \n\t");
+        write(&whitespace);
+        assert_eq!(
+            load_kbuild_graph_capture(
+                &path,
+                *blake3::hash(&whitespace).as_bytes(),
+                whitespace.len() as u64
+            )
+            .unwrap(),
+            graph
+        );
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b" true");
+        write(&trailing);
+        let error = load_kbuild_graph_capture(
+            &path,
+            *blake3::hash(&trailing).as_bytes(),
+            trailing.len() as u64,
+        )
+        .unwrap_err();
+        assert!(error
+            .root_cause()
+            .to_string()
+            .contains("trailing characters"));
+        let truncated = &valid[..valid.len() - 1];
+        write(truncated);
+        assert!(load_kbuild_graph_capture(
+            &path,
+            *blake3::hash(truncated).as_bytes(),
+            truncated.len() as u64
+        )
+        .unwrap_err()
+        .root_cause()
+        .to_string()
+        .contains("EOF"));
+        write(&valid);
+        assert!(
+            load_kbuild_graph_capture(&path, [0; 32], valid.len() as u64)
+                .unwrap_err()
+                .to_string()
+                .contains("digest does not match")
+        );
+        assert!(load_kbuild_graph_capture(
+            &path,
+            *blake3::hash(&valid).as_bytes(),
+            valid.len() as u64 - 1
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("regular-file budget"));
+        assert!(
+            load_kbuild_graph_capture(&path, *blake3::hash(&valid).as_bytes(), u64::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("byte budget overflowed")
+        );
     }
 
     #[cfg(unix)]
