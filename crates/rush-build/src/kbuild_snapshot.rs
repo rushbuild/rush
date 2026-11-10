@@ -18769,6 +18769,7 @@ fn declared_kbuild_outputs(
 ) -> Result<(
     BTreeMap<u64, BTreeSet<PathBuf>>,
     BTreeMap<u64, Vec<PathBuf>>,
+    BTreeMap<PathBuf, (u64, usize)>,
 )> {
     let mut by_action = BTreeMap::new();
     let mut ordered_by_action = BTreeMap::new();
@@ -18788,15 +18789,16 @@ fn declared_kbuild_outputs(
             if !outputs.insert(path.clone()) {
                 anyhow::bail!("Kbuild action repeats a declared persistent output");
             }
+            let output_index = ordered_outputs.len();
             ordered_outputs.push(path.clone());
-            if owners.insert(path, action_index).is_some() {
+            if owners.insert(path, (action_index, output_index)).is_some() {
                 anyhow::bail!("Kbuild graph assigns one persistent output to multiple actions");
             }
         }
         by_action.insert(action_index, outputs);
         ordered_by_action.insert(action_index, ordered_outputs);
     }
-    Ok((by_action, ordered_by_action))
+    Ok((by_action, ordered_by_action, owners))
 }
 
 #[cfg(unix)]
@@ -19716,6 +19718,7 @@ struct KbuildProcessOwnershipMatcher {
     output_root: PathBuf,
     declared_outputs: BTreeMap<u64, BTreeSet<PathBuf>>,
     declared_output_order: BTreeMap<u64, Vec<PathBuf>>,
+    declared_output_locations: BTreeMap<PathBuf, (u64, usize)>,
     mutation_candidates: BTreeMap<KbuildProcessOwner, BTreeSet<PathBuf>>,
     mutation_events: Vec<(KbuildProcessOwner, KbuildMutationCandidate)>,
     final_output_observations: Vec<KbuildFinalOutputObservation>,
@@ -19879,7 +19882,7 @@ impl KbuildProcessOwnershipMatcher {
             outcome_census.insert(owner, KbuildOwnedOutcomeCensus::default());
             mutation_candidates.insert(owner, BTreeSet::new());
         }
-        let (declared_outputs, declared_output_order) =
+        let (declared_outputs, declared_output_order, declared_output_locations) =
             declared_kbuild_outputs(capture, output_root)?;
         Ok(Self {
             stream_digest,
@@ -19946,6 +19949,7 @@ impl KbuildProcessOwnershipMatcher {
             output_root: output_root.to_path_buf(),
             declared_outputs,
             declared_output_order,
+            declared_output_locations,
             mutation_candidates,
             mutation_events: Vec::new(),
             final_output_observations: Vec::new(),
@@ -20772,15 +20776,7 @@ impl KbuildProcessOwnershipMatcher {
         boundary: KbuildFinalOutputBoundary,
     ) -> Result<()> {
         let target = bytes_path(&identity.target);
-        let location = self
-            .declared_output_order
-            .iter()
-            .find_map(|(action_index, paths)| {
-                paths
-                    .iter()
-                    .position(|path| path == &target)
-                    .map(|output_index| (*action_index, output_index))
-            });
+        let location = self.declared_output_locations.get(&target).copied();
         let Some((action_index, output_index)) = location else {
             return Ok(());
         };
@@ -25527,6 +25523,280 @@ mod tests {
                 .to_string()
                 .contains("byte budget overflowed")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_output_index_matches_linear_path_and_position_semantics() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut capture = test_graph_reader_capture();
+        let binary_path =
+            PathBuf::from(std::ffi::OsString::from_vec(b"/output/raw-\xff.o".to_vec()));
+        capture.actions[0]
+            .persistent_outputs
+            .push(binary_path.clone());
+        let (sets, ordered, indexed) =
+            declared_kbuild_outputs(&capture, Path::new("/output")).unwrap();
+        let old_lookup = |target: &Path| {
+            ordered.iter().find_map(|(action, paths)| {
+                paths
+                    .iter()
+                    .position(|path| path == target)
+                    .map(|position| (*action, position))
+            })
+        };
+        let mut targets = ordered.values().flatten().cloned().collect::<Vec<_>>();
+        targets.extend([
+            PathBuf::from("/output/./action-0-z"),
+            PathBuf::from("/output//action-1-a"),
+            PathBuf::from("/source/header.h"),
+            PathBuf::from("/output/action-0-z/suffix"),
+            PathBuf::from("action-0-z"),
+            PathBuf::from("/output"),
+        ]);
+        for target in targets {
+            assert_eq!(
+                indexed.get(&target).copied(),
+                old_lookup(&target),
+                "{}",
+                target.display()
+            );
+        }
+        assert_eq!(indexed[&PathBuf::from("/output/action-0-z")], (0, 0));
+        assert_eq!(indexed[&PathBuf::from("/output/action-0-a")], (0, 1));
+        assert_eq!(indexed[&binary_path], (0, 2));
+        assert_eq!(sets[&0].len(), ordered[&0].len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_output_index_preserves_ownership_and_root_refusals() {
+        for (defect, expected) in [
+            ("same-action", "repeats a declared persistent output"),
+            ("cross-action", "multiple actions"),
+            ("outside", "outside the output root"),
+            ("root", "names the output root itself"),
+            ("relative", "not absolute"),
+            ("parent", "unresolved parent component"),
+        ] {
+            let mut capture = test_graph_reader_capture();
+            match defect {
+                "same-action" => {
+                    let duplicate = capture.actions[0].persistent_outputs[0].clone();
+                    capture.actions[0].persistent_outputs.push(duplicate);
+                }
+                "cross-action" => {
+                    let duplicate = capture.actions[0].persistent_outputs[0].clone();
+                    capture.actions[1].persistent_outputs.push(duplicate);
+                }
+                "outside" => capture.actions[0]
+                    .persistent_outputs
+                    .push(PathBuf::from("/other/out")),
+                "root" => capture.actions[0]
+                    .persistent_outputs
+                    .push(PathBuf::from("/output")),
+                "relative" => capture.actions[0]
+                    .persistent_outputs
+                    .push(PathBuf::from("relative")),
+                "parent" => capture.actions[0]
+                    .persistent_outputs
+                    .push(PathBuf::from("/output/../escape")),
+                _ => unreachable!(),
+            }
+            let error = declared_kbuild_outputs(&capture, Path::new("/output")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{defect}: {error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_output_index_preserves_boundary_values_order_and_refusals() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_root = std::fs::canonicalize(temp.path()).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut capture = test_graph_reader_capture();
+        for action in &mut capture.actions {
+            for invocation in
+                std::iter::once(&mut action.analyzer).chain(action.commands.iter_mut())
+            {
+                invocation.executable = executable.clone();
+                invocation.working_directory = output_root.clone();
+            }
+            for path in &mut action.persistent_outputs {
+                *path = output_root.join(path.file_name().unwrap());
+            }
+        }
+        capture.requested_outputs = vec![capture.actions[1].persistent_outputs[0].clone()];
+        let boundaries = KbuildProcessBoundaryDeclaration {
+            analyzer: KbuildInvocationBoundary {
+                process: 1,
+                invocation_index: 0,
+            },
+            actions: vec![
+                KbuildActionBoundary {
+                    action_index: 0,
+                    commands: vec![KbuildInvocationBoundary {
+                        process: 2,
+                        invocation_index: 0,
+                    }],
+                },
+                KbuildActionBoundary {
+                    action_index: 1,
+                    commands: vec![KbuildInvocationBoundary {
+                        process: 3,
+                        invocation_index: 0,
+                    }],
+                },
+            ],
+        };
+        let mut matcher =
+            KbuildProcessOwnershipMatcher::new(&capture, &boundaries, &output_root, [1; 32])
+                .unwrap();
+        matcher.start_process(1, None).unwrap();
+        matcher.start_process(2, Some(1)).unwrap();
+        matcher.start_process(3, Some(1)).unwrap();
+        let value = CapturedMappedFileValue::WholeFile {
+            bytes: 7,
+            digest: [6; 32],
+            mode: libc::S_IFREG | 0o644,
+        };
+        let identity = |path: &Path| CapturedDescriptorIdentity {
+            target: os_bytes(path.as_os_str()),
+            device: 4,
+            inode: 5,
+            kind: CapturedDescriptorKind::RegularFile,
+        };
+        let mut expected = Vec::new();
+        for (ordinal, (action, output, process, boundary)) in [
+            (1_u64, 1_usize, 3_u64, KbuildFinalOutputBoundary::Close),
+            (0, 0, 2, KbuildFinalOutputBoundary::DescriptorReplacement),
+            (0, 1, 2, KbuildFinalOutputBoundary::Exit),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = &capture.actions[action as usize].persistent_outputs[output];
+            let legacy = matcher
+                .declared_output_order
+                .iter()
+                .find_map(|(owner, paths)| {
+                    paths
+                        .iter()
+                        .position(|candidate| candidate == path)
+                        .map(|position| (*owner, position))
+                })
+                .unwrap();
+            assert_eq!(legacy, (action, output));
+            matcher
+                .record_final_output_value(
+                    process,
+                    20 + ordinal as u64,
+                    3,
+                    &identity(path),
+                    9,
+                    value,
+                    boundary,
+                )
+                .unwrap();
+            expected.push(KbuildFinalOutputObservation {
+                owner: KbuildProcessOwner::Action(action),
+                process,
+                stream_ordinal: 20 + ordinal as u64,
+                descriptor: 3,
+                action_index: legacy.0,
+                output_index: legacy.1 as u64,
+                object: KbuildOutputObjectIdentity {
+                    device: 4,
+                    inode: 5,
+                    mount_id: 9,
+                },
+                bytes: 7,
+                digest: [6; 32],
+                mode: libc::S_IFREG | 0o644,
+                boundary,
+            });
+        }
+        assert_eq!(matcher.final_output_observations, expected);
+        let mut ignored = identity(&output_root.join("undeclared-readable-input"));
+        ignored.kind = CapturedDescriptorKind::Directory;
+        matcher
+            .record_final_output_value(
+                999,
+                40,
+                3,
+                &ignored,
+                9,
+                CapturedMappedFileValue::Unwitnessed,
+                KbuildFinalOutputBoundary::Close,
+            )
+            .unwrap();
+        assert_eq!(
+            matcher.final_output_observations, expected,
+            "unknown inputs remain ignored before kind/value/process validation"
+        );
+        let matched = identity(&capture.actions[0].persistent_outputs[0]);
+        let mut wrong_kind = matched.clone();
+        wrong_kind.kind = CapturedDescriptorKind::Directory;
+        assert!(matcher
+            .record_final_output_value(
+                2,
+                41,
+                3,
+                &wrong_kind,
+                9,
+                value,
+                KbuildFinalOutputBoundary::Close
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("regular descriptor"));
+        assert!(matcher
+            .record_final_output_value(
+                2,
+                42,
+                3,
+                &matched,
+                9,
+                CapturedMappedFileValue::Unwitnessed,
+                KbuildFinalOutputBoundary::Close
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no whole-file value"));
+        assert!(matcher
+            .record_final_output_value(
+                2,
+                43,
+                3,
+                &matched,
+                9,
+                CapturedMappedFileValue::WholeFile {
+                    bytes: 7,
+                    digest: [6; 32],
+                    mode: libc::S_IFDIR | 0o755
+                },
+                KbuildFinalOutputBoundary::Close
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("non-regular mode"));
+        assert!(matcher
+            .record_final_output_value(
+                999,
+                44,
+                3,
+                &matched,
+                9,
+                value,
+                KbuildFinalOutputBoundary::Close
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no process owner"));
+        assert_eq!(matcher.final_output_observations, expected);
     }
 
     #[cfg(unix)]
