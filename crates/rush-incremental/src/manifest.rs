@@ -149,6 +149,23 @@ fn canonicalize_content_observations(deps: Vec<Dependency>) -> Vec<Dependency> {
 }
 
 impl DependencyManifest {
+    /// Canonicalize borrowed observations without cloning repeated payloads.
+    ///
+    /// Keep distinct proof payloads until the existing conservative content
+    /// reducer has seen them. Removing only exact duplicates is idempotent for
+    /// that reducer and for the final dedup, including process probes. Keep the
+    /// first Ord-equal representation, matching the stable owned sort. Scratch
+    /// storage grows with distinct observations, not the raw recording length.
+    pub(crate) fn from_recorded_refs<'a>(
+        recorded: impl IntoIterator<Item = &'a Dependency>,
+    ) -> Self {
+        let mut distinct = BTreeSet::new();
+        for dep in recorded {
+            distinct.insert(dep);
+        }
+        Self::from_recorded(distinct.into_iter().cloned().collect())
+    }
+
     /// Build a canonical manifest from a raw recorded list: dedup identical
     /// observations and sort into a deterministic order.
     ///
@@ -1032,6 +1049,220 @@ mod metadata_preflight_tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn borrowed_recordings_preserve_exact_canonical_wire_and_fingerprint() {
+        let path = PathBuf::from("/snapshot/header.h");
+        let digest = content_digest(b"header");
+        let proof = crate::FileContentBinding {
+            version: 1,
+            path: path.clone(),
+            digest,
+            len: 6,
+            mode: 0o100644,
+            dev: 1,
+            ino: 2,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            read_start_ns: 3_000_000_001,
+            read_end_ns: 3_000_000_002,
+        };
+        let mut later = proof.clone();
+        later.read_start_ns += 10;
+        later.read_end_ns += 10;
+        let mut other_inode = proof.clone();
+        other_inode.ino += 1;
+        let mut invalid = proof.clone();
+        invalid.version = 99;
+        let mut fresh = proof.clone();
+        fresh.read_start_ns = 1;
+        fresh.read_end_ns = 2;
+        let mut wrong_value = proof.clone();
+        wrong_value.digest = [9; 32];
+        let content = |binding| Dependency::FileContent {
+            path: path.clone(),
+            digest,
+            binding,
+        };
+        let probe = Dependency::ProcessProbe {
+            program: PathBuf::from("/bin/tool"),
+            args: vec![vec![0xff, b'a']],
+            env_keys: vec![b"PATH".to_vec()],
+            cwd: PathBuf::from("/snapshot"),
+            status: 0,
+            stdout_digest: [3; 32],
+            stderr_digest: [4; 32],
+            compare_stderr: true,
+        };
+        let mut other_probe = probe.clone();
+        if let Dependency::ProcessProbe {
+            status,
+            compare_stderr,
+            ..
+        } = &mut other_probe
+        {
+            *status = 1;
+            *compare_stderr = false;
+        }
+        let common = vec![
+            Dependency::FileContent {
+                path: path.clone(),
+                digest: [8; 32],
+                binding: None,
+            },
+            Dependency::FileExistence {
+                path: path.clone(),
+                exists: true,
+                kind: Some(FileKind::File),
+            },
+            Dependency::FileExistence {
+                path: path.clone(),
+                exists: false,
+                kind: None,
+            },
+            Dependency::Symlink {
+                path: path.clone(),
+                target: Some(PathBuf::from("other")),
+            },
+            Dependency::Symlink {
+                path: path.clone(),
+                target: None,
+            },
+            Dependency::DirListing {
+                path: path.clone(),
+                entries_digest: [1; 32],
+            },
+            Dependency::Env {
+                name: vec![0xff],
+                value: Some(vec![0xfe]),
+            },
+            Dependency::Env {
+                name: vec![0xff],
+                value: None,
+            },
+            Dependency::Opt {
+                key: "mode".into(),
+                value: Some("a".into()),
+            },
+            Dependency::Opt {
+                key: "mode".into(),
+                value: Some("b".into()),
+            },
+            Dependency::ConfigFingerprint { digest: [2; 32] },
+            Dependency::FileMetadata {
+                path: path.clone(),
+                present: true,
+                len: 6,
+                mode: 0o100644,
+                mtime_ns: 1,
+                ctime_ns: 1,
+                dev: 1,
+                ino: 2,
+            },
+            Dependency::FileMetadata {
+                path: path.clone(),
+                present: true,
+                len: 7,
+                mode: 0o100644,
+                mtime_ns: 2,
+                ctime_ns: 2,
+                dev: 1,
+                ino: 3,
+            },
+            probe,
+            other_probe,
+            Dependency::LinuxProcFilesystems {
+                bytes: 9,
+                digest: [5; 32],
+            },
+            Dependency::LinuxProcVmOvercommitMemory { value: 0 },
+            Dependency::LinuxProcVmOvercommitMemory { value: 1 },
+            Dependency::LinuxCgroupV2CpuMax {
+                values: vec![(9, [6; 32])],
+            },
+            // Path ordering normalizes these spellings; their wire bytes differ.
+            Dependency::FileExistence {
+                path: PathBuf::from("/snapshot/a//b"),
+                exists: false,
+                kind: None,
+            },
+            Dependency::FileExistence {
+                path: PathBuf::from("/snapshot/a/b"),
+                exists: false,
+                kind: None,
+            },
+        ];
+        for bindings in [
+            vec![None],
+            vec![Some(proof.clone())],
+            vec![Some(proof.clone()), Some(later)],
+            vec![Some(proof.clone()), None],
+            vec![Some(proof.clone()), Some(other_inode)],
+            vec![Some(proof.clone()), Some(invalid)],
+            vec![Some(proof.clone()), Some(fresh)],
+            vec![Some(proof), Some(wrong_value)],
+        ] {
+            let mut values = common.clone();
+            values.extend(bindings.into_iter().map(content));
+            for rotation in 0..values.len() {
+                values.rotate_left(1);
+                let mut raw = Vec::new();
+                for (index, dep) in values.iter().enumerate() {
+                    raw.extend(std::iter::repeat(dep.clone()).take(1 + (index + rotation) % 7));
+                }
+                if rotation % 2 == 0 {
+                    raw.reverse();
+                }
+                let expected = DependencyManifest::from_recorded(raw.clone());
+                let actual = DependencyManifest::from_recorded_refs(raw.iter());
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&expected).unwrap(),
+                    "proof payload and probe multiplicity must match the owned path"
+                );
+                assert_eq!(actual.fingerprint(), expected.fingerprint());
+            }
+        }
+        let empty = DependencyManifest::from_recorded_refs(std::iter::empty());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn borrowed_manifest_keeps_raw_marks_and_conflicting_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("header.h");
+        fs::write(&file, b"first").unwrap();
+        let io = RealTrackedIo::new(semantics(), dir.path());
+        io.read_file(&file).unwrap();
+        let prefix = io.captured_since(0);
+        let mark = io.mark();
+        for _ in 0..4096 {
+            io.record_deps(&prefix);
+        }
+        let raw = io.captured_since(mark);
+        let first = io.manifest();
+        assert_eq!(first.len(), prefix.len());
+        assert_eq!(io.mark(), mark + raw.len());
+        assert_eq!(io.captured_since(mark), raw);
+        assert_eq!(first.validate_staleness(&semantics()), Staleness::Fresh);
+        fs::write(&file, b"second").unwrap();
+        io.read_file(&file).unwrap();
+        let both = io.manifest();
+        assert_eq!(both.len(), prefix.len() + 1);
+        assert_eq!(
+            both.deps()
+                .iter()
+                .filter(|dep| matches!(dep, Dependency::FileContent { .. }))
+                .count(),
+            2,
+            "contradictory values and their kind observation must survive"
+        );
+        assert!(matches!(
+            both.validate_staleness(&semantics()),
+            Staleness::Stale { .. }
+        ));
+        assert_eq!(io.captured_since(0)[..mark], prefix);
     }
 
     #[test]

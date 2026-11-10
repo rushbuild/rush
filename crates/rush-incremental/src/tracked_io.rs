@@ -899,7 +899,7 @@ impl TrackedIo for RealTrackedIo {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        DependencyManifest::from_recorded(guard.clone())
+        DependencyManifest::from_recorded_refs(guard.iter())
     }
 
     fn mark(&self) -> usize {
