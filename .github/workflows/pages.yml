@@ -6,6 +6,7 @@ on:
     paths:
       - index.html
       - buck2.html
+      - docs/design/compiler-discovery.html
       - images/rush.png
       - scripts/pages/**
       - .github/workflows/pages.yml

@@ -12,7 +12,7 @@ from urllib.parse import quote, urlsplit
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_URL = 'https://github.com/rushbuild/rush/blob/main/'
 ASSETS = ('images/rush.png',)
-PAGES = ('index.html', 'buck2.html')
+PAGES = ('index.html', 'buck2.html', 'docs/design/compiler-discovery.html')
 
 
 def published_link(match):
@@ -48,7 +48,9 @@ def main():
     # Refuse an existing destination rather than overwriting a working tree.
     args.output.mkdir(parents=True, exist_ok=False)
     for name, page in pages.items():
-        (args.output / name).write_text(page)
+        destination = args.output / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(page)
     for asset in ASSETS:
         destination = args.output / asset
         destination.parent.mkdir(parents=True, exist_ok=True)
