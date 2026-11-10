@@ -62,7 +62,7 @@ use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -72,6 +72,8 @@ const DIGEST_DOMAIN: &[u8] = b"rush.process-capture-stream.v1\n";
 const HEADER_RESERVED_BYTES: usize = 16;
 const HEADER_BYTES: u64 = 88;
 const FRAME_PREFIX_BYTES: u64 = 24;
+// Bound read-ahead while batching the framing reader's small scalar reads.
+const STREAM_READ_BUFFER_BYTES: usize = 64 * 1024;
 const FRAME_DIGEST_BYTES: u64 = 32;
 const FOOTER_BYTES: u64 = 484;
 const TRAILER_BYTES: u64 = 48;
@@ -3700,7 +3702,10 @@ pub fn load_process_capture_stream(
     limits: ProcessCaptureStreamLimits,
 ) -> Result<(ProcessCaptureReceipt, ProcessCaptureStreamSeal)> {
     let expected_identity = expected_summary.identity;
-    let mut file = open_capture_stream(path, limits)?;
+    let mut file = BufReader::with_capacity(
+        STREAM_READ_BUFFER_BYTES,
+        open_capture_stream(path, limits)?,
+    );
     let checked = scan_stream(&mut file, expected_identity, limits, false, None)?;
     file.seek(SeekFrom::Start(0))
         .context("rewind integrity-checked process capture stream")?;
@@ -3749,7 +3754,10 @@ pub fn visit_process_capture_stream<V: ProcessCaptureStreamVisitor>(
     mut visitor: V,
 ) -> Result<(V, ProcessCaptureStreamSeal)> {
     let expected_identity = expected_summary.identity;
-    let mut file = open_capture_stream(path, limits)?;
+    let mut file = BufReader::with_capacity(
+        STREAM_READ_BUFFER_BYTES,
+        open_capture_stream(path, limits)?,
+    );
     let checked = scan_stream(&mut file, expected_identity, limits, false, None)?;
     if checked.summary != expected_summary {
         anyhow::bail!("process capture stream differs from its trusted writer summary");
@@ -5340,7 +5348,7 @@ struct ScannedStream {
 }
 
 fn scan_stream(
-    file: &mut File,
+    file: &mut impl Read,
     expected_identity: ProcessCaptureStreamIdentity,
     limits: ProcessCaptureStreamLimits,
     decode: bool,
@@ -6715,7 +6723,7 @@ fn validate_private_file(file: &File) -> Result<()> {
     Ok(())
 }
 
-fn read_array<const N: usize>(file: &mut File, context: &'static str) -> Result<[u8; N]> {
+fn read_array<const N: usize>(file: &mut impl Read, context: &'static str) -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
     file.read_exact(&mut bytes).with_context(|| context)?;
     Ok(bytes)
@@ -9711,6 +9719,131 @@ os.rmdir(d)
         let mut missing_terminal = loaded;
         missing_terminal.processes[0].terminal_syscalls = 0;
         assert!(missing_terminal.validate_complete().is_err());
+    }
+
+    #[test]
+    fn buffered_scans_preserve_events_receipts_and_seals_with_fewer_file_reads() {
+        struct CountingFile {
+            file: File,
+            reads: usize,
+            bytes: usize,
+        }
+        impl Read for CountingFile {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let count = self.file.read(buffer)?;
+                self.bytes += count;
+                Ok(count)
+            }
+        }
+        #[derive(Default)]
+        struct RecordingSink {
+            events: Vec<(u8, Vec<u8>)>,
+            receipt: ReceiptBuilder,
+        }
+        impl ProcessCaptureSink for RecordingSink {
+            fn record(&mut self, event: ProcessCaptureEvent) -> Result<()> {
+                self.events
+                    .push(encode_event(&event, limits().max_frame_bytes)?);
+                self.receipt.record(event)
+            }
+        }
+
+        let temp = private_tempdir();
+        let path = temp.path().join("buffered.stream");
+        let mut expected = all_event_fixture_receipt();
+        // This synthetic codec fixture includes one payload larger than the
+        // read buffer and every modeled event family in an actual private file.
+        expected.processes[0].invocations[0]
+            .argv
+            .push(vec![b'x'; STREAM_READ_BUFFER_BYTES + 17]);
+        let summary = write_receipt(&path, &expected);
+        assert!(summary.stream_bytes > STREAM_READ_BUFFER_BYTES as u64);
+
+        let mut unbuffered = CountingFile {
+            file: open_capture_stream(&path, limits()).unwrap(),
+            reads: 0,
+            bytes: 0,
+        };
+        let mut raw_sink = RecordingSink::default();
+        let raw_scan = scan_stream(
+            &mut unbuffered,
+            IDENTITY,
+            limits(),
+            true,
+            Some(&mut raw_sink),
+        )
+        .unwrap();
+        let mut buffered = BufReader::with_capacity(
+            STREAM_READ_BUFFER_BYTES,
+            CountingFile {
+                file: open_capture_stream(&path, limits()).unwrap(),
+                reads: 0,
+                bytes: 0,
+            },
+        );
+        let mut buffered_sink = RecordingSink::default();
+        let buffered_scan = scan_stream(
+            &mut buffered,
+            IDENTITY,
+            limits(),
+            true,
+            Some(&mut buffered_sink),
+        )
+        .unwrap();
+        assert_eq!(raw_scan, buffered_scan);
+        assert_eq!(raw_scan.summary, summary);
+        assert_eq!(raw_sink.events, buffered_sink.events);
+        assert_eq!(raw_sink.receipt.finish(raw_scan.root).unwrap(), expected);
+        assert_eq!(
+            buffered_sink.receipt.finish(buffered_scan.root).unwrap(),
+            expected
+        );
+        assert_eq!(unbuffered.bytes, buffered.get_ref().bytes);
+        assert!(
+            buffered.get_ref().reads < unbuffered.reads,
+            "buffering must reduce real underlying file reads, without timing assumptions"
+        );
+
+        // Exercise both public two-pass APIs, including the buffered rewind and
+        // semantic validation, rather than only the private framing decoder.
+        let (loaded, seal) = load_process_capture_stream(&path, summary, limits()).unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(seal.summary, summary);
+        let (visitor, visited) =
+            visit_process_capture_stream(&path, summary, limits(), CountingVisitor::default())
+                .unwrap();
+        assert_eq!(visitor.process_started, summary.process_count());
+        assert_eq!(visitor.process_finished, summary.process_count());
+        assert_eq!(visited.summary, summary);
+    }
+
+    #[test]
+    fn buffered_scan_rejects_trailing_bytes_already_read_ahead() {
+        use std::io::BufRead;
+        let temp = private_tempdir();
+        let path = temp.path().join("prefetched-trailing.stream");
+        write_fixture(&path);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < STREAM_READ_BUFFER_BYTES as u64);
+        let mut buffered = BufReader::with_capacity(
+            STREAM_READ_BUFFER_BYTES,
+            open_capture_stream(&path, limits()).unwrap(),
+        );
+        assert_eq!(buffered.fill_buf().unwrap().len() as u64, size);
+        assert_eq!(
+            buffered.get_mut().stream_position().unwrap(),
+            size,
+            "the raw fd is at EOF, but its buffered trailing byte must still reject"
+        );
+        let error = scan_stream(&mut buffered, IDENTITY, limits(), false, None).unwrap_err();
+        assert!(format!("{error:#}").contains("trailing bytes"), "{error:#}");
     }
 
     #[test]
