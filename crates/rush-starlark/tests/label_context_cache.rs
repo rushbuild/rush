@@ -283,3 +283,129 @@ fn changed_repository_alias_retires_cached_parent_reexports() {
         });
     }
 }
+
+#[cfg(unix)]
+fn with_build_load_context<R>(root: &Path, package: &Path, owner: &str, body: impl FnOnce() -> R) -> R {
+    struct RestoreContext;
+    impl Drop for RestoreContext {
+        fn drop(&mut self) { BzlLoader::pop_thread_context(); }
+    }
+    BzlLoader::push_thread_context_frame(rush_starlark::bzl_loader::BzlContextFrame {
+        repo_root: root.to_path_buf(), package_dir: package.to_path_buf(),
+        repository: Some(owner.to_string()), load_stack: Vec::new(), workspace_repository_context: None,
+    });
+    let _restore = RestoreContext;
+    body()
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_roots_keep_relative_loads_and_logical_package_aliases() {
+    for global in [false, true] {
+        let (root, loader) = setup(global.then(GlobalBzlCache::new));
+        let physical = root.path().join("shared");
+        std::os::unix::fs::symlink(physical.join("defs"), physical.join("package_alias")).unwrap();
+        let outside = root.path().join("individual-source.bzl");
+        std::fs::write(&outside, SOURCE).unwrap();
+        std::os::unix::fs::symlink(&outside, physical.join("defs/linked.bzl")).unwrap();
+        for owner in ["owner_a", "owner_b"] {
+            let logical = root.path().join(format!("logical-{owner}"));
+            std::os::unix::fs::symlink(&physical, &logical).unwrap();
+            loader.lock().unwrap().add_external_repo(owner.into(), logical);
+        }
+        // Cold, warm and cross-command caches must all use the logical owner
+        // and package, including two owners of the same physical source.
+        for _ in 0..2 {
+            analysis(root.path(), || {
+                for (owner, dependency) in [("owner_a", "dep_a"), ("owner_b", "dep_b")] {
+                    let logical = root.path().join(format!("logical-{owner}"));
+                    for package in ["defs", "package_alias"] {
+                        {
+                            let mut state = loader.lock().unwrap();
+                            state.set_current_repo_root(logical.clone());
+                            state.set_current_repo_name(Some(owner.into()));
+                            state.set_current_package(logical.join(package));
+                        }
+                        let expected = Value::List(vec![
+                            Value::String(format!("@@{owner}//cfg:mode")),
+                            Value::String(format!("@@{owner}//{package}:local")),
+                            Value::String(format!("@@{dependency}//cfg:mode")),
+                        ]);
+                        with_build_load_context(&logical, &logical.join(package), owner, || {
+                            for filename in ["module.bzl", ":module.bzl", "linked.bzl", ":linked.bzl"] {
+                                for _ in 0..2 {
+                                    let source = format!("load({filename:?}, \"labels\")\nresult = labels()\n");
+                                    assert_eq!(evaluate(&loader, &source), expected, "{owner}/{package}/{filename}");
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_load_package_outside_registered_root_is_refused() {
+    let (root, loader) = setup(Some(GlobalBzlCache::new()));
+    let physical = root.path().join("shared");
+    let logical = root.path().join("logical-owner");
+    std::os::unix::fs::symlink(&physical, &logical).unwrap();
+    let outside = root.path().join("escape");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("module.bzl"), SOURCE).unwrap();
+    loader.lock().unwrap().add_external_repo("owner_a".into(), logical.clone());
+    analysis(root.path(), || {
+        for package in [outside, logical.join("../escape")] {
+            let mut state = loader.lock().unwrap();
+            state.set_current_repo_root(logical.clone());
+            state.set_current_repo_name(Some("owner_a".into()));
+            state.set_current_package(package.clone());
+            drop(state);
+            let error = with_build_load_context(&logical, &package, "owner_a", || {
+                BzlLoader::load_bzl_from_evaluator(loader.clone(), ":module.bzl", &[("labels".into(), "labels".into())]).unwrap_err()
+            });
+            assert!(format!("{error:#}").contains("outside its repository root"), "{error:#}");
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_load_records_registered_root_symlink_witness() {
+    use rush_incremental::{tracked, Dependency, RealTrackedIo, Staleness, TrackedIo};
+    let (root, loader) = setup(Some(GlobalBzlCache::new()));
+    let physical = root.path().join("shared");
+    let logical = root.path().join("logical-owner");
+    std::os::unix::fs::symlink(&physical, &logical).unwrap();
+    {
+        let mut state = loader.lock().unwrap();
+        state.add_external_repo("owner_a".into(), logical.clone());
+        state.set_current_repo_root(logical.clone());
+        state.set_current_repo_name(Some("owner_a".into()));
+        state.set_current_package(logical.join("defs"));
+    }
+    let semantics = rush_command_core::CommandSemantics::from_process();
+    let io = Arc::new(RealTrackedIo::new(semantics.clone(), root.path()));
+    tracked::scope(io.clone(), || {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        with_build_load_context(&logical, &logical.join("defs"), "owner_a", || {
+            assert_eq!(evaluate(&loader, "load(\"module.bzl\", \"labels\")\nresult = labels()\n"), expected("owner_a", "dep_a"));
+        });
+    });
+    assert!(io.manifest().deps().iter().any(|dependency| matches!(dependency,
+        Dependency::Symlink { path, .. } if path == &logical)),
+        "logical repository symlink was not retained as an analysis dependency");
+    let manifest = io.manifest();
+    assert_eq!(manifest.validate(&semantics).staleness, Staleness::Fresh);
+    let replacement = root.path().join("equal-byte-replacement");
+    std::fs::create_dir_all(replacement.join("defs")).unwrap();
+    std::fs::write(replacement.join("defs/module.bzl"), SOURCE).unwrap();
+    std::fs::remove_file(&logical).unwrap();
+    std::os::unix::fs::symlink(&replacement, &logical).unwrap();
+    assert_ne!(manifest.validate(&semantics).staleness, Staleness::Fresh,
+        "equal source bytes must not conceal a changed repository root witness");
+}

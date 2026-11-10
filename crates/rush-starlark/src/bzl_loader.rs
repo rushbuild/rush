@@ -6723,7 +6723,7 @@ impl BzlLoader {
         if label.starts_with("@local_xla//tsl/") && self.external_repos.contains_key("local_tsl") {
             owner = Some("local_tsl".to_string());
         }
-        let root = match owner.as_deref().filter(|owner| !owner.is_empty()) {
+        let logical_root = match owner.as_deref().filter(|owner| !owner.is_empty()) {
             Some(owner) => self.external_repos.get(owner).map(|entry| entry.value().clone())
                 .or_else(|| label.strip_prefix('@').filter(|label| !label.starts_with('@'))
                     .and_then(|label| label.split("//").next())
@@ -6731,7 +6731,8 @@ impl BzlLoader {
                 .unwrap_or_else(|| caller_root.clone()),
             None => self.workspace_root.clone(),
         };
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let root = rush_incremental::tracked::canonicalize(&logical_root)
+            .with_context(|| format!("Resolve repository root for module {}", path.display()))?;
         let file_parent = path.parent().ok_or_else(|| anyhow!("No parent for .bzl file {}", path.display()))?.to_path_buf();
         let package_dir = if let Some((_, target)) = label.split_once("//") {
             target.split_once(':').map(|(package, _)| {
@@ -6753,8 +6754,20 @@ impl BzlLoader {
         } else if let Some(name) = self.main_workspace_name() {
             mapping.entry(name).or_default();
         }
-        let package = package_dir.strip_prefix(&root).with_context(|| format!("Module {} is outside its repository root", path.display()))?
-            .to_string_lossy().replace('\\', "/");
+        // BUILD callers retain the logical registered root (which may be a
+        // managed symlink), while nested module frames use the physical root.
+        // Compare matching spellings before normalizing the frame. Blindly
+        // canonicalizing package_dir would change a package symlink's logical
+        // Label() address; deriving it from the physical file would also break
+        // legitimate individual-file symlinks outside the repository.
+        let relative_package = package_dir.strip_prefix(&logical_root)
+            .or_else(|_| package_dir.strip_prefix(&root))
+            .with_context(|| format!("Module {} is outside its repository root", path.display()))?;
+        if relative_package.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+            anyhow::bail!("Module {} is outside its repository root", path.display());
+        }
+        let package = relative_package.to_string_lossy().replace('\\', "/");
+        let package_dir = root.join(relative_package);
         // The source may be an individual symlink outside the logical root.
         // Derive the load target from its address, never from the physical IO key.
         let filename = if let Some((_, target)) = label.split_once("//") {
@@ -10560,7 +10573,7 @@ mod tests {
             cache.clone(),
         );
 
-        rush_incremental::tracked::test_scope(temp.path(), || {
+        let (canonical, admission) = rush_incremental::tracked::test_scope(temp.path(), || {
             let loaded = loader
                 .load_bzl(
                     "//:defs.bzl",
@@ -10572,16 +10585,15 @@ mod tests {
                 loaded.get("value"),
                 Some(Value::String(value)) if value == "tracked"
             ));
-        });
-
-        let canonical = std::fs::canonicalize(&bzl_path).expect("canonical .bzl path");
-        let admission = {
+            // Key reconstruction observes the tracked repository-root witness,
+            // so keep this private cache inspection in the producing scope.
+            let canonical = rush_incremental::tracked::canonicalize(&bzl_path).expect("canonical .bzl path");
             let entry = cache
                 .symbol_cache
                 .get(&loader.module_cache_key("//:defs.bzl", &canonical).expect("module key").0)
                 .expect("cached direct .bzl value");
-            Arc::clone(&entry.admission)
-        };
+            (canonical, Arc::clone(&entry.admission))
+        });
         let admission = admission
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
