@@ -743,6 +743,15 @@ pub fn collect_generated_header_paths(
     paths
 }
 
+/// One declared source's actual file layout for protoc import resolution.
+/// This is metadata, not filesystem freshness or execution admission authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProtoSourceImport {
+    pub artifact: rush_action::ids::ArtifactId,
+    pub import_root: PathBuf,
+    pub import_path: PathBuf,
+}
+
 /// Phase 5.C0 P2: typed proto-files provider.
 ///
 /// `proto_library` exposes this with its direct `.proto`
@@ -762,6 +771,9 @@ pub fn collect_generated_header_paths(
 pub struct ProtoFilesInfo {
     pub direct_sources: Box<[rush_action::ids::ArtifactId]>,
     pub transitive_sources: Arc<crate::nested_set::NestedSet<rush_action::ids::ArtifactId>>,
+    /// Complete declared layouts, or unknown for legacy source-only providers.
+    /// An unknown layout must never be inferred from a repository basename.
+    pub declared_imports: Option<Arc<crate::nested_set::NestedSet<ProtoSourceImport>>>,
 }
 
 impl ProtoFilesInfo {
@@ -769,27 +781,164 @@ impl ProtoFilesInfo {
         Arc::new(ProtoFilesInfo {
             direct_sources: Vec::new().into_boxed_slice(),
             transitive_sources: crate::nested_set::NestedSet::empty(),
+            declared_imports: Some(crate::nested_set::NestedSet::empty()),
         })
     }
 
-    /// Build from direct .proto ArtifactIds plus dep ProtoFilesInfo
-    /// arcs. Transitive coverage attaches dep transitive sets as
-    /// Arc children — never flattens.
+    /// Compatibility constructor: source IDs alone do not establish import layout.
     pub fn from_direct_and_deps(
         direct: Vec<rush_action::ids::ArtifactId>,
         deps: impl IntoIterator<Item = Arc<ProtoFilesInfo>>,
     ) -> Arc<ProtoFilesInfo> {
         let deps: Vec<_> = deps.into_iter().collect();
-        let transitive = crate::nested_set::NestedSet::new(
+        Arc::new(ProtoFilesInfo {
+            transitive_sources: crate::nested_set::NestedSet::new(
+                direct.clone(),
+                deps.iter()
+                    .map(|dep| Arc::clone(&dep.transitive_sources))
+                    .collect(),
+            ),
+            direct_sources: direct.into_boxed_slice(),
+            declared_imports: None,
+        })
+    }
+
+    /// Preserve declared dependency order and refuse incomplete or conflicting
+    /// source/import mappings. Registry/configuration and real-file admission
+    /// remain separate; use `validate_declared_imports` before consuming IDs.
+    pub fn from_declared_sources_and_deps(
+        direct: Vec<ProtoSourceImport>,
+        deps: impl IntoIterator<Item = Arc<ProtoFilesInfo>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let deps: Vec<_> = deps.into_iter().collect();
+        let imports = crate::nested_set::NestedSet::new(
             direct.clone(),
             deps.iter()
-                .map(|d| Arc::clone(&d.transitive_sources))
-                .collect(),
+                .map(|dep| {
+                    dep.declared_imports.clone().ok_or_else(|| {
+                        anyhow::anyhow!("proto dependency has unknown declared import layout")
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
         );
-        Arc::new(ProtoFilesInfo {
-            direct_sources: direct.into_boxed_slice(),
-            transitive_sources: transitive,
-        })
+        let info = Arc::new(Self {
+            direct_sources: direct.iter().map(|source| source.artifact).collect(),
+            transitive_sources: crate::nested_set::NestedSet::new(
+                direct.iter().map(|source| source.artifact).collect(),
+                deps.iter()
+                    .map(|dep| Arc::clone(&dep.transitive_sources))
+                    .collect(),
+            ),
+            declared_imports: Some(imports),
+        });
+        info.checked_imports()?;
+        Ok(info)
+    }
+
+    fn checked_imports(&self) -> anyhow::Result<Vec<ProtoSourceImport>> {
+        use std::collections::{HashMap, HashSet};
+        use std::path::Component;
+        let imports = self
+            .declared_imports
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("proto provider has unknown declared import layout"))?;
+        let mut logical = HashMap::new();
+        let mut artifacts = HashMap::new();
+        let mut result = Vec::new();
+        for source in imports.iter() {
+            anyhow::ensure!(
+                source.import_root.is_absolute()
+                    && !source
+                        .import_root
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
+                "proto import root must be an absolute normalized source root"
+            );
+            anyhow::ensure!(
+                !source.import_path.as_os_str().is_empty()
+                    && source
+                        .import_path
+                        .components()
+                        .all(|c| matches!(c, Component::Normal(_)))
+                    && source.import_path.extension() == Some(std::ffi::OsStr::new("proto")),
+                "proto import path must be a relative literal .proto path"
+            );
+            if let Some(previous) = logical.insert(source.import_path.clone(), source.artifact) {
+                anyhow::ensure!(
+                    previous == source.artifact,
+                    "conflicting proto sources for import {}",
+                    source.import_path.display()
+                );
+            }
+            if let Some(previous) = artifacts.insert(source.artifact, source.clone()) {
+                anyhow::ensure!(
+                    previous == source,
+                    "proto source has conflicting declared import layouts"
+                );
+            } else {
+                result.push(source);
+            }
+        }
+        let declared: HashSet<_> = artifacts.keys().copied().collect();
+        let sources: HashSet<_> = self.transitive_sources.iter().collect();
+        anyhow::ensure!(
+            declared == sources,
+            "declared proto import layouts do not cover the complete source closure"
+        );
+        anyhow::ensure!(
+            self.direct_sources
+                .iter()
+                .all(|source| declared.contains(source)),
+            "direct proto source is missing its declared import layout"
+        );
+        Ok(result)
+    }
+
+    /// First occurrence of each root in direct/dependency declaration order.
+    /// `None` means incomplete/invalid metadata, never an empty search policy.
+    pub fn ordered_import_roots(&self) -> Option<Vec<PathBuf>> {
+        let mut seen = std::collections::HashSet::new();
+        Some(
+            self.checked_imports()
+                .ok()?
+                .into_iter()
+                .filter_map(|source| {
+                    seen.insert(source.import_root.clone())
+                        .then_some(source.import_root)
+                })
+                .collect(),
+        )
+    }
+
+    /// Validate real source IDs and exact physical layout in this registry and
+    /// configuration. This performs no filesystem read or producer-completion
+    /// certification; the driver must independently admit each actual file.
+    pub fn validate_declared_imports(
+        &self,
+        registry: &rush_action::ids::ArtifactRegistry,
+        config: rush_action::ids::ConfigId,
+    ) -> anyhow::Result<()> {
+        for source in self.checked_imports()? {
+            anyhow::ensure!(
+                (source.artifact.0 as usize) < registry.artifact_count(),
+                "proto import artifact is outside the current registry"
+            );
+            let physical = source.import_root.join(&source.import_path);
+            anyhow::ensure!(
+                registry.artifact_path(source.artifact) == physical
+                    && registry.find_artifact_by_path(&physical, config) == Some(source.artifact),
+                "proto import artifact has the wrong physical layout or configuration"
+            );
+            let data = registry.artifact(source.artifact);
+            anyhow::ensure!(
+                data.is_source
+                    && data.kind == rush_action::ids::ArtifactKind::Source
+                    && data.owner_action.is_none()
+                    && data.owner_action_declared.is_none(),
+                "proto import metadata requires an actual source, not a generated artifact"
+            );
+        }
+        Ok(())
     }
 }
 

@@ -122,6 +122,17 @@ pub trait BuildRule: Send + Sync {
     }
 }
 
+/// Native source-only proto declaration, not execution or filesystem authority.
+/// Drivers must validate exact dependencies/current-config source providers,
+/// real files, and zero actions/generated/pending work, then skip BOTH build
+/// and scheduler dispatch before returning those actual source artifacts.
+#[derive(Clone, Copy, Debug)]
+pub struct ProtoSourceMetadataDeclaration<'a> {
+    pub sources: &'a [String],
+    pub dependencies: &'a [String],
+    pub strip_import_prefix: Option<&'a str>,
+}
+
 /// Instance of a rule with specific attributes
 #[async_trait]
 pub trait RuleInstance: Send + Sync {
@@ -154,6 +165,11 @@ pub trait RuleInstance: Send + Sync {
     /// unchanged. Rule names or user attributes do not grant this request or
     /// discharge those checks. Ordinary rules default to no forwarding request.
     fn identity_artifact_forwarder(&self) -> Option<&str> {
+        None
+    }
+
+    /// Out-of-band source metadata request. Names/attributes grant no admission.
+    fn proto_source_metadata(&self) -> Option<ProtoSourceMetadataDeclaration<'_>> {
         None
     }
 
@@ -558,6 +574,10 @@ impl RuleInstance for RuleMetadataInstance {
 
     fn identity_artifact_forwarder(&self) -> Option<&str> {
         self.inner.identity_artifact_forwarder()
+    }
+
+    fn proto_source_metadata(&self) -> Option<ProtoSourceMetadataDeclaration<'_>> {
+        self.inner.proto_source_metadata()
     }
 
     fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {

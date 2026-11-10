@@ -13002,8 +13002,42 @@ impl BuildRule for TfCcTestRule {
     }
 }
 
-/// proto_library - Protocol buffer library
+/// proto_library - source-only protocol buffer metadata.
 pub struct ProtoLibraryRule;
+
+fn proto_literal_list(attrs: &HashMap<String, Value>, key: &str) -> Result<Vec<String>> {
+    let values = match attrs.get(key) {
+        None => return Ok(Vec::new()),
+        Some(Value::List(values)) => values,
+        _ => anyhow::bail!("proto_library {key} requires a resolved literal string list"),
+    };
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let Value::String(value) = value else {
+                anyhow::bail!("proto_library {key} requires literal strings");
+            };
+            anyhow::ensure!(
+                !value.is_empty() && !value.contains('\0') && seen.insert(value.clone()),
+                "proto_library {key} contains an empty, invalid, or repeated declaration"
+            );
+            Ok(value.clone())
+        })
+        .collect()
+}
+
+fn proto_literal_relative_path(raw: &str, allow_dot: bool) -> Result<PathBuf> {
+    anyhow::ensure!(!raw.is_empty() && !raw.contains(['\0', '\\', ':', '@'])
+        && !Path::new(raw).is_absolute()
+        && raw.split('/').all(|part| !part.is_empty() && part != ".."
+            && (part != "." || allow_dot)),
+        "proto_library requires a literal package-relative source/prefix, not a label, generated, or virtual path: {raw}");
+    Ok(Path::new(raw)
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect())
+}
 
 #[async_trait]
 impl BuildRule for ProtoLibraryRule {
@@ -13013,14 +13047,43 @@ impl BuildRule for ProtoLibraryRule {
 
     fn parse_attributes(&self, attrs: &HashMap<String, Value>) -> Result<Box<dyn RuleInstance>> {
         let name = extract_string(attrs, "name")?;
-        let srcs = extract_string_list(attrs, "srcs")?;
-        let deps = extract_string_list(attrs, "deps")?;
-
-        Ok(Box::new(ProtoLibraryInstance { name, srcs, deps }))
+        let srcs = proto_literal_list(attrs, "srcs")?;
+        for src in &srcs {
+            let source = proto_literal_relative_path(src, false)?;
+            anyhow::ensure!(
+                source.extension() == Some(std::ffi::OsStr::new("proto")),
+                "proto_library source must be a literal .proto file: {src}"
+            );
+        }
+        let deps = proto_literal_list(attrs, "deps")?;
+        let strip_import_prefix = match attrs.get("strip_import_prefix") {
+            None | Some(Value::None) => None,
+            Some(Value::String(prefix)) => {
+                let relative = prefix.strip_prefix('/').unwrap_or(prefix);
+                if !relative.is_empty() {
+                    proto_literal_relative_path(relative, true)?;
+                }
+                Some(prefix.clone())
+            }
+            _ => anyhow::bail!("proto_library strip_import_prefix must be a literal string"),
+        };
+        match attrs.get("import_prefix") {
+            None | Some(Value::None) => {}
+            Some(Value::String(prefix)) if prefix.is_empty() => {}
+            _ => anyhow::bail!(
+                "proto_library nonempty/virtual import_prefix is not supported by source metadata"
+            ),
+        }
+        Ok(Box::new(ProtoLibraryInstance {
+            name,
+            srcs,
+            deps,
+            strip_import_prefix,
+        }))
     }
 
     fn documentation(&self) -> &str {
-        "Proto library - defines protocol buffer files"
+        "Source-only proto library with declared import roots; no code generation"
     }
 }
 
@@ -13028,6 +13091,135 @@ pub struct ProtoLibraryInstance {
     name: String,
     srcs: Vec<String>,
     deps: Vec<String>,
+    strip_import_prefix: Option<String>,
+}
+
+impl ProtoLibraryInstance {
+    fn source_layouts(
+        &self,
+        workspace: &Path,
+        package: &Path,
+    ) -> Result<Vec<(PathBuf, PathBuf, PathBuf)>> {
+        use std::path::Component;
+        anyhow::ensure!(
+            workspace.is_absolute()
+                && !workspace
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+                && package
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_))),
+            "proto_library requires an absolute repository root and a normalized relative package"
+        );
+        // Empty/omitted stripping retains repository-relative imports. A nonempty
+        // relative prefix is package-relative; a leading slash is repository-relative.
+        let import_root = match self.strip_import_prefix.as_deref() {
+            None | Some("") => workspace.to_owned(),
+            Some(prefix) if prefix.starts_with('/') => {
+                let relative = &prefix[1..];
+                workspace.join(if relative.is_empty() {
+                    PathBuf::new()
+                } else {
+                    proto_literal_relative_path(relative, true)?
+                })
+            }
+            Some(prefix) => workspace
+                .join(package)
+                .join(proto_literal_relative_path(prefix, true)?),
+        };
+        self.srcs
+            .iter()
+            .map(|src| {
+                let physical = workspace
+                    .join(package)
+                    .join(proto_literal_relative_path(src, false)?);
+                let logical = physical.strip_prefix(&import_root).with_context(|| {
+                    format!("proto_library source {src} is outside strip_import_prefix")
+                })?;
+                anyhow::ensure!(
+                    !logical.as_os_str().is_empty(),
+                    "proto source has empty import path"
+                );
+                Ok((physical.clone(), import_root.clone(), logical.to_owned()))
+            })
+            .collect()
+    }
+
+    fn dependency_metadata(
+        &self,
+        ctx: &crate::analysis_context::AnalysisContext,
+    ) -> Result<Vec<std::sync::Arc<crate::providers::ProtoFilesInfo>>> {
+        let mut selected = HashSet::new();
+        self.deps
+            .iter()
+            .map(|dependency| {
+                let matches: Vec<_> = ctx
+                    .labeled_dep_providers()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (label, _))| {
+                        crate::providers::dep_label_matches_repository_exact(
+                            label,
+                            dependency,
+                            ctx.package(),
+                            ctx.workspace(),
+                        )
+                    })
+                    .collect();
+                anyhow::ensure!(matches.len() == 1,
+                "proto_library requires one exact source metadata prerequisite for {dependency}");
+                let (index, (_, provider)) = matches[0];
+                anyhow::ensure!(
+                    selected.insert(index),
+                    "proto_library repeats a resolved dependency"
+                );
+                let proto = provider.get_proto_files().with_context(|| {
+                    format!("proto_library prerequisite {dependency} has no source metadata")
+                })?;
+                proto.validate_declared_imports(ctx.registry(), ctx.config_id())?;
+                Ok(std::sync::Arc::clone(proto))
+            })
+            .collect()
+    }
+
+    fn analyze_sources(
+        &self,
+        ctx: &mut crate::analysis_context::AnalysisContext,
+    ) -> Result<ProviderSet> {
+        use crate::providers::{ProtoFilesInfo, ProtoSourceImport};
+        use rush_action::ids::ArtifactKind;
+        let deps = self.dependency_metadata(ctx)?;
+        let layouts = self.source_layouts(ctx.workspace_root(), Path::new(ctx.package()))?;
+        // A preexisting generated artifact cannot become a source because its
+        // output happens to exist at analysis time.
+        for (physical, _, _) in &layouts {
+            if let Some(id) = ctx
+                .registry()
+                .find_artifact_by_path(physical, ctx.config_id())
+            {
+                let data = ctx.registry().artifact(id);
+                anyhow::ensure!(
+                    data.is_source
+                        && data.kind == ArtifactKind::Source
+                        && data.owner_action.is_none()
+                        && data.owner_action_declared.is_none(),
+                    "proto_library generated/virtual source metadata is unsupported: {}",
+                    physical.display()
+                );
+            }
+        }
+        let direct = layouts
+            .into_iter()
+            .map(|(physical, import_root, import_path)| ProtoSourceImport {
+                artifact: ctx.register_source_artifact(&physical, ArtifactKind::Source),
+                import_root,
+                import_path,
+            })
+            .collect();
+        let proto = ProtoFilesInfo::from_declared_sources_and_deps(direct, deps)?;
+        proto.validate_declared_imports(ctx.registry(), ctx.config_id())?;
+        Ok(ProviderSet::empty().with_proto_files(proto))
+    }
 }
 
 #[async_trait]
@@ -13035,57 +13227,59 @@ impl RuleInstance for ProtoLibraryInstance {
     fn target_name(&self) -> &str {
         &self.name
     }
-
     fn dependencies(&self) -> Vec<String> {
         self.deps.clone()
     }
 
-    async fn build(&self, context: &BuildContext) -> Result<Vec<Artifact>> {
-        // Proto library just tracks .proto files - no compilation yet
-        // Actual proto compilation happens in cc_proto_library
-        let mut artifacts = Vec::new();
-        for src in &self.srcs {
-            let proto_path = context.source_path(src);
-            artifacts.push(Artifact {
-                path: proto_path,
-                artifact_type: ArtifactType::Source,
-            });
-        }
-        Ok(artifacts)
+    fn proto_source_metadata(&self) -> Option<crate::ProtoSourceMetadataDeclaration<'_>> {
+        Some(crate::ProtoSourceMetadataDeclaration {
+            sources: &self.srcs,
+            dependencies: &self.deps,
+            strip_import_prefix: self.strip_import_prefix.as_deref(),
+        })
     }
 
-    /// Phase 5.C0 P2: proto_library exposes ProtoFilesInfo so
-    /// downstream cc_proto_library can enumerate the .proto
-    /// closure via the typed path (no raw artifact NestedSet
-    /// walks). Direct sources are this rule's `srcs`; transitive
-    /// coverage chains through dep proto_library
-    /// ProtoFilesInfo.
+    fn validate_analysis_dependencies(
+        &self,
+        ctx: &crate::analysis_context::AnalysisContext,
+    ) -> Result<()> {
+        self.source_layouts(ctx.workspace_root(), Path::new(ctx.package()))?;
+        self.dependency_metadata(ctx)?;
+        Ok(())
+    }
+
+    async fn build(&self, context: &BuildContext) -> Result<Vec<Artifact>> {
+        self.source_layouts(
+            &context.workspace_root,
+            context
+                .package_path
+                .as_deref()
+                .unwrap_or_else(|| Path::new("")),
+        )?
+        .into_iter()
+        .map(|(path, _, _)| {
+            Ok(Artifact {
+                path,
+                artifact_type: ArtifactType::Source,
+            })
+        })
+        .collect()
+    }
+
     fn analyze(
         &self,
         ctx: &mut crate::analysis_context::AnalysisContext,
-        dep_providers: &[std::sync::Arc<ProviderSet>],
+        _dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
-        use crate::providers::ProtoFilesInfo;
-        use rush_action::ids::ArtifactKind;
-        use std::path::Path;
-        let direct: Vec<_> = self
-            .srcs
-            .iter()
-            .map(|s| ctx.register_source_artifact(Path::new(s), ArtifactKind::Source))
-            .collect();
-        // Dep ProtoFilesInfo arcs from upstream proto_library
-        // deps. extract_proto_files mirrors extract_cc_infos —
-        // pulls every dep's proto_files slot, dropping deps
-        // that don't expose this provider (cc_library deps,
-        // etc.). This is the typed-path enumeration that
-        // replaces the legacy raw artifact NestedSet walk for
-        // proto closures.
-        let dep_pfis: Vec<std::sync::Arc<ProtoFilesInfo>> = dep_providers
-            .iter()
-            .filter_map(|p| p.proto_files.clone())
-            .collect();
-        let pfi = ProtoFilesInfo::from_direct_and_deps(direct, dep_pfis);
-        ProviderSet::empty().with_proto_files(pfi)
+        match self.analyze_sources(ctx) {
+            Ok(providers) => providers,
+            Err(error) => {
+                ctx.fail_native_namespace_analysis(format!(
+                    "proto source metadata refused: {error:#}"
+                ));
+                ProviderSet::empty()
+            }
+        }
     }
 
     fn rule_type(&self) -> &str {
@@ -18071,5 +18265,468 @@ mod link_argv_partition_tests {
             parse_mold_small_link_threads_override(Some("3".to_string())),
             MoldSmallLinkThreadsOverride::Flag("-Wl,--threads=3".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod native_proto_source_metadata_tests {
+    use super::*;
+    use crate::analysis_context::{AnalysisContext, StubIncludeResolver};
+    use crate::context::Toolchain;
+    use crate::providers::{ProtoFilesInfo, ProtoSourceImport};
+    use rush_action::ids::{
+        ArtifactId, ArtifactKey, ArtifactKind, ArtifactRegistry, ConfigId, TargetId,
+    };
+    use std::sync::Arc;
+
+    fn source(
+        registry: &mut ArtifactRegistry,
+        path: &Path,
+        config: ConfigId,
+        owner: TargetId,
+    ) -> ArtifactId {
+        let exec_path = registry.intern_path(path);
+        registry.intern_artifact(
+            ArtifactKey { config, exec_path },
+            ArtifactKind::Source,
+            true,
+            owner,
+            None,
+        )
+    }
+
+    fn declaration(
+        name: &str,
+        sources: &[&str],
+        deps: &[&str],
+        strip: Option<&str>,
+    ) -> HashMap<String, Value> {
+        let mut attrs = HashMap::from([
+            ("name".into(), Value::String(name.into())),
+            (
+                "srcs".into(),
+                Value::List(sources.iter().map(|s| Value::String((*s).into())).collect()),
+            ),
+            (
+                "deps".into(),
+                Value::List(deps.iter().map(|s| Value::String((*s).into())).collect()),
+            ),
+        ]);
+        if let Some(prefix) = strip {
+            attrs.insert("strip_import_prefix".into(), Value::String(prefix.into()));
+        }
+        attrs
+    }
+
+    fn analyze(
+        rule: &dyn RuleInstance,
+        registry: &mut ArtifactRegistry,
+        workspace: &Path,
+        package: &str,
+        target: TargetId,
+        config: ConfigId,
+        deps: &[(String, Arc<ProviderSet>)],
+    ) -> Result<ProviderSet> {
+        let resolver = StubIncludeResolver::new(workspace.to_owned());
+        let toolchain = Toolchain::default();
+        let mut ctx = AnalysisContext::new(
+            target,
+            config,
+            package,
+            Some("owner"),
+            Path::new("/output"),
+            registry,
+            &resolver,
+            &toolchain,
+            workspace,
+            &[],
+        )
+        .with_labeled_dep_providers(deps);
+        rule.validate_analysis_dependencies(&ctx)?;
+        let providers = rule.analyze(
+            &mut ctx,
+            &deps.iter().map(|(_, p)| Arc::clone(p)).collect::<Vec<_>>(),
+        );
+        anyhow::ensure!(
+            ctx.native_namespace_analysis_error().is_none(),
+            "{}",
+            ctx.native_namespace_analysis_error()
+                .unwrap_or("unknown metadata failure")
+        );
+        Ok(providers)
+    }
+
+    #[test]
+    fn native_proto_metadata_config7_reuses_sources_and_preserves_import_closure() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let protobuf = temp.path().join("protobuf");
+        let application = temp.path().join("application");
+        let any = protobuf.join("src/google/protobuf/any.proto");
+        let local = application.join("pkg/local.proto");
+        std::fs::create_dir_all(any.parent().unwrap())?;
+        std::fs::create_dir_all(local.parent().unwrap())?;
+        std::fs::write(&any, b"syntax = \"proto3\"; message Any {}\n")?;
+        std::fs::write(
+            &local,
+            b"syntax = \"proto3\"; import \"google/protobuf/any.proto\";\n",
+        )?;
+        let mut registry = ArtifactRegistry::new();
+        let config = ConfigId(7);
+        // Interning is per physical source/config, not exclusive to one proto owner.
+        let any_id = source(&mut registry, &any, config, TargetId(1));
+        let wrapped = crate::with_rule_metadata(
+            ProtoLibraryRule.parse_attributes(&declaration(
+                "any",
+                &["src/google/protobuf/any.proto"],
+                &[],
+                Some("src"),
+            ))?,
+            Some(vec!["//visibility:public".into()]),
+            true,
+            Vec::new(),
+        );
+        let raw = wrapped.proto_source_metadata().unwrap();
+        assert_eq!(raw.sources, &["src/google/protobuf/any.proto".to_owned()]);
+        assert!(raw.dependencies.is_empty());
+        assert_eq!(raw.strip_import_prefix, Some("src"));
+        let any_info = analyze(
+            wrapped.as_ref(),
+            &mut registry,
+            &protobuf,
+            "",
+            TargetId(2),
+            config,
+            &[],
+        )?;
+        let any_proto = any_info.get_proto_files().unwrap();
+        assert_eq!(any_proto.direct_sources.as_ref(), &[any_id]);
+        assert_eq!(registry.artifact(any_id).owner_target, TargetId(1));
+        assert_eq!(
+            any_proto.ordered_import_roots().unwrap(),
+            [protobuf.join("src")]
+        );
+        let dependencies = vec![("@@owner//:any".into(), Arc::new(any_info))];
+        let rule = ProtoLibraryRule.parse_attributes(&declaration(
+            "local",
+            &["local.proto"],
+            &["//:any"],
+            None,
+        ))?;
+        let result = analyze(
+            rule.as_ref(),
+            &mut registry,
+            &application,
+            "pkg",
+            TargetId(3),
+            config,
+            &dependencies,
+        )?;
+        let info = result.get_proto_files().unwrap();
+        info.validate_declared_imports(&registry, config)?;
+        assert!(info
+            .validate_declared_imports(&registry, ConfigId::DEFAULT)
+            .is_err());
+        assert_eq!(
+            info.ordered_import_roots().unwrap(),
+            [application.clone(), protobuf.join("src")]
+        );
+        let layouts = info
+            .declared_imports
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            layouts
+                .iter()
+                .map(|s| s.import_path.clone())
+                .collect::<Vec<_>>(),
+            [
+                PathBuf::from("pkg/local.proto"),
+                PathBuf::from("google/protobuf/any.proto")
+            ]
+        );
+        assert_eq!(
+            info.transitive_sources.iter().collect::<HashSet<_>>(),
+            [info.direct_sources[0], any_id].into_iter().collect()
+        );
+        assert_eq!(registry.artifact_path(info.direct_sources[0]), local);
+        assert_eq!(registry.artifact_count(), 2);
+        assert_eq!(registry.declared_action_count(), 0);
+        assert!(result.get_cc_info().is_none());
+        assert!(result.get_default_info().is_none());
+        assert!(result.files.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn native_proto_metadata_strip_prefix_resolves_package_and_repository_scopes() -> Result<()> {
+        let workspace = Path::new("/source");
+        let mut registry = ArtifactRegistry::new();
+        for (index, strip) in [Some("sub"), Some("/pkg/sub"), None]
+            .into_iter()
+            .enumerate()
+        {
+            let rule = ProtoLibraryRule.parse_attributes(&declaration(
+                "p",
+                &["sub/p.proto"],
+                &[],
+                strip,
+            ))?;
+            let result = analyze(
+                rule.as_ref(),
+                &mut registry,
+                workspace,
+                "pkg",
+                TargetId(index as u32),
+                ConfigId(7),
+                &[],
+            )?;
+            let proto = result.get_proto_files().unwrap();
+            let layout = proto
+                .declared_imports
+                .as_ref()
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                registry.artifact_path(layout.artifact),
+                Path::new("/source/pkg/sub/p.proto")
+            );
+            assert_eq!(
+                layout.import_root,
+                if strip.is_some() {
+                    PathBuf::from("/source/pkg/sub")
+                } else {
+                    workspace.to_owned()
+                }
+            );
+            assert_eq!(
+                layout.import_path,
+                if strip.is_some() {
+                    PathBuf::from("p.proto")
+                } else {
+                    PathBuf::from("pkg/sub/p.proto")
+                }
+            );
+        }
+        let outside = ProtoLibraryRule.parse_attributes(&declaration(
+            "outside",
+            &["sub/p.proto"],
+            &[],
+            Some("elsewhere"),
+        ))?;
+        assert!(analyze(
+            outside.as_ref(),
+            &mut registry,
+            workspace,
+            "pkg",
+            TargetId(9),
+            ConfigId(7),
+            &[]
+        )
+        .is_err());
+        for src in [
+            "../p.proto",
+            ":p.proto",
+            "@repo//:p.proto",
+            "/p.proto",
+            "p.cc",
+            "./p.proto",
+            "a//p.proto",
+        ] {
+            assert!(
+                ProtoLibraryRule
+                    .parse_attributes(&declaration("bad", &[src], &[], None))
+                    .is_err(),
+                "{src}"
+            );
+        }
+        for prefix in ["../src", "/../src", "//src", "src/../other"] {
+            assert!(
+                ProtoLibraryRule
+                    .parse_attributes(&declaration("bad", &["p.proto"], &[], Some(prefix)))
+                    .is_err(),
+                "{prefix}"
+            );
+        }
+        let mut invalid = declaration("bad", &["p.proto"], &[], None);
+        invalid.insert("import_prefix".into(), Value::String("virtual".into()));
+        assert!(ProtoLibraryRule.parse_attributes(&invalid).is_err());
+        invalid = declaration("bad", &["p.proto"], &[], None);
+        invalid.insert("srcs".into(), Value::Dict(HashMap::new()));
+        assert!(ProtoLibraryRule.parse_attributes(&invalid).is_err());
+        invalid = declaration("bad", &["p.proto"], &[], None);
+        invalid.insert("deps".into(), Value::List(vec![Value::Int(1)]));
+        assert!(ProtoLibraryRule.parse_attributes(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_proto_metadata_refuses_unknown_foreign_generated_and_wrong_config_dependencies(
+    ) -> Result<()> {
+        let mut registry = ArtifactRegistry::new();
+        let id = source(
+            &mut registry,
+            Path::new("/source/dependency.proto"),
+            ConfigId(7),
+            TargetId(1),
+        );
+        let known = ProtoFilesInfo::from_declared_sources_and_deps(
+            vec![ProtoSourceImport {
+                artifact: id,
+                import_root: "/source".into(),
+                import_path: "dependency.proto".into(),
+            }],
+            std::iter::empty(),
+        )?;
+        let unknown = ProtoFilesInfo::from_direct_and_deps(vec![id], std::iter::empty());
+        assert!(unknown.ordered_import_roots().is_none());
+        let rule = ProtoLibraryRule.parse_attributes(&declaration(
+            "consumer",
+            &[],
+            &["//:dependency"],
+            None,
+        ))?;
+        for (label, provider, config) in [
+            (
+                "@@owner//:dependency",
+                ProviderSet::empty().with_proto_files(unknown),
+                ConfigId(7),
+            ),
+            (
+                "@@foreign//:dependency",
+                ProviderSet::empty().with_proto_files(Arc::clone(&known)),
+                ConfigId(7),
+            ),
+            (
+                "@@owner//:dependency",
+                ProviderSet::empty().with_proto_files(Arc::clone(&known)),
+                ConfigId(8),
+            ),
+            ("@@owner//:dependency", ProviderSet::empty(), ConfigId(7)),
+        ] {
+            let deps = [(label.into(), Arc::new(provider))];
+            assert!(analyze(
+                rule.as_ref(),
+                &mut registry,
+                Path::new("/source"),
+                "",
+                TargetId(2),
+                config,
+                &deps
+            )
+            .is_err());
+        }
+        assert!(analyze(
+            rule.as_ref(),
+            &mut registry,
+            Path::new("/source"),
+            "",
+            TargetId(2),
+            ConfigId(7),
+            &[]
+        )
+        .is_err());
+        let path = registry.intern_path(Path::new("/source/generated.proto"));
+        registry.intern_artifact(
+            ArtifactKey {
+                config: ConfigId(7),
+                exec_path: path,
+            },
+            ArtifactKind::Generated,
+            false,
+            TargetId(3),
+            None,
+        );
+        let generated = ProtoLibraryRule.parse_attributes(&declaration(
+            "generated",
+            &["generated.proto"],
+            &[],
+            None,
+        ))?;
+        let resolver = StubIncludeResolver::new("/source".into());
+        let toolchain = Toolchain::default();
+        let before = registry.artifact_count();
+        let mut ctx = AnalysisContext::new(
+            TargetId(4),
+            ConfigId(7),
+            "",
+            Some("owner"),
+            Path::new("/output"),
+            &mut registry,
+            &resolver,
+            &toolchain,
+            Path::new("/source"),
+            &[],
+        );
+        assert!(generated.analyze(&mut ctx, &[]).get_proto_files().is_none());
+        assert!(ctx
+            .native_namespace_analysis_error()
+            .unwrap()
+            .contains("generated/virtual"));
+        assert_eq!(ctx.registry().artifact_count(), before);
+        assert_eq!(ctx.registry().declared_action_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn native_proto_metadata_complete_layouts_refuse_collisions_and_missing_source_coverage(
+    ) -> Result<()> {
+        let mut registry = ArtifactRegistry::new();
+        let a = source(
+            &mut registry,
+            Path::new("/a/common.proto"),
+            ConfigId(7),
+            TargetId(1),
+        );
+        let b = source(
+            &mut registry,
+            Path::new("/b/common.proto"),
+            ConfigId(7),
+            TargetId(2),
+        );
+        let layout = |artifact, root: &str| ProtoSourceImport {
+            artifact,
+            import_root: root.into(),
+            import_path: "common.proto".into(),
+        };
+        let left = ProtoFilesInfo::from_declared_sources_and_deps(
+            vec![layout(a, "/a")],
+            std::iter::empty(),
+        )?;
+        assert!(ProtoFilesInfo::from_declared_sources_and_deps(
+            vec![layout(b, "/b")],
+            [Arc::clone(&left)]
+        )
+        .is_err());
+        let broken = Arc::new(ProtoFilesInfo {
+            direct_sources: vec![a].into_boxed_slice(),
+            transitive_sources: crate::nested_set::NestedSet::new(vec![a], Vec::new()),
+            declared_imports: Some(crate::nested_set::NestedSet::empty()),
+        });
+        assert!(ProtoFilesInfo::from_declared_sources_and_deps(Vec::new(), [broken]).is_err());
+        let diamond =
+            ProtoFilesInfo::from_declared_sources_and_deps(Vec::new(), [Arc::clone(&left), left])?;
+        assert_eq!(
+            diamond.ordered_import_roots().unwrap(),
+            [PathBuf::from("/a")]
+        );
+        diamond.validate_declared_imports(&registry, ConfigId(7))?;
+        assert_eq!(
+            ProtoFilesInfo::empty().ordered_import_roots().unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        assert!(ProtoFilesInfo::from_declared_sources_and_deps(
+            vec![ProtoSourceImport {
+                artifact: a,
+                import_root: "/a".into(),
+                import_path: "../common.proto".into(),
+            }],
+            std::iter::empty()
+        )
+        .is_err());
+        Ok(())
     }
 }
