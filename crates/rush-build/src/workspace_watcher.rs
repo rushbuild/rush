@@ -1620,11 +1620,13 @@ mod tests {
         let dep = Dependency::FileContent {
             path: PathBuf::from("/ws/a.cc"),
             digest: [0u8; 32],
+            binding: None,
         };
         assert!(dep_dirty(&st, &dep).is_some());
         let clean = Dependency::FileContent {
             path: PathBuf::from("/ws/b.cc"),
             digest: [0u8; 32],
+            binding: None,
         };
         assert!(dep_dirty(&st, &clean).is_none());
     }
@@ -1710,7 +1712,7 @@ mod tests {
     // returns Err (→ the caller full-validates, → the change rebuilds).
 
     fn content_dep(p: &Path) -> Dependency {
-        Dependency::FileContent { path: p.to_path_buf(), digest: [0u8; 32] }
+        Dependency::FileContent { path: p.to_path_buf(), digest: [0u8; 32], binding: None }
     }
     fn dirlisting_dep(p: &Path) -> Dependency {
         Dependency::DirListing { path: p.to_path_buf(), entries_digest: [0u8; 32] }
@@ -1782,6 +1784,7 @@ mod tests {
         let original = Dependency::FileContent {
             path: source.clone(),
             digest: *blake3::hash(b"before").as_bytes(),
+            binding: None,
         };
         let probe = Dependency::ProcessProbe {
             program: "/usr/bin/touch".into(),

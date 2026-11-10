@@ -196,6 +196,22 @@ pub fn metadata_full(path: &Path) -> bool {
     current_required().metadata_full(path)
 }
 
+/// Observe a canonical regular file using fresh uncached OS metadata. See
+/// [`TrackedIo::fresh_canonical_regular_file_metadata`].
+pub fn fresh_canonical_regular_file_metadata(
+    path: &Path,
+) -> std::io::Result<Option<crate::CanonicalRegularFileMetadata>> {
+    current_required().fresh_canonical_regular_file_metadata(path)
+}
+
+/// Read a canonical regular file with descriptor-bound identity. See
+/// [`TrackedIo::read_canonical_regular_file`].
+pub fn read_canonical_regular_file(
+    path: &Path,
+) -> std::io::Result<Option<crate::CanonicalRegularFileRead>> {
+    current_required().read_canonical_regular_file(path)
+}
+
 /// Read a symlink's target through the current analysis IO. See
 /// [`TrackedIo::read_link`].
 pub fn read_link(path: &Path) -> Option<PathBuf> {

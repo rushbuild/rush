@@ -2225,6 +2225,7 @@ exit 0
     }
 }
 
+mod tool_fingerprint;
 mod workspace_repository_inputs;
 pub use workspace_repository_inputs::{
     prepare_workspace_repository_fetch, record_workspace_repository_fetch,

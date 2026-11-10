@@ -25,7 +25,8 @@ use std::time::Instant;
 pub const EXTERNAL_ANALYSIS_SNAPSHOT_SCHEMA: &str = "org.rushbuild.external-analysis-snapshot";
 
 /// Current external analysis snapshot layout.
-pub const EXTERNAL_ANALYSIS_SNAPSHOT_VERSION: u32 = 15;
+// Version 16 adds an explicit optional descriptor binding to FileContent.
+pub const EXTERNAL_ANALYSIS_SNAPSHOT_VERSION: u32 = 16;
 
 /// Reserved execution-property key for a fail-closed must-execute policy.
 pub(crate) const MANDATORY_EXECUTION_PROPERTY: &str = "rush.mandatory-execution";
@@ -497,15 +498,7 @@ impl ExternalAnalysisSnapshot {
 
     /// Validate graph structure without consulting mutable filesystem state.
     pub fn validate_structure(&self) -> Result<()> {
-        if self.schema != EXTERNAL_ANALYSIS_SNAPSHOT_SCHEMA {
-            anyhow::bail!("unsupported external analysis schema {:?}", self.schema);
-        }
-        if self.version != EXTERNAL_ANALYSIS_SNAPSHOT_VERSION {
-            if self.version == 14 {
-                anyhow::bail!("unsupported external analysis version 14; reassemble retained capture with this Rush binary");
-            }
-            anyhow::bail!("unsupported external analysis version {}", self.version);
-        }
+        validate_snapshot_format(&self.schema, self.version)?;
         if self.key.rush_compat_fingerprint != daemon_compat_fingerprint() {
             anyhow::bail!("external analysis snapshot has an incompatible Rush identity");
         }
@@ -614,6 +607,34 @@ impl ExternalSnapshotAdmission {
     }
 }
 
+fn validate_snapshot_format(schema: &str, version: u32) -> Result<()> {
+    if schema != EXTERNAL_ANALYSIS_SNAPSHOT_SCHEMA {
+        anyhow::bail!("unsupported external analysis schema {schema:?}");
+    }
+    if version != EXTERNAL_ANALYSIS_SNAPSHOT_VERSION {
+        if matches!(version, 14 | 15) {
+            anyhow::bail!("unsupported external analysis version {version}; reassemble retained capture or recapture with this Rush binary");
+        }
+        anyhow::bail!("unsupported external analysis version {version}");
+    }
+    Ok(())
+}
+
+/// Decode the current layout after checking its stable schema/version prefix.
+/// Old payloads must never be interpreted as the current dependency layout.
+/// Callers still perform their complete structure, key and freshness checks.
+pub fn decode_serialized_snapshot(bytes: &[u8]) -> Result<ExternalAnalysisSnapshot> {
+    use bincode::Options;
+    let (schema, version): (String, u32) = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(bytes.len() as u64)
+        .deserialize(bytes)
+        .context("decode external analysis format header")?;
+    validate_snapshot_format(&schema, version)?;
+    bincode::deserialize(bytes).context("decode external analysis payload")
+}
+
 /// Atomically persist a fully validated snapshot.
 pub fn persist(path: &Path, snapshot: &ExternalAnalysisSnapshot) -> Result<()> {
     snapshot.validate_structure()?;
@@ -698,10 +719,10 @@ pub(crate) fn load_serialized_if_fresh(
 ) -> ExternalSnapshotAdmission {
     let diagnostics = std::env::var("RUSH_EXTERNAL_OBSERVATION_STATS").as_deref() == Ok("1");
     let started = Instant::now();
-    let mut snapshot: ExternalAnalysisSnapshot = match bincode::deserialize(&bytes) {
+    let mut snapshot = match decode_serialized_snapshot(bytes) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return ExternalSnapshotAdmission::Invalid(format!("snapshot decode failed: {error}"))
+            return ExternalSnapshotAdmission::Invalid(format!("snapshot decode failed: {error:#}"))
         }
     };
     let decode_elapsed = started.elapsed();
@@ -1711,6 +1732,7 @@ mod tests {
         let manifest = DependencyManifest::from_deps(vec![Dependency::FileContent {
             path: analysis_input.to_path_buf(),
             digest: content_digest_of_regular_file(analysis_input, 1 << 20).unwrap(),
+            binding: None,
         }]);
         ExternalAnalysisSnapshot::new(
             key,
@@ -1768,6 +1790,111 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn snapshot_binary_codec_preserves_optional_content_bindings() {
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let snapshot = snapshot(temp.path(), &analysis_input);
+        let bytes = bincode::serialize(&snapshot).unwrap();
+        let decoded = bincode::deserialize::<ExternalAnalysisSnapshot>(&bytes);
+        assert!(
+            decoded.is_ok(),
+            "snapshot binary decode failed: {decoded:?}"
+        );
+        assert_eq!(decoded.unwrap(), snapshot);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_binary_codec_preserves_descriptor_bound_content() {
+        use rush_incremental::{RealTrackedIo, TrackedIo};
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let mut snapshot = snapshot(temp.path(), &analysis_input);
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let io = RealTrackedIo::new(semantics(temp.path()), temp.path());
+        io.read_canonical_regular_file(&std::fs::canonicalize(&analysis_input).unwrap())
+            .unwrap()
+            .unwrap();
+        snapshot.analysis_manifest = io.manifest();
+        assert!(snapshot.analysis_manifest.deps().iter().any(|dep| matches!(
+            dep,
+            Dependency::FileContent {
+                binding: Some(_),
+                ..
+            }
+        )));
+        let bytes = bincode::serialize(&snapshot).unwrap();
+        let decoded = decode_serialized_snapshot(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.analysis_manifest.deps(),
+            snapshot.analysis_manifest.deps(),
+            "raw descriptor proof must survive, not only semantic manifest equality"
+        );
+        assert!(matches!(
+            load_serialized_if_fresh(&bytes, &snapshot.key, &semantics(temp.path())),
+            ExternalSnapshotAdmission::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_binary_dependency_layout_is_rejected_before_payload_decode() {
+        #[derive(Serialize)]
+        enum LegacyDependency {
+            FileContent { path: PathBuf, digest: [u8; 32] },
+        }
+        #[derive(Serialize)]
+        struct LegacyManifest {
+            deps: Vec<LegacyDependency>,
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let analysis_input = temp.path().join("Makefile");
+        std::fs::write(&analysis_input, b"all:\n").unwrap();
+        let snapshot = snapshot(temp.path(), &analysis_input);
+        // Encode the actual v15 dependency layout, which has no Option field.
+        let legacy = bincode::serialize(&(
+            &snapshot.schema,
+            15u32,
+            &snapshot.key,
+            &snapshot.analyzer,
+            LegacyManifest {
+                deps: vec![LegacyDependency::FileContent {
+                    path: analysis_input,
+                    digest: content_digest_of_regular_file(
+                        temp.path().join("Makefile").as_path(),
+                        1 << 20,
+                    )
+                    .unwrap(),
+                }],
+            },
+            &snapshot.graph,
+        ))
+        .unwrap();
+        // The first byte of the following two-entry graph root map is not an
+        // Option tag. This also reproduces the original None-omission defect.
+        let error = bincode::deserialize::<ExternalAnalysisSnapshot>(&legacy).unwrap_err();
+        assert!(matches!(*error, bincode::ErrorKind::InvalidTagEncoding(2)));
+        let admission = load_serialized_if_fresh(&legacy, &snapshot.key, &semantics(temp.path()));
+        match admission {
+            ExternalSnapshotAdmission::Invalid(reason) => {
+                assert!(
+                    reason.contains("unsupported external analysis version 15"),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("reassemble retained capture or recapture"),
+                    "{reason}"
+                );
+            }
+            other => panic!("legacy layout was admitted: {other:?}"),
+        }
+        let oversized_header = bincode::serialize(&u64::MAX).unwrap();
+        assert!(decode_serialized_snapshot(&oversized_header).is_err());
     }
 
     #[test]
@@ -1854,7 +1981,7 @@ mod tests {
         assert_ne!(raw_key, complete_key);
         assert_eq!(runtime_directory_observation_profile(&action.execution_properties).unwrap(),
             RuntimeDirectoryObservationProfile::CompletePrivateEnumerations);
-        assert_eq!(snapshot.version, 15); // A version-14 reader must reject this new contract.
+        assert_eq!(snapshot.version, 16); // Older readers must reject the new dependency layout.
         snapshot.validate_structure().unwrap();
         let destination = temp.path().join("snapshot.bin");
         persist(&destination, &snapshot).unwrap();

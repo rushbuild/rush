@@ -1827,7 +1827,7 @@ async fn main() -> Result<()> {
             if needle.is_empty() {
                 usage();
             }
-            let snapshot: ExternalAnalysisSnapshot = bincode::deserialize(
+            let snapshot = rush_build::external_analysis_snapshot::decode_serialized_snapshot(
                 &std::fs::read(&snapshot_path)
                     .with_context(|| format!("read {}", snapshot_path.display()))?,
             )

@@ -8,6 +8,7 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rush_command_core::CommandSemantics;
 
@@ -17,7 +18,10 @@ use crate::tracked_io::{classify, lookup_option};
 
 /// Domain tag for the manifest fingerprint so it can never collide with an
 /// unrelated blake3 hash (or with a per-dependency content/dir digest).
-const MANIFEST_DOMAIN: &[u8] = b"rush.incremental.v1/manifest-fingerprint/1\n";
+// V2 distinguishes descriptor-qualified content reuse from the legacy stat-only
+// contract. Restart resident daemons on upgrade. Proof payload/wall-clock times
+// are serialized for validation, but are not semantic build inputs.
+const MANIFEST_DOMAIN: &[u8] = b"rush.incremental.v2/manifest-fingerprint/2\n";
 
 /// The outcome of [`DependencyManifest::validate`].
 ///
@@ -37,11 +41,111 @@ pub struct Validated {
 /// reuse-admission key.
 ///
 /// Holds an ordered, deduped `Vec<Dependency>` in a canonical (sorted) order, so
-/// two analyses that made the *same set* of observations in a *different order*
-/// produce an identical manifest (and identical [`fingerprint`](Self::fingerprint)).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// two analyses that made the same semantic observations produce an equal
+/// manifest and fingerprint. Descriptor-read proof payload is serialized but
+/// excluded from semantic equality/identity; missing proof wins conservatively.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DependencyManifest {
+    #[serde(deserialize_with = "deserialize_manifest_deps")]
     deps: Vec<Dependency>,
+}
+
+impl PartialEq for DependencyManifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.deps.len() == other.deps.len()
+            && self
+                .deps
+                .iter()
+                .zip(&other.deps)
+                .all(|(a, b)| match (a, b) {
+                    (
+                        Dependency::FileContent {
+                            path: a,
+                            digest: ad,
+                            ..
+                        },
+                        Dependency::FileContent {
+                            path: b,
+                            digest: bd,
+                            ..
+                        },
+                    ) => a == b && ad == bd,
+                    _ => a == b,
+                })
+    }
+}
+impl Eq for DependencyManifest {}
+
+fn deserialize_manifest_deps<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Dependency>, D::Error> {
+    let deps = <Vec<Dependency> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(canonicalize_content_observations(deps))
+}
+
+// Coalesce only identical content values within side-effect-free spans. Any
+// missing/invalid/unqualified proof wins conservatively; never create a binding
+// by combining an ordinary content read with a separate metadata observation.
+fn canonicalize_content_observations(deps: Vec<Dependency>) -> Vec<Dependency> {
+    fn span(deps: Vec<Dependency>) -> Vec<Dependency> {
+        let mut content = BTreeMap::<(PathBuf, [u8; 32]), Option<crate::FileContentBinding>>::new();
+        for dep in &deps {
+            if let Dependency::FileContent {
+                path,
+                digest,
+                binding,
+            } = dep
+            {
+                let binding = binding
+                    .as_ref()
+                    .filter(|binding| {
+                        binding.matches_content(path, digest) && binding.historically_qualified()
+                    })
+                    .cloned();
+                content
+                    .entry((path.clone(), *digest))
+                    .and_modify(|existing| {
+                        *existing = match (existing.as_ref(), binding.as_ref()) {
+                            (Some(a), Some(b)) if a.same_bound_value(b) => Some(
+                                if (a.read_start_ns, a.read_end_ns)
+                                    <= (b.read_start_ns, b.read_end_ns)
+                                {
+                                    a.clone()
+                                } else {
+                                    b.clone()
+                                },
+                            ),
+                            _ => None,
+                        };
+                    })
+                    .or_insert(binding);
+            }
+        }
+        deps.into_iter()
+            .filter_map(|dep| match dep {
+                Dependency::FileContent { path, digest, .. } => content
+                    .remove(&(path.clone(), digest))
+                    .map(|binding| Dependency::FileContent {
+                        path,
+                        digest,
+                        binding,
+                    }),
+                other => Some(other),
+            })
+            .collect()
+    }
+    let mut result = Vec::new();
+    let mut pending = Vec::new();
+    for dep in deps {
+        if matches!(dep, Dependency::ProcessProbe { .. }) {
+            result.extend(span(std::mem::take(&mut pending)));
+            result.push(dep);
+        } else {
+            pending.push(dep);
+        }
+    }
+    result.extend(span(pending));
+    result
 }
 
 impl DependencyManifest {
@@ -55,6 +159,9 @@ impl DependencyManifest {
     /// distinct dependencies and both must hold for reuse.
     pub(crate) fn from_recorded(mut recorded: Vec<Dependency>) -> Self {
         recorded.sort();
+        // Preserve the existing native canonical sort before coalescing proof
+        // variants, so intervening raw probes cannot change wire multiplicity.
+        let mut recorded = canonicalize_content_observations(recorded);
         recorded.dedup();
         Self { deps: recorded }
     }
@@ -81,7 +188,7 @@ impl DependencyManifest {
     }
 
     /// Re-check every recorded dependency against the current world, returning the
-    /// FIRST [`Staleness::Stale`] or [`Staleness::Fresh`] if all still match.
+    /// [`Staleness::Stale`] or [`Staleness::Fresh`] if all still match.
     ///
     /// Filesystem dependencies are re-checked against the real filesystem;
     /// environment and option dependencies are re-checked against the **passed**
@@ -90,13 +197,14 @@ impl DependencyManifest {
     /// `--define` or env var invalidates a retained graph.
     /// Validate and return both the verdict and the admitted manifest.
     ///
-    /// On the first stale dependency this returns `Stale` with the original
+    /// Within a side-effect-free span, stale full metadata takes precedence
+    /// over content reads. Process-probe boundaries retain their ordering.
+    /// On rejection this returns `Stale` with the original
     /// manifest as `refreshed` (reuse is rejected; nothing to refresh). When all
     /// dependencies still hold, the original exact observations are returned;
     /// re-reading them would only reproduce values already compared by `recheck`.
     pub fn validate(&self, sem: &CommandSemantics) -> Validated {
-        let metadata_shortcuts = fresh_metadata_shortcuts(&self.deps, sem);
-        if let Some((dep, reason)) = first_stale(&self.deps, sem, &metadata_shortcuts) {
+        if let Some((dep, reason)) = first_stale(&self.deps, sem) {
             return Validated {
                 staleness: Staleness::Stale {
                     dep: dep.clone(),
@@ -134,7 +242,7 @@ impl DependencyManifest {
     }
 }
 
-/// Find the first stale dependency while preserving process-probe ordering.
+/// Find a stale dependency while preserving process-probe ordering.
 ///
 /// Side-effect-free spans are checked concurrently. A process probe runs only
 /// after every preceding observation was proven fresh, matching the original
@@ -142,7 +250,6 @@ impl DependencyManifest {
 fn first_stale<'a>(
     deps: &'a [Dependency],
     sem: &CommandSemantics,
-    metadata_shortcuts: &BTreeSet<&Path>,
 ) -> Option<(&'a Dependency, String)> {
     let mut start = 0usize;
     while start < deps.len() {
@@ -157,8 +264,15 @@ fn first_stale<'a>(
             .iter()
             .position(|dep| matches!(dep, Dependency::ProcessProbe { .. }))
             .map_or(deps.len(), |offset| start + offset);
-        for (offset, reason) in
-            recheck_observations(&deps[start..end], sem, metadata_shortcuts)
+        // Metadata rejection takes diagnostic precedence within this
+        // side-effect-free span. In particular, a known kind/identity change
+        // must not trigger a content read of a FIFO before rejecting reuse.
+        // Never move this preflight across the preceding process probe.
+        let metadata_shortcuts = match preflight_metadata(&deps[start..end], sem) {
+            Ok(shortcuts) => shortcuts,
+            Err(stale) => return Some(stale),
+        };
+        for (offset, reason) in recheck_observations(&deps[start..end], sem, &metadata_shortcuts)
             .into_iter()
             .enumerate()
         {
@@ -173,28 +287,92 @@ fn first_stale<'a>(
 
 /// Find content dependencies whose unique companion metadata is unchanged.
 ///
-/// A metadata mismatch merely withholds the shortcut: normal content hashing
-/// still decides the earlier content dependency, and the metadata dependency
-/// retains its existing stale decision later in canonical order.
-fn fresh_metadata_shortcuts<'a>(
+/// Check each full metadata observation once before this span's content reads.
+/// A mismatch already rejects the manifest: returning that actual metadata
+/// dependency avoids an unnecessary, potentially blocking content re-read.
+/// Matching unique companions retain the existing content early cutoff.
+fn preflight_metadata<'a>(
     deps: &'a [Dependency],
     sem: &CommandSemantics,
-) -> BTreeSet<&'a Path> {
+) -> Result<BTreeSet<&'a Path>, (&'a Dependency, String)> {
+    preflight_metadata_at(deps, sem, SystemTime::now())
+}
+
+fn preflight_metadata_at<'a>(
+    deps: &'a [Dependency],
+    sem: &CommandSemantics,
+    now: SystemTime,
+) -> Result<BTreeSet<&'a Path>, (&'a Dependency, String)> {
     let mut metadata = BTreeMap::<&Path, (&Dependency, usize)>::new();
+    let mut contents = BTreeMap::<&Path, Vec<&Dependency>>::new();
     for dep in deps {
+        if let Dependency::FileContent { path, .. } = dep {
+            contents.entry(path).or_default().push(dep);
+        }
         if let Dependency::FileMetadata { path, .. } = dep {
+            if let Some(reason) = recheck(dep, sem) {
+                return Err((dep, reason));
+            }
             metadata
                 .entry(path.as_path())
                 .and_modify(|(_, count)| *count += 1)
                 .or_insert((dep, 1));
         }
     }
-    metadata
+    Ok(metadata
         .into_iter()
         .filter_map(|(path, (dep, count))| {
-            (count == 1 && recheck(dep, sem).is_none()).then_some(path)
+            let content = contents.get(path)?;
+            let [Dependency::FileContent {
+                path: content_path,
+                digest,
+                binding: Some(binding),
+            }] = content.as_slice()
+            else {
+                return None;
+            };
+            (count == 1
+                && content_shortcut_metadata_eligible(dep, now)
+                && binding.matches_content(content_path, digest)
+                && binding.matches_metadata(dep)
+                && binding.qualifies_at(now))
+            .then_some(path)
         })
-        .collect()
+        .collect())
+}
+
+fn content_shortcut_metadata_eligible(dep: &Dependency, now: SystemTime) -> bool {
+    #[cfg(unix)]
+    {
+        let Dependency::FileMetadata {
+            present: true,
+            mode,
+            mtime_ns,
+            ctime_ns,
+            ..
+        } = dep
+        else {
+            return false;
+        };
+        let Ok(now) = now.duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        let Ok(now) = i128::try_from(now.as_nanos()) else {
+            return false;
+        };
+        // Symlink-node metadata cannot witness its followed target's content.
+        // Unknown, future and recent/coarse timestamps require actual hashing.
+        mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+            && *mtime_ns > 0
+            && *ctime_ns > 0
+            && now - mtime_ns >= 2_000_000_000
+            && now - ctime_ns >= 2_000_000_000
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dep, now);
+        false
+    }
 }
 
 /// Recheck one side-effect-free manifest span with bounded parallelism.
@@ -250,6 +428,12 @@ fn recheck_observation(
     sem: &CommandSemantics,
     metadata_shortcuts: &BTreeSet<&Path>,
 ) -> Option<String> {
+    if matches!(dep, Dependency::FileMetadata { .. }) {
+        // This exact observation was checked by the span's preflight. Reuse
+        // the same outcome that admitted the content shortcut, not a second
+        // observation that could reopen the unsafe content fallback path.
+        return None;
+    }
     if let Dependency::FileContent { path, .. } = dep {
         if metadata_shortcuts.contains(path.as_path()) {
             return None;
@@ -265,14 +449,13 @@ fn recheck_observation(
 /// the real filesystem.
 fn recheck(dep: &Dependency, sem: &CommandSemantics) -> Option<String> {
     match dep {
-        Dependency::FileContent { path, digest } => {
+        Dependency::FileContent { path, digest, .. } => {
             // Re-hash current contents. The manifest-level caller may skip this
             // read only when a unique companion FileMetadata dependency matches
             // every recorded field exactly. Without that witness, correctness is
             // the content digest and unreadable bytes are stale.
-            match fs::read(path) {
-                Ok(bytes) => {
-                    let current = content_digest(&bytes);
+            match validation_content_digest(path) {
+                Ok(current) => {
                     if &current != digest {
                         Some(format!("file content changed: {}", path.display()))
                     } else {
@@ -480,11 +663,71 @@ fn recheck(dep: &Dependency, sem: &CommandSemantics) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
+fn open_content_for_validation(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Follow final symlinks intentionally: FileContent records the bytes read
+    // through them. A FIFO target must not wait for a writer before fstat.
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn validation_content_digest_with_open(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<fs::File>,
+) -> std::io::Result<[u8; 32]> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let signature = |md: &fs::Metadata| {
+        (
+            md.dev(),
+            md.ino(),
+            md.mode(),
+            md.len(),
+            md.mtime(),
+            md.mtime_nsec(),
+            md.ctime(),
+            md.ctime_nsec(),
+        )
+    };
+    let mut file = open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "content validation requires a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !after.is_file() || signature(&before) != signature(&after) {
+        return Err(std::io::Error::other(
+            "file changed during content validation",
+        ));
+    }
+    Ok(content_digest(&bytes))
+}
+
+fn validation_content_digest(path: &Path) -> std::io::Result<[u8; 32]> {
+    #[cfg(unix)]
+    {
+        validation_content_digest_with_open(path, open_content_for_validation)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::read(path).map(|bytes| content_digest(&bytes))
+    }
+}
+
 /// Encode one dependency into the fingerprint hasher, length-prefixed and
 /// tagged per variant so no two variants (or values) can collide.
 fn encode_dep(hasher: &mut blake3::Hasher, dep: &Dependency) {
     match dep {
-        Dependency::FileContent { path, digest } => {
+        Dependency::FileContent { path, digest, .. } => {
             hasher.update(&[0u8]);
             update_lp(hasher, path_bytes(path).as_slice());
             hasher.update(digest);
@@ -771,5 +1014,623 @@ fn os_string_bytes(s: &std::ffi::OsString) -> Vec<u8> {
     #[cfg(not(unix))]
     {
         s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod metadata_preflight_tests {
+    use super::*;
+    use crate::{RealTrackedIo, TrackedIo};
+    use bytes::Bytes;
+    use rush_protocol::command::v1::RunRequest;
+
+    fn semantics() -> CommandSemantics {
+        CommandSemantics::from_run_request(&RunRequest {
+            argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build")],
+            protocol_major: rush_protocol::PROTOCOL_MAJOR,
+            protocol_minor: rush_protocol::PROTOCOL_MINOR,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn metadata_preflight_retains_unique_companion_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool");
+        fs::write(&file, b"contents").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let sem = semantics();
+        let io = RealTrackedIo::new(sem.clone(), dir.path());
+        io.read_canonical_regular_file(&file).unwrap().unwrap();
+        let manifest = io.manifest();
+        let metadata = manifest
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::FileMetadata { .. }))
+            .unwrap()
+            .clone();
+        let content = manifest
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::FileContent { .. }))
+            .unwrap()
+            .clone();
+        let later = SystemTime::now() + std::time::Duration::from_secs(10);
+        let unique = vec![content.clone(), metadata.clone()];
+        assert!(preflight_metadata_at(&unique, &sem, later)
+            .unwrap()
+            .contains(file.as_path()));
+        let duplicate = vec![content, metadata.clone(), metadata];
+        assert!(
+            preflight_metadata_at(&duplicate, &sem, later)
+                .unwrap()
+                .is_empty(),
+            "duplicate metadata must not gain a new content shortcut"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_preflight_fifo_rejects_before_content_and_preserves_probe_boundaries() {
+        use std::os::unix::ffi::OsStrExt;
+        const CHILD_ROOT: &str = "RUSH_MANIFEST_METADATA_FIFO_CHILD";
+        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+            let temp = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "manifest::metadata_preflight_tests::metadata_preflight_fifo_rejects_before_content_and_preserves_probe_boundaries", "--nocapture"])
+                .env(CHILD_ROOT, temp.path()).stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()).spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "manifest FIFO child failed: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "manifest FIFO child blocked: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        let file = root.join("tool");
+        fs::write(&file, b"original").unwrap();
+        let sem = semantics();
+        let file_io = RealTrackedIo::new(sem.clone(), &root);
+        file_io.metadata_full(&file);
+        file_io.read_file(&file).unwrap();
+        let recorded_file_deps = file_io.manifest().deps().to_vec();
+        let content_io = RealTrackedIo::new(sem.clone(), &root);
+        content_io.read_file(&file).unwrap();
+        let content_only_fifo = content_io.manifest();
+        let link = root.join("followed-fifo");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let link_io = RealTrackedIo::new(sem.clone(), &root);
+        link_io.read_file(&link).unwrap();
+        let followed_fifo = link_io.manifest();
+        let counter = root.join("counter");
+        let probe_io = RealTrackedIo::new(sem.clone(), &root);
+        let arguments = vec![
+            b"-c".to_vec(),
+            b"printf x >> \"$1\"; printf stable".to_vec(),
+            b"probe".to_vec(),
+            counter.as_os_str().as_bytes().to_vec(),
+        ];
+        assert_eq!(
+            probe_io
+                .probe_process(Path::new("/bin/sh"), &arguments, &[], &root)
+                .unwrap()
+                .status,
+            0
+        );
+        let probe = probe_io
+            .manifest()
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::ProcessProbe { .. }))
+            .unwrap()
+            .clone();
+        assert_eq!(fs::read(&counter).unwrap(), b"x");
+        fs::remove_file(&file).unwrap();
+        let cpath = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        for manifest in [&content_only_fifo, &followed_fifo] {
+            assert!(
+                matches!(
+                    manifest.validate_staleness(&sem),
+                    Staleness::Stale {
+                        dep: Dependency::FileContent { .. },
+                        ..
+                    }
+                ),
+                "content hashing must refuse a known FIFO or followed FIFO without blocking"
+            );
+        }
+        let race = root.join("content-open-race");
+        fs::write(&race, b"regular").unwrap();
+        let error = validation_content_digest_with_open(&race, |path| {
+            fs::remove_file(path)?;
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            if unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            open_content_for_validation(path)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        // Use only authentic observations, explicitly preserving their order to
+        // exercise both process-probe boundaries (including persisted order).
+        let later_probe = DependencyManifest {
+            deps: recorded_file_deps
+                .iter()
+                .cloned()
+                .chain(std::iter::once(probe.clone()))
+                .collect(),
+        };
+        let rejected = later_probe.validate(&sem);
+        assert!(
+            matches!(&rejected.staleness, Staleness::Stale { dep: Dependency::FileMetadata { path, .. }, .. } if path == &file)
+        );
+        assert_eq!(rejected.refreshed, later_probe);
+        assert_eq!(
+            fs::read(&counter).unwrap(),
+            b"x",
+            "metadata refusal must precede the later process probe"
+        );
+
+        let earlier_probe = DependencyManifest {
+            deps: std::iter::once(probe).chain(recorded_file_deps).collect(),
+        };
+        let rejected = earlier_probe.validate(&sem);
+        assert!(
+            matches!(&rejected.staleness, Staleness::Stale { dep: Dependency::FileMetadata { path, .. }, .. } if path == &file)
+        );
+        assert_eq!(rejected.refreshed, earlier_probe);
+        assert_eq!(
+            fs::read(&counter).unwrap(),
+            b"xx",
+            "later metadata must not suppress an earlier process probe"
+        );
+
+        let plain = root.join("content-only");
+        fs::write(&plain, b"one").unwrap();
+        let plain_io = RealTrackedIo::new(sem.clone(), &root);
+        plain_io.read_file(&plain).unwrap();
+        let plain_manifest = plain_io.manifest();
+        assert_eq!(plain_manifest.validate_staleness(&sem), Staleness::Fresh);
+        fs::write(&plain, b"two").unwrap();
+        assert!(
+            matches!(
+                plain_manifest.validate_staleness(&sem),
+                Staleness::Stale {
+                    dep: Dependency::FileContent { .. },
+                    ..
+                }
+            ),
+            "content-only dependencies must retain their actual hashing decision"
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn metadata_shortcuts_do_not_hide_symlink_target_edits_or_missing_content() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let other = dir.path().join("same-bytes-target");
+        let link = dir.path().join("link");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&other, b"old").unwrap();
+        symlink(&target, &link).unwrap();
+        let sem = semantics();
+        let io = RealTrackedIo::new(sem.clone(), dir.path());
+        io.read_file(&link).unwrap();
+        io.metadata_full(&link);
+        let manifest = io.manifest();
+        assert_eq!(manifest.validate_staleness(&sem), Staleness::Fresh);
+        let future = SystemTime::now() + std::time::Duration::from_secs(10);
+        assert!(
+            !preflight_metadata_at(manifest.deps(), &sem, future)
+                .unwrap()
+                .contains(link.as_path()),
+            "even old symlink-node metadata cannot discharge followed content"
+        );
+        fs::write(&target, b"new").unwrap();
+        let rejected = manifest.validate(&sem);
+        assert!(matches!(
+            rejected.staleness,
+            Staleness::Stale {
+                dep: Dependency::FileContent { .. },
+                ..
+            }
+        ));
+        assert_eq!(rejected.refreshed, manifest);
+        fs::write(&target, b"old").unwrap();
+        let content_only_io = RealTrackedIo::new(sem.clone(), dir.path());
+        content_only_io.read_file(&link).unwrap();
+        let content_only = content_only_io.manifest();
+        fs::remove_file(&link).unwrap();
+        symlink(&other, &link).unwrap();
+        assert_eq!(
+            content_only.validate_staleness(&sem),
+            Staleness::Fresh,
+            "equal bytes on a different stable followed inode remain content-equivalent"
+        );
+        let absent = dir.path().join("disappearing");
+        fs::write(&absent, b"old").unwrap();
+        let missing_io = RealTrackedIo::new(sem.clone(), dir.path());
+        missing_io.read_file(&absent).unwrap();
+        fs::remove_file(&absent).unwrap();
+        missing_io.metadata_full(&absent);
+        let missing = missing_io.manifest();
+        assert!(!preflight_metadata_at(missing.deps(), &sem, future)
+            .unwrap()
+            .contains(absent.as_path()));
+        assert!(
+            matches!(
+                missing.validate_staleness(&sem),
+                Staleness::Stale {
+                    dep: Dependency::FileContent { .. },
+                    ..
+                }
+            ),
+            "matching absent metadata must not skip the unreadable old content"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_shortcut_clock_guard_requires_known_aged_regular_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"old").unwrap();
+        let sem = semantics();
+        let io = RealTrackedIo::new(sem.clone(), dir.path());
+        io.read_file(&file).unwrap();
+        io.metadata_full(&file);
+        let manifest = io.manifest();
+        let metadata = manifest
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::FileMetadata { .. }))
+            .unwrap();
+        let Dependency::FileMetadata {
+            mtime_ns, ctime_ns, ..
+        } = metadata
+        else {
+            unreachable!()
+        };
+        let recent = UNIX_EPOCH
+            + std::time::Duration::from_nanos(u64::try_from((*mtime_ns).max(*ctime_ns)).unwrap());
+        let aged = recent + std::time::Duration::from_secs(10);
+        assert!(!content_shortcut_metadata_eligible(metadata, recent));
+        assert!(!content_shortcut_metadata_eligible(
+            metadata,
+            recent - std::time::Duration::from_secs(1)
+        ));
+        assert!(!content_shortcut_metadata_eligible(metadata, UNIX_EPOCH));
+        assert!(content_shortcut_metadata_eligible(metadata, aged));
+        let mut unknown = metadata.clone();
+        if let Dependency::FileMetadata { ctime_ns, .. } = &mut unknown {
+            *ctime_ns = 0;
+        }
+        assert!(!content_shortcut_metadata_eligible(&unknown, aged));
+        // Both observations below are authentic: content was read before the
+        // write, while the companion metadata was recorded after it. Since the
+        // new metadata is recent, validation must hash and expose the conflict.
+        let conflicting_io = RealTrackedIo::new(sem.clone(), dir.path());
+        conflicting_io.read_file(&file).unwrap();
+        fs::write(&file, b"new").unwrap();
+        conflicting_io.metadata_full(&file);
+        let conflicting = conflicting_io.manifest();
+        assert!(!preflight_metadata(conflicting.deps(), &sem)
+            .unwrap()
+            .contains(file.as_path()));
+        assert!(matches!(
+            conflicting.validate_staleness(&sem),
+            Staleness::Stale {
+                dep: Dependency::FileContent { .. },
+                ..
+            }
+        ));
+        let aged_clock = SystemTime::now() + std::time::Duration::from_secs(10);
+        assert!(
+            !preflight_metadata_at(conflicting.deps(), &sem, aged_clock)
+                .unwrap()
+                .contains(file.as_path()),
+            "old content and later metadata cannot acquire a fabricated association when they age"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(matches!(
+            conflicting.validate_staleness(&sem),
+            Staleness::Stale {
+                dep: Dependency::FileContent { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn descriptor_bindings_preserve_semantic_identity_and_conservative_wire_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool");
+        fs::write(&file, b"stable tool").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let sem = semantics();
+        let first_io = RealTrackedIo::new(sem.clone(), dir.path());
+        first_io
+            .read_canonical_regular_file(&file)
+            .unwrap()
+            .unwrap();
+        let first = first_io.manifest();
+        let first_content = first
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::FileContent { .. }))
+            .unwrap()
+            .clone();
+        let Dependency::FileContent {
+            binding: Some(first_binding),
+            ..
+        } = &first_content
+        else {
+            panic!("aged descriptor read must retain its actual proof");
+        };
+        assert!(first_binding.qualifies_at(SystemTime::now()));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let second_io = RealTrackedIo::new(sem.clone(), dir.path());
+        second_io
+            .read_canonical_regular_file(&file)
+            .unwrap()
+            .unwrap();
+        let second = second_io.manifest();
+        let second_content = second
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::FileContent { .. }))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            first, second,
+            "read-clock provenance is not a semantic input"
+        );
+        assert_eq!(first.fingerprint(), second.fingerprint());
+        assert_ne!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap(),
+            "actual read times are still serialized as proof payload"
+        );
+        let repeated = DependencyManifest::from_deps(
+            first_io
+                .captured_since(0)
+                .into_iter()
+                .chain(second_io.captured_since(0))
+                .collect(),
+        );
+        assert_eq!(repeated, first);
+        assert_eq!(repeated.fingerprint(), first.fingerprint());
+        assert_eq!(
+            repeated
+                .deps()
+                .iter()
+                .filter(|dep| matches!(dep, Dependency::FileContent { .. }))
+                .count(),
+            1
+        );
+        let interleaved_io = RealTrackedIo::new(sem.clone(), dir.path());
+        interleaved_io
+            .read_canonical_regular_file(&file)
+            .unwrap()
+            .unwrap();
+        interleaved_io
+            .probe_process(
+                Path::new("/bin/sh"),
+                &[b"-c".to_vec(), b"printf stable".to_vec()],
+                &[],
+                dir.path(),
+            )
+            .unwrap();
+        interleaved_io
+            .read_canonical_regular_file(&file)
+            .unwrap()
+            .unwrap();
+        let interleaved = interleaved_io.manifest();
+        let interleaved_roundtrip: DependencyManifest =
+            serde_json::from_value(serde_json::to_value(&interleaved).unwrap()).unwrap();
+        assert_eq!(interleaved, interleaved_roundtrip);
+        assert_eq!(
+            interleaved.fingerprint(),
+            interleaved_roundtrip.fingerprint()
+        );
+        assert_eq!(
+            interleaved
+                .deps()
+                .iter()
+                .filter(|dep| matches!(dep, Dependency::FileContent { .. }))
+                .count(),
+            1,
+            "a raw intervening probe must not make proof times semantic multiplicity"
+        );
+        let mut wire_deps = first.deps().to_vec();
+        wire_deps.push(second_content);
+        let duplicate_wire: DependencyManifest =
+            serde_json::from_value(serde_json::json!({"deps": wire_deps})).unwrap();
+        assert_eq!(duplicate_wire, first);
+        assert_eq!(duplicate_wire.fingerprint(), first.fingerprint());
+        let ordinary_io = RealTrackedIo::new(sem.clone(), dir.path());
+        ordinary_io.read_file(&file).unwrap();
+        let ordinary_content = ordinary_io
+            .manifest()
+            .deps()
+            .iter()
+            .find(|dep| matches!(dep, Dependency::FileContent { .. }))
+            .unwrap()
+            .clone();
+        let mut mixed_deps = first.deps().to_vec();
+        mixed_deps.push(ordinary_content);
+        let mixed: DependencyManifest =
+            serde_json::from_value(serde_json::json!({"deps": mixed_deps})).unwrap();
+        assert_eq!(mixed, first);
+        assert_eq!(mixed.fingerprint(), first.fingerprint());
+        assert!(mixed
+            .deps()
+            .iter()
+            .any(|dep| matches!(dep, Dependency::FileContent { binding: None, .. })));
+        assert!(
+            !preflight_metadata(mixed.deps(), &sem)
+                .unwrap()
+                .contains(file.as_path()),
+            "mixed bound/unbound observations must never invent a binding"
+        );
+        let validated = first.validate(&sem);
+        assert_eq!(validated.staleness, Staleness::Fresh);
+        assert_eq!(
+            serde_json::to_value(&validated.refreshed).unwrap(),
+            serde_json::to_value(&first).unwrap(),
+            "validation must preserve exact proof payload, not only semantic equality"
+        );
+        let mut old = blake3::Hasher::new();
+        old.update(b"rush.incremental.v1/manifest-fingerprint/1\n");
+        old.update(&(first.deps().len() as u64).to_le_bytes());
+        for dep in first.deps() {
+            encode_dep(&mut old, dep);
+        }
+        assert_ne!(
+            first.fingerprint(),
+            *old.finalize().as_bytes(),
+            "v2 must not reuse the old stat-only namespace"
+        );
+        let mut legacy_json = serde_json::to_value(&first).unwrap();
+        for dep in legacy_json["deps"].as_array_mut().unwrap() {
+            if let Some(content) = dep.get_mut("FileContent") {
+                content.as_object_mut().unwrap().remove("binding");
+            }
+        }
+        let legacy: DependencyManifest = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy, first);
+        assert_eq!(legacy.fingerprint(), first.fingerprint());
+        assert!(!preflight_metadata(legacy.deps(), &sem)
+            .unwrap()
+            .contains(file.as_path()));
+        assert_eq!(legacy.validate_staleness(&sem), Staleness::Fresh);
+        let content_index = first
+            .deps()
+            .iter()
+            .position(|dep| matches!(dep, Dependency::FileContent { .. }))
+            .unwrap();
+        for key in ["version", "digest", "path", "read_end_ns"] {
+            let mut json = serde_json::to_value(&first).unwrap();
+            let binding = &mut json["deps"][content_index]["FileContent"]["binding"];
+            match key {
+                "version" => binding["version"] = serde_json::json!(99),
+                "digest" => binding["digest"] = serde_json::to_value([0u8; 32]).unwrap(),
+                "path" => binding["path"] = serde_json::json!(dir.path().join("other")),
+                "read_end_ns" => binding["read_end_ns"] = serde_json::json!(0),
+                _ => unreachable!(),
+            }
+            let invalid: DependencyManifest = serde_json::from_value(json).unwrap();
+            assert!(
+                !preflight_metadata(invalid.deps(), &sem)
+                    .unwrap()
+                    .contains(file.as_path()),
+                "{key}"
+            );
+            assert_eq!(
+                invalid.validate_staleness(&sem),
+                Staleness::Fresh,
+                "invalid provenance must hash valid content, not invent a value"
+            );
+        }
+        let mut malformed = serde_json::to_value(&first).unwrap();
+        malformed["deps"][content_index]["FileContent"]["binding"]
+            .as_object_mut()
+            .unwrap()
+            .remove("read_start_ns");
+        assert!(serde_json::from_value::<DependencyManifest>(malformed).is_err());
+        let mut unknown = serde_json::to_value(&first).unwrap();
+        unknown["deps"][content_index]["FileContent"]["binding"]["unknown"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<DependencyManifest>(unknown).is_err());
+        let before_read_end = UNIX_EPOCH
+            + std::time::Duration::from_nanos(
+                u64::try_from(first_binding.read_end_ns - 1).unwrap(),
+            );
+        assert!(
+            !preflight_metadata_at(first.deps(), &sem, before_read_end)
+                .unwrap()
+                .contains(file.as_path()),
+            "a clock behind the actual historical read end cannot grant reuse"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn descriptor_fresh_read_proof_never_ages_into_a_shortcut() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fresh");
+        fs::write(&file, b"fresh bytes").unwrap();
+        let sem = semantics();
+        let io = RealTrackedIo::new(sem.clone(), dir.path());
+        io.read_canonical_regular_file(&file).unwrap().unwrap();
+        let raw = io.captured_since(0);
+        let binding = raw
+            .iter()
+            .find_map(|dep| match dep {
+                Dependency::FileContent {
+                    binding: Some(binding),
+                    ..
+                } => Some(binding),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!binding.historically_qualified());
+        assert!(!binding.qualifies_at(SystemTime::now() + std::time::Duration::from_secs(20)));
+        let canonical = io.manifest();
+        assert!(canonical
+            .deps()
+            .iter()
+            .any(|dep| matches!(dep, Dependency::FileContent { binding: None, .. })));
+        assert!(!preflight_metadata_at(
+            canonical.deps(),
+            &sem,
+            SystemTime::now() + std::time::Duration::from_secs(20)
+        )
+        .unwrap()
+        .contains(file.as_path()));
+        let later_stat_io = RealTrackedIo::new(sem.clone(), dir.path());
+        later_stat_io.read_file(&file).unwrap();
+        fs::write(&file, b"other bytes").unwrap();
+        later_stat_io.metadata_full(&file);
+        let contradictory = later_stat_io.manifest();
+        assert!(!preflight_metadata_at(
+            contradictory.deps(),
+            &sem,
+            SystemTime::now() + std::time::Duration::from_secs(20)
+        )
+        .unwrap()
+        .contains(file.as_path()));
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(matches!(
+            contradictory.validate_staleness(&sem),
+            Staleness::Stale {
+                dep: Dependency::FileContent { .. },
+                ..
+            }
+        ));
     }
 }

@@ -745,7 +745,11 @@ fn command_environment_default_is_unsupported() {
         fn validate_manifest(&self, _: &DependencyManifest) -> Validated { unreachable!() }
     }
     let io: crate::tracked::SharedTrackedIo = std::sync::Arc::new(NoCommandEnvironment);
-    let error = crate::tracked::scope(io, crate::tracked::command_environment).unwrap_err();
+    let error = crate::tracked::scope(io.clone(), crate::tracked::command_environment).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let error = crate::tracked::scope(io.clone(), || crate::tracked::fresh_canonical_regular_file_metadata(Path::new("/unused"))).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let error = crate::tracked::scope(io, || crate::tracked::read_canonical_regular_file(Path::new("/unused"))).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }
 
@@ -939,4 +943,264 @@ fn metadata_full_negative_probe_flips() {
         |d| matches!(d, Dependency::FileMetadata { present: false, .. }),
         "FileMetadata absent->present stale",
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn canonical_regular_file_metadata_is_fresh_and_records_negative_nonregular_inputs() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tool");
+    fs::write(&file, b"same bytes").unwrap();
+    let io = RealTrackedIo::new(semantics(&[], &[]), dir.path());
+    assert!(io.exists(&file));
+    let first = io
+        .fresh_canonical_regular_file_metadata(&file)
+        .unwrap()
+        .unwrap();
+    let replacement = dir.path().join("new");
+    fs::write(&replacement, b"same bytes").unwrap();
+    fs::rename(replacement, &file).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o700)).unwrap();
+    let second = io
+        .fresh_canonical_regular_file_metadata(&file)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.ino, second.ino);
+    assert_eq!(second.mode & 0o777, 0o700);
+    assert!(
+        matches!(
+            io.manifest().validate_staleness(&semantics(&[], &[])),
+            Staleness::Stale { .. }
+        ),
+        "both old and current observations must remain, rather than replacing old dependencies"
+    );
+    let missing = dir.path().join("missing");
+    assert_eq!(
+        io.fresh_canonical_regular_file_metadata(&missing)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(io.manifest().deps().iter().any(|dep| matches!(dep,
+        Dependency::FileMetadata { path, present: false, .. } if path == &missing)));
+    assert!(io
+        .fresh_canonical_regular_file_metadata(dir.path())
+        .unwrap()
+        .is_none());
+    let alias = dir.path().join("alias");
+    symlink(&file, &alias).unwrap();
+    assert!(io
+        .fresh_canonical_regular_file_metadata(&alias)
+        .unwrap()
+        .is_none());
+    assert!(io.manifest().deps().iter().any(|dep| matches!(dep,
+        Dependency::FileMetadata { path, present: true, mode, .. } if path == &alias && mode & 0o170000 == 0o120000)));
+    assert_eq!(
+        io.read_canonical_regular_file(&alias).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn canonical_regular_file_read_records_descriptor_bound_bytes_metadata_and_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tool");
+    fs::write(&file, b"exact tool bytes").unwrap();
+    let io = RealTrackedIo::new(semantics(&[], &[]), dir.path());
+    let read = io.read_canonical_regular_file(&file).unwrap().unwrap();
+    assert_eq!(read.contents.as_ref(), b"exact tool bytes");
+    assert_eq!(read.metadata.len, 16);
+    let deps = io.manifest();
+    assert_eq!(deps.len(), 3);
+    assert!(deps.deps().iter().any(|dep| matches!(dep,
+        Dependency::FileContent { path, digest, .. } if path == &file && *digest == crate::content_digest(b"exact tool bytes"))));
+    assert!(deps.deps().iter().any(|dep| matches!(dep,
+        Dependency::FileExistence { path, exists: true, kind: Some(crate::FileKind::File) } if path == &file)));
+    assert_eq!(
+        read.metadata,
+        io.fresh_canonical_regular_file_metadata(&file)
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(
+        deps.validate_staleness(&semantics(&[], &[])),
+        Staleness::Fresh
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn canonical_regular_file_read_rejects_parent_directory_rename_aba() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let active = dir.path().join("active");
+    let other = dir.path().join("other");
+    let saved = dir.path().join("saved");
+    fs::create_dir(&active).unwrap();
+    fs::create_dir(&other).unwrap();
+    let file = active.join("tool");
+    fs::write(&file, b"first").unwrap();
+    fs::write(other.join("tool"), b"other").unwrap();
+    let io = RealTrackedIo::new(semantics(&[], &[]), dir.path());
+    let before = io
+        .fresh_canonical_regular_file_metadata(&file)
+        .unwrap()
+        .unwrap();
+    let error = io
+        .read_canonical_regular_file_with_open_for_test(&file, |path| {
+            // Change only the parent directory identity: restoring it leaves the
+            // original file's full stat unchanged, defeating path-only pre/post
+            // checks. The descriptor really opens the other inode during the ABA.
+            fs::rename(&active, &saved)?;
+            fs::rename(&other, &active)?;
+            let opened = RealTrackedIo::open_canonical_regular_candidate_for_test(path)?;
+            fs::rename(&active, &other)?;
+            fs::rename(&saved, &active)?;
+            let mut captured = Vec::new();
+            opened.try_clone()?.read_to_end(&mut captured)?;
+            assert_eq!(captured, b"other");
+            Ok(opened)
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changed before descriptor-bound read"),
+        "{error}"
+    );
+    let after = io
+        .fresh_canonical_regular_file_metadata(&file)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "this control must reproduce identical pre/post pathname stat"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"first");
+    assert!(
+        !io.manifest()
+            .deps()
+            .iter()
+            .any(|dep| matches!(dep, Dependency::FileContent { .. })),
+        "bytes from the transient inode must not be admitted under restored metadata"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn canonical_regular_file_open_races_refuse_fifo_and_symlink_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    const CHILD_ROOT: &str = "RUSH_CANONICAL_FILE_KIND_RACE_CHILD";
+    let Some(root) = std::env::var_os(CHILD_ROOT) else {
+        // Contain the race test in its own child: a regression to blocking
+        // File::open must fail this test, not strand a Cargo worker on a FIFO.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::canonical_regular_file_open_races_refuse_fifo_and_symlink_without_blocking",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "kind-race child failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "kind-race child blocked: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let known_fifo = root.join("known-fifo");
+    let cpath = std::ffi::CString::new(known_fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let io = RealTrackedIo::new(semantics(&[], &[]), &root);
+    assert_eq!(
+        io.read_canonical_regular_file(&known_fifo)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a known FIFO must be an error, never an unsupported-capability fallback"
+    );
+    assert!(io.manifest().deps().iter().any(|dep| matches!(dep,
+        Dependency::FileMetadata { path, present: true, mode, .. } if path == &known_fifo && mode & 0o170000 == 0o010000)));
+    let refused = root.join("filesystem-refusal");
+    fs::write(&refused, b"regular tool").unwrap();
+    let error = io
+        .read_canonical_regular_file_with_open_for_test(&refused, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem refused the actual open",
+            ))
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "a capable backend's I/O refusal must not authorize an ordinary-read fallback"
+    );
+    let other = root.join("other");
+    fs::write(&other, b"other bytes").unwrap();
+    for kind in ["fifo", "symlink"] {
+        let file = root.join(kind);
+        fs::write(&file, b"regular tool").unwrap();
+        let io = RealTrackedIo::new(semantics(&[], &[]), &root);
+        let error = io
+            .read_canonical_regular_file_with_open_for_test(&file, |path| {
+                fs::remove_file(path)?;
+                if kind == "fifo" {
+                    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    if unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) } != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else {
+                    symlink(&other, path)?;
+                }
+                // Invoke the exact production nonblocking/no-follow opener after
+                // the precheck. There is deliberately no FIFO writer anywhere.
+                RealTrackedIo::open_canonical_regular_candidate_for_test(path)
+            })
+            .unwrap_err();
+        if kind == "symlink" {
+            assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed before descriptor-bound read"),
+                "{error}"
+            );
+        }
+        assert!(
+            !io.manifest()
+                .deps()
+                .iter()
+                .any(|dep| matches!(dep, Dependency::FileContent { .. })),
+            "a swapped nonregular file must be refused before any byte read"
+        );
+    }
 }

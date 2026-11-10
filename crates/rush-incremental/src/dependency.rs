@@ -1,6 +1,99 @@
 //! The recorded-dependency types and the digest helpers used to compute them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Descriptor-read provenance for a content observation, not a new build input.
+/// Only the descriptor-bound tracked reader emits this proof. Legacy/ordinary
+/// reads have no binding and must hash during validation. Raw times explain
+/// historical qualification but are excluded from semantic fingerprints.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct FileContentBinding {
+    pub version: u32,
+    pub path: PathBuf,
+    pub digest: [u8; 32],
+    pub len: u64,
+    pub mode: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime_ns: i128,
+    pub ctime_ns: i128,
+    pub read_start_ns: i128,
+    pub read_end_ns: i128,
+}
+
+pub(crate) fn clock_ns(now: SystemTime) -> Option<i128> {
+    i128::try_from(now.duration_since(UNIX_EPOCH).ok()?.as_nanos()).ok()
+}
+
+impl FileContentBinding {
+    pub fn matches_content(&self, path: &Path, digest: &[u8; 32]) -> bool {
+        self.version == 1 && self.path == path && &self.digest == digest
+    }
+
+    pub fn matches_metadata(&self, metadata: &Dependency) -> bool {
+        matches!(metadata, Dependency::FileMetadata { path, present: true, len, mode, dev, ino, mtime_ns, ctime_ns }
+            if path == &self.path && (*len, *mode, *dev, *ino, *mtime_ns, *ctime_ns)
+                == (self.len, self.mode, self.dev, self.ino, self.mtime_ns, self.ctime_ns))
+    }
+
+    pub fn historically_qualified(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.version == 1
+                && self.path.is_absolute()
+                && self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+                && self.mtime_ns > 0
+                && self.ctime_ns > 0
+                && self.read_start_ns > 0
+                && self.read_end_ns >= self.read_start_ns
+                && self.read_start_ns - self.mtime_ns >= 2_000_000_000
+                && self.read_start_ns - self.ctime_ns >= 2_000_000_000
+                && self.read_end_ns - self.mtime_ns >= 2_000_000_000
+                && self.read_end_ns - self.ctime_ns >= 2_000_000_000
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub fn qualifies_at(&self, now: SystemTime) -> bool {
+        self.historically_qualified()
+            && clock_ns(now).is_some_and(|now| {
+                now >= self.read_end_ns
+                    && now - self.mtime_ns >= 2_000_000_000
+                    && now - self.ctime_ns >= 2_000_000_000
+            })
+    }
+
+    pub(crate) fn same_bound_value(&self, other: &Self) -> bool {
+        (
+            self.version,
+            &self.path,
+            self.digest,
+            self.len,
+            self.mode,
+            self.dev,
+            self.ino,
+            self.mtime_ns,
+            self.ctime_ns,
+        ) == (
+            other.version,
+            &other.path,
+            other.digest,
+            other.len,
+            other.mode,
+            other.dev,
+            other.ino,
+            other.mtime_ns,
+            other.ctime_ns,
+        )
+    }
+}
 
 /// The on-disk kind of a path, as observed by an existence / type probe.
 ///
@@ -74,7 +167,14 @@ impl FileKind {
 )]
 pub enum Dependency {
     /// read_file / read_to_string: CONTENT matters. blake3 of the bytes.
-    FileContent { path: PathBuf, digest: [u8; 32] },
+    FileContent {
+        path: PathBuf,
+        digest: [u8; 32],
+        // Binary serializers are positional: None must retain its Option tag.
+        // The default still accepts legacy human-readable records without it.
+        #[serde(default)]
+        binding: Option<FileContentBinding>,
+    },
     /// exists() / metadata(): presence + type matter (NOT content).
     FileExistence {
         path: PathBuf,
@@ -158,8 +258,10 @@ fn default_compare_process_stderr() -> bool {
 /// The result of re-checking a [`crate::DependencyManifest`] against the current
 /// world.
 ///
-/// [`Staleness::Stale`] names the *first* dependency that no longer matches so the
-/// daemon can both reject reuse and report a human-readable reason for the miss.
+/// [`Staleness::Stale`] names a dependency that no longer matches so the daemon
+/// can reject reuse and explain the miss. Within a side-effect-free validation
+/// span, full metadata refusal precedes content reads; process-probe boundaries
+/// retain their ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Staleness {
     Fresh,

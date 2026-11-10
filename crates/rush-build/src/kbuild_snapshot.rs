@@ -14618,6 +14618,7 @@ fn materialize_kbuild_external_input_manifests(
         dependencies.push(Dependency::FileContent {
             path: seed.source_path.clone(),
             digest: content_digest(&seed.bytes),
+            binding: None,
         });
     }
     let mut analysis_file_metadata_dependencies = 0_u64;
@@ -14649,6 +14650,7 @@ fn materialize_kbuild_external_input_manifests(
                 dependencies.push(Dependency::FileContent {
                     path: input.absolute_path.clone(),
                     digest: *dependency_digest,
+                    binding: None,
                 });
             }
             KbuildCurrentInputValue::Directory {
@@ -31790,7 +31792,7 @@ mod tests {
             .any(|dependency| {
                 matches!(
                     dependency,
-                    Dependency::FileContent { path, digest }
+                    Dependency::FileContent { path, digest, .. }
                         if path == &file_path && *digest == content_digest(b"seed bytes\n")
                 )
             }));

@@ -33,10 +33,12 @@ mod probe;
 pub mod tracked;
 mod tracked_io;
 
-pub use crate::dependency::{content_digest, dir_listing_digest, Dependency, FileKind, Staleness};
+pub use crate::dependency::{content_digest, dir_listing_digest, Dependency, FileContentBinding, FileKind, Staleness};
 pub use crate::manifest::{DependencyManifest, Validated};
 pub use crate::probe::{content_digest_of_regular_file, stat_meta, FileMeta};
-pub use crate::tracked_io::{ProcessProbeResult, RealTrackedIo, TrackedIo};
+pub use crate::tracked_io::{
+    CanonicalRegularFileMetadata, CanonicalRegularFileRead, ProcessProbeResult, RealTrackedIo, TrackedIo,
+};
 
 #[cfg(test)]
 mod tests;

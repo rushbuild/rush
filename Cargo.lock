@@ -3417,9 +3417,11 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "libc",
  "rush-command-core",
  "rush-protocol",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

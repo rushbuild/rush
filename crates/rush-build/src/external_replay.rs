@@ -3537,6 +3537,7 @@ mod tests {
         let manifest = DependencyManifest::from_deps(vec![Dependency::FileContent {
             path: makefile.clone(),
             digest: content_digest_of_regular_file(&makefile, 1 << 20).unwrap(),
+            binding: None,
         }]);
         ExternalAnalysisSnapshot::new(
             key,

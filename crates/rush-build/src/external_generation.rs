@@ -622,8 +622,8 @@ impl ExternalGenerationStore {
         if *blake3::hash(&bytes).as_bytes() != snapshot_digest {
             anyhow::bail!("prepared external snapshot content digest changed");
         }
-        let snapshot: ExternalAnalysisSnapshot =
-            bincode::deserialize(&bytes).context("decode prepared external snapshot")?;
+        let snapshot = crate::external_analysis_snapshot::decode_serialized_snapshot(&bytes)
+            .context("decode prepared external snapshot")?;
         if snapshot.key.stable_hash() != key_hash
             || output_root_hash(&snapshot.key.output_root) != self.output_hash
         {

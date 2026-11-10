@@ -559,7 +559,7 @@ pub fn prepare_workspace_repository_fetch(
     if !tracked::metadata_full(&executable) {
         bail!("Bazel executable is unavailable");
     }
-    let executable_sha = digest(&tracked::read_file(&executable)?);
+    let executable_sha = super::tool_fingerprint::tracked_tool_sha256(&executable)?;
     let home = environment
         .iter()
         .find(|(key, _)| key == b"HOME")

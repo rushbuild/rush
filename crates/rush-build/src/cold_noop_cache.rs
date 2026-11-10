@@ -70,7 +70,8 @@ use crate::freshness_ledger::FreshnessLedger;
 
 /// Bump when the on-disk record layout changes incompatibly. An older-schema
 /// record is a cache MISS (never an error).
-const SCHEMA_VERSION: u32 = 1;
+// Version 2 adds the explicit FileContent descriptor-binding Option field.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Subdirectory under the workspace cache root holding cold-no-op certificates.
 const CACHE_SUBDIR: &str = "daemon-noop-cache";
@@ -240,6 +241,12 @@ pub struct LoadedCertificate {
 pub fn load(workspace_root: &Path, key: &AnalysisKey) -> Option<LoadedCertificate> {
     let path = certificate_path(workspace_root, key);
     let bytes = std::fs::read(&path).ok()?;
+    // Reject older layouts before decoding the changed dependency payload.
+    // Fixed-width little-endian encoding matches bincode::serialize below.
+    let version = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    if version != SCHEMA_VERSION {
+        return None;
+    }
     let cert: Certificate = match bincode::deserialize(&bytes) {
         Ok(c) => c,
         Err(_) => {
@@ -305,7 +312,11 @@ mod tests {
         let mut paths = HashMap::new();
         paths.insert(tracked.clone(), rush_incremental::stat_meta(&tracked));
         let ledger = FreshnessLedger::from_parts(paths, 1);
-        let manifest = DependencyManifest::from_deps(Vec::new());
+        let manifest = DependencyManifest::from_deps(vec![rush_incremental::Dependency::FileContent {
+            path: tracked.clone(),
+            digest: rush_incremental::content_digest_of_regular_file(&tracked, 1 << 20).unwrap(),
+            binding: None,
+        }]);
         let key = key_for(ws, &["//:foo"]);
 
         persist(ws, &key, &manifest, &ledger);
@@ -329,6 +340,51 @@ mod tests {
         assert!(
             loaded2.ledger.verify().is_err(),
             "a touched tracked file must invalidate the reconstructed ledger"
+        );
+    }
+
+    #[test]
+    fn legacy_binary_dependency_layout_is_a_miss_before_payload_decode() {
+        #[derive(serde::Serialize)]
+        enum LegacyDependency {
+            FileContent { path: PathBuf, digest: [u8; 32] },
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyManifest {
+            deps: Vec<LegacyDependency>,
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let tracked = ws.join("out.o");
+        std::fs::write(&tracked, b"hello").unwrap();
+        let key = key_for(ws, &["//:foo"]);
+        let legacy = bincode::serialize(&(
+            1u32,
+            key.stable_hash(),
+            &key,
+            LegacyManifest {
+                deps: vec![LegacyDependency::FileContent {
+                    path: tracked.clone(),
+                    digest: rush_incremental::content_digest_of_regular_file(&tracked, 1 << 20)
+                        .unwrap(),
+                }],
+            },
+            vec![LedgerEntry {
+                path: tracked.clone(),
+                meta: rush_incremental::stat_meta(&tracked),
+            }],
+            1usize,
+            0u64,
+        ))
+        .unwrap();
+        let path = certificate_path(ws, &key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        assert!(load(ws, &key).is_none());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            legacy,
+            "recognized legacy layouts must not be decoded as corruption or removed"
         );
     }
 

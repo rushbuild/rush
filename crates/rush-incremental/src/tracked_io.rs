@@ -18,6 +18,28 @@ use crate::dependency::{content_digest, dir_listing_digest, Dependency, FileKind
 use crate::manifest::{DependencyManifest, Validated};
 use crate::probe::{run_probe, stat_snapshot};
 
+/// Fresh identity of a canonical regular file, including change-time metadata.
+/// A backend must not obtain this observation from a command-local path memo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRegularFileMetadata {
+    pub len: u64,
+    pub mode: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime_ns: i128,
+    pub ctime_ns: i128,
+}
+
+/// Bytes bound to one opened file description and an unchanged canonical path.
+/// The backend checks the same descriptor's identity before and after reading,
+/// and the pathname against that identity. Ordinary path reads cannot supply
+/// this guarantee during an A→B→A pathname replacement.
+#[derive(Debug)]
+pub struct CanonicalRegularFileRead {
+    pub contents: Bytes,
+    pub metadata: CanonicalRegularFileMetadata,
+}
+
 /// The interface analysis MUST read the world through.
 ///
 /// Every method that observes the filesystem, the environment, or a build option
@@ -48,6 +70,36 @@ pub trait TrackedIo {
     /// decision depends on the executable bit or other metadata that
     /// [`Self::metadata_kind`] does not capture (e.g. resolving `protoc`/`gcc`).
     fn metadata_full(&self, path: &Path) -> bool;
+
+    /// Observe a canonical regular file's full metadata without path memos.
+    /// Records FileMetadata, including negative/nonregular observations. None
+    /// disables guarded reuse for an unsupported platform or noncanonical file.
+    fn fresh_canonical_regular_file_metadata(
+        &self,
+        _path: &Path,
+    ) -> std::io::Result<Option<CanonicalRegularFileMetadata>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TrackedIo does not provide fresh canonical file identity",
+        ))
+    }
+
+    /// Read one canonical regular file with descriptor-bound pre/post identity.
+    /// Records exact FileContent, FileMetadata and regular-kind observations.
+    /// None/Unsupported is reserved for an unsupported backend/platform and
+    /// permits an ordinary tracked read without a content memo. A capable
+    /// backend must reject known nonregular/noncanonical paths with an error,
+    /// so callers cannot fall back to a blocking FIFO read. Returned bytes must
+    /// never be paired with another inode's pathname metadata.
+    fn read_canonical_regular_file(
+        &self,
+        _path: &Path,
+    ) -> std::io::Result<Option<CanonicalRegularFileRead>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TrackedIo does not provide descriptor-bound file reads",
+        ))
+    }
 
     /// Read a symlink's target. Records [`Dependency::Symlink`]. Returns `None`
     /// when the path is not a symlink / cannot be read.
@@ -212,6 +264,222 @@ pub struct RealTrackedIo {
 }
 
 impl RealTrackedIo {
+    // A regular pathname may become a FIFO or symlink before open. Never wait
+    // for a FIFO writer or follow a replaced final component; descriptor type
+    // and identity checks still run before reading any bytes.
+    fn open_canonical_regular_candidate(path: &Path) -> std::io::Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                .open(path)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::File::open(path)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_canonical_regular_candidate_for_test(
+        path: &Path,
+    ) -> std::io::Result<fs::File> {
+        Self::open_canonical_regular_candidate(path)
+    }
+    #[cfg(test)]
+    pub(crate) fn read_canonical_regular_file_with_open_for_test(
+        &self,
+        path: &Path,
+        open: impl FnOnce(&Path) -> std::io::Result<fs::File>,
+    ) -> std::io::Result<Option<CanonicalRegularFileRead>> {
+        self.read_canonical_regular_file_with_open(path, open)
+            .map_err(Self::bound_read_error)
+    }
+
+    fn bound_read_error(error: std::io::Error) -> std::io::Error {
+        // This backend implements the capability. An OS/filesystem refusal is
+        // an I/O failure, not the trait's unsupported-capability fallback.
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            std::io::Error::other(error)
+        } else {
+            error
+        }
+    }
+    fn record_regular_metadata(&self, path: &Path, md: &CanonicalRegularFileMetadata) {
+        self.record(Dependency::FileMetadata {
+            path: path.to_path_buf(),
+            present: true,
+            len: md.len,
+            mode: md.mode,
+            mtime_ns: md.mtime_ns,
+            ctime_ns: md.ctime_ns,
+            dev: md.dev,
+            ino: md.ino,
+        });
+    }
+
+    /// Only capability implementations use these uncached OS observations.
+    fn canonical_regular_metadata(
+        path: &Path,
+    ) -> std::io::Result<Option<CanonicalRegularFileMetadata>> {
+        #[cfg(unix)]
+        {
+            let md = fs::symlink_metadata(path)?;
+            if !md.file_type().is_file() || fs::canonicalize(path)? != path {
+                return Ok(None);
+            }
+            Ok(Some(Self::regular_metadata(&md)))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    fn regular_metadata(md: &fs::Metadata) -> CanonicalRegularFileMetadata {
+        use std::os::unix::fs::MetadataExt;
+        CanonicalRegularFileMetadata {
+            len: md.len(),
+            mode: md.mode(),
+            dev: md.dev(),
+            ino: md.ino(),
+            mtime_ns: i128::from(md.mtime()) * 1_000_000_000 + i128::from(md.mtime_nsec()),
+            ctime_ns: i128::from(md.ctime()) * 1_000_000_000 + i128::from(md.ctime_nsec()),
+        }
+    }
+
+    // An opener injection permits a deterministic real rename-ABA regression;
+    // the production capability always supplies File::open, never a path read.
+    fn read_canonical_regular_file_with_open(
+        &self,
+        path: &Path,
+        open: impl FnOnce(&Path) -> std::io::Result<fs::File>,
+    ) -> std::io::Result<Option<CanonicalRegularFileRead>> {
+        #[cfg(not(unix))]
+        {
+            let _ = open;
+            self.metadata_full(path);
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            let np = self.norm(path);
+            let expected = match Self::canonical_regular_metadata(&np) {
+                Ok(Some(md)) => md,
+                Ok(None) => {
+                    self.metadata_full(&np);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "descriptor-bound read requires a canonical regular file",
+                    ));
+                }
+                Err(error) => {
+                    self.metadata_full(&np);
+                    return Err(error);
+                }
+            };
+            self.record_regular_metadata(&np, &expected);
+            let mut file = match open(&np) {
+                Ok(file) => file,
+                Err(error) => {
+                    self.metadata_full(&np);
+                    self.record(Dependency::FileExistence {
+                        path: np,
+                        exists: false,
+                        kind: None,
+                    });
+                    return Err(error);
+                }
+            };
+            let before = file.metadata()?;
+            if !before.is_file() || Self::regular_metadata(&before) != expected {
+                self.metadata_full(&np);
+                return Err(std::io::Error::other(
+                    "canonical regular file changed before descriptor-bound read",
+                ));
+            }
+            let read_start = crate::dependency::clock_ns(std::time::SystemTime::now());
+            let mut bytes = Vec::new();
+            if let Err(error) = file.read_to_end(&mut bytes) {
+                self.metadata_full(&np);
+                self.record(Dependency::FileExistence {
+                    path: np,
+                    exists: false,
+                    kind: None,
+                });
+                return Err(error);
+            }
+            let digest = content_digest(&bytes);
+            let record_unbound = || {
+                self.record(Dependency::FileContent {
+                    path: np.clone(),
+                    digest,
+                    binding: None,
+                })
+            };
+            let after = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    record_unbound();
+                    return Err(error);
+                }
+            };
+            let path_after = match Self::canonical_regular_metadata(&np) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    record_unbound();
+                    self.metadata_full(&np);
+                    return Err(error);
+                }
+            };
+            if !after.is_file()
+                || Self::regular_metadata(&after) != expected
+                || path_after.as_ref() != Some(&expected)
+            {
+                record_unbound();
+                self.metadata_full(&np);
+                return Err(std::io::Error::other(
+                    "canonical regular file changed during descriptor-bound read",
+                ));
+            }
+            let read_end = crate::dependency::clock_ns(std::time::SystemTime::now());
+            let binding = read_start
+                .zip(read_end)
+                .map(|(read_start_ns, read_end_ns)| crate::FileContentBinding {
+                    version: 1,
+                    path: np.clone(),
+                    digest,
+                    len: expected.len,
+                    mode: expected.mode,
+                    dev: expected.dev,
+                    ino: expected.ino,
+                    mtime_ns: expected.mtime_ns,
+                    ctime_ns: expected.ctime_ns,
+                    read_start_ns,
+                    read_end_ns,
+                });
+            self.record(Dependency::FileContent {
+                path: np.clone(),
+                digest,
+                binding,
+            });
+            self.record(Dependency::FileExistence {
+                path: np,
+                exists: true,
+                kind: Some(FileKind::File),
+            });
+            Ok(Some(CanonicalRegularFileRead {
+                contents: Bytes::from(bytes),
+                metadata: expected,
+            }))
+        }
+    }
+
     /// Create a tracker backed by the given per-command semantics, rooted at
     /// `root` (the workspace/exec root). Relative paths passed to the accessors
     /// are joined to `root` and lexically canonicalized before recording, so the
@@ -398,6 +666,7 @@ impl TrackedIo for RealTrackedIo {
                 self.record(Dependency::FileContent {
                     path: np.clone(),
                     digest: content_digest(&bytes),
+                    binding: None,
                 });
                 // ALSO record the path's kind so a regular-file -> symlink swap to
                 // identical content is caught (the content digest alone misses it).
@@ -426,6 +695,7 @@ impl TrackedIo for RealTrackedIo {
                 self.record(Dependency::FileContent {
                     path: np.clone(),
                     digest: content_digest(s.as_bytes()),
+                    binding: None,
                 });
                 self.record_kind(&np);
                 Ok(s)
@@ -468,6 +738,31 @@ impl TrackedIo for RealTrackedIo {
             ino: s.ino,
         });
         s.present
+    }
+
+    fn fresh_canonical_regular_file_metadata(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<Option<CanonicalRegularFileMetadata>> {
+        let np = self.norm(path);
+        match Self::canonical_regular_metadata(&np) {
+            Ok(Some(md)) => {
+                self.record_regular_metadata(&np, &md);
+                Ok(Some(md))
+            }
+            other => {
+                self.metadata_full(&np);
+                other
+            }
+        }
+    }
+
+    fn read_canonical_regular_file(
+        &self,
+        path: &Path,
+    ) -> std::io::Result<Option<CanonicalRegularFileRead>> {
+        self.read_canonical_regular_file_with_open(path, Self::open_canonical_regular_candidate)
+            .map_err(Self::bound_read_error)
     }
 
     fn read_link(&self, path: &Path) -> Option<PathBuf> {
