@@ -6823,79 +6823,139 @@ fn is_canonical_self_descriptor_member_vector(descriptor: i32, members: &[Vec<u8
 fn require_kbuild_procfs_directory_execution_sequence(
     checkpoints: &[&KbuildProcfsDirectoryCheckpoint],
 ) -> Result<()> {
-    if checkpoints.len() != 2 {
+    if checkpoints.len() < 2 {
         anyhow::bail!("Kbuild procfs directory opening has an incomplete enumeration sequence");
     }
     let first = checkpoints[0];
-    let eof = checkpoints[1];
-    // libc may stat the directory descriptor and initialize allocator state
-    // between open and its first read. The retained anchor proves descriptor
-    // lineage across that gap, and position zero proves that no entries were
-    // consumed. Keep the value-bearing read and EOF attempt consecutive.
-    if first.anchor != eof.anchor
-        || first.open_attempt != eof.open_attempt
-        || first.executable_digest != eof.executable_digest
-        || first.observation.value != eof.observation.value
-        || first.members != eof.members
-        || !is_canonical_self_descriptor_member_vector(first.anchor.descriptor, &first.members)
+    if !is_canonical_self_descriptor_member_vector(first.anchor.descriptor, &first.members)
         || first.anchor.open_stream_ordinal >= first.observation.stream_ordinal
-        || first.observation.stream_ordinal >= eof.observation.stream_ordinal
         || first.anchor.open_syscall_index >= first.attempt.syscall_index
-        || first.attempt.syscall_index.checked_add(1) != Some(eof.attempt.syscall_index)
     {
         anyhow::bail!("Kbuild procfs directory opening has a noncanonical execution sequence");
     }
-    let CapturedGetdents64Outcome::Enumerated {
-        returned_bytes: first_bytes,
-        position_after: first_position_after,
-        entries: first_entries,
-        directory_value: first_value,
-    } = &first.attempt.outcome
+    let KbuildObservedInputValue::Directory { entries: witnessed_entries, .. } =
+        first.observation.value
     else {
-        anyhow::bail!("Kbuild procfs directory opening has no first enumeration");
-    };
-    let CapturedGetdents64Outcome::Enumerated {
-        returned_bytes: eof_bytes,
-        position_after: eof_position_after,
-        entries: eof_entries,
-        directory_value: eof_value,
-    } = &eof.attempt.outcome
-    else {
-        anyhow::bail!("Kbuild procfs directory opening has no EOF enumeration");
-    };
-    let delivered_names = first_entries
-        .iter()
-        .map(|entry| entry.name.as_slice())
-        .collect::<Vec<_>>();
-    let expected_entries = first
-        .members
-        .len()
-        .checked_add(2)
-        .and_then(|entries| u64::try_from(entries).ok())
-        .context("Kbuild procfs directory entry count overflowed")?;
-    let mut delivered_members = delivered_names.get(2..).unwrap_or_default().to_vec();
-    delivered_members.sort();
-    let KbuildObservedInputValue::Directory { entries, .. } = first.observation.value else {
         anyhow::bail!("Kbuild procfs directory opening has no retained directory value");
     };
-    if entries != expected_entries
-        || first.attempt.request.position_before != Some(0)
-        || *first_bytes == 0
-        || *first_position_after <= 0
-        || delivered_names.first().copied() != Some(b".".as_slice())
+    let expected_entries = first.members.len().checked_add(2)
+        .and_then(|entries| u64::try_from(entries).ok())
+        .context("Kbuild procfs directory entry count overflowed")?;
+    if witnessed_entries != expected_entries {
+        anyhow::bail!("Kbuild procfs directory opening did not prove its exact descriptor census");
+    }
+    // libc may stat the newly opened descriptor and initialize allocator state
+    // before its first read. After that, require an uninterrupted sequence of
+    // nonempty pages ending at one exact EOF. Directory cookies are opaque:
+    // compare their continuity, never their numeric ordering. A complete
+    // /proc/self/fd read may be split even with a large requested buffer.
+    let mut position = Some(0);
+    let mut previous: Option<&KbuildProcfsDirectoryCheckpoint> = None;
+    let mut delivered_names = Vec::new();
+    let mut first_value = None;
+    for (index, checkpoint) in checkpoints.iter().copied().enumerate() {
+        if first.anchor != checkpoint.anchor
+            || first.open_attempt != checkpoint.open_attempt
+            || first.executable_digest != checkpoint.executable_digest
+            || first.observation.value != checkpoint.observation.value
+            || first.members != checkpoint.members
+            || first.attempt.request.identity != checkpoint.attempt.request.identity
+            || first.attempt.request.mount_id != checkpoint.attempt.request.mount_id
+            || checkpoint.attempt.request.descriptor != first.anchor.descriptor
+            || previous.is_some_and(|previous|
+                previous.observation.stream_ordinal >= checkpoint.observation.stream_ordinal
+                    || previous.attempt.syscall_index.checked_add(1)
+                        != Some(checkpoint.attempt.syscall_index))
+        {
+            anyhow::bail!("Kbuild procfs directory opening has a noncanonical execution sequence");
+        }
+        let CapturedGetdents64Outcome::Enumerated {
+            returned_bytes, position_after, entries, directory_value,
+        } = &checkpoint.attempt.outcome else {
+            anyhow::bail!("Kbuild procfs directory opening did not prove its exact descriptor census");
+        };
+        let expected_value = first_value.get_or_insert(directory_value);
+        let is_eof = index + 1 == checkpoints.len();
+        let encoded_bytes = entries.iter().try_fold(0_u32, |total, entry|
+            total.checked_add(u32::from(entry.record_length)))
+            .context("Kbuild procfs directory page byte count overflowed")?;
+        if checkpoint.attempt.request.requested_bytes == 0
+            || checkpoint.attempt.request.position_before != position
+            || returned_bytes > &checkpoint.attempt.request.requested_bytes
+            || *returned_bytes != encoded_bytes
+            || directory_value != *expected_value
+            || if is_eof {
+                *returned_bytes != 0 || !entries.is_empty() || Some(*position_after) != position
+            } else {
+                *returned_bytes == 0 || entries.is_empty()
+                    || entries.last().map(|entry| entry.next_position) != Some(*position_after)
+            }
+        {
+            anyhow::bail!("Kbuild procfs directory opening did not prove its exact descriptor census");
+        }
+        if u64::try_from(delivered_names.len().checked_add(entries.len())
+            .context("Kbuild procfs directory delivered entry count overflowed")?)? > expected_entries
+        {
+            anyhow::bail!("Kbuild procfs directory opening did not prove its exact descriptor census");
+        }
+        delivered_names.extend(entries.iter().map(|entry| entry.name.as_slice()));
+        position = Some(*position_after);
+        previous = Some(checkpoint);
+    }
+    let mut delivered_members = delivered_names.get(2..).unwrap_or_default().to_vec();
+    delivered_members.sort();
+    if delivered_names.first().copied() != Some(b".".as_slice())
         || delivered_names.get(1).copied() != Some(b"..".as_slice())
-        || !delivered_members
-            .iter()
-            .copied()
-            .eq(first.members.iter().map(Vec::as_slice))
-        || eof.attempt.request.requested_bytes == 0
-        || eof.attempt.request.position_before != Some(*first_position_after)
-        || *eof_bytes != 0
-        || *eof_position_after != *first_position_after
-        || !eof_entries.is_empty()
-        || first_value != eof_value
+        || !delivered_members.iter().copied().eq(first.members.iter().map(Vec::as_slice))
     {
         anyhow::bail!("Kbuild procfs directory opening did not prove its exact descriptor census");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_kbuild_procfs_directory_policy_coverage(
+    policy: &KbuildProcfsMandatoryExecutionSeal,
+    directories: &KbuildProcfsDirectoryCensus,
+) -> Result<()> {
+    let mut sequences = BTreeMap::<KbuildProcfsDirectorySequenceKey,
+        Vec<&KbuildProcfsDirectoryCheckpoint>>::new();
+    for checkpoint in directories.checkpoints.values() {
+        let KbuildProcessOwner::Action(action_index) = checkpoint.observation.owner else { continue; };
+        sequences.entry(KbuildProcfsDirectorySequenceKey { action_index,
+            process: checkpoint.anchor.process, descriptor: checkpoint.anchor.descriptor,
+            open_stream_ordinal: checkpoint.anchor.open_stream_ordinal })
+            .or_default().push(checkpoint);
+    }
+    let mut expected = BTreeMap::<u64, (u64, u64)>::new();
+    let mut observations = 0_u64;
+    for (opening, checkpoints) in &sequences {
+        require_kbuild_procfs_directory_execution_sequence(checkpoints)?;
+        let pages = u64::try_from(checkpoints.len()).context("Kbuild procfs page count overflowed")?;
+        observations = observations.checked_add(pages).context("Kbuild procfs observation count overflowed")?;
+        let counts = expected.entry(opening.action_index).or_default();
+        counts.0 = counts.0.checked_add(pages).context("Kbuild action procfs page count overflowed")?;
+        counts.1 = counts.1.checked_add(1).context("Kbuild action procfs opening count overflowed")?;
+    }
+    let mut seen = BTreeSet::new();
+    for action in &policy.actions {
+        let counts = expected.get(&action.action_index).copied().unwrap_or_default();
+        if !seen.insert(action.action_index)
+            || (action.directory_observations, action.directory_openings) != counts
+        {
+            anyhow::bail!("Kbuild procfs directory mandatory execution policy is incomplete");
+        }
+    }
+    if policy.graph_digest != directories.seal.graph_digest
+        || policy.stream_digest != directories.seal.stream_digest
+        || policy.assignment_digest != directories.seal.assignment_digest
+        || policy.directory_census_digest != directories.seal.census_digest
+        || policy.directory_observations != directories.seal.action_observations
+        || policy.directory_observations != observations
+        || policy.directory_openings != u64::try_from(sequences.len())?
+        || !expected.keys().all(|action| seen.contains(action))
+    {
+        anyhow::bail!("Kbuild procfs directory mandatory execution policy is incomplete");
     }
     Ok(())
 }
@@ -12952,6 +13012,7 @@ fn kbuild_mandatory_action_eligibility(
         anyhow::bail!("Kbuild mandatory-action eligibility has inconsistent identity");
     }
     require_kbuild_procfs_directory_census(procfs_directories)?;
+    require_kbuild_procfs_directory_policy_coverage(procfs, procfs_directories)?;
     let action_count = u64::try_from(generated.action_inputs.len())
         .context("Kbuild mandatory-action count does not fit u64")?;
     if declared_output_order.len() != generated.action_inputs.len() {
@@ -13031,15 +13092,10 @@ fn kbuild_mandatory_action_eligibility(
             .read_observations
             .checked_add(policy.directory_observations)
             .context("Kbuild mandatory-action evidence count overflowed")?;
-        let expected_directory_observations = policy
-            .directory_openings
-            .checked_mul(2)
-            .context("Kbuild mandatory-action directory evidence count overflowed")?;
         if total_observations == 0
             || policy.executable_identities == 0
             || (policy.read_observations == 0) != policy.classes.is_empty()
             || (policy.directory_observations == 0) != policy.directory_classes.is_empty()
-            || policy.directory_observations != expected_directory_observations
         {
             anyhow::bail!("Kbuild mandatory-action policy has empty evidence");
         }
@@ -24070,15 +24126,9 @@ fn assemble_kbuild_graph_envelope(
     if procfs_mandatory_execution.read_observations() != procfs_reads.action_observations() {
         anyhow::bail!("Kbuild procfs mandatory execution policy is incomplete");
     }
-    if procfs_mandatory_execution.directory_observations()
-        != procfs_directories.seal.action_observations()
-        || procfs_mandatory_execution
-            .directory_openings()
-            .checked_mul(2)
-            != Some(procfs_directories.seal.action_observations())
-    {
-        anyhow::bail!("Kbuild procfs directory mandatory execution policy is incomplete");
-    }
+    require_kbuild_procfs_directory_policy_coverage(
+        &procfs_mandatory_execution, &procfs_directories,
+    )?;
     let mandatory_action_eligibility = mandatory_action_eligibility
         .context("Kbuild mandatory-action eligibility policy did not run")?;
     if mandatory_action_eligibility.seal.procfs_policy_digest
@@ -25441,6 +25491,181 @@ mod tests {
             10,
             &numeric_order
         ));
+    }
+
+    #[cfg(unix)]
+    fn test_paginated_procfs_fd_sequence(pages: &[usize]) -> Vec<KbuildProcfsDirectoryCheckpoint> {
+        // Shape from genuine xargs /proc/self/fd openings: a 32KiB request
+        // may return '.', '..' or individual FDs before the final data page.
+        let members = (0..=3).map(|fd| fd.to_string().into_bytes()).collect::<Vec<_>>();
+        let object = KbuildInputObjectIdentity { device: 4, inode: 5,
+            mount_id: Some(6), kind: KbuildInputObjectKind::Directory };
+        let identity = CapturedDescriptorIdentity { target: b"/proc/4321/fd".to_vec(),
+            device: 4, inode: 5, kind: CapturedDescriptorKind::Directory };
+        let open = CapturedOpenAttempt {
+            syscall_index: 39,
+            request: CapturedOpenRequest { system_call: CapturedOpenSystemCall::OpenAt,
+                path: b"/proc/self/fd".to_vec(), directory: None,
+                flags: (libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
+                mode: 0, resolve: 0 },
+            outcome: CapturedOpenOutcome::Opened { descriptor: 3,
+                identity: identity.clone(), mount_id: 6, file_value: None },
+        };
+        let anchor = KbuildDirectoryPathAnchor { process: 17, descriptor: 3,
+            path: PathBuf::from("/proc/4321/fd"), object,
+            open_syscall_index: 39, open_stream_ordinal: 10 };
+        let names = [b".".as_slice(), b"..", b"0", b"1", b"2", b"3"];
+        let cookies = [1, 2, 3, 4, 5, 66];
+        let mut offset = 0; let mut before = 0;
+        pages.iter().enumerate().map(|(page, count)| {
+            let delivered = (offset..offset + count).map(|index| CapturedDirectoryEntry {
+                inode: 100 + index as u64, next_position: cookies[index], record_length: 24,
+                file_type: if index < 2 { libc::DT_DIR } else { libc::DT_LNK },
+                name: names[index].to_vec(),
+            }).collect::<Vec<_>>();
+            let after = delivered.last().map_or(before, |entry| entry.next_position);
+            let checkpoint = KbuildProcfsDirectoryCheckpoint {
+                observation: KbuildInputObservation { owner: KbuildProcessOwner::Action(0),
+                    process: 17, ordinal: page as u64, stream_ordinal: 100 + page as u64,
+                    syscall_index: Some(43 + page as u64), class: KbuildInputObservationClass::Directory,
+                    path: anchor.path.clone(), object,
+                    value: KbuildObservedInputValue::Directory { entries: 6, digest: [8; 32],
+                        listing_digest: captured_directory_listing_digest(&members).unwrap() } },
+                executable_digest: [9; 32], members: members.clone(), anchor: anchor.clone(),
+                open_attempt: open.clone(),
+                attempt: CapturedGetdents64Attempt { syscall_index: 43 + page as u64,
+                    request: CapturedGetdents64Request { descriptor: 3, identity: Some(identity.clone()),
+                        mount_id: Some(6), position_before: Some(before), requested_bytes: 32_768 },
+                    outcome: CapturedGetdents64Outcome::Enumerated {
+                        returned_bytes: (*count * 24) as u32, position_after: after, entries: delivered,
+                        directory_value: CapturedDirectoryValue::Complete { entries: 6,
+                            digest: [8; 32], members: members.clone() } } },
+            };
+            offset += count; before = after;
+            checkpoint
+        }).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn procfs_fd_directory_execution_accepts_complete_paginated_reads() {
+        // Preserve both actual outlier page shapes and the ordinary pair.
+        for pages in [&[6, 0][..], &[1, 5, 0], &[1, 1, 1, 1, 2, 0]] {
+            let checkpoints = test_paginated_procfs_fd_sequence(pages);
+            require_kbuild_procfs_directory_execution_sequence(&checkpoints.iter().collect::<Vec<_>>()).unwrap();
+        }
+        // Cookies are opaque, not numerical progress counters.
+        let mut checkpoints = test_paginated_procfs_fd_sequence(&[1, 5, 0]);
+        let CapturedGetdents64Outcome::Enumerated { position_after, entries, .. } =
+            &mut checkpoints[0].attempt.outcome else { unreachable!() };
+        *position_after = 99; entries[0].next_position = 99;
+        checkpoints[1].attempt.request.position_before = Some(99);
+        require_kbuild_procfs_directory_execution_sequence(&checkpoints.iter().collect::<Vec<_>>()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn procfs_fd_directory_execution_rejects_broken_paginated_reads() {
+        for defect in ["no-eof", "extra-eof", "empty-data", "cursor-gap", "wrong-cookie",
+            "witness", "members", "missing-member", "duplicate-member", "dot-order",
+            "syscall-gap", "executable", "anchor", "identity", "mount", "page-bytes"] {
+            let mut checkpoints = test_paginated_procfs_fd_sequence(&[1, 5, 0]);
+            match defect {
+                "no-eof" => { checkpoints.pop(); }
+                "extra-eof" => {
+                    let mut extra = checkpoints.last().unwrap().clone();
+                    extra.attempt.syscall_index += 1; extra.observation.stream_ordinal += 1;
+                    checkpoints.push(extra);
+                }
+                "cursor-gap" => checkpoints[1].attempt.request.position_before = Some(2),
+                "syscall-gap" => checkpoints[1].attempt.syscall_index += 1,
+                "members" => checkpoints[1].members[0] = b"other".to_vec(),
+                "executable" => checkpoints[1].executable_digest[0] ^= 1,
+                "anchor" => checkpoints[1].anchor.open_syscall_index += 1,
+                "identity" => checkpoints[1].attempt.request.identity.as_mut().unwrap().inode += 1,
+                "mount" => checkpoints[1].attempt.request.mount_id = Some(7),
+                other => {
+                    let CapturedGetdents64Outcome::Enumerated { returned_bytes,
+                        position_after, entries, directory_value } = &mut checkpoints[1].attempt.outcome
+                        else { unreachable!() };
+                    match other {
+                        "empty-data" => { *returned_bytes = 0; entries.clear(); }
+                        "wrong-cookie" => *position_after = 17,
+                        "witness" => {
+                            let CapturedDirectoryValue::Complete { digest, .. } = directory_value else { unreachable!() };
+                            digest[0] ^= 1;
+                        }
+                        "missing-member" => { entries.remove(1); *returned_bytes -= 24; }
+                        "duplicate-member" => entries[2].name = entries[1].name.clone(),
+                        "dot-order" => entries[0].name = b".".to_vec(),
+                        "page-bytes" => *returned_bytes += 1,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(require_kbuild_procfs_directory_execution_sequence(&checkpoints.iter().collect::<Vec<_>>()).is_err(), "{defect}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn procfs_fd_directory_aggregate_covers_every_paginated_opening() {
+        // Actual C capture shape:309 ordinary pairs plus one3read and one6read
+        // opening. Derive both the census and policy, then use the SAME final
+        // assembly coverage guard. A fixed2*opening guard rejects311/627.
+        let mut checkpoints = Vec::new();
+        for opening in 0..311_u64 {
+            let pages = match opening { 309 => &[1, 5, 0][..],
+                310 => &[1, 1, 1, 1, 2, 0], _ => &[6, 0] };
+            for mut checkpoint in test_paginated_procfs_fd_sequence(pages) {
+                checkpoint.observation.ordinal = checkpoints.len() as u64;
+                checkpoint.observation.stream_ordinal += opening * 100;
+                checkpoint.observation.syscall_index = checkpoint.observation.syscall_index.map(|index| index + opening * 100);
+                checkpoint.anchor.open_stream_ordinal += opening * 100;
+                checkpoint.anchor.open_syscall_index += opening * 100;
+                checkpoint.open_attempt.syscall_index += opening * 100;
+                checkpoint.attempt.syscall_index += opening * 100;
+                checkpoints.push(checkpoint);
+            }
+        }
+        let observations = checkpoints.iter().map(|checkpoint| checkpoint.observation.clone()).collect::<Vec<_>>();
+        let input = kbuild_input_value_census([1; 32], [2; 32], [3; 32],
+            &observations, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let members = checkpoints.iter().map(|checkpoint|
+            (checkpoint.observation.ordinal, checkpoint.members.clone())).collect();
+        let retention = kbuild_directory_member_retention([1; 32], [2; 32], [3; 32],
+            &input, &observations, &members).unwrap();
+        let anchors = checkpoints.iter().map(|checkpoint|
+            (checkpoint.observation.ordinal, checkpoint.anchor.clone())).collect();
+        let opens = checkpoints.iter().map(|checkpoint|
+            (checkpoint.observation.ordinal, checkpoint.open_attempt.clone())).collect();
+        let attempts = checkpoints.iter().map(|checkpoint|
+            (checkpoint.observation.ordinal, checkpoint.attempt.clone())).collect();
+        let directories = kbuild_procfs_directory_census([1; 32], [2; 32], [3; 32],
+            &input, &retention, &observations, &anchors, &opens, &attempts,
+            &BTreeMap::from([(17, [9; 32])]), &BTreeMap::from([(17, None)])).unwrap();
+        let reads = kbuild_procfs_read_census([1; 32], [2; 32], [3; 32], &[]).unwrap();
+        let policy = kbuild_procfs_mandatory_execution_policy([1; 32], [2; 32], [3; 32],
+            &reads, &[], &directories, 1).unwrap();
+        assert_eq!(policy.directory_openings(), 311);
+        assert_eq!(policy.directory_observations(), 627);
+        assert_eq!(directories.seal.action_observations(), 627);
+        assert_ne!(policy.directory_openings().checked_mul(2), Some(627));
+        require_kbuild_procfs_directory_policy_coverage(&policy, &directories).unwrap();
+        for defect in ["global-pages", "global-openings", "action-pages", "action-openings", "missing-action", "duplicate-action", "census-binding"] {
+            let mut invalid = policy.clone();
+            match defect {
+                "global-pages" => invalid.directory_observations -= 1,
+                "global-openings" => invalid.directory_openings -= 1,
+                "action-pages" => invalid.actions[0].directory_observations -= 1,
+                "action-openings" => invalid.actions[0].directory_openings -= 1,
+                "missing-action" => invalid.actions.clear(),
+                "duplicate-action" => invalid.actions.push(invalid.actions[0].clone()),
+                "census-binding" => invalid.directory_census_digest[0] ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(require_kbuild_procfs_directory_policy_coverage(&invalid, &directories).is_err(), "{defect}");
+        }
     }
 
     #[cfg(unix)]
@@ -28883,12 +29108,19 @@ mod tests {
         .to_string()
         .contains("empty evidence"));
         let mut overflowed_evidence = mandatory_policy.clone();
+        // Keep the empty directory census and every directory count/class
+        // coherent. Exercise overflow of the read accumulator across two
+        // ordered actions rather than fabricating an unproved directory.
+        overflowed_evidence.read_observations = u64::MAX;
         overflowed_evidence.actions[0].read_observations = u64::MAX;
-        overflowed_evidence.actions[0].directory_observations = 1;
-        overflowed_evidence.actions[0].directory_openings = 1;
-        overflowed_evidence.actions[0]
-            .directory_classes
-            .push(KbuildProcfsDirectoryClass::ProcessFileDescriptors);
+        let mut second_reader = mandatory_policy.actions[0].clone();
+        second_reader.action_index = 2;
+        overflowed_evidence.actions.push(second_reader);
+        require_kbuild_procfs_directory_policy_coverage(
+            &overflowed_evidence,
+            &empty_procfs_directories,
+        )
+        .unwrap();
         assert!(kbuild_mandatory_action_eligibility(
             &overflowed_evidence,
             &eligibility_ownership,
@@ -28906,7 +29138,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string()
-        .contains("overflowed"));
+        .contains("Kbuild mandatory-action procfs count overflowed"));
         let mut unisolatable_ownership = eligibility_ownership.clone();
         unisolatable_ownership[1].credentials.effective_user = 1;
         assert!(kbuild_mandatory_action_eligibility(
