@@ -7,6 +7,7 @@ pub mod providers;
 pub mod python_runtime;
 pub mod registry;
 pub mod rules_cc;
+pub mod rules_cc_projection;
 pub mod rules_config;
 pub mod rules_proto_toolchain;
 pub mod rules_python;
@@ -129,6 +130,19 @@ pub trait RuleInstance: Send + Sync {
 
     /// Get dependencies
     fn dependencies(&self) -> Vec<String>;
+
+    /// Subset needed for analysis/providers only. This alone grants no
+    /// execution pruning: consumers must retain demanded artifact producers.
+    /// Existing drivers do not activate this inactive projection seam yet.
+    fn analysis_only_dependencies(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Closed pure C++ provider projection, never a custom-rule name waiver.
+    /// Runtime integration must additionally require zero declared actions.
+    fn cc_projection_kind(&self) -> Option<rules_cc_projection::CcProjectionKind> {
+        None
+    }
 
     /// Literal options-consumer declaration, when implemented by this rule.
     /// The orchestrator separately qualifies source and configured providers.
@@ -519,6 +533,14 @@ impl RuleInstance for RuleMetadataInstance {
 
     fn dependencies(&self) -> Vec<String> {
         self.inner.dependencies()
+    }
+
+    fn analysis_only_dependencies(&self) -> Vec<String> {
+        self.inner.analysis_only_dependencies()
+    }
+
+    fn cc_projection_kind(&self) -> Option<rules_cc_projection::CcProjectionKind> {
+        self.inner.cc_projection_kind()
     }
 
     fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {

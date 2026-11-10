@@ -75,9 +75,50 @@ impl CcInfo {
         direct: DirectCcInfo,
         deps: impl IntoIterator<Item = Arc<CcInfo>>,
     ) -> Arc<CcInfo> {
+        Self::from_direct_with_header_view(direct, deps, None)
+    }
+
+    /// Producer-qualified native cc_library header view: its ordinary and
+    /// public textual headers are both exposed by Bazel's `headers` field.
+    /// Dependencies must themselves carry an explicit view; otherwise the
+    /// result remains unknown and a header projection refuses it.
+    pub fn from_native_direct_and_deps(
+        direct: DirectCcInfo,
+        deps: impl IntoIterator<Item = Arc<CcInfo>>,
+    ) -> Arc<CcInfo> {
+        Self::from_direct_with_header_view(direct, deps, Some(true))
+    }
+
+    /// Explicit cc_common-style context: direct textual headers stay separate
+    /// from its explicitly supplied `headers` view. This is not a declaration
+    /// that arbitrary legacy providers have compatible header semantics.
+    pub fn from_declared_direct_and_deps(
+        direct: DirectCcInfo,
+        deps: impl IntoIterator<Item = Arc<CcInfo>>,
+    ) -> Arc<CcInfo> {
+        Self::from_direct_with_header_view(direct, deps, Some(false))
+    }
+
+    fn from_direct_with_header_view(
+        direct: DirectCcInfo,
+        deps: impl IntoIterator<Item = Arc<CcInfo>>,
+        include_textual: Option<bool>,
+    ) -> Arc<CcInfo> {
         // Collect deps once so we can iterate twice (compilation +
         // linking) without consuming the iterator.
         let deps: Vec<Arc<CcInfo>> = deps.into_iter().collect();
+
+        let bazel_headers = include_textual.and_then(|include_textual| {
+            let transitive = deps
+                .iter()
+                .map(|dep| dep.compilation.bazel_headers.clone())
+                .collect::<Option<Vec<_>>>()?;
+            let mut direct_headers = direct.headers.clone();
+            if include_textual {
+                direct_headers.extend(direct.textual_headers.iter().copied());
+            }
+            Some(NestedSet::new(direct_headers, transitive))
+        });
 
         // Compilation context: each dep's `compilation` Arc is now
         // unconditional (post-5.B.3.e — no longer Option). Use the
@@ -117,16 +158,25 @@ impl CcInfo {
                 .map(|c| Arc::clone(&c.system_include_dirs))
                 .collect(),
         );
+        let comp_framework = OrderedNestedSet::new(
+            direct.framework_include_dirs,
+            dep_compilations
+                .iter()
+                .map(|c| Arc::clone(&c.framework_include_dirs))
+                .collect(),
+        );
         let comp_def = OrderedNestedSet::new(
             direct.defines,
             dep_compilations.iter().map(|c| Arc::clone(&c.defines)).collect(),
         );
         let compilation = Arc::new(CcCompilationContext {
             headers: comp_headers,
+            bazel_headers,
             textual_headers: comp_textual,
             include_dirs: comp_inc,
             quote_include_dirs: comp_quote,
             system_include_dirs: comp_sys,
+            framework_include_dirs: comp_framework,
             defines: comp_def,
             // local_defines is direct-only; no transitive merging.
             local_defines: direct.local_defines.into_boxed_slice(),
@@ -188,6 +238,14 @@ pub fn cc_info_structural_census(
             ns_field(infos.iter().map(|i| &i.compilation.headers)),
         ),
         (
+            "compilation.bazel_headers",
+            ns_field(
+                infos
+                    .iter()
+                    .filter_map(|i| i.compilation.bazel_headers.as_ref()),
+            ),
+        ),
+        (
             "compilation.textual_headers",
             ns_field(infos.iter().map(|i| &i.compilation.textual_headers)),
         ),
@@ -202,6 +260,14 @@ pub fn cc_info_structural_census(
         (
             "compilation.system_include_dirs",
             ns_field(infos.iter().map(|i| i.compilation.system_include_dirs.inner())),
+        ),
+        (
+            "compilation.framework_include_dirs",
+            ns_field(
+                infos
+                    .iter()
+                    .map(|i| i.compilation.framework_include_dirs.inner()),
+            ),
         ),
         (
             "compilation.defines",
@@ -337,6 +403,45 @@ pub fn extract_cc_infos(deps: &[Arc<ProviderSet>]) -> Vec<Arc<CcInfo>> {
     deps.iter().filter_map(|p| p.cc_info.clone()).collect()
 }
 
+/// Flatten public define IDs in semantic postorder, before resolving strings.
+/// Shared nodes are visited once by Arc identity and complete values are kept
+/// at their first occurrence. Different values of one macro remain distinct.
+pub fn flatten_transitive_define_ids<'a>(
+    roots: impl IntoIterator<Item = &'a Arc<NestedSet<StringId>>>,
+) -> Vec<StringId> {
+    use crate::nested_set::FastHashSet;
+
+    fn walk(
+        node: &Arc<NestedSet<StringId>>,
+        seen_nodes: &mut FastHashSet<*const NestedSet<StringId>>,
+        seen_values: &mut FastHashSet<StringId>,
+        out: &mut Vec<StringId>,
+    ) {
+        let ptr = Arc::as_ptr(node);
+        if !seen_nodes.insert(ptr) {
+            return;
+        }
+        // Children first → postorder (transitive deps precede own).
+        for child in node.transitive() {
+            walk(child, seen_nodes, seen_values, out);
+        }
+        for sid in node.direct() {
+            // StringId is the interner's canonical exact-value identity.
+            if seen_values.insert(*sid) {
+                out.push(*sid);
+            }
+        }
+    }
+
+    let mut seen_nodes = FastHashSet::default();
+    let mut seen_values = FastHashSet::default();
+    let mut out = Vec::new();
+    for root in roots {
+        walk(root, &mut seen_nodes, &mut seen_values, &mut out);
+    }
+    out
+}
+
 /// Flatten the transitive `defines` exported by a set of dependency
 /// compilation `defines` roots into the `-D` payload strings (without the
 /// `-D` prefix), Bazel-faithfully.
@@ -364,39 +469,10 @@ pub fn flatten_transitive_defines<'a>(
     strings: &rush_action::ids::StringInterner,
     roots: impl IntoIterator<Item = &'a Arc<NestedSet<StringId>>>,
 ) -> Vec<String> {
-    use crate::nested_set::FastHashSet;
-
-    fn walk(
-        node: &Arc<NestedSet<StringId>>,
-        strings: &rush_action::ids::StringInterner,
-        seen_nodes: &mut FastHashSet<*const NestedSet<StringId>>,
-        seen_values: &mut FastHashSet<StringId>,
-        out: &mut Vec<String>,
-    ) {
-        let ptr = Arc::as_ptr(node);
-        if !seen_nodes.insert(ptr) {
-            return;
-        }
-        // Children first → postorder (transitive deps precede own).
-        for child in node.transitive() {
-            walk(child, strings, seen_nodes, seen_values, out);
-        }
-        for sid in node.direct() {
-            // StringId is the interner's canonical value identity. Allocate the
-            // output String only when the ID is first observed.
-            if seen_values.insert(*sid) {
-                out.push(strings.str(*sid).to_string());
-            }
-        }
-    }
-
-    let mut seen_nodes = FastHashSet::default();
-    let mut seen_values = FastHashSet::default();
-    let mut out: Vec<String> = Vec::new();
-    for root in roots {
-        walk(root, strings, &mut seen_nodes, &mut seen_values, &mut out);
-    }
-    out
+    flatten_transitive_define_ids(roots)
+        .into_iter()
+        .map(|id| strings.str(id).to_string())
+        .collect()
 }
 
 /// The final ordered `-D` payload list for a compile action: the
@@ -1228,6 +1304,10 @@ pub struct CcCompilationContext {
     /// Dedup-ok (`NestedSet`): same header artifact reached two
     /// ways is one header.
     pub headers: Arc<NestedSet<ArtifactId>>,
+    /// Exact producer-qualified Bazel `compilation_context.headers` view.
+    /// `None` is unknown, never permission to guess a headers/textual union.
+    /// Native cc_library and explicit cc_common contexts differ here.
+    pub bazel_headers: Option<Arc<NestedSet<ArtifactId>>>,
     /// Textual headers (`textual_hdrs` in Bazel) — included via
     /// `#include` but not exposed as compilable units. Same
     /// dedup semantics as `headers`.
@@ -1240,6 +1320,9 @@ pub struct CcCompilationContext {
     pub quote_include_dirs: Arc<OrderedNestedSet<PathId>>,
     /// `-isystem <dir>` system-style include paths.
     pub system_include_dirs: Arc<OrderedNestedSet<PathId>>,
+    /// Framework search roots retain their own typed bucket. Native compiler
+    /// support is not implied; pure projections refuse nonempty values.
+    pub framework_include_dirs: Arc<OrderedNestedSet<PathId>>,
     /// `-D<name>=<value>` preprocessor defines visible
     /// transitively. Order matters when later defines override
     /// earlier ones via re-`#define`.
@@ -1258,10 +1341,12 @@ impl CcCompilationContext {
     pub fn empty() -> Self {
         Self {
             headers: NestedSet::empty(),
+            bazel_headers: None,
             textual_headers: NestedSet::empty(),
             include_dirs: OrderedNestedSet::empty(),
             quote_include_dirs: OrderedNestedSet::empty(),
             system_include_dirs: OrderedNestedSet::empty(),
+            framework_include_dirs: OrderedNestedSet::empty(),
             defines: OrderedNestedSet::empty(),
             local_defines: Vec::new().into_boxed_slice(),
         }
@@ -1330,6 +1415,7 @@ pub struct DirectCcInfo {
     pub include_dirs: Vec<PathId>,
     pub quote_include_dirs: Vec<PathId>,
     pub system_include_dirs: Vec<PathId>,
+    pub framework_include_dirs: Vec<PathId>,
     pub defines: Vec<StringId>,
     pub local_defines: Vec<StringId>,
     pub linker_inputs: Vec<LinkerInputId>,
@@ -1566,6 +1652,7 @@ mod tests {
         let dep2 = NestedSet::new(vec![a_again], vec![Arc::clone(&child)]);
 
         let roots = vec![dep1, dep2];
+        assert_eq!(flatten_transitive_define_ids(roots.iter()), [c, a, b]);
         let out = flatten_transitive_defines(&interner, roots.iter());
 
         // Postorder: child's CHILD_DEF before dep1's own; dep2's child is
