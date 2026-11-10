@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{anyhow, Result};
+use crate::configured_target::{ConfiguredTargetKey, NodeKey, NodeScope};
+use crate::configuration_table::ConfigurationDigest;
 use rush_rules::RuleInstance;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -154,10 +156,88 @@ impl fmt::Display for Label {
     }
 }
 
-/// Node in the dependency graph
-pub struct DependencyNode {
+/// Borrowed label edges in the legacy target inspection view. Configured
+/// incoming edges are outside this view; execution uses exact key APIs.
+#[derive(Clone, Copy)]
+pub struct LegacyNodeLabels<'a> {
+    keys: &'a [NodeKey],
+}
+
+pub struct LegacyLabelIter<'a> {
+    keys: std::slice::Iter<'a, NodeKey>,
+}
+
+impl<'a> Iterator for LegacyLabelIter<'a> {
+    type Item = &'a Label;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.keys.find_map(NodeKey::legacy_label)
+    }
+}
+
+impl<'a> LegacyNodeLabels<'a> {
+    pub fn iter(&self) -> LegacyLabelIter<'a> { LegacyLabelIter { keys: self.keys.iter() } }
+    pub fn len(&self) -> usize { self.iter().count() }
+    pub fn is_empty(&self) -> bool { self.first().is_none() }
+    pub fn first(&self) -> Option<&'a Label> { self.iter().next() }
+    pub fn contains(&self, label: &Label) -> bool { self.iter().any(|entry| entry == label) }
+}
+
+impl<'a> IntoIterator for &LegacyNodeLabels<'a> {
+    type Item = &'a Label;
+    type IntoIter = LegacyLabelIter<'a>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+
+impl fmt::Debug for LegacyNodeLabels<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq<Vec<Label>> for LegacyNodeLabels<'_> {
+    fn eq(&self, other: &Vec<Label>) -> bool { self.iter().eq(other.iter()) }
+}
+
+impl std::ops::Index<usize> for LegacyNodeLabels<'_> {
+    type Output = Label;
+    fn index(&self, index: usize) -> &Self::Output { self.iter().nth(index).expect("legacy edge index out of bounds") }
+}
+
+/// Read-only public Label API. References borrow the single keyed node store;
+/// no projected graph, edge vectors, or RuleInstances are duplicated.
+#[derive(Clone, Copy)]
+pub struct LegacyTargetNodeView<'a> {
+    pub label: &'a Label,
+    pub rule_instance: &'a Arc<dyn RuleInstance>,
+    pub dependencies: LegacyNodeLabels<'a>,
+    pub dependents: LegacyNodeLabels<'a>,
+    pub(crate) package_group_references: LegacyNodeLabels<'a>,
+    pub(crate) configuration_references: LegacyNodeLabels<'a>,
+    pub(crate) constraint_value_references: LegacyNodeLabels<'a>,
+    pub(crate) constraint_setting_reference: Option<&'a Label>,
+}
+
+/// Controlled legacy mutation: replacement reparses all edges atomically.
+/// Exposing a mutable Label projection would let changes bypass keyed edges.
+pub struct LegacyTargetNodeMutView<'a> {
+    graph: &'a mut DependencyGraph,
+    label: Label,
+}
+
+impl LegacyTargetNodeMutView<'_> {
+    pub fn view(&self) -> LegacyTargetNodeView<'_> { self.graph.get(&self.label).expect("borrowed legacy node exists") }
+    pub fn replace_rule_instance(&mut self, rule: Box<dyn RuleInstance>) -> Result<()> {
+        self.graph.add_node(self.label.clone(), rule)?;
+        self.graph.rebuild_reverse_edges();
+        Ok(())
+    }
+}
+
+/// A single authoritative node. Every scheduling and metadata edge carries
+/// full identity; normal production insertion still creates LegacyTarget only.
+pub(crate) struct DependencyNode {
     /// The label identifying this target
-    pub label: Label,
+    pub label: NodeKey,
 
     /// The rule instance. `Arc` (not `Box`) so the PASS-B parallel build
     /// wavefront can clone the handle into independent `'static` build futures
@@ -166,38 +246,38 @@ pub struct DependencyNode {
     pub rule_instance: Arc<dyn RuleInstance>,
 
     /// Dependencies (labels of targets this depends on)
-    pub dependencies: Vec<Label>,
+    pub dependencies: Vec<NodeKey>,
 
     /// Package-group labels referenced by this target's visibility, or by a
     /// package_group's `includes`. These are analysis metadata edges: they
     /// participate in lazy discovery and validation, but never provider flow
     /// or build ordering.
-    pub(crate) package_group_references: Vec<Label>,
+    pub(crate) package_group_references: Vec<NodeKey>,
 
     /// Configurable-condition labels referenced by this target's `select()`
     /// expressions. Like package groups, these are analysis metadata edges:
     /// they are loaded and visibility-checked without contributing providers
     /// or build ordering.
-    pub(crate) configuration_references: Vec<Label>,
+    pub(crate) configuration_references: Vec<NodeKey>,
 
     /// The subset of configuration metadata edges originating from
     /// `config_setting(constraint_values = ...)`. Their final alias-resolved
     /// targets must specifically be `constraint_value` declarations.
-    pub(crate) constraint_value_references: Vec<Label>,
+    pub(crate) constraint_value_references: Vec<NodeKey>,
 
     /// The `constraint_setting` metadata reference owned by a native
     /// `constraint_value`. It is loaded and provider/type-validated only when
     /// that value enters the configured metadata closure.
-    pub(crate) constraint_setting_reference: Option<Label>,
+    pub(crate) constraint_setting_reference: Option<NodeKey>,
 
     /// Reverse dependencies (labels of targets that depend on this)
-    pub dependents: Vec<Label>,
+    pub dependents: Vec<NodeKey>,
 }
 
 /// Dependency graph for build orchestration
 pub struct DependencyGraph {
     /// All nodes indexed by label
-    nodes: HashMap<Label, DependencyNode>,
+    nodes: HashMap<NodeKey, DependencyNode>,
 
     /// Apparent repository names that identify the main repository.
     /// Labels are canonicalized at graph ingress so every later phase sees
@@ -208,6 +288,8 @@ pub struct DependencyGraph {
     /// orchestrator. Graph validation may run after thread-local scopes have
     /// been restored, so compatibility checks must use this explicit value.
     configuration_registry_scope: Option<String>,
+    configured_registry_scopes: HashMap<ConfigurationDigest, String>,
+    configured_visibility_options: HashMap<ConfigurationDigest, VisibilityOptions>,
 
     visibility_options: VisibilityOptions,
 }
@@ -340,24 +422,76 @@ impl DependencyGraph {
             nodes: HashMap::new(),
             main_repository_aliases,
             configuration_registry_scope: None,
+            configured_registry_scopes: HashMap::new(),
+            configured_visibility_options: HashMap::new(),
             visibility_options: VisibilityOptions::default(),
         }
     }
 
     pub(crate) fn set_configuration_registry_scope(&mut self, scope: String) {
+        // Installing legacy authority cannot leave a configured registry
+        // accidentally pointing at the same mutable workspace namespace.
+        self.configured_registry_scopes.retain(|_, configured| configured != &scope);
         self.configuration_registry_scope = Some(scope);
     }
 
     pub(crate) fn feature_flag_error_is_verified(&self, label: &Label, rule: &dyn RuleInstance) -> bool {
-        rule.configuration_error_needs_feature_flag_proof()
-            && self.configuration_registry_scope.as_deref().is_some_and(|scope|
-                rush_starlark::config_defines::feature_flag_condition_is_verified(scope, &label.to_string()))
+        self.feature_flag_key_error_is_verified(&NodeKey::LegacyTarget(label.clone()), rule)
     }
 
-    fn has_pycross_environment_alias_profile(&self, label: &Label) -> bool {
-        self.configuration_registry_scope.as_deref().is_some_and(|scope| {
+    fn registry_scope_for_key(&self, key: &NodeKey) -> Option<&str> {
+        match key.scope() {
+            NodeScope::LegacyTarget => self.configuration_registry_scope.as_deref(),
+            NodeScope::Configured(digest) => self.configured_registry_scopes.get(&digest).map(String::as_str),
+        }
+    }
+
+    /// The producer of a complete configuration must supply its actual scoped
+    /// metadata authority. A configured key never inherits the legacy registry.
+    pub(crate) fn set_configured_registry_scope(&mut self, configuration: ConfigurationDigest, scope: String) -> Result<()> {
+        if scope.is_empty() { return Err(anyhow!("configured metadata registry scope is empty")); }
+        if self.configuration_registry_scope.as_ref() == Some(&scope)
+            || self.configured_registry_scopes.iter().any(|(digest, other)| *digest != configuration && other == &scope) {
+            return Err(anyhow!("configured metadata registry authority must be distinct from legacy and other configurations"));
+        }
+        if self.configured_registry_scopes.get(&configuration).is_some_and(|old| old != &scope) {
+            return Err(anyhow!("configured metadata registry scope cannot be replaced"));
+        }
+        self.configured_registry_scopes.insert(configuration, scope);
+        Ok(())
+    }
+
+    /// Caller supplies the actual immutable configuration's visibility policy;
+    /// neither a digest nor the legacy command can establish these values.
+    pub(crate) fn set_configured_visibility_options(&mut self, configuration: ConfigurationDigest, options: VisibilityOptions) -> Result<()> {
+        if self.configured_visibility_options.get(&configuration).is_some_and(|old| *old != options) {
+            return Err(anyhow!("configured visibility authority cannot be replaced"));
+        }
+        self.configured_visibility_options.insert(configuration, options);
+        Ok(())
+    }
+
+    fn visibility_options_for_key(&self, key: &NodeKey) -> Option<VisibilityOptions> {
+        match key.scope() {
+            NodeScope::LegacyTarget => Some(self.visibility_options),
+            NodeScope::Configured(digest) => self.configured_visibility_options.get(&digest).copied(),
+        }
+    }
+
+    fn require_visibility_options(&self, key: &NodeKey) -> Result<VisibilityOptions> {
+        self.visibility_options_for_key(key).ok_or_else(|| anyhow!("configured metadata/visibility scope for {key} has no explicit authority"))
+    }
+
+    fn feature_flag_key_error_is_verified(&self, label: &NodeKey, rule: &dyn RuleInstance) -> bool {
+        rule.configuration_error_needs_feature_flag_proof()
+            && self.registry_scope_for_key(label).is_some_and(|scope|
+                rush_starlark::config_defines::feature_flag_condition_is_verified(scope, &label.label().to_string()))
+    }
+
+    fn has_pycross_environment_alias_profile(&self, label: &NodeKey) -> bool {
+        self.registry_scope_for_key(label).is_some_and(|scope| {
             rush_starlark::config_defines::pycross_environment_alias_profile_in_scope(
-                scope, &label.to_string(),
+                scope, &label.label().to_string(),
             ).is_some()
         })
     }
@@ -381,14 +515,28 @@ impl DependencyGraph {
         label
     }
 
+    fn canonicalize_key(&self, key: NodeKey) -> NodeKey {
+        key.with_label(self.canonicalize_label(key.label().clone()))
+    }
+
     fn package_spec_matches(
         &self,
         group: &Label,
         candidate: &Label,
         raw_specification: &str,
     ) -> Result<(bool, bool)> {
-        if self.visibility_options.fix_package_group_reporoot_syntax
-            && !self.visibility_options.package_group_has_public_syntax
+        self.package_spec_matches_with_options(group, candidate, raw_specification, self.visibility_options)
+    }
+
+    fn package_spec_matches_for_key(&self, group: &NodeKey, candidate: &NodeKey, specification: &str) -> Result<(bool, bool)> {
+        self.package_spec_matches_with_options(group.label(), candidate.label(), specification, self.require_visibility_options(group)?)
+    }
+
+    fn package_spec_matches_with_options(
+        &self, group: &Label, candidate: &Label, raw_specification: &str, options: VisibilityOptions,
+    ) -> Result<(bool, bool)> {
+        if options.fix_package_group_reporoot_syntax
+            && !options.package_group_has_public_syntax
         {
             return Err(anyhow!(
                 "Package group {} cannot use the repository-local //... \
@@ -419,7 +567,7 @@ impl DependencyGraph {
 
         let matches = match specification {
             "public" | "private"
-                if !self.visibility_options.package_group_has_public_syntax =>
+                if !options.package_group_has_public_syntax =>
             {
                 return Err(anyhow!(
                     "Package group {} uses '{}' but public/private package \
@@ -475,9 +623,7 @@ impl DependencyGraph {
 
                 if recursive
                     && package.is_empty()
-                    && !self
-                        .visibility_options
-                        .fix_package_group_reporoot_syntax
+                    && !options.fix_package_group_reporoot_syntax
                 {
                     true
                 } else if candidate.workspace != group.workspace {
@@ -499,13 +645,13 @@ impl DependencyGraph {
 
     fn package_group_contains(
         &self,
-        group: &Label,
-        candidate: &Label,
-        visibility_owner: &Label,
-        stack: &mut Vec<Label>,
-        cache: &mut HashMap<Label, bool>,
+        group: &NodeKey,
+        candidate: &NodeKey,
+        visibility_owner: &NodeKey,
+        stack: &mut Vec<NodeKey>,
+        cache: &mut HashMap<NodeKey, bool>,
     ) -> Result<bool> {
-        let group = self.canonicalize_label(group.clone());
+        let group = self.canonicalize_key(group.clone());
         if let Some(cycle_start) = stack.iter().position(|entry| entry == &group) {
             let mut cycle = stack[cycle_start..].to_vec();
             cycle.push(group.clone());
@@ -573,7 +719,7 @@ impl DependencyGraph {
         let mut negative_match = false;
         for specification in packages {
             let (negative, matches) =
-                self.package_spec_matches(&group, candidate, specification)?;
+                self.package_spec_matches_for_key(&group, candidate, specification)?;
             if negative {
                 negative_match |= matches;
             } else {
@@ -604,11 +750,12 @@ impl DependencyGraph {
 
     fn validate_visibility_edge(
         &self,
-        dependent: &Label,
+        dependent: &NodeKey,
         dependency: &DependencyNode,
     ) -> Result<()> {
-        let same_package = dependent.workspace == dependency.label.workspace
-            && dependent.package == dependency.label.package;
+        self.require_visibility_options(&dependency.label)?;
+        let same_package = dependent.label().workspace == dependency.label.label().workspace
+            && dependent.label().package == dependency.label.label().package;
         if same_package || dependency.rule_instance.rule_type() == "package_group" {
             return Ok(());
         }
@@ -637,8 +784,8 @@ impl DependencyGraph {
             let specification = specification.trim();
             let parsed = Label::parse(
                 specification,
-                dependency.label.workspace.as_deref(),
-                Some(&dependency.label.package),
+                dependency.label.label().workspace.as_deref(),
+                Some(&dependency.label.label().package),
             )
             .map_err(|error| {
                 anyhow!(
@@ -648,25 +795,26 @@ impl DependencyGraph {
                     error
                 )
             })?;
-            let parsed = self.canonicalize_label(parsed);
-            if Self::is_public_visibility_label(&parsed) {
+            let parsed = dependency.label.with_label(self.canonicalize_label(parsed));
+            if Self::is_public_visibility_label(parsed.label()) {
                 granted = true;
                 continue;
             }
-            if Self::is_private_visibility_label(&parsed) {
+            if Self::is_private_visibility_label(parsed.label()) {
                 private = true;
                 continue;
             }
-            let same_repository = dependent.workspace == parsed.workspace;
-            let package_match = dependent.package == parsed.package;
-            let subpackage_match = parsed.package.is_empty()
+            let same_repository = dependent.label().workspace == parsed.label().workspace;
+            let package_match = dependent.label().package == parsed.label().package;
+            let subpackage_match = parsed.label().package.is_empty()
                 || package_match
                 || dependent
+                    .label()
                     .package
-                    .strip_prefix(&parsed.package)
+                    .strip_prefix(&parsed.label().package)
                     .is_some_and(|suffix| suffix.starts_with('/'));
 
-            match parsed.target.as_str() {
+            match parsed.label().target.as_str() {
                 "__pkg__" if same_repository && package_match => granted = true,
                 "__subpackages__" if same_repository && subpackage_match => granted = true,
                 "__pkg__" | "__subpackages__" => {}
@@ -712,12 +860,8 @@ impl DependencyGraph {
         target: &DependencyNode,
     ) -> bool {
         target.rule_instance.rule_type() == "config_setting"
-            && self
-                .visibility_options
-                .enforce_config_setting_visibility
-            && !self
-                .visibility_options
-                .config_setting_private_default_visibility
+            && self.visibility_options_for_key(&target.label).is_some_and(|options|
+                options.enforce_config_setting_visibility && !options.config_setting_private_default_visibility)
             && !target.rule_instance.visibility_was_explicit()
     }
 
@@ -733,7 +877,7 @@ impl DependencyGraph {
             && label.target == "private"
     }
 
-    fn alias_actual(node: &DependencyNode) -> Result<&Label> {
+    fn alias_actual(node: &DependencyNode) -> Result<&NodeKey> {
         let [actual] = node.dependencies.as_slice() else {
             return Err(anyhow!(
                 "Configuration alias {} must have exactly one actual \
@@ -742,15 +886,19 @@ impl DependencyGraph {
                 node.dependencies.len()
             ));
         };
+        if actual.scope() != node.label.scope() {
+            return Err(anyhow!("configuration metadata alias {} crosses configuration scope to {}", node.label, actual));
+        }
         Ok(actual)
     }
 
     fn validate_configuration_references(
         &self,
-        owner: &Label,
+        owner: &NodeKey,
         node: &DependencyNode,
         inherited_pycross_environment_alias: bool,
     ) -> Result<()> {
+        let visibility_options = self.require_visibility_options(owner)?;
         let check_owner_visibility = !node
             .rule_instance
             .suppresses_configuration_condition_visibility();
@@ -792,7 +940,7 @@ impl DependencyGraph {
                     let preserved_pycross_flag_boundary = pycross_environment_alias
                         && (inherited_pycross_environment_alias || !first)
                         && condition.rule_instance.configuration_error_needs_feature_flag_proof();
-                    let verified_feature_flag_boundary = self.feature_flag_error_is_verified(
+                    let verified_feature_flag_boundary = self.feature_flag_key_error_is_verified(
                         current_label, condition.rule_instance.as_ref());
                     if !preserved_pycross_flag_boundary && !verified_feature_flag_boundary {
                         return Err(anyhow!(
@@ -807,12 +955,8 @@ impl DependencyGraph {
                 if condition.rule_instance.is_configuration_alias() {
                     if check_owner_visibility
                         && first
-                        && self
-                            .visibility_options
-                            .enforce_config_setting_visibility
-                        && self
-                            .visibility_options
-                            .config_setting_private_default_visibility
+                        && visibility_options.enforce_config_setting_visibility
+                        && visibility_options.config_setting_private_default_visibility
                     {
                         self.validate_visibility_edge(owner, condition)?;
                     }
@@ -825,9 +969,7 @@ impl DependencyGraph {
                             actual_label
                         )
                     })?;
-                    if self
-                        .visibility_options
-                        .enforce_config_setting_visibility
+                    if visibility_options.enforce_config_setting_visibility
                     {
                         self.validate_visibility_edge(&condition.label, actual)?;
                     }
@@ -845,13 +987,9 @@ impl DependencyGraph {
                     ));
                 }
                 if check_owner_visibility
-                    && self
-                        .visibility_options
-                        .enforce_config_setting_visibility
+                    && visibility_options.enforce_config_setting_visibility
                     && (first
-                        || !self
-                            .visibility_options
-                            .config_setting_private_default_visibility)
+                        || !visibility_options.config_setting_private_default_visibility)
                 {
                     self.validate_visibility_edge(owner, condition)?;
                 }
@@ -869,8 +1007,8 @@ impl DependencyGraph {
     /// their normal target-kind, cycle, visibility, and missing-target checks.
     fn pycross_environment_metadata_scope(
         &self,
-        roots: &HashSet<Label>,
-    ) -> HashSet<Label> {
+        roots: &HashSet<NodeKey>,
+    ) -> HashSet<NodeKey> {
         let mut queue = VecDeque::new();
         for label in self.configuration_metadata_scope(roots) {
             if self.has_pycross_environment_alias_profile(&label)
@@ -899,7 +1037,7 @@ impl DependencyGraph {
 
     fn validate_constraint_value_references(
         &self,
-        owner: &Label,
+        owner: &NodeKey,
         node: &DependencyNode,
     ) -> Result<()> {
         let mut references = node.constraint_value_references.clone();
@@ -981,9 +1119,9 @@ impl DependencyGraph {
 
     fn validate_constraint_value_setting_reference(
         &self,
-        owner: &Label,
+        owner: &NodeKey,
         value: &DependencyNode,
-    ) -> Result<Label> {
+    ) -> Result<NodeKey> {
         if value.rule_instance.rule_type() != "constraint_value" {
             return Err(anyhow!(
                 "Target {} is a {}, not a constraint_value",
@@ -1037,8 +1175,10 @@ impl DependencyGraph {
         }
     }
 
-    fn validate_loaded_package_groups(&self) -> Result<()> {
+    fn validate_loaded_package_groups(&self, scope: &HashSet<NodeKey>) -> Result<()> {
+        let configurations: HashSet<_> = scope.iter().map(NodeKey::scope).collect();
         for (label, node) in &self.nodes {
+            if !configurations.contains(&label.scope()) { continue; }
             if node.rule_instance.rule_type() != "package_group" {
                 continue;
             }
@@ -1053,7 +1193,7 @@ impl DependencyGraph {
                     )
                 })?;
             for specification in packages {
-                self.package_spec_matches(label, label, specification)?;
+                self.package_spec_matches_for_key(label, label, specification)?;
             }
         }
         Ok(())
@@ -1068,8 +1208,8 @@ impl DependencyGraph {
     /// whether its BUILD file was part of the initial parse or loaded lazily.
     fn configuration_metadata_scope(
         &self,
-        critical_set: &HashSet<Label>,
-    ) -> HashSet<Label> {
+        critical_set: &HashSet<NodeKey>,
+    ) -> HashSet<NodeKey> {
         let mut scope = critical_set.clone();
         let mut visited_conditions = HashSet::new();
         let mut queue = VecDeque::new();
@@ -1118,7 +1258,16 @@ impl DependencyGraph {
 
     /// Add a node to the graph
     pub fn add_node(&mut self, label: Label, rule_instance: Box<dyn RuleInstance>) -> Result<()> {
-        let label = self.canonicalize_label(label);
+        self.add_key_node(NodeKey::LegacyTarget(label), rule_instance)
+    }
+
+    pub(crate) fn add_configured_node(&mut self, key: ConfiguredTargetKey, rule_instance: Box<dyn RuleInstance>) -> Result<()> {
+        self.add_key_node(NodeKey::Configured(key), rule_instance)
+    }
+
+    fn add_key_node(&mut self, key: NodeKey, rule_instance: Box<dyn RuleInstance>) -> Result<()> {
+        let key = self.canonicalize_key(key);
+        let label = key.label().clone();
         // Parse dependencies from rule instance
         let dep_strings = rule_instance.dependencies();
         let current_package = label.package_path();
@@ -1189,7 +1338,7 @@ impl DependencyGraph {
                 dep.workspace = Some("local_tsl".to_string());
             }
         }
-        let dependencies = dependencies
+        let dependencies: Vec<Label> = dependencies
             .into_iter()
             .map(|dependency| self.canonicalize_label(dependency))
             .collect();
@@ -1341,37 +1490,59 @@ impl DependencyGraph {
             .transpose()?;
 
         let node = DependencyNode {
-            label: label.clone(),
+            label: key.clone(),
             // Box -> Arc (From impl); callers keep passing Box::new(rule), no
             // churn at the ~42 add_node call sites.
             rule_instance: Arc::from(rule_instance),
-            dependencies,
-            package_group_references,
-            configuration_references,
-            constraint_value_references,
-            constraint_setting_reference,
+            dependencies: dependencies.into_iter().map(|label| key.with_label(label)).collect(),
+            package_group_references: package_group_references.into_iter().map(|label| key.with_label(label)).collect(),
+            configuration_references: configuration_references.into_iter().map(|label| key.with_label(label)).collect(),
+            constraint_value_references: constraint_value_references.into_iter().map(|label| key.with_label(label)).collect(),
+            constraint_setting_reference: constraint_setting_reference.map(|label| key.with_label(label)),
             dependents: Vec::new(),
         };
 
-        self.nodes.insert(label, node);
+        self.nodes.insert(key, node);
+        Ok(())
+    }
+
+    /// A transition replaces only the configuration of already declared build
+    /// dependencies. It cannot invent a new dependency label or metadata scope.
+    /// This stores identity only; no production loader/executor calls it yet.
+    pub(crate) fn set_configured_dependency_keys(&mut self, key: &NodeKey, dependencies: Vec<NodeKey>) -> Result<()> {
+        let key = self.canonicalize_key(key.clone());
+        let dependencies: Vec<_> = dependencies.into_iter().map(|key| self.canonicalize_key(key)).collect();
+        if key.scope() == NodeScope::LegacyTarget {
+            return Err(anyhow!("legacy target dependencies cannot activate configured transitions"));
+        }
+        if dependencies.iter().any(|dependency| dependency.scope() == NodeScope::LegacyTarget) {
+            return Err(anyhow!("configured dependency transitions require complete configured keys; LegacyTarget has no semantic configuration"));
+        }
+        let node = self.nodes.get_mut(&key).ok_or_else(|| anyhow!("unknown configured dependency owner {key}"))?;
+        if node.dependencies.len() != dependencies.len()
+            || node.dependencies.iter().zip(&dependencies).any(|(old, new)| old.label() != new.label()) {
+            return Err(anyhow!("configured transition must preserve declared dependency labels and order for {key}"));
+        }
+        node.dependencies = dependencies;
+        self.rebuild_reverse_edges();
         Ok(())
     }
 
     /// Check if the graph already contains a node for the given label
-    pub fn has_node(&self, label: &Label) -> bool {
+    pub(crate) fn has_key(&self, label: &NodeKey) -> bool {
         self.nodes.contains_key(label)
     }
 
     /// The `rule_type()` of the node at `label`, if present. Used by
     /// output-label alias resolution to confirm a derived producer target is
     /// actually a `cc_shared_library` before aliasing its .so output to it.
-    pub fn node_rule_type(&self, label: &Label) -> Option<&str> {
+    pub(crate) fn key_rule_type(&self, label: &NodeKey) -> Option<&str> {
         self.nodes.get(label).map(|n| n.rule_instance.rule_type())
     }
 
     /// Snapshot of every label currently in the graph. Used by the lazy-load
     /// loop to seed its "needed" set from the initial BUILD-parse state.
-    pub fn all_labels(&self) -> Vec<Label> {
+    pub(crate) fn all_keys(&self) -> Vec<NodeKey> {
         self.nodes.keys().cloned().collect()
     }
 
@@ -1384,13 +1555,13 @@ impl DependencyGraph {
     /// of only handling the single edge that `resolve()` happens to report
     /// first (which caused the loop to hit its iteration cap on large
     /// targets like `//tensorflow/core:lib_internal_impl`).
-    pub fn unresolved_deps(&self) -> Vec<(Label, Label)> {
+    pub(crate) fn unresolved_key_deps(&self) -> Vec<(NodeKey, NodeKey)> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        let all_nodes: HashSet<Label> = self.nodes.keys().cloned().collect();
+        let all_nodes: HashSet<NodeKey> = self.nodes.keys().cloned().collect();
         let missing_conditions =
             self.missing_configuration_references_for_scope(&all_nodes);
-        let condition_owners: HashMap<Label, Label> = missing_conditions
+        let condition_owners: HashMap<NodeKey, NodeKey> = missing_conditions
             .iter()
             .map(|(owner, condition)| (condition.clone(), owner.clone()))
             .collect();
@@ -1399,7 +1570,8 @@ impl DependencyGraph {
                 if self.nodes.contains_key(dep) {
                     continue;
                 }
-                if !Self::dep_edge_is_mandatory(node)
+                if node.label.scope() == NodeScope::LegacyTarget
+                    && !Self::dep_edge_is_mandatory(node)
                     && Self::is_skippable_missing_dep(dep)
                 {
                     continue;
@@ -1443,7 +1615,7 @@ impl DependencyGraph {
     fn push_package_group_seeds(
         &self,
         target: &DependencyNode,
-        seeds: &mut Vec<(Label, Label)>,
+        seeds: &mut Vec<(NodeKey, NodeKey)>,
     ) {
         if self.uses_config_setting_public_default(target) {
             return;
@@ -1455,8 +1627,8 @@ impl DependencyGraph {
 
     fn package_group_seeds_for_scope(
         &self,
-        critical_set: &HashSet<Label>,
-    ) -> Vec<(Label, Label)> {
+        critical_set: &HashSet<NodeKey>,
+    ) -> Vec<(NodeKey, NodeKey)> {
         let mut seeds = Vec::new();
         for label in self.configuration_metadata_scope(critical_set) {
             let Some(node) = self.nodes.get(&label) else {
@@ -1475,9 +1647,9 @@ impl DependencyGraph {
 
     fn missing_package_groups_for_scope(
         &self,
-        critical_set: &HashSet<Label>,
-    ) -> Vec<(Label, Label)> {
-        let mut queue: VecDeque<(Label, Label)> = self
+        critical_set: &HashSet<NodeKey>,
+    ) -> Vec<(NodeKey, NodeKey)> {
+        let mut queue: VecDeque<(NodeKey, NodeKey)> = self
             .package_group_seeds_for_scope(critical_set)
             .into();
         let mut visited = HashSet::new();
@@ -1502,7 +1674,7 @@ impl DependencyGraph {
 
     fn validate_package_group_metadata_for_scope(
         &self,
-        critical_set: &HashSet<Label>,
+        critical_set: &HashSet<NodeKey>,
     ) -> Result<()> {
         for (owner, group) in self
             .package_group_seeds_for_scope(critical_set)
@@ -1527,8 +1699,8 @@ impl DependencyGraph {
 
     fn missing_configuration_references_for_scope(
         &self,
-        critical_set: &HashSet<Label>,
-    ) -> Vec<(Label, Label)> {
+        critical_set: &HashSet<NodeKey>,
+    ) -> Vec<(NodeKey, NodeKey)> {
         let mut queue = VecDeque::new();
         for owner in critical_set {
             let Some(node) = self.nodes.get(owner) else {
@@ -1616,20 +1788,20 @@ impl DependencyGraph {
     /// alone, so the lazy loader chases everything else and lets the
     /// rule_type filters in the orchestrator classify it once its BUILD
     /// file is parsed.
-    fn is_skippable_for_discovery(dep: &Label) -> bool {
+    fn is_skippable_for_discovery(dep: &NodeKey) -> bool {
         #[cfg(not(target_os = "windows"))]
-        if dep.target.ends_with(".dll")
-            || dep.target.ends_with(".lib")
-            || dep.target.contains("_windows")
+        if dep.label().target.ends_with(".dll")
+            || dep.label().target.ends_with(".lib")
+            || dep.label().target.contains("_windows")
         {
             return true;
         }
         #[cfg(not(target_os = "macos"))]
-        if dep.target.ends_with(".dylib") || dep.target.contains("_macos") {
+        if dep.label().target.ends_with(".dylib") || dep.label().target.contains("_macos") {
             return true;
         }
         #[cfg(not(target_os = "linux"))]
-        if dep.target.contains("_linux") {
+        if dep.label().target.contains("_linux") {
             return true;
         }
         // GPU-variant targets are skippable ONLY when GPU is NOT configured.
@@ -1643,10 +1815,10 @@ impl DependencyGraph {
         let gpu_enabled = std::env::var("RUSH_ENABLE_ROCM").as_deref() == Ok("1")
             || std::env::var("RUSH_ENABLE_GPU").as_deref() == Ok("1");
         if !gpu_enabled
-            && (dep.target.ends_with("_gpu")
-                || dep.target.ends_with("_gpu_lib")
-                || dep.target.contains("_cuda")
-                || dep.target.contains("_rocm"))
+            && (dep.label().target.ends_with("_gpu")
+                || dep.label().target.ends_with("_gpu_lib")
+                || dep.label().target.contains("_cuda")
+                || dep.label().target.contains("_rocm"))
         {
             return true;
         }
@@ -1662,19 +1834,19 @@ impl DependencyGraph {
     /// helper libraries whose names merely contain `_test_`:
     /// `//tensorflow/core/grappler/inputs:trivial_test_graph_input_yielder`
     /// is a `cc_library`, but `contains("_test_")` matched it, so
-    /// `find_all_missing_in_scope` never emitted it, its BUILD file was
+    /// `find_all_missing_keys` never emitted it, its BUILD file was
     /// never parsed, no node existed, and six grappler tests died on
     /// `undefined reference to TrivialTestGraphInputYielder`. A missing
     /// label has no rule_type yet — parsing its BUILD is what supplies one
     /// — so discovery must chase it and let 96d26bd1's rule_type filters
     /// (build_orchestrator_ext.rs:2606, :3347) reject real test rules.
-    fn is_skippable_missing_dep(dep: &Label) -> bool {
+    fn is_skippable_missing_dep(dep: &NodeKey) -> bool {
         if Self::is_skippable_for_discovery(dep) {
             return true;
         }
-        if dep.target.ends_with("_test")
-            || dep.target.ends_with("_tests")
-            || dep.target.contains("_test_")
+        if dep.label().target.ends_with("_test")
+            || dep.label().target.ends_with("_tests")
+            || dep.label().target.contains("_test_")
         {
             return true;
         }
@@ -1690,24 +1862,16 @@ impl DependencyGraph {
     ///
     /// Still populates `node.dependents` for every node. Still applies
     /// the platform/GPU/test skip rules.
-    pub fn resolve_within_scope(&mut self, critical_set: &HashSet<Label>) -> Result<()> {
-        self.validate_loaded_package_groups()?;
+    pub(crate) fn resolve_key_scope(&mut self, critical_set: &HashSet<NodeKey>) -> Result<()> {
+        for key in critical_set {
+            self.require_visibility_options(key)?;
+            if key.scope() != NodeScope::LegacyTarget && !self.nodes.contains_key(key) {
+                return Err(anyhow!("unknown configured scope root {key}"));
+            }
+        }
+        self.validate_loaded_package_groups(critical_set)?;
         self.validate_package_group_metadata_for_scope(critical_set)?;
-        // Build reverse dependency map (same as resolve())
-        let mut reverse_deps: HashMap<Label, Vec<Label>> = HashMap::new();
-        for (label, node) in &self.nodes {
-            for dep_label in &node.dependencies {
-                reverse_deps
-                    .entry(dep_label.clone())
-                    .or_default()
-                    .push(label.clone());
-            }
-        }
-        for (label, dependents) in reverse_deps {
-            if let Some(node) = self.nodes.get_mut(&label) {
-                node.dependents = dependents;
-            }
-        }
+        self.rebuild_reverse_edges();
 
         // Validate only critical-path deps.
         for (label, node) in &self.nodes {
@@ -1719,7 +1883,8 @@ impl DependencyGraph {
                     self.validate_visibility_edge(label, dependency)?;
                     continue;
                 }
-                if !Self::dep_edge_is_mandatory(node)
+                if node.label.scope() == NodeScope::LegacyTarget
+                    && !Self::dep_edge_is_mandatory(node)
                     && Self::is_skippable_missing_dep(dep)
                 {
                     continue;
@@ -1731,7 +1896,7 @@ impl DependencyGraph {
                 ));
             }
         }
-        let mut configuration_scope: Vec<Label> = self
+        let mut configuration_scope: Vec<NodeKey> = self
             .configuration_metadata_scope(critical_set)
             .into_iter()
             .collect();
@@ -1766,48 +1931,30 @@ impl DependencyGraph {
     /// Walk labels in lexical order so the diagnostic is stable even though the
     /// graph itself is stored in a HashMap.
     pub fn validate_declared_output_ownership(&self) -> Result<()> {
-        let mut nodes: Vec<&DependencyNode> = self.nodes.values().collect();
-        nodes.sort_by(|left, right| {
-            left.label
-                .workspace
-                .cmp(&right.label.workspace)
-                .then_with(|| left.label.package.cmp(&right.label.package))
-                .then_with(|| left.label.target.cmp(&right.label.target))
-        });
+        self.validate_key_declared_output_ownership(&self.legacy_scope())
+    }
 
-        let mut owners: HashMap<(Option<String>, String, PathBuf), Label> = HashMap::new();
+    pub(crate) fn validate_key_declared_output_ownership(&self, scope: &HashSet<NodeKey>) -> Result<()> {
+        let configurations: HashSet<_> = scope.iter().map(NodeKey::scope).collect();
+        let mut nodes: Vec<_> = self.nodes.values().filter(|node| configurations.contains(&node.label.scope())).collect();
+        nodes.sort_by_key(|node| node.label.to_string());
+        let mut owners: HashMap<(NodeScope, Option<String>, String, PathBuf), NodeKey> = HashMap::new();
         for node in nodes {
+            let label = node.label.label();
             for output in node.rule_instance.declared_outputs() {
-                let normalized = Self::normalize_declared_output(&node.label, &output)?;
-                let key = (
-                    node.label.workspace.clone(),
-                    node.label.package.clone(),
-                    normalized.clone(),
-                );
+                let normalized = Self::normalize_declared_output(label, &output)?;
+                let key = (node.label.scope(), label.workspace.clone(), label.package.clone(), normalized.clone());
                 if let Some(owner) = owners.get(&key) {
-                    let output_label = Label {
-                        workspace: node.label.workspace.clone(),
-                        package: node.label.package.clone(),
-                        target: normalized.to_string_lossy().into_owned(),
-                    };
+                    let output_label = Label { workspace: label.workspace.clone(), package: label.package.clone(),
+                        target: normalized.to_string_lossy().into_owned() };
                     if owner == &node.label {
-                        return Err(anyhow!(
-                            "Target {} declares output {} more than once",
-                            node.label,
-                            output_label
-                        ));
+                        return Err(anyhow!("Target {} declares output {} more than once", node.label, output_label));
                     }
-                    return Err(anyhow!(
-                        "Declared output {} has multiple owners: {} and {}",
-                        output_label,
-                        owner,
-                        node.label
-                    ));
+                    return Err(anyhow!("Declared output {} has multiple owners: {} and {}", output_label, owner, node.label));
                 }
                 owners.insert(key, node.label.clone());
             }
         }
-
         Ok(())
     }
 
@@ -1834,7 +1981,7 @@ impl DependencyGraph {
 
     /// Collect *all* missing critical-path dependencies in a single pass.
     ///
-    /// Analogous to `resolve_within_scope`, but instead of aborting on
+    /// Analogous to `resolve_key_scope`, but instead of aborting on
     /// the first missing edge it walks the full critical set and
     /// returns every `(dependent, missing_dep)` pair, skipping only
     /// platform/GPU labels per `is_skippable_for_discovery` — test-NAMED
@@ -1847,26 +1994,26 @@ impl DependencyGraph {
     /// graph nodes × topological depth.
     ///
     /// Does not mutate the graph; callers should run the normal
-    /// `resolve_within_scope` once the batch is empty to pick up any
+    /// `resolve_key_scope` once the batch is empty to pick up any
     /// late reverse-dep edges.
-    pub fn find_all_missing_in_scope(
+    pub(crate) fn find_all_missing_keys(
         &self,
-        critical_set: &HashSet<Label>,
-    ) -> Vec<(Label, Label)> {
-        self.find_all_missing_in_scope_with_configuration(critical_set).0
+        critical_set: &HashSet<NodeKey>,
+    ) -> Vec<(NodeKey, NodeKey)> {
+        self.find_all_missing_keys_with_configuration(critical_set).0
     }
 
     /// Retain the configuration-metadata provenance already found by the
     /// scoped traversal. Compatibility library resolvers must not replace
     /// these declarations, including alias destinations, with library stubs.
-    pub(crate) fn find_all_missing_in_scope_with_configuration(
+    pub(crate) fn find_all_missing_keys_with_configuration(
         &self,
-        critical_set: &HashSet<Label>,
-    ) -> (Vec<(Label, Label)>, HashMap<Label, Label>) {
+        critical_set: &HashSet<NodeKey>,
+    ) -> (Vec<(NodeKey, NodeKey)>, HashMap<NodeKey, NodeKey>) {
         let mut missing = Vec::new();
         let missing_conditions =
             self.missing_configuration_references_for_scope(critical_set);
-        let condition_owners: HashMap<Label, Label> = missing_conditions
+        let condition_owners: HashMap<NodeKey, NodeKey> = missing_conditions
             .iter()
             .map(|(owner, condition)| (condition.clone(), owner.clone()))
             .collect();
@@ -1878,7 +2025,8 @@ impl DependencyGraph {
                 if self.nodes.contains_key(dep) {
                     continue;
                 }
-                if !Self::dep_edge_is_mandatory(node)
+                if node.label.scope() == NodeScope::LegacyTarget
+                    && !Self::dep_edge_is_mandatory(node)
                     && Self::is_skippable_for_discovery(dep)
                 {
                     continue;
@@ -1890,7 +2038,7 @@ impl DependencyGraph {
                 missing.push((owner, dep.clone()));
             }
         }
-        let mut seen: HashSet<Label> = missing
+        let mut seen: HashSet<NodeKey> = missing
             .iter()
             .map(|(_, dependency)| dependency.clone())
             .collect();
@@ -1912,69 +2060,12 @@ impl DependencyGraph {
     }
 
     /// Resolve dependencies and build reverse dependency edges
-    pub fn resolve(&mut self) -> Result<()> {
-        self.validate_loaded_package_groups()?;
-        let all_nodes: HashSet<Label> = self.nodes.keys().cloned().collect();
-        self.validate_package_group_metadata_for_scope(&all_nodes)?;
-        // Build reverse dependency map
-        let mut reverse_deps: HashMap<Label, Vec<Label>> = HashMap::new();
-
-        for (label, node) in &self.nodes {
-            for dep_label in &node.dependencies {
-                reverse_deps
-                    .entry(dep_label.clone())
-                    .or_default()
-                    .push(label.clone());
-            }
-        }
-
-        // Populate dependents
-        for (label, dependents) in reverse_deps {
-            if let Some(node) = self.nodes.get_mut(&label) {
-                node.dependents = dependents;
-            }
-        }
-
-        // Validate all dependencies exist
-        // Skip platform-specific and hardware-specific dependencies that don't apply
-        let pycross_environment_scope =
-            self.pycross_environment_metadata_scope(&all_nodes);
-        for (label, node) in &self.nodes {
-            for dep in &node.dependencies {
-                if let Some(dependency) = self.nodes.get(dep) {
-                    self.validate_visibility_edge(label, dependency)?;
-                    continue;
-                }
-                // Same platform/GPU/test skip heuristic as the lazy-load
-                // paths (was a duplicated inline copy), guarded so alias
-                // referent edges are never suppressed.
-                if !Self::dep_edge_is_mandatory(node)
-                    && Self::is_skippable_missing_dep(dep)
-                {
-                    continue;
-                }
-                return Err(anyhow!(
-                    "Target {} depends on {} which doesn't exist in the graph",
-                    label,
-                    dep
-                ));
-            }
-            self.validate_configuration_references(
-                label,
-                node,
-                pycross_environment_scope.contains(label),
-            )?;
-            self.validate_constraint_value_references(label, node)?;
-            if node.rule_instance.rule_type() == "constraint_value" {
-                self.validate_constraint_value_setting_reference(label, node)?;
-            }
-        }
-
-        Ok(())
+    pub(crate) fn resolve_all_keys(&mut self) -> Result<()> {
+        self.resolve_key_scope(&self.nodes.keys().cloned().collect())
     }
 
     /// Get all nodes reachable from a target (transitive dependencies)
-    pub fn get_reachable_nodes(&self, target: &Label) -> HashSet<Label> {
+    pub(crate) fn get_reachable_keys(&self, target: &NodeKey) -> HashSet<NodeKey> {
         let mut reachable = HashSet::new();
         let mut queue = VecDeque::new();
         // #39 graph-RSS: only the first few missing edges are ever printed, so
@@ -2029,26 +2120,40 @@ impl DependencyGraph {
     /// Topological sort scoped to a specific target - only includes reachable nodes
     ///
     /// Returns targets in dependency order (dependencies before dependents)
-    pub fn topological_sort_from(&self, target: &Label) -> Result<Vec<Label>> {
-        let reachable = self.get_reachable_nodes(target);
-        self.topological_sort_scoped(&reachable)
+    pub(crate) fn topological_sort_keys_from(&self, target: &NodeKey) -> Result<Vec<NodeKey>> {
+        if target.scope() != NodeScope::LegacyTarget && !self.nodes.contains_key(target) {
+            return Err(anyhow!("unknown configured traversal root {target}"));
+        }
+        let reachable = self.get_reachable_keys(target);
+        self.topological_sort_key_scope(&reachable)
     }
 
     /// Topological sort scoped to the union of nodes reachable from
     /// several roots. `rush build t1 t2 …` batches N requested labels
     /// into one invocation: analysis already chases every root, so the
     /// build order must cover the union too — not just the first label.
-    pub fn topological_sort_from_roots(&self, targets: &[Label]) -> Result<Vec<Label>> {
+    pub(crate) fn topological_sort_keys_from_roots(&self, targets: &[NodeKey]) -> Result<Vec<NodeKey>> {
         let mut reachable = HashSet::new();
         for target in targets {
-            reachable.extend(self.get_reachable_nodes(target));
+            if target.scope() != NodeScope::LegacyTarget && !self.nodes.contains_key(target) {
+                return Err(anyhow!("unknown configured traversal root {target}"));
+            }
+            reachable.extend(self.get_reachable_keys(target));
         }
-        self.topological_sort_scoped(&reachable)
+        self.topological_sort_key_scope(&reachable)
     }
 
     /// Topological sort scoped to a set of nodes
-    fn topological_sort_scoped(&self, scope: &HashSet<Label>) -> Result<Vec<Label>> {
-        let mut in_degree: HashMap<Label, usize> = HashMap::new();
+    fn topological_sort_key_scope(&self, scope: &HashSet<NodeKey>) -> Result<Vec<NodeKey>> {
+        for key in scope {
+            let Some(node) = self.nodes.get(key) else { continue; };
+            if key.scope() != NodeScope::LegacyTarget {
+                if let Some(missing) = node.dependencies.iter().find(|dep| !self.nodes.contains_key(*dep)) {
+                    return Err(anyhow!("configured target {key} depends on missing exact key {missing}"));
+                }
+            }
+        }
+        let mut in_degree: HashMap<NodeKey, usize> = HashMap::new();
 
         // Only consider nodes in scope
         for label in scope {
@@ -2063,7 +2168,7 @@ impl DependencyGraph {
         }
 
         // Queue nodes with no dependencies
-        let mut queue: VecDeque<Label> = in_degree
+        let mut queue: VecDeque<NodeKey> = in_degree
             .iter()
             .filter(|(_, &degree)| degree == 0)
             .map(|(label, _)| label.clone())
@@ -2093,8 +2198,8 @@ impl DependencyGraph {
         //
         // `in_degree` here is maintained by decrementing via
         // `node.dependents` as each label is dequeued — but if `resolve()`
-        // / `resolve_within_scope()` didn't populate `dependents` to cover
-        // every forward edge (Label-equality / parse-context quirks can
+        // / `resolve_key_scope()` didn't populate `dependents` to cover
+        // every forward edge (NodeKey-equality / parse-context quirks can
         // drop reverse edges silently), some nodes end up stuck with
         // `in_degree > 0` even though every actual dep in scope has been
         // sorted. Rather than reporting a bogus cycle, recompute in-degree
@@ -2105,8 +2210,8 @@ impl DependencyGraph {
         let mut recovered_any = true;
         while recovered_any {
             recovered_any = false;
-            let sorted_snapshot: HashSet<Label> = sorted.iter().cloned().collect();
-            let stuck: Vec<Label> = in_degree
+            let sorted_snapshot: HashSet<NodeKey> = sorted.iter().cloned().collect();
+            let stuck: Vec<NodeKey> = in_degree
                 .iter()
                 .filter(|(l, &d)| d > 0 && !sorted_snapshot.contains(l))
                 .map(|(l, _)| l.clone())
@@ -2123,7 +2228,7 @@ impl DependencyGraph {
                             scope.contains(*dep) && !sorted_snapshot.contains(*dep)
                         })
                         .count();
-                    let dependents: Vec<Label> = node
+                    let dependents: Vec<NodeKey> = node
                         .dependents
                         .iter()
                         .filter(|d| scope.contains(*d))
@@ -2153,7 +2258,7 @@ impl DependencyGraph {
             // bug. "all deps in-scope are sorted but in_degree > 0" means the
             // decrement loop never fired — usually because the reverse edge
             // wasn't wired up in `resolve`.
-            let sorted_set: HashSet<&Label> = sorted.iter().collect();
+            let sorted_set: HashSet<&NodeKey> = sorted.iter().collect();
             let mut detail: Vec<String> = Vec::new();
             for (label, &degree) in in_degree.iter().filter(|(_, &d)| d > 0).take(40) {
                 let node = self.nodes.get(label);
@@ -2202,8 +2307,8 @@ impl DependencyGraph {
     /// Topological sort - returns build order
     ///
     /// Returns targets in dependency order (dependencies before dependents)
-    pub fn topological_sort(&self) -> Result<Vec<Label>> {
-        let mut in_degree: HashMap<Label, usize> = HashMap::new();
+    pub(crate) fn topological_sort_keys(&self) -> Result<Vec<NodeKey>> {
+        let mut in_degree: HashMap<NodeKey, usize> = HashMap::new();
 
         // Calculate in-degree for each node (count only dependencies that exist in the graph)
         // This fixes the case where validation skips certain missing deps but they still
@@ -2218,20 +2323,23 @@ impl DependencyGraph {
                     if self.nodes.contains_key(*dep) {
                         return true;
                     }
+                    if label.scope() != NodeScope::LegacyTarget {
+                        return true;
+                    }
                     // Skip these - they're platform/GPU specific and were filtered in validation
                     #[cfg(not(target_os = "windows"))]
-                    if dep.target.ends_with(".dll")
-                        || dep.target.ends_with(".lib")
-                        || dep.target.contains("_windows")
+                    if dep.label().target.ends_with(".dll")
+                        || dep.label().target.ends_with(".lib")
+                        || dep.label().target.contains("_windows")
                     {
                         return false;
                     }
                     #[cfg(not(target_os = "macos"))]
-                    if dep.target.ends_with(".dylib") || dep.target.contains("_macos") {
+                    if dep.label().target.ends_with(".dylib") || dep.label().target.contains("_macos") {
                         return false;
                     }
                     #[cfg(not(target_os = "linux"))]
-                    if dep.target.contains("_linux") {
+                    if dep.label().target.contains("_linux") {
                         return false;
                     }
                     // GPU-variant MISSING deps are skippable (don't count toward
@@ -2244,17 +2352,17 @@ impl DependencyGraph {
                     let gpu_enabled = std::env::var("RUSH_ENABLE_ROCM").as_deref() == Ok("1")
                         || std::env::var("RUSH_ENABLE_GPU").as_deref() == Ok("1");
                     if !gpu_enabled
-                        && (dep.target.ends_with("_gpu")
-                            || dep.target.ends_with("_gpu_lib")
-                            || dep.target.contains("_cuda")
-                            || dep.target.contains("_rocm"))
+                        && (dep.label().target.ends_with("_gpu")
+                            || dep.label().target.ends_with("_gpu_lib")
+                            || dep.label().target.contains("_cuda")
+                            || dep.label().target.contains("_rocm"))
                     {
                         return false;
                     }
                     // Skip test targets
-                    if dep.target.ends_with("_test")
-                        || dep.target.ends_with("_tests")
-                        || dep.target.contains("_test_")
+                    if dep.label().target.ends_with("_test")
+                        || dep.label().target.ends_with("_tests")
+                        || dep.label().target.contains("_test_")
                     {
                         return false;
                     }
@@ -2267,7 +2375,7 @@ impl DependencyGraph {
         }
 
         // Queue nodes with no dependencies
-        let mut queue: VecDeque<Label> = in_degree
+        let mut queue: VecDeque<NodeKey> = in_degree
             .iter()
             .filter(|(_, &degree)| degree == 0)
             .map(|(label, _)| label.clone())
@@ -2312,34 +2420,129 @@ impl DependencyGraph {
         Ok(sorted)
     }
 
-    /// Get a node by label
-    pub fn get(&self, label: &Label) -> Option<&DependencyNode> {
-        self.nodes.get(label)
+    fn legacy_scope(&self) -> HashSet<NodeKey> {
+        self.nodes.keys().filter(|key| key.scope() == NodeScope::LegacyTarget).cloned().collect()
     }
 
-    /// Get a mutable node by label
-    pub fn get_mut(&mut self, label: &Label) -> Option<&mut DependencyNode> {
-        self.nodes.get_mut(label)
+    fn legacy_key(&self, label: &Label) -> NodeKey {
+        NodeKey::LegacyTarget(self.canonicalize_label(label.clone()))
     }
 
-    /// Borrow nodes in the explicit target inspection view, without exposing
-    /// the backing map. Labels and nodes refer to the authoritative store.
-    ///
-    /// The graph currently has one target configuration, so this view includes
-    /// every node. It is not a configured execution order. A future configured
-    /// store must retain an explicit target view rather than choose whichever
-    /// instance of a label happens to be encountered first.
-    pub fn iter_target_nodes(&self) -> impl Iterator<Item = (&Label, &DependencyNode)> + '_ {
-        self.nodes.iter()
+    fn legacy_root_key(&self, label: &Label) -> Result<NodeKey> {
+        let key = self.legacy_key(label);
+        if !self.nodes.contains_key(&key) && self.nodes.keys().any(|candidate|
+            candidate.scope() != NodeScope::LegacyTarget && candidate.label() == key.label()) {
+            return Err(anyhow!("Label root {} has configured instances but no legacy target instance; use exact configured key traversal", key.label()));
+        }
+        Ok(key)
     }
 
-    /// Number of nodes in the same target inspection view as
-    /// [`Self::iter_target_nodes`]. This does not activate configured storage.
-    pub fn target_node_count(&self) -> usize {
-        self.nodes.len()
+    fn legacy_keys(&self, labels: &HashSet<Label>) -> HashSet<NodeKey> {
+        labels.iter().map(|label| self.legacy_key(label)).collect()
     }
 
-    /// Number of nodes in the graph
+    fn project_legacy_keys(keys: impl IntoIterator<Item = NodeKey>) -> Result<Vec<Label>> {
+        keys.into_iter().map(|key| match key {
+            NodeKey::LegacyTarget(label) => Ok(label),
+            NodeKey::Configured(_) => Err(anyhow!("legacy Label traversal cannot return configured execution identity {key}; use exact key traversal")),
+        }).collect()
+    }
+
+    fn legacy_view(node: &DependencyNode) -> LegacyTargetNodeView<'_> {
+        LegacyTargetNodeView {
+            label: node.label.label(), rule_instance: &node.rule_instance,
+            dependencies: LegacyNodeLabels { keys: &node.dependencies },
+            dependents: LegacyNodeLabels { keys: &node.dependents },
+            package_group_references: LegacyNodeLabels { keys: &node.package_group_references },
+            configuration_references: LegacyNodeLabels { keys: &node.configuration_references },
+            constraint_value_references: LegacyNodeLabels { keys: &node.constraint_value_references },
+            constraint_setting_reference: node.constraint_setting_reference.as_ref().and_then(NodeKey::legacy_label),
+        }
+    }
+
+    pub fn get(&self, label: &Label) -> Option<LegacyTargetNodeView<'_>> {
+        self.nodes.get(&self.legacy_key(label)).map(Self::legacy_view)
+    }
+
+    pub fn get_mut(&mut self, label: &Label) -> Option<LegacyTargetNodeMutView<'_>> {
+        let label = self.canonicalize_label(label.clone());
+        self.nodes.contains_key(&NodeKey::LegacyTarget(label.clone()))
+            .then_some(LegacyTargetNodeMutView { graph: self, label })
+    }
+
+    pub(crate) fn get_key(&self, key: &NodeKey) -> Option<&DependencyNode> {
+        self.nodes.get(&self.canonicalize_key(key.clone()))
+    }
+
+    /// The explicit legacy target inspection view. Configured/exec entries
+    /// never answer a Label lookup, census, or generated-output producer scan.
+    pub fn iter_target_nodes(&self) -> impl Iterator<Item = (&Label, LegacyTargetNodeView<'_>)> + '_ {
+        self.nodes.iter().filter_map(|(key, node)| key.legacy_label().map(|label| (label, Self::legacy_view(node))))
+    }
+
+    pub fn target_node_count(&self) -> usize { self.iter_target_nodes().count() }
+    pub fn has_node(&self, label: &Label) -> bool { self.nodes.contains_key(&self.legacy_key(label)) }
+    pub fn node_rule_type(&self, label: &Label) -> Option<&str> {
+        self.nodes.get(&self.legacy_key(label)).map(|node| node.rule_instance.rule_type())
+    }
+    pub fn all_labels(&self) -> Vec<Label> { self.iter_target_nodes().map(|(label, _)| label.clone()).collect() }
+
+    pub fn unresolved_deps(&self) -> Vec<(Label, Label)> {
+        self.unresolved_key_deps().into_iter().filter_map(|(owner, dep)| {
+            match (owner, dep) { (NodeKey::LegacyTarget(owner), NodeKey::LegacyTarget(dep)) => Some((owner, dep)), _ => None }
+        }).collect()
+    }
+
+    pub fn resolve_within_scope(&mut self, scope: &HashSet<Label>) -> Result<()> {
+        self.resolve_key_scope(&self.legacy_keys(scope))
+    }
+    pub fn resolve(&mut self) -> Result<()> { self.resolve_key_scope(&self.legacy_scope()) }
+
+    pub fn find_all_missing_in_scope(&self, scope: &HashSet<Label>) -> Vec<(Label, Label)> {
+        self.find_all_missing_in_scope_with_configuration(scope).0
+    }
+    pub(crate) fn find_all_missing_in_scope_with_configuration(&self, scope: &HashSet<Label>) -> (Vec<(Label, Label)>, HashMap<Label, Label>) {
+        let (missing, provenance) = self.find_all_missing_keys_with_configuration(&self.legacy_keys(scope));
+        let missing = missing.into_iter().map(|(owner, dep)| match (owner, dep) {
+            (NodeKey::LegacyTarget(owner), NodeKey::LegacyTarget(dep)) => (owner, dep),
+            _ => unreachable!("legacy metadata edges inherit only legacy identity"),
+        }).collect();
+        let provenance = provenance.into_iter().map(|(dep, owner)| match (dep, owner) {
+            (NodeKey::LegacyTarget(dep), NodeKey::LegacyTarget(owner)) => (dep, owner),
+            _ => unreachable!("legacy metadata edges inherit only legacy identity"),
+        }).collect();
+        (missing, provenance)
+    }
+
+    /// Label execution/traversal is a checked projection, never an arbitrary
+    /// configured instance of the same label. Production still inserts legacy.
+    pub fn get_reachable_nodes(&self, target: &Label) -> Result<HashSet<Label>> {
+        Ok(Self::project_legacy_keys(self.get_reachable_keys(&self.legacy_root_key(target)?))?.into_iter().collect())
+    }
+    pub fn topological_sort_from(&self, target: &Label) -> Result<Vec<Label>> {
+        Self::project_legacy_keys(self.topological_sort_keys_from(&self.legacy_root_key(target)?)?)
+    }
+    pub fn topological_sort_from_roots(&self, targets: &[Label]) -> Result<Vec<Label>> {
+        let roots = targets.iter().map(|label| self.legacy_root_key(label)).collect::<Result<Vec<_>>>()?;
+        Self::project_legacy_keys(self.topological_sort_keys_from_roots(&roots)?)
+    }
+    pub fn topological_sort(&self) -> Result<Vec<Label>> {
+        // The all-graph execution API cannot silently discard configured
+        // instances. Unlike target inspection, this is a checked full order.
+        Self::project_legacy_keys(self.topological_sort_keys()?)
+    }
+
+    fn rebuild_reverse_edges(&mut self) {
+        let mut reverse: HashMap<NodeKey, Vec<NodeKey>> = HashMap::new();
+        for (owner, node) in &self.nodes {
+            for dep in &node.dependencies { reverse.entry(dep.clone()).or_default().push(owner.clone()); }
+        }
+        for (key, node) in &mut self.nodes {
+            node.dependents = reverse.remove(key).unwrap_or_default();
+        }
+    }
+
+    /// Number of nodes in the graph (all exact identities).
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -2399,11 +2602,11 @@ impl DependencyGraph {
         );
         let _ = writeln!(
             out,
-            "  dependency_edges={} dependent_edges={} (Label Vec capacity slots={} ~{:.1} MB @ size_of Label)",
+            "  dependency_edges={} dependent_edges={} (NodeKey Vec capacity slots={} ~{:.1} MB @ size_of NodeKey)",
             dependency_edges,
             dependent_edges,
             dep_vec_cap,
-            mb(dep_vec_cap * std::mem::size_of::<Label>())
+            mb(dep_vec_cap * std::mem::size_of::<NodeKey>())
         );
         let _ = writeln!(
             out,
@@ -2788,6 +2991,260 @@ mod tests {
             conditions.iter().map(|value| value.to_string()).collect(),
         );
         graph.add_node(label, instance).unwrap();
+    }
+
+    fn configured_fixture_key(label: &str, role: crate::configuration_table::ConfigurationRole) -> NodeKey {
+        use crate::configuration_table::{ConfigurationValue, SelectedInputIdentity};
+        let platform = SelectedInputIdentity::new(b"unit-test-platform", [1; 32]).unwrap();
+        let execution = SelectedInputIdentity::new(b"unit-test-execution-platform", [2; 32]).unwrap();
+        let toolchain = SelectedInputIdentity::new(b"unit-test-toolchain", [3; 32]).unwrap();
+        NodeKey::Configured(ConfiguredTargetKey::new(Label::parse(label, None, None).unwrap(),
+            ConfigurationValue::new(role, Vec::new(), platform, execution, toolchain).digest()))
+    }
+
+    fn add_configured_fixture(graph: &mut DependencyGraph, key: &NodeKey, rule: Box<dyn RuleInstance>) {
+        let NodeKey::Configured(key) = key else { panic!("configured fixture needs a configured key"); };
+        // Unit fixtures explicitly supply their visibility policy. The graph
+        // does not infer this authority from a digest or the legacy command.
+        graph.set_configured_visibility_options(key.configuration(), VisibilityOptions::default()).unwrap();
+        graph.add_configured_node(key.clone(), rule).unwrap();
+    }
+
+    #[test]
+    fn configured_graph_keeps_duplicate_labels_out_of_legacy_lookup() {
+        use crate::configuration_table::ConfigurationRole::{Exec, Target};
+        let mut graph = DependencyGraph::new();
+        let exec = configured_fixture_key("//pkg:tool", Exec);
+        let target = configured_fixture_key("//pkg:tool", Target);
+        let label = exec.label().clone();
+        let NodeKey::Configured(exec_key) = &exec else { unreachable!() };
+        graph.add_configured_node(exec_key.clone(), Box::new(DummyInstance { deps: Vec::new() })).unwrap();
+        assert!(graph.get(&label).is_none());
+        assert!(!graph.has_node(&label));
+        assert_eq!(graph.target_node_count(), 0);
+        assert!(graph.all_labels().is_empty());
+        assert!(graph.get_reachable_nodes(&label).unwrap_err().to_string().contains("no legacy target"));
+        assert!(graph.topological_sort_from(&label).is_err());
+        assert!(graph.resolve_key_scope(&HashSet::from([exec.clone()])).unwrap_err().to_string().contains("no explicit authority"));
+        graph.set_configured_visibility_options(exec_key.configuration(), VisibilityOptions::default()).unwrap();
+        add_configured_fixture(&mut graph, &target, Box::new(DummyInstance { deps: Vec::new() }));
+        graph.add_node(label.clone(), Box::new(DummyInstance { deps: Vec::new() })).unwrap();
+        assert_eq!(graph.len(), 3);
+        assert_eq!(graph.target_node_count(), 1);
+        assert_eq!(graph.all_labels(), vec![label.clone()]);
+        let legacy = graph.get(&label).unwrap();
+        assert!(!Arc::ptr_eq(legacy.rule_instance, &graph.get_key(&exec).unwrap().rule_instance));
+        assert!(!Arc::ptr_eq(&graph.get_key(&target).unwrap().rule_instance, &graph.get_key(&exec).unwrap().rule_instance));
+        assert_eq!(graph.topological_sort_from(&label).unwrap(), vec![label.clone()]);
+        assert!(graph.set_configured_dependency_keys(&NodeKey::LegacyTarget(label), Vec::new()).is_err(),
+            "legacy loader APIs cannot activate a configured transition");
+    }
+
+    #[test]
+    fn configured_graph_edges_reachability_cycles_and_reverse_edges_use_full_keys() {
+        use crate::configuration_table::ConfigurationRole::{Exec, Target};
+        let mut graph = DependencyGraph::new();
+        let target_a = configured_fixture_key("//pkg:a", Target);
+        let exec_a = configured_fixture_key("//pkg:a", Exec);
+        let exec_b = configured_fixture_key("//pkg:b", Exec);
+        add_configured_fixture(&mut graph, &target_a, Box::new(DummyInstance { deps: vec![":b".into()] }));
+        add_configured_fixture(&mut graph, &exec_b, Box::new(DummyInstance { deps: vec![":a".into()] }));
+        add_configured_fixture(&mut graph, &exec_a, Box::new(DummyInstance { deps: Vec::new() }));
+        graph.set_configured_dependency_keys(&target_a, vec![exec_b.clone()]).unwrap();
+        graph.resolve_all_keys().unwrap();
+        assert_eq!(graph.get_reachable_keys(&target_a), HashSet::from([target_a.clone(), exec_a.clone(), exec_b.clone()]));
+        let order = graph.topological_sort_keys_from(&target_a).unwrap();
+        assert_eq!(order, vec![exec_a.clone(), exec_b.clone(), target_a.clone()]);
+        assert_eq!(graph.get_key(&exec_a).unwrap().dependents, vec![exec_b.clone()]);
+        assert_eq!(graph.get_key(&exec_b).unwrap().dependents, vec![target_a.clone()]);
+        let legacy_b = exec_b.label().clone();
+        graph.add_node(legacy_b.clone(), Box::new(DummyInstance { deps: Vec::new() })).unwrap();
+        let before_dependencies = graph.get_key(&target_a).unwrap().dependencies.clone();
+        let before_dependents = graph.get_key(&exec_b).unwrap().dependents.clone();
+        assert!(graph.set_configured_dependency_keys(&target_a,
+            vec![NodeKey::LegacyTarget(legacy_b.clone())]).unwrap_err().to_string().contains("complete configured keys"));
+        assert_eq!(graph.get_key(&target_a).unwrap().dependencies, before_dependencies);
+        assert_eq!(graph.get_key(&exec_b).unwrap().dependents, before_dependents);
+        assert!(graph.get(&legacy_b).unwrap().dependents.is_empty());
+        assert_eq!(graph.topological_sort_keys_from(&target_a).unwrap(), order);
+        assert_eq!(graph.get_reachable_keys(&target_a), HashSet::from([target_a.clone(), exec_a.clone(), exec_b.clone()]));
+        assert_eq!(graph.topological_sort_from(&legacy_b).unwrap(), vec![legacy_b]);
+        assert!(DependencyGraph::project_legacy_keys(order).is_err());
+        assert!(graph.set_configured_dependency_keys(&target_a, vec![exec_a.clone()]).is_err(),
+            "transition metadata cannot invent a new dependency label");
+        add_configured_fixture(&mut graph, &exec_a, Box::new(DummyInstance { deps: vec![":b".into()] }));
+        graph.resolve_all_keys().unwrap();
+        assert!(graph.topological_sort_keys_from(&target_a).unwrap_err().to_string().contains("Circular dependency"));
+        add_configured_fixture(&mut graph, &exec_a, Box::new(DummyInstance { deps: Vec::new() }));
+        graph.resolve_all_keys().unwrap();
+        assert_eq!(graph.get_key(&exec_b).unwrap().dependents, vec![target_a.clone()],
+            "replacement must not retain an obsolete reverse edge from another exact key");
+        assert_eq!(graph.topological_sort_keys_from(&target_a).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn configured_graph_missing_conditions_and_aliases_do_not_borrow_other_configurations() {
+        use crate::configuration_table::ConfigurationRole::{Exec, Target};
+        let mut graph = DependencyGraph::new();
+        let target = configured_fixture_key("//app:consumer", Target);
+        let exec = configured_fixture_key("//app:consumer", Exec);
+        let target_condition = configured_fixture_key("//cfg:enabled", Target);
+        let exec_condition = configured_fixture_key("//cfg:enabled", Exec);
+        for owner in [&target, &exec] {
+            add_configured_fixture(&mut graph, owner, rush_rules::with_rule_metadata(
+                Box::new(DummyInstance { deps: Vec::new() }), None, true, vec!["//cfg:enabled".into()]));
+        }
+        let missing = graph.find_all_missing_keys(&HashSet::from([target.clone(), exec.clone()]));
+        assert_eq!(missing.into_iter().map(|(_, key)| key).collect::<HashSet<_>>(),
+            HashSet::from([target_condition.clone(), exec_condition.clone()]));
+        add_configured_fixture(&mut graph, &exec_condition, rush_rules::with_rule_metadata(
+            Box::new(DummyInstance { deps: Vec::new() }), Some(vec!["//visibility:public".into()]), true, Vec::new()));
+        add_config_setting(&mut graph, "//cfg:enabled", Some(vec!["//visibility:public".into()]), true);
+        assert_eq!(graph.find_all_missing_keys(&HashSet::from([target.clone()])), vec![(target.clone(), target_condition.clone())]);
+        add_configured_fixture(&mut graph, &target_condition, rush_rules::with_rule_metadata(
+            Box::new(DummyConfigurationConditionInstance { name: "enabled".into(), rule_type: "config_setting" }),
+            Some(vec!["//visibility:public".into()]), true, Vec::new()));
+        graph.resolve_key_scope(&HashSet::from([target.clone()])).unwrap();
+        assert!(graph.resolve_key_scope(&HashSet::from([exec.clone()])).unwrap_err().to_string().contains("not a config_setting"));
+        // Even explicit transition keys cannot turn metadata alias actuals
+        // into an implicit lookup in the target condition's other config.
+        let alias = configured_fixture_key("//cfg:alias", Target);
+        add_configured_fixture(&mut graph, &alias, Box::new(DummyAliasInstance { name: "alias".into(), actual: ":enabled".into() }));
+        graph.set_configured_dependency_keys(&alias, vec![exec_condition]).unwrap();
+        let consumer = configured_fixture_key("//app:alias_consumer", Target);
+        add_configured_fixture(&mut graph, &consumer, rush_rules::with_rule_metadata(
+            Box::new(DummyInstance { deps: Vec::new() }), None, true, vec!["//cfg:alias".into()]));
+        assert!(graph.resolve_key_scope(&HashSet::from([consumer])).unwrap_err().to_string().contains("crosses configuration scope"));
+    }
+
+    #[test]
+    fn configured_graph_registry_authority_isolated_by_configuration_and_command() {
+        use crate::configuration_table::ConfigurationRole::{Exec, Target};
+        use rush_starlark::config_defines as registry;
+
+        fn declare(scope: &str) {
+            registry::with_configuration_scope(scope, || {
+                registry::begin_command(&[]);
+                registry::consider_config_setting_predicates(None, "cfg", "feature",
+                    &HashMap::new(), &HashMap::new(), &[],
+                    &HashMap::from([("//cfg:flag".into(), "a".into())]));
+            });
+        }
+        fn publish(scope: &str, actual: &str) {
+            let predicate = registry::feature_flag_predicate(scope, "//cfg:feature").unwrap();
+            // Exercise the existing verified-metadata publication boundary;
+            // this unit test does not emulate a provider or execute a config.
+            registry::install_verified_feature_flag_condition(scope,
+                registry::feature_flag_generation(scope), predicate,
+                std::collections::BTreeMap::from([("//cfg:flag".into(), ("//cfg:flag".into(), actual.into()))])).unwrap();
+        }
+        fn condition() -> Box<dyn RuleInstance> {
+            let rule = rush_rules::rules_config::ConfigSettingRule.parse_attributes(&HashMap::from([
+                ("name".into(), Value::String("feature".into())),
+                ("flag_values".into(), Value::Dict(HashMap::from([("//cfg:flag".into(), Value::String("a".into()))]))),
+            ])).unwrap();
+            rush_rules::with_rule_metadata(rule, Some(vec!["//visibility:public".into()]), true, Vec::new())
+        }
+        fn consumer() -> Box<dyn RuleInstance> {
+            rush_rules::with_rule_metadata(Box::new(DummyInstance { deps: Vec::new() }), None, true,
+                vec!["//cfg:feature".into()])
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(temp.path(), || {
+            let legacy_scope = format!("{}:legacy", temp.path().display());
+            let target_scope = format!("{}:target", temp.path().display());
+            let exec_scope = format!("{}:exec", temp.path().display());
+            for scope in [&legacy_scope, &target_scope, &exec_scope] { declare(scope); }
+            publish(&legacy_scope, "a");
+            publish(&exec_scope, "b");
+            assert!(registry::is_active_config_setting_in_scope(&legacy_scope, "//cfg:feature"));
+            assert!(!registry::is_active_config_setting_in_scope(&exec_scope, "//cfg:feature"));
+
+            let mut graph = DependencyGraph::new();
+            graph.set_configuration_registry_scope(legacy_scope.clone());
+            let owner_label = Label::parse("//app:consumer", None, None).unwrap();
+            graph.add_node(owner_label.clone(), consumer()).unwrap();
+            graph.add_node(Label::parse("//cfg:feature", None, None).unwrap(), condition()).unwrap();
+            let target = configured_fixture_key("//app:consumer", Target);
+            let exec = configured_fixture_key("//app:consumer", Exec);
+            for role in [Target, Exec] {
+                add_configured_fixture(&mut graph, &configured_fixture_key("//app:consumer", role), consumer());
+                add_configured_fixture(&mut graph, &configured_fixture_key("//cfg:feature", role), condition());
+            }
+            let NodeScope::Configured(target_digest) = target.scope() else { unreachable!() };
+            let NodeScope::Configured(exec_digest) = exec.scope() else { unreachable!() };
+            graph.resolve_within_scope(&HashSet::from([owner_label.clone()])).unwrap();
+            assert!(graph.resolve_key_scope(&HashSet::from([target.clone()])).unwrap_err().to_string().contains("unconfigurable"),
+                "missing configured authority cannot consume the legacy proof");
+            assert!(graph.set_configured_registry_scope(target_digest, legacy_scope.clone()).is_err());
+            graph.set_configured_registry_scope(target_digest, target_scope.clone()).unwrap();
+            assert!(graph.set_configured_registry_scope(exec_digest, target_scope.clone()).is_err(),
+                "two configurations cannot alias one registry authority");
+            graph.set_configured_registry_scope(exec_digest, exec_scope.clone()).unwrap();
+            assert!(graph.set_configured_registry_scope(target_digest, format!("{target_scope}:replacement")).is_err());
+            graph.resolve_key_scope(&HashSet::from([exec.clone()])).unwrap();
+            assert!(graph.resolve_key_scope(&HashSet::from([target.clone()])).unwrap_err().to_string().contains("unconfigurable"),
+                "exec proof for the same condition label cannot authorize target metadata");
+            publish(&target_scope, "a");
+            graph.resolve_key_scope(&HashSet::from([target.clone()])).unwrap();
+            assert!(registry::is_active_config_setting_in_scope(&target_scope, "//cfg:feature"));
+            registry::with_configuration_scope(&target_scope, || registry::begin_command(&[]));
+            assert!(graph.resolve_key_scope(&HashSet::from([target])).unwrap_err().to_string().contains("unconfigurable"));
+            graph.resolve_key_scope(&HashSet::from([exec])).unwrap();
+            graph.resolve_within_scope(&HashSet::from([owner_label])).unwrap();
+        });
+    }
+
+    #[test]
+    fn configured_graph_missing_dependencies_are_configuration_qualified() {
+        use crate::configuration_table::ConfigurationRole::{Exec, Target};
+        let mut graph = DependencyGraph::new();
+        let mut owners = Vec::new();
+        let mut expected = HashSet::new();
+        for role in [Target, Exec] {
+            let owner = configured_fixture_key("//pkg:consumer", role);
+            add_configured_fixture(&mut graph, &owner, Box::new(DummyInstance { deps: vec![":required_test".into()] }));
+            expected.insert(configured_fixture_key("//pkg:required_test", role));
+            owners.push(owner);
+        }
+        // A legacy declaration must not fill either configured missing edge.
+        graph.add_node(Label::parse("//pkg:required_test", None, None).unwrap(),
+            Box::new(DummyInstance { deps: Vec::new() })).unwrap();
+        assert_eq!(graph.unresolved_key_deps().into_iter().map(|(_, dep)| dep).collect::<HashSet<_>>(), expected);
+        for owner in owners {
+            assert!(graph.resolve_key_scope(&HashSet::from([owner.clone()])).unwrap_err().to_string().contains("required_test"),
+                "configured missing edges cannot inherit legacy test/platform skip heuristics");
+            assert!(graph.topological_sort_keys_from(&owner).unwrap_err().to_string().contains("missing exact key"));
+        }
+    }
+
+    #[test]
+    fn configured_graph_visibility_and_output_ownership_stay_in_exact_scope() {
+        use crate::configuration_table::ConfigurationRole::{Exec, Target};
+        let mut graph = DependencyGraph::new();
+        let mut roots = Vec::new();
+        for role in [Target, Exec] {
+            let consumer = configured_fixture_key("//clients:consumer", role);
+            let secret = configured_fixture_key("//owner:secret", role);
+            let group = configured_fixture_key("//groups:friends", role);
+            add_configured_fixture(&mut graph, &consumer, Box::new(DummyInstance { deps: vec!["//owner:secret".into()] }));
+            add_configured_fixture(&mut graph, &secret, Box::new(DummyVisibilityInstance { visibility: vec!["//groups:friends".into()] }));
+            add_configured_fixture(&mut graph, &group, Box::new(DummyPackageGroupInstance {
+                name: "friends".into(), packages: vec![if role == Target { "//clients/...".into() } else { "//nobody/...".into() }], includes: Vec::new() }));
+            roots.push(graph.get_reachable_keys(&consumer));
+            let output = configured_fixture_key("//generated:producer", role);
+            add_configured_fixture(&mut graph, &output, Box::new(DummyOutputInstance { outputs: vec!["result.h".into()] }));
+        }
+        graph.resolve_key_scope(&roots[0]).unwrap();
+        assert!(graph.resolve_key_scope(&roots[1]).unwrap_err().to_string().contains("not visible"));
+        let both: HashSet<_> = graph.all_keys().into_iter().collect();
+        graph.validate_key_declared_output_ownership(&both).unwrap();
+        let target_collision = configured_fixture_key("//generated:second", Target);
+        add_configured_fixture(&mut graph, &target_collision, Box::new(DummyOutputInstance { outputs: vec!["./result.h".into()] }));
+        assert!(graph.validate_key_declared_output_ownership(&HashSet::from([target_collision])).unwrap_err().to_string().contains("multiple owners"));
+        graph.validate_key_declared_output_ownership(&HashSet::from([configured_fixture_key("//generated:producer", Exec)])).unwrap();
+        graph.validate_declared_output_ownership().unwrap();
     }
 
     #[test]
@@ -4650,9 +5107,9 @@ mod tests {
         let restricted = Label::parse("//groups:restricted", None, None).unwrap();
         assert!(!graph
             .package_group_contains(
-                &restricted,
-                &candidate,
-                &owner,
+                &NodeKey::LegacyTarget(restricted.clone()),
+                &NodeKey::LegacyTarget(candidate.clone()),
+                &NodeKey::LegacyTarget(owner.clone()),
                 &mut Vec::new(),
                 &mut HashMap::new(),
             )
@@ -4661,9 +5118,9 @@ mod tests {
         let union = Label::parse("//groups:union", None, None).unwrap();
         assert!(graph
             .package_group_contains(
-                &union,
-                &candidate,
-                &owner,
+                &NodeKey::LegacyTarget(union.clone()),
+                &NodeKey::LegacyTarget(candidate.clone()),
+                &NodeKey::LegacyTarget(owner.clone()),
                 &mut Vec::new(),
                 &mut HashMap::new(),
             )
@@ -4691,9 +5148,9 @@ mod tests {
             assert_eq!(
                 graph
                     .package_group_contains(
-                        &group,
-                        &candidate,
-                        &owner,
+                        &NodeKey::LegacyTarget(group.clone()),
+                        &NodeKey::LegacyTarget(candidate.clone()),
+                        &NodeKey::LegacyTarget(owner.clone()),
                         &mut Vec::new(),
                         &mut HashMap::new(),
                     )
@@ -4894,9 +5351,9 @@ mod tests {
         add_package_group(&mut unknown, "//groups:outer", &[], &[":missing"]);
         let error = unknown
             .package_group_contains(
-                &Label::parse("//groups:outer", None, None).unwrap(),
-                &candidate,
-                &owner,
+                &NodeKey::LegacyTarget(Label::parse("//groups:outer", None, None).unwrap()),
+                &NodeKey::LegacyTarget(candidate.clone()),
+                &NodeKey::LegacyTarget(owner.clone()),
                 &mut Vec::new(),
                 &mut HashMap::new(),
             )
@@ -4915,9 +5372,9 @@ mod tests {
             .unwrap();
         let error = wrong_kind
             .package_group_contains(
-                &Label::parse("//groups:outer", None, None).unwrap(),
-                &candidate,
-                &owner,
+                &NodeKey::LegacyTarget(Label::parse("//groups:outer", None, None).unwrap()),
+                &NodeKey::LegacyTarget(candidate.clone()),
+                &NodeKey::LegacyTarget(owner.clone()),
                 &mut Vec::new(),
                 &mut HashMap::new(),
             )
@@ -4931,9 +5388,9 @@ mod tests {
         add_package_group(&mut cycle, "//groups:b", &[], &[":a"]);
         let error = cycle
             .package_group_contains(
-                &Label::parse("//groups:a", None, None).unwrap(),
-                &candidate,
-                &owner,
+                &NodeKey::LegacyTarget(Label::parse("//groups:a", None, None).unwrap()),
+                &NodeKey::LegacyTarget(candidate.clone()),
+                &NodeKey::LegacyTarget(owner.clone()),
                 &mut Vec::new(),
                 &mut HashMap::new(),
             )
@@ -5037,7 +5494,7 @@ mod tests {
 
         graph.add_node(label.clone(), instance).unwrap();
 
-        let node = graph.nodes.get(&label).unwrap();
+        let node = graph.get(&label).unwrap();
         let dep = &node.dependencies[0];
         assert_eq!(dep.package, "");
         assert_eq!(dep.target, "source_context_proto");
@@ -5095,7 +5552,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let reachable = graph.get_reachable_nodes(&lib_label);
+        let reachable = graph.get_reachable_nodes(&lib_label).unwrap();
         assert!(reachable.contains(&lib_label));
         assert!(reachable.contains(&dep_label));
         assert_eq!(reachable.len(), 2, "missing //pkg:absent must not be included");

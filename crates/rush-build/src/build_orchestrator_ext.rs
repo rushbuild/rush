@@ -4,7 +4,7 @@
 
 use crate::cache_paths;
 use crate::dependency_graph::{
-    DependencyGraph, DependencyNode, Label, VisibilityOptions,
+    DependencyGraph, LegacyTargetNodeView, Label, VisibilityOptions,
 };
 use crate::external_deps::SystemPackageMapper;
 use crate::proto_expander::ProtoAliasExpander;
@@ -563,9 +563,9 @@ fn static_archive_materialization_labels(
     graph: &DependencyGraph,
     build_order: &[Label],
     root_labels: &[Label],
-) -> HashSet<String> {
+) -> Result<HashSet<String>> {
     if root_labels.is_empty() {
-        return build_order.iter().map(ToString::to_string).collect();
+        return Ok(build_order.iter().map(ToString::to_string).collect());
     }
 
     let mut materialize: HashSet<String> =
@@ -577,12 +577,12 @@ fn static_archive_materialization_labels(
         if !static_archive_consumer_rule_kind(node.rule_instance.rule_type()) {
             continue;
         }
-        for reachable in graph.get_reachable_nodes(label) {
+        for reachable in graph.get_reachable_nodes(label)? {
             materialize.insert(reachable.to_string());
         }
     }
 
-    materialize
+    Ok(materialize)
 }
 
 fn normalize_prune_path(path: &Path, workspace_root: &Path) -> PathBuf {
@@ -3967,7 +3967,7 @@ impl BuildOrchestrator {
                 ),
             );
             for root in &reachability_roots {
-                for reachable in graph.get_reachable_nodes(root) {
+                for reachable in graph.get_reachable_nodes(root)? {
                     needed.insert(reachable);
                 }
             }
@@ -5070,7 +5070,7 @@ impl BuildOrchestrator {
             &graph,
             &build_order,
             &root_labels,
-        );
+        )?;
         if std::env::var("RUSH_DEBUG_ARCHIVE_MATERIALIZATION").as_deref() == Ok("1") {
             let producer_count = build_order
                 .iter()
@@ -7872,7 +7872,7 @@ impl BuildOrchestrator {
                         }
                         break 'skip false;
                     }
-                    refresh_built_providers_for_target(&label, node, &mut built_providers);
+                    refresh_built_providers_for_target(&label, &node, &mut built_providers);
                     if build_chatter {
                         eprintln!(
                             "🟰 output-equivalence prune: skipping {} — active deps rebuilt byte-identical",
@@ -8294,7 +8294,7 @@ impl BuildOrchestrator {
             // Store artifacts as a depset DAG node (identity aliases forward by Arc).
             let nested = build_committed_target_artifacts(
                 &label,
-                node,
+                &node,
                 artifacts,
                 &built_artifacts,
             )?;
@@ -8302,7 +8302,7 @@ impl BuildOrchestrator {
 
             // Post-build provider refresh (cc_shared_library's CcSharedLibraryInfo
             // is only knowable after the link; Mutex-guarded so safe under Arc).
-            refresh_built_providers_for_target(&label, node, &mut built_providers);
+            refresh_built_providers_for_target(&label, &node, &mut built_providers);
             if build_chatter {
                 eprintln!();
             }
@@ -11948,7 +11948,7 @@ mod shared_library_alias_tests {
     };
     #[cfg(unix)]
     use super::install_shared_library_alias_symlink;
-    use crate::dependency_graph::{DependencyNode, Label};
+    use crate::dependency_graph::{DependencyGraph, Label};
     use rush_rules::{nested_set::NestedSet, Artifact, ArtifactType, RuleInstance};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -11998,20 +11998,13 @@ mod shared_library_alias_tests {
         );
         let built_artifacts =
             HashMap::from([(producer_label.to_string(), Arc::clone(&producer))]);
-        let node = DependencyNode {
-            label: alias_label.clone(),
-            rule_instance: Arc::new(SharedLibraryOutputAlias {
-                name: "libfoo.so".to_string(),
-                actual: producer_label.to_string(),
-                visibility: None,
-            }),
-            dependencies: vec![producer_label],
-            package_group_references: vec![],
-            configuration_references: vec![],
-            constraint_value_references: vec![],
-            constraint_setting_reference: None,
-            dependents: vec![],
-        };
+        let mut graph = DependencyGraph::new();
+        graph.add_node(alias_label.clone(), Box::new(SharedLibraryOutputAlias {
+            name: "libfoo.so".to_string(),
+            actual: producer_label.to_string(),
+            visibility: None,
+        })).unwrap();
+        let node = graph.get(&alias_label).unwrap();
 
         let committed = build_committed_target_artifacts(
             &alias_label,
@@ -14281,7 +14274,7 @@ async fn resolved_default_info_artifacts(
 
 fn build_committed_target_artifacts(
     label: &Label,
-    node: &DependencyNode,
+    node: &LegacyTargetNodeView<'_>,
     artifacts: Vec<Artifact>,
     built_artifacts: &impl ArtifactLookup,
 ) -> Result<Arc<rush_rules::nested_set::NestedSet<Artifact>>> {
@@ -14334,7 +14327,7 @@ fn build_committed_target_artifacts(
 
 fn refresh_built_providers_for_target(
     label: &Label,
-    node: &DependencyNode,
+    node: &LegacyTargetNodeView<'_>,
     built_providers: &mut HashMap<String, ProviderSet>,
 ) {
     let rule_type = node.rule_instance.rule_type();
