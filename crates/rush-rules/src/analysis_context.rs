@@ -147,6 +147,12 @@ pub struct AnalysisContext<'a> {
     /// adds to its argv at build time. Owned by the orchestrator
     /// and borrowed for the duration of analyze().
     workspace_root: &'a Path,
+    /// Optional MAIN execution namespace; independent of this target's source
+    /// repository root. Defaults to None for unchanged main-only callers.
+    native_execution_root: Option<&'a Path>,
+    /// Fatal admission failure for the source-only namespace profile. An
+    /// incomplete action is insufficient: runtime may materialize its input.
+    native_namespace_error: Option<String>,
     /// Phase 5.C.4: external workspace roots from the build's
     /// repository registration. Used by analyze() to add
     /// `-I<extra>` flags so cross-repo includes resolve (e.g.
@@ -191,9 +197,33 @@ impl<'a> AnalysisContext<'a> {
             include_resolver,
             toolchain,
             workspace_root,
+            native_execution_root: None,
+            native_namespace_error: None,
             extra_proto_paths,
             labeled_dep_providers: &[],
         }
+    }
+
+    pub fn with_native_execution_root(mut self, root: Option<&'a Path>) -> Self {
+        self.native_execution_root = root;
+        self
+    }
+
+    pub fn native_execution_root(&self) -> Option<&Path> {
+        self.native_execution_root
+    }
+
+    /// Preserve the first failed namespace proof for the orchestrator to reject
+    /// before provider/snapshot adoption. This is independent of declaration
+    /// completeness, which ordinary legacy genrules may legitimately require.
+    pub fn fail_native_namespace_analysis(&mut self, error: impl Into<String>) {
+        if self.native_namespace_error.is_none() {
+            self.native_namespace_error = Some(error.into());
+        }
+    }
+
+    pub fn native_namespace_analysis_error(&self) -> Option<&str> {
+        self.native_namespace_error.as_deref()
     }
 
     /// Attach the labeled dep providers (in `node.dependencies` order).

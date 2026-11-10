@@ -2430,6 +2430,7 @@ impl BuildOrchestrator {
         // Generated-repository settings read CUDA/ROCm environment through
         // tracked IO. Run activation only after installing this command's IO,
         // and scope it so those configuration inputs enter the same manifest.
+        crate::native_execroot::require_default_layout(&semantics)?;
         let native_configuration = rush_command_core::native_options::NativeConfiguration::from_command_semantics(&semantics)
             .map_err(anyhow::Error::msg)?;
         let command_build_config = crate::output_tree::BuildConfig::parse(&native_configuration.compilation_mode)
@@ -2574,6 +2575,7 @@ impl BuildOrchestrator {
                 crate::phase_profile::record("analysis_key_lookup", t_lookup.elapsed());
             }
             if let Some(candidate) = candidate_opt {
+                if let Some(namespace) = &candidate.native_execroot { namespace.validate()?; }
                 let t_v0 = std::time::Instant::now();
                 // ── Phase-2 WATCHER FAST PATH ────────────────────────────────
                 //
@@ -3064,6 +3066,8 @@ impl BuildOrchestrator {
             // end). The certificate's stored key (incl. the daemon-compat
             // fingerprint folding the running binary's identity) is matched
             // exactly on load, so a rebuilt rush never trusts a stale cert.
+            // This binary publishes certificates only for native_execroot=None;
+            // external namespace builds always reconstruct and validate their owned view.
             let cold_cache_disabled =
                 std::env::var("RUSH_DISABLE_COLD_NOOP_CACHE").as_deref() == Ok("1")
                     || std::env::var("RUSH_DISABLE_FRESHNESS_LEDGER").as_deref() == Ok("1");
@@ -5166,6 +5170,28 @@ impl BuildOrchestrator {
         let artifact_registry: Arc<tokio::sync::Mutex<rush_action::ids::ArtifactRegistry>> =
             Arc::new(tokio::sync::Mutex::new(rush_action::ids::ArtifactRegistry::new()));
         let resolver_repo_paths = self.external_repo_paths.lock().await.clone();
+        // A source registry is not an execution layout. Build a separate owned
+        // MAIN view only when this requested closure actually uses externals.
+        let native_repositories = build_order.iter().filter_map(|label| label.workspace.as_ref())
+            .map(|name| resolver_repo_paths.get(name).cloned()
+                .map(|root| (name.clone(), root))
+                .ok_or_else(|| anyhow!("external source root is not registered for @{name}")))
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let native_execroot = if native_repositories.is_empty() {
+            None
+        } else {
+            anyhow::ensure!(!self.remote_executor.as_ref().is_some_and(|executor| executor.is_reapi()),
+                "native REAPI does not support the external-repository execution namespace; use a portable remote action manifest");
+            let aliases = std::collections::BTreeMap::from([
+                ("rush-out".to_owned(), output_dir.clone()),
+                ("rush-bin".to_owned(), output_dir.join(format!("k8-{}", command_build_config.dir_name())).join("bin")),
+            ]);
+            Some(Arc::new(self.with_tracked_scope(|| {
+                let cache = crate::native_execroot::command_cache_root(&self.workspace_root)?;
+                crate::native_execroot::NativeExecroot::prepare(&self.workspace_root, &cache, &native_repositories, &aliases)
+            })?))
+        };
+
         // Phase 5.C.4: extra_proto_paths derived from the same
         // external_repo_paths snapshot, captured once for PASS A
         // so analyze() can populate CppCompile / link argv with
@@ -5319,17 +5345,20 @@ impl BuildOrchestrator {
                         &target_workspace_root,
                         &extra_proto_paths,
                     )
-                    .with_labeled_dep_providers(&labeled_dep_providers_vec);
-                node.rule_instance
-                    .validate_analysis_dependencies(&analysis_ctx)
-                    .with_context(|| {
-                        format!(
-                            "validating analysis dependencies for target '{}'",
-                            label,
-                        )
-                    })?;
-                node.rule_instance
-                    .analyze(&mut analysis_ctx, &dep_providers_vec)
+                    .with_labeled_dep_providers(&labeled_dep_providers_vec)
+                    .with_native_execution_root(native_execroot.as_ref().map(|namespace| namespace.root()));
+                let mut analyze = || -> Result<_> {
+                    node.rule_instance.validate_analysis_dependencies(&analysis_ctx)
+                        .with_context(|| format!("validating analysis dependencies for target '{}'", label))?;
+                    let providers = node.rule_instance.analyze(&mut analysis_ctx, &dep_providers_vec);
+                    if native_execroot.is_some() {
+                        if let Some(error) = analysis_ctx.native_namespace_analysis_error() {
+                            anyhow::bail!("native execution namespace analysis refused for {label}: {error}");
+                        }
+                    }
+                    Ok(providers)
+                };
+                if native_execroot.is_some() { self.with_tracked_scope(analyze)? } else { analyze()? }
             };
             let rule_type = node.rule_instance.rule_type();
             if provider_forwarding_alias_rule_kind(rule_type) {
@@ -6566,6 +6595,7 @@ impl BuildOrchestrator {
                 target_id_by_label,
                 expanded_targets,
                 resolver_repo_paths,
+                native_execroot,
                 output_dir,
                 toolchain,
                 retained_execution_state: std::sync::Mutex::new(None),
@@ -6803,6 +6833,11 @@ impl BuildOrchestrator {
         snapshot: &std::sync::Arc<crate::analysis_snapshot::AnalysisSnapshot>,
         mut prune_plan: Option<PassBPrunePlan>,
     ) -> Result<()> {
+        if let Some(namespace) = &snapshot.native_execroot {
+            namespace.validate()?;
+            anyhow::ensure!(!self.remote_executor.as_ref().is_some_and(|executor| executor.is_reapi()),
+                "native REAPI does not support the external-repository execution namespace; use a portable remote action manifest");
+        }
         let _profile_execute_pass_b = self.profiler.scope("execute_pass_b", "build");
         use rush_rules::nested_set::NestedSet;
         // Immutable analysis state — borrowed from the retained snapshot. The
@@ -7909,33 +7944,17 @@ impl BuildOrchestrator {
                         }
                     }
                 }
-                let target_workspace_root = if let Some(ref ws_name) = label.workspace {
-                    let repo_paths = self.external_repo_paths.lock().await;
-                    match repo_paths.get(ws_name) {
-                        Some(p) => p.clone(),
-                        None => {
-                            eprintln!(
-                                "  ⚠️  Unknown external repo @{} for target {}; using main workspace root (target is stubbed so this won't produce artifacts)",
-                                ws_name, label
-                            );
-                            self.workspace_root.clone()
-                        }
-                    }
-                } else {
-                    self.workspace_root.clone()
+                let target_workspace_root = match label.workspace.as_ref() {
+                    Some(name) => snapshot.resolver_repo_paths.get(name).cloned()
+                        .ok_or_else(|| anyhow!("snapshot external source root missing for @{name}"))?,
+                    None => self.workspace_root.clone(),
                 };
                 let target_output_dir = repository_output_root(
                     output_dir,
                     label.workspace.as_deref(),
                 );
                 let package_path = PathBuf::from(&label.package);
-                let extra_proto_paths: Vec<PathBuf> = {
-                    // #1 P1 determinism: sort the HashMap.values() so the
-                    // compile -I<external> ordering (hence action argv/keys) is
-                    // reproducible run-to-run. See the sort at the PASS-A site.
-                    let repo_paths = self.external_repo_paths.lock().await;
-                    collect_extra_proto_paths(&repo_paths)
-                };
+                let extra_proto_paths = collect_extra_proto_paths(&snapshot.resolver_repo_paths);
                 let materialize_static_libraries =
                     static_archive_materialization.contains(&label.to_string());
                 let dirty_paths = prune_plan
@@ -7946,6 +7965,7 @@ impl BuildOrchestrator {
                     .with_package(package_path)
                     .with_repository(label.workspace.clone())
                     .with_main_workspace_root(self.workspace_root.clone())
+                    .with_native_execution_root(snapshot.native_execroot.as_ref().map(|namespace| namespace.root().to_owned()))
                     .with_toolchain(toolchain.clone())
                     .with_dependencies(dep_artifacts, dep_providers)
                     .with_materialize_static_libraries(materialize_static_libraries)
@@ -8026,7 +8046,8 @@ impl BuildOrchestrator {
                     None
                 };
 
-                running.push(async move {
+                let execution_io = if snapshot.native_execroot.is_some() { self.tracked_io_shared() } else { None };
+                running.push(crate::native_execroot::scope_future(execution_io.clone(), async move {
                     let _target_span = profiler_target.scope_on_lane(&label_s, "target");
                     let artifacts = if use_scheduler {
                         let target_id =
@@ -8103,7 +8124,7 @@ impl BuildOrchestrator {
                             let rt_owned = rt.to_string();
                             let handle = tokio::runtime::Handle::current();
                             tokio::task::spawn_blocking(move || {
-                                handle.block_on(async move {
+                                let run = || handle.block_on(async move {
                                     rule_b.build(&context).await.with_context(|| {
                                         format!(
                                             "Failed to build target {} (rule_type={}){}",
@@ -8112,14 +8133,18 @@ impl BuildOrchestrator {
                                             poisoned_stub_note()
                                         )
                                     })
-                                })
+                                });
+                                match execution_io {
+                                    Some(io) => rush_incremental::tracked::scope(io, run),
+                                    None => run(),
+                                }
                             })
                             .await
                             .map_err(|e| anyhow!("legacy build task join error: {}", e))??
                         }
                     };
                     Ok::<(usize, Vec<Artifact>), anyhow::Error>((cur, artifacts))
-                });
+                }));
             }
 
             // Await one completed build, then COMMIT it (driver).
@@ -8599,7 +8624,11 @@ impl BuildOrchestrator {
                 // committed too. Pruned rebuilds deliberately do not rewrite
                 // the cold certificate; its old ledger safely misses after a
                 // restart and forces full reconstruction of the artifact DAG.
+                // The disk certificate cannot carry an owned namespace proof.
+                // This engine publishes it only for unchanged MAIN-only actions;
+                // binary identity in AnalysisKey excludes older engines' certificates.
                 if retained_committed
+                    && snapshot.native_execroot.is_none()
                     && std::env::var("RUSH_DISABLE_COLD_NOOP_CACHE").as_deref()
                         != Ok("1")
                 {
@@ -24932,6 +24961,205 @@ genrule(
             "a late inactive write must refuse retained-state publication"
         );
 
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod native_execution_namespace_tests {
+    use super::*;
+    use bytes::Bytes;
+    use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+    use rush_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn request(root: &Path, targets: &[String], flags: &[&str]) -> Result<rush_command_core::CommandSemantics> {
+        let arguments: Vec<_> = flags.iter().map(|value| value.to_string()).collect();
+        let mut request = RunRequest {
+            auth_cookie: Bytes::new(),
+            argv: std::iter::once(Bytes::from_static(b"rush"))
+                .chain(std::iter::once(Bytes::from_static(b"build")))
+                .chain(targets.iter().map(|target| Bytes::copy_from_slice(target.as_bytes()))).collect(),
+            working_directory: Bytes::copy_from_slice(root.as_os_str().as_bytes()),
+            environment: vec![EnvironmentVariable {
+                name: Bytes::from_static(b"RUSH_EFFECTIVE_BUILD_ARGUMENTS_V1"),
+                value: Bytes::from(rush_command_core::build_arguments::encode(&arguments)),
+            }],
+            block_for_lock: true, client_build_id: "native-namespace-test".into(),
+            protocol_major: PROTOCOL_MAJOR, protocol_minor: PROTOCOL_MINOR,
+            workspace_config: Vec::new(),
+        };
+        rush_command_core::populate_workspace_config(&mut request, root);
+        Ok(rush_command_core::CommandSemantics::from_run_request(&request)?)
+    }
+
+    #[test]
+    fn native_layout_uses_only_ordered_immutable_build_arguments() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for flags in [vec![], vec!["--experimental_sibling_repository_layout=false"],
+            vec!["--experimental_sibling_repository_layout=no"], vec!["--experimental_sibling_repository_layout=False"],
+            vec!["--experimental_sibling_repository_layout=F"],
+            vec!["--action_env", "--experimental_sibling_repository_layout=true"],
+            vec!["--copt", "--experimental_sibling_repository_layout=true"],
+            vec!["--experimental_sibling_repository_layout", "--noexperimental_sibling_repository_layout"]] {
+            crate::native_execroot::require_default_layout(&request(temp.path(), &[], &flags)?)?;
+        }
+        for flags in [vec!["--experimental_sibling_repository_layout"],
+            vec!["--experimental_sibling_repository_layout=false", "--experimental_sibling_repository_layout=true"],
+            vec!["--experimental_sibling_repository_layout=YES"],
+            vec!["--experimental_sibling_repository_layout=true", "--action_env", "--experimental_sibling_repository_layout=false"],
+            vec!["--experimental_sibling_repository_layout=true", "--copt", "--experimental_sibling_repository_layout=false"],
+            vec!["--experimental_sibling_repository_layout=unknown"]] {
+            assert!(crate::native_execroot::require_default_layout(&request(temp.path(), &[], &flags)?).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_layout_refuses_explicit_legacy_argv_without_expanded_transport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for (flags, rejected) in [(vec![], false),
+            (vec!["--experimental_sibling_repository_layout=true"], true),
+            (vec!["--experimental_sibling_repository_layout=false"], false),
+            (vec!["--experimental_sibling_repository_layout=no"], false),
+            (vec!["--experimental_sibling_repository_layout=False"], false),
+            (vec!["--action_env", "--experimental_sibling_repository_layout=true"], false),
+            (vec!["--copt", "--experimental_sibling_repository_layout=true"], false),
+            (vec!["--experimental_sibling_repository_layout=true", "--action_env", "--experimental_sibling_repository_layout=false"], true),
+            (vec!["--experimental_sibling_repository_layout=true", "--copt", "--experimental_sibling_repository_layout=false"], true),
+            (vec!["--experimental_sibling_repository_layout=YES"], true),
+            (vec!["--daemon", "--experimental_sibling_repository_layout=true"], false),
+            (vec!["--experimental_sibling_repository_layout=true", "--watchfs", "--experimental_sibling_repository_layout=false"], true),
+            (vec!["--unknown-option", "--experimental_sibling_repository_layout=false"], true),
+            (vec!["--unknown-option", "--", "--experimental_sibling_repository_layout=true"], true),
+            (vec!["--experimental_sibling_repository_layout=true", "--noexperimental_sibling_repository_layout"], false)] {
+            let request = RunRequest {
+                auth_cookie: Bytes::new(),
+                argv: std::iter::once(Bytes::from_static(b"rush"))
+                    .chain(std::iter::once(Bytes::from_static(b"build")))
+                    .chain(flags.into_iter().map(Bytes::from)).collect(),
+                working_directory: Bytes::copy_from_slice(temp.path().as_os_str().as_bytes()),
+                environment: Vec::new(), block_for_lock: true,
+                client_build_id: "legacy-layout-test".into(),
+                protocol_major: PROTOCOL_MAJOR, protocol_minor: PROTOCOL_MINOR,
+                workspace_config: Vec::new(),
+            };
+            let command = rush_command_core::CommandSemantics::from_run_request(&request)?;
+            assert_eq!(crate::native_execroot::require_default_layout(&command).is_err(), rejected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_layout_preserved_two_token_transport_keeps_opaque_operands() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for option in ["--action_env", "--repo_env", "--copt", "--cxxopt"] {
+            let request = RunRequest {
+                auth_cookie: Bytes::new(), argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build")],
+                working_directory: Bytes::copy_from_slice(temp.path().as_os_str().as_bytes()),
+                environment: vec![EnvironmentVariable {
+                    name: Bytes::from_static(b"RUSH_EFFECTIVE_BUILD_ARGUMENTS_V1"),
+                    value: Bytes::from(serde_json::json!({"version":1,"tokens":[option,"--experimental_sibling_repository_layout=true"]}).to_string()),
+                }],
+                block_for_lock:true, client_build_id:"layout-boundary-test".into(),
+                protocol_major:PROTOCOL_MAJOR, protocol_minor:PROTOCOL_MINOR, workspace_config:Vec::new(),
+            };
+            crate::native_execroot::require_default_layout(&rush_command_core::CommandSemantics::from_run_request(&request)?)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_external_namespace_executes_cpp_genrules_and_revalidates_outputs() -> Result<()> {
+        once_cell::sync::Lazy::force(&super::source_file_resolution_tests::TEST_CLONE_CACHE);
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("main");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(repository.join("pkg/headers/nested"))?;
+        std::fs::write(source.join("WORKSPACE"), "workspace(name = 'main')\n")?;
+        // The unrelated declared/registered source must not activate the
+        // namespace for a MAIN-only requested closure.
+        std::fs::write(source.join("BUILD"), "cc_library(name = 'main_only')\n")?;
+        std::fs::write(repository.join("pkg/BUILD"), r#"
+root = Label("@owner_a//pkg:probe").workspace_root
+cc_binary(name = "probe", srcs = ["main.cc", "headers/nested/value.h"],
+          copts = ["-I" + root + "/pkg/headers"])
+cc_binary(name = "missing_include", srcs = ["main.cc", "headers/nested/value.h"])
+genrule(name = "read_main_namespace", outs = ["copy.txt"],
+        cmd = "cat external/owner_a/pkg/value.txt > $@")
+"#)?;
+        std::fs::write(repository.join("pkg/main.cc"), "#include <nested/value.h>\nint main() { return VALUE == 42 ? 0 : 1; }\n")?;
+        std::fs::write(repository.join("pkg/headers/nested/value.h"), "#define VALUE 42\n")?;
+        std::fs::write(repository.join("pkg/value.txt"), "external source\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(source.clone());
+        orchestrator.external_repo_paths.lock().await.insert("owner_a".into(), repository.clone());
+        orchestrator.bzl_loader.lock().unwrap().add_external_repo("owner_a".into(), repository.clone());
+
+        let main_targets = vec!["//:main_only".into()];
+        let main_request = request(&source, &main_targets, &[])?;
+        orchestrator.build_with_dependencies_with_semantics(main_targets.clone(), main_request.clone()).await?;
+        let main_key = crate::analysis_snapshot::AnalysisKey::new(&main_request, source.clone(), main_targets);
+        assert!(orchestrator.snapshot_cache.get(&main_key).unwrap().native_execroot.is_none());
+        assert!(!source.join(".cache/rush/native-execroots-v1").exists());
+
+        let targets = vec!["@owner_a//pkg:probe".into(), "@owner_a//pkg:read_main_namespace".into()];
+        let semantics = request(&source, &targets, &[])?;
+        orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, source.clone(), targets.clone());
+        let snapshot = orchestrator.snapshot_cache.get(&key).unwrap();
+        let namespace = snapshot.native_execroot.as_ref().unwrap();
+        namespace.validate()?;
+        assert_eq!(std::fs::read_link(namespace.root().join("external/owner_a"))?, repository);
+        assert!(crate::cold_noop_cache::load(&source, &key).is_none(), "disk certificate must not bypass namespace validation");
+        let state = snapshot.retained_execution_state().unwrap();
+        let binary = state.artifact_forest["@owner_a//pkg:probe"].flatten().into_iter()
+            .find(|artifact| artifact.path.file_name() == Some(std::ffi::OsStr::new("probe")))
+            .context("missing actual executable")?.path.clone();
+        assert!(std::process::Command::new(&binary).status()?.success());
+        let generated = source.join("rush-out/external/repo-owner_a/genfiles/pkg/copy.txt");
+        assert_eq!(std::fs::read_to_string(&generated)?, "external source\n");
+        // A warm no-op still validates the immutable owned entries.
+        orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        std::fs::write(repository.join("pkg/headers/nested/value.h"), "#define VALUE 43\n")?;
+        orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        assert!(!std::process::Command::new(&binary).status()?.success(), "header edit reused a stale object");
+        let retained_before_refusal = orchestrator.snapshot_cache.get(&key).unwrap();
+        let manifest_before_refusal = retained_before_refusal.manifest.fingerprint();
+        let execution_before_refusal = retained_before_refusal.retained_execution_state()
+            .context("successful header edit must retain its execution state")?;
+        let binary_before_refusal = std::fs::read(&binary)?;
+        let valid_source = std::fs::read(repository.join("pkg/main.cc"))?;
+        std::fs::write(repository.join("pkg/main.cc"), "#define HEADER <nested/value.h>\n#include HEADER\nint main(){return VALUE;}\n")?;
+        let fresh_io = rush_incremental::RealTrackedIo::new(semantics.clone(), &source);
+        assert!(matches!(fresh_io.validate_manifest(&retained_before_refusal.manifest).staleness,
+            rush_incremental::Staleness::Stale { .. }), "changed source must invalidate the previous proof");
+        let error = orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await
+            .expect_err("unsupported proof must fail analysis even when outputs/cache exist");
+        assert!(format!("{error:#}").contains("native execution namespace analysis refused"), "{error:#}");
+        // The established Stale path evicts the old cache entry before fresh
+        // analysis. A failed new proof must publish no replacement, while any
+        // outstanding reader keeps its immutable manifest and execution state.
+        assert!(orchestrator.snapshot_cache.get(&key).is_none(),
+            "failed namespace proof must publish no new snapshot after stale eviction");
+        assert_eq!(retained_before_refusal.manifest.fingerprint(), manifest_before_refusal);
+        assert_eq!(retained_before_refusal.manifest_fingerprint, manifest_before_refusal);
+        assert!(retained_before_refusal.retained_execution_state_matches(&execution_before_refusal),
+            "failed analysis must not change an outstanding reader's execution revision");
+        assert_eq!(std::fs::read(&binary)?, binary_before_refusal);
+        std::fs::write(repository.join("pkg/main.cc"), valid_source)?;
+        // A foreign entry must refuse before a retained no-op can succeed.
+        std::fs::write(namespace.root().join("foreign-entry"), "preserve")?;
+        let error = orchestrator.build_with_dependencies_with_semantics(targets, semantics).await.expect_err("foreign entry must refuse");
+        assert!(format!("{error:#}").contains("native execution namespace"));
+        assert_eq!(std::fs::read_to_string(namespace.root().join("foreign-entry"))?, "preserve");
+
+        let negative = vec!["@owner_a//pkg:missing_include".into()];
+        // Missing -I remains a real compiler refusal, rather than an automatic
+        // header-parent include that could mask a broken namespace.
+        std::fs::remove_file(namespace.root().join("foreign-entry"))?;
+        let error = orchestrator.build_with_dependencies_with_semantics(negative.clone(), request(&source, &negative, &[])?).await.expect_err("missing include flag must fail");
+        assert!(format!("{error:#}").to_ascii_lowercase().contains("compil"), "{error:#}");
         Ok(())
     }
 }

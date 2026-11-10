@@ -243,6 +243,97 @@ pub struct CcCompileCommandSpec {
     pub toolchain_identity: Option<String>,
 }
 
+/// The explicit GCC/Clang header-search subset admitted by the native
+/// execution namespace. Parse the supplied normalized compile arguments,
+/// preserving toolchain and rule search order in analysis and execution.
+/// Preserve the existing host SDK assumptions. Implicit SDK file values still
+/// require compiler input discovery; this parser covers declared source roots.
+pub(crate) struct NamespaceIncludeSearch {
+    pub quote: Vec<PathBuf>,
+    pub ordinary: Vec<PathBuf>,
+    pub system: Vec<PathBuf>,
+    pub forced: Vec<String>,
+}
+
+impl NamespaceIncludeSearch {
+    pub fn from_argv(argv: &[String], cwd: &Path) -> anyhow::Result<Self> {
+        let mut search = Self {
+            quote: Vec::new(), ordinary: Vec::new(), system: Vec::new(), forced: Vec::new(),
+        };
+        let mut index = 0;
+        while index < argv.len() {
+            let arg = &argv[index];
+            // These operands are data, even when they look like options.
+            if matches!(arg.as_str(), "-D" | "-U" | "-o" | "-target" | "--target") {
+                index += 2;
+                continue;
+            }
+            if let Some(language) = arg.strip_prefix("-x") {
+                let language = if language.is_empty() {
+                    index += 1;
+                    argv.get(index).ok_or_else(|| anyhow::anyhow!("missing operand for -x"))?.as_str()
+                } else { language };
+                if !matches!(language, "c" | "c++" | "none") {
+                    anyhow::bail!("native execution namespace does not admit source language {language:?}");
+                }
+                index += 1;
+                continue;
+            }
+            if arg.starts_with('@') || arg == "-I-"
+                || arg.starts_with("-idirafter") || arg.starts_with("-iprefix")
+                || arg.starts_with("-iwithprefix") || arg.starts_with("-isysroot")
+                || arg.starts_with("--sysroot") || arg.starts_with("-nostdinc")
+                || arg.starts_with("-Wp,") || arg == "-Xpreprocessor"
+                || arg.starts_with("-ivfsoverlay") || arg.starts_with("-iframework")
+                || arg.starts_with("-F") || arg.starts_with("-imacros")
+                || arg.starts_with("-include-pch") || arg.starts_with("-fmodule")
+                || arg.starts_with("--include") || arg.starts_with("-B")
+                || arg.starts_with("-imultilib") || arg.starts_with("-imultiarch")
+                || arg.starts_with("-internal-isystem") || arg.starts_with("-cxx-isystem")
+                || arg.starts_with("-working-directory") || arg.starts_with("--config")
+                || arg == "-Xclang" || arg.starts_with("-fplugin")
+                || arg.starts_with("-specs") || arg.starts_with("--specs") || arg == "-wrapper"
+                || arg == "-Xassembler" || arg == "-Xlinker" || arg == "-mllvm"
+                || arg.starts_with("-Wa,") || arg.starts_with("-M")
+                // GCC dump-name operands can look like search options. Refuse
+                // the family rather than interpreting its operand as a root.
+                || arg.starts_with("-dumpbase") || arg.starts_with("--dumpbase")
+                || arg.starts_with("-dumpdir") || arg.starts_with("--dumpdir")
+            {
+                anyhow::bail!("native execution namespace does not admit header-search option {arg:?}");
+            }
+            for flag in ["-iquote", "-isystem", "-include", "-I"] {
+                let Some(suffix) = arg.strip_prefix(flag) else { continue; };
+                let value = if suffix.is_empty() {
+                    index += 1;
+                    argv.get(index).ok_or_else(|| anyhow::anyhow!("missing operand for {flag}"))?
+                } else { suffix };
+                if value.is_empty() || value.starts_with('=') || value.starts_with('-') || value.contains("$SYSROOT") {
+                    anyhow::bail!("native execution namespace does not admit {flag} operand {value:?}");
+                }
+                if flag == "-include" {
+                    search.forced.push(value.to_string());
+                } else {
+                    let path = Path::new(value);
+                    let path = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+                    let roots = match flag {
+                        "-iquote" => &mut search.quote,
+                        "-isystem" => &mut search.system,
+                        _ => &mut search.ordinary,
+                    };
+                    if !roots.contains(&path) { roots.push(path); }
+                }
+                break;
+            }
+            index += 1;
+        }
+        // GCC ignores an ordinary -I which also names an explicit system
+        // directory: it retains the latter's system-search position.
+        search.ordinary.retain(|path| !search.system.contains(path));
+        Ok(search)
+    }
+}
+
 impl CcCompileCommandSpec {
     /// Phase 5.C.4 commit 12: minimal constructor for a
     /// generated-source C++ compile (cc_proto_library's CppCompile
@@ -274,6 +365,8 @@ impl CcCompileCommandSpec {
         // `#include "<repo>/<path>.pb.h"` resolves. Pass the genfiles dir
         // protoc wrote into; empty PathBuf to opt out.
         genfiles_root: PathBuf,
+        // MAIN owned execution namespace, when explicitly supplied by context.
+        cwd: Option<PathBuf>,
     ) -> Self {
         let parent = src_path
             .parent()
@@ -288,7 +381,7 @@ impl CcCompileCommandSpec {
         Self {
             mnemonic: "CppCompile".to_string(),
             executable: cxx,
-            cwd: None,
+            cwd,
             is_c_source: false,
             wants_no_rtti: false,
             src_path: src_path.clone(),
@@ -350,6 +443,8 @@ impl CcCompileCommandSpec {
         src_path: PathBuf,
         obj_path: PathBuf,
         declared_input_paths: Vec<PathBuf>,
+        // Set before normalization/keying; None retains legacy execution.
+        cwd: Option<PathBuf>,
     ) -> NormalizedCommandSpec {
         let mut argv: Vec<String> = Vec::new();
         argv.extend(cxxflags.iter().cloned());
@@ -369,7 +464,7 @@ impl CcCompileCommandSpec {
         let mut spec = NormalizedCommandSpec {
             mnemonic: "CppCompile".to_string(),
             executable: cxx,
-            cwd: None,
+            cwd,
             argv,
             env: Vec::new(),
             declared_inputs: declared_input_paths,
@@ -777,6 +872,92 @@ pub fn resolve_include_under_package(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_include_search_refuses_gcc_dump_operands_after_real_tool_control() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        std::fs::create_dir(root.join("fake")).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        let fake = root.join("fake/value.h");
+        let real = root.join("real/value.h");
+        std::fs::write(&fake, "#define VALUE 41\n").unwrap();
+        std::fs::write(&real, "#define VALUE 42\n").unwrap();
+        let source = root.join("main.cc");
+        let executable = root.join("program");
+        std::fs::write(
+            &source,
+            "#include <value.h>\nint main() { return VALUE; }\n",
+        )
+        .unwrap();
+        let compile_and_run = |options: &[String], expected: i32| {
+            match std::fs::remove_file(&executable) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("remove old fixture executable: {error}"),
+            }
+            let mut arguments = vec!["-std=c++17".to_owned()];
+            arguments.extend_from_slice(options);
+            arguments.extend([
+                source.to_str().unwrap().to_owned(),
+                "-o".to_owned(),
+                executable.to_str().unwrap().to_owned(),
+            ]);
+            let compiled = std::process::Command::new("/usr/bin/g++")
+                .args(&arguments)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "actual GCC rejected {arguments:?}: {}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            assert!(executable.is_file());
+            assert_eq!(
+                std::process::Command::new(&executable)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(expected),
+                "actual header selected for {arguments:?}"
+            );
+            arguments
+        };
+        // Both roots exist. Without a dump operand, the first real -I wins.
+        compile_and_run(&["-Ifake".into(), "-Ireal".into()], 41);
+        for option in [
+            "-dumpbase",
+            "-dumpbase-ext",
+            "-dumpdir",
+            "--dumpbase",
+            "--dumpbase-ext",
+            "--dumpdir",
+        ] {
+            for value in [42, 43] {
+                std::fs::write(&real, format!("#define VALUE {value}\n")).unwrap();
+                let options = vec![option.to_owned(), "-Ifake".into(), "-Ireal".into()];
+                // The first -I-looking token is dump-name data, not a root.
+                let arguments = compile_and_run(&options, value);
+                let error = NamespaceIncludeSearch::from_argv(&arguments, root)
+                    .err()
+                    .expect("dump operand must refuse before literal header selection");
+                assert!(error.to_string().contains(option), "{error:#}");
+                assert_eq!(std::fs::read(&fake).unwrap(), b"#define VALUE 41\n");
+            }
+            // Prefix refusal also covers joined spellings conservatively;
+            // these are refusal controls, not extra admitted GCC syntax.
+            for joined in [format!("{option}=ignored"), format!("{option}ignored")] {
+                assert!(NamespaceIncludeSearch::from_argv(
+                    &[joined, "-Ifake".into(), "-Ireal".into()],
+                    root,
+                )
+                .is_err());
+            }
+        }
+    }
+
     fn compile_spec_min(is_c_source: bool) -> CcCompileCommandSpec {
         CcCompileCommandSpec {
             mnemonic: if is_c_source {
@@ -1031,6 +1212,7 @@ mod tests {
                 PathBuf::from("/ws/out/proto/greeting.pb.h"),
             ],
             PathBuf::new(), // genfiles_root: opt out for this standalone case
+            None,
         );
         assert!(matches!(spec.include_layout, IncludeLayout::Standalone));
         let n = spec.to_normalized_command_spec();

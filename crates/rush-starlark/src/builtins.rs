@@ -1529,7 +1529,7 @@ fn builtin_label(args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
             let workspace_root = if workspace_name.is_empty() {
                 String::new()
             } else {
-                format!("../{}", workspace_name)
+                format!("external/{}", workspace_name)
             };
 
             Ok(Value::Label {
@@ -3988,7 +3988,7 @@ mod tests {
                 assert_eq!(package, "core");
                 assert_eq!(name, "ops");
                 assert_eq!(workspace_name, "tensorflow");
-                assert_eq!(workspace_root, "../tensorflow");
+                assert_eq!(workspace_root, "external/tensorflow");
             }
             _ => panic!("Expected Label value"),
         }

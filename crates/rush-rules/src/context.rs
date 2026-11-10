@@ -74,6 +74,10 @@ pub struct BuildContext {
     pub workspace_root: PathBuf,
     /// Main workspace root that owns shared caches and fetched toolchains.
     pub main_workspace_root: PathBuf,
+    /// Rush-owned MAIN execution namespace for a requested external closure.
+    /// Source repository identity stays in workspace_root. None preserves the
+    /// existing main-only execution/REAPI contract.
+    pub native_execution_root: Option<PathBuf>,
     pub output_dir: PathBuf,
     pub package_path: Option<PathBuf>,
     /// Canonical repository name for an external target; `None` for main.
@@ -254,6 +258,7 @@ impl BuildContext {
     pub fn new(workspace_root: PathBuf, output_dir: PathBuf) -> Self {
         Self {
             main_workspace_root: workspace_root.clone(),
+            native_execution_root: None,
             workspace_root,
             output_dir,
             package_path: None,
@@ -376,6 +381,15 @@ impl BuildContext {
     pub fn with_repository(mut self, repository: Option<String>) -> Self {
         self.repository = repository;
         self
+    }
+
+    pub fn with_native_execution_root(mut self, root: Option<PathBuf>) -> Self {
+        self.native_execution_root = root;
+        self
+    }
+
+    pub fn native_execution_root(&self) -> Option<&Path> {
+        self.native_execution_root.as_deref()
     }
 
     pub fn with_main_workspace_root(mut self, main_workspace_root: PathBuf) -> Self {

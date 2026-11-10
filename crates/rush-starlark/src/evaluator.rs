@@ -784,7 +784,7 @@ pub(crate) fn dictionary_key_value(key: &str) -> Value {
                 workspace_root: if workspace_name.is_empty() {
                     String::new()
                 } else {
-                    format!("../{workspace_name}")
+                    format!("external/{workspace_name}")
                 },
                 workspace_name,
             }
@@ -10884,9 +10884,11 @@ ws_root = label.workspace_root
             evaluator.get_var("ws_name"),
             Some(Value::String("foo".to_string()))
         );
+        // Match the default execution layout proved by the Bazel 6.5
+        // repository-layout oracle; sibling layout is explicitly unsupported.
         assert_eq!(
             evaluator.get_var("ws_root"),
-            Some(Value::String("../foo".to_string()))
+            Some(Value::String("external/foo".to_string()))
         );
     }
 

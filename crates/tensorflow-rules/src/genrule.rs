@@ -322,7 +322,7 @@ impl RuleInstance for GenruleInstance {
         let output = Command::new("sh")
             .arg("-c")
             .arg(&expanded_cmd)
-            .current_dir(&context.workspace_root)
+            .current_dir(context.native_execution_root().unwrap_or(&context.workspace_root))
             .output()
             .await?;
 

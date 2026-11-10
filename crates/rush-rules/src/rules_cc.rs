@@ -19,6 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 
+// Intern the optional MAIN execution workspace before action registration.
+// Source/include ownership continues to use the per-repository workspace root.
+fn analysis_native_working_dir(
+    context: &mut crate::analysis_context::AnalysisContext,
+) -> Option<rush_action::ids::PathId> {
+    let root = context.native_execution_root()?.to_path_buf();
+    Some(context.intern_path(&root))
+}
+
 const CXX_ENV: &str = "RUSH_CXX";
 const TF_CRITICAL_CXX_ENV: &str = "RUSH_TF_CRITICAL_CXX";
 const TF_BATCH_UTIL_SOURCE_SUFFIX: &str = "/tensorflow/core/util/batch_util.cc";
@@ -1044,6 +1053,377 @@ fn reachable_source_headers_for_sink_source(
     selected
 }
 
+/// Namespace admission is deliberately narrower than a C++ preprocessor.
+/// Literal includes are followed in driver search order, including the logical
+/// directory of a symlinked header. Every lookup (including misses before the
+/// winner) is tracked. Provider layout may be cached, resolution never is.
+fn namespace_compile_headers(
+    source: &Path,
+    argv: &[String],
+    cwd: &Path,
+    declared: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    use rush_incremental::tracked;
+    use rush_incremental::FileKind;
+    let io = tracked::current().ok_or_else(|| anyhow!(
+        "native execution namespace header admission requires tracked command IO"))?;
+    if crate::cc_command_spec::is_assembly_source_path(source) {
+        return Err(anyhow!("native execution namespace does not admit assembler translation units"));
+    }
+    // Runtime staging can change an include farm after PASS-A. Preserve the
+    // old observations, but never let its path memos decide this new walk.
+    io.refresh_filesystem_observations();
+    for name in [b"CPATH".as_slice(), b"C_INCLUDE_PATH", b"CPLUS_INCLUDE_PATH", b"OBJC_INCLUDE_PATH"] {
+        if io.getenv(name).is_some() {
+            return Err(anyhow!("native execution namespace does not admit header-search environment {}",
+                String::from_utf8_lossy(name)));
+        }
+    }
+    let mut search = crate::cc_command_spec::NamespaceIncludeSearch::from_argv(argv, cwd)?;
+    // GCC folds directory aliases when a root appears in both -I and
+    // -isystem. Resolve these afresh as well as the individual candidates.
+    let mut system_roots = HashSet::new();
+    for root in &search.system {
+        match tracked::canonicalize(root) {
+            Ok(path) => { system_roots.insert(path); },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error).context("resolve system include root"),
+        }
+    }
+    let mut ordinary = Vec::new();
+    for root in search.ordinary {
+        match tracked::canonicalize(&root) {
+            Ok(path) if system_roots.contains(&path) => {},
+            Ok(_) => ordinary.push(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ordinary.push(root),
+            Err(error) => return Err(error).context("resolve ordinary include root"),
+        }
+    }
+    search.ordinary = ordinary;
+    let absolute = |path: &Path| if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+    let mut identities: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for header in declared {
+        let path = absolute(header);
+        match tracked::canonicalize(&path) {
+            Ok(identity) => identities.entry(identity).or_default().push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error).with_context(|| format!("resolve declared header {}", path.display())),
+        }
+    }
+    let source = absolute(source);
+    let mut queue = vec![source.clone()];
+    let mut selected = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut forced = search.forced.clone();
+    while let Some(path) = queue.pop() {
+        let canonical = tracked::canonicalize(&path).with_context(|| format!(
+            "native execution namespace requires source/header {} before header admission", path.display()))?;
+        // A file can be reached through several logical farms whose quoted
+        // children differ. Dedup only the same file AND effective containing
+        // directory, so ./ aliases cannot create an endless traversal.
+        let directory = tracked::canonicalize(path.parent().unwrap_or(cwd))?;
+        if !visited.insert((canonical.clone(), directory)) { continue; }
+        let read = io.read_canonical_regular_file(&canonical)
+            .with_context(|| format!("read namespace header/source {}", path.display()))?
+            .ok_or_else(|| anyhow!("native execution namespace requires descriptor-bound regular-file reads for {}", path.display()))?;
+        let body = std::str::from_utf8(&read.contents)
+            .with_context(|| format!("namespace header/source {} must be UTF-8", path.display()))?;
+        let mut includes = namespace_literal_includes(body)
+            .with_context(|| format!("header admission for {}", path.display()))?;
+        if path == source {
+            // -include searches cwd before the ordinary quote/include chains.
+            includes.extend(forced.drain(..).map(|token| (token, true, true)));
+        }
+        for (token, quoted, is_forced) in includes {
+            let token_path = Path::new(&token);
+            let mut candidates = Vec::new();
+            if token_path.is_absolute() { candidates.push(token_path.to_path_buf()); }
+            else {
+                if quoted {
+                    candidates.push(if is_forced { cwd.join(token_path) }
+                        else { path.parent().unwrap_or(cwd).join(token_path) });
+                    candidates.extend(search.quote.iter().map(|root| root.join(token_path)));
+                }
+                candidates.extend(search.ordinary.iter().chain(&search.system).map(|root| root.join(token_path)));
+            }
+            for (index, candidate) in candidates.iter().enumerate() {
+                namespace_refuse_precompiled_header(candidate)?;
+                let resolved = match tracked::canonicalize(&candidate) {
+                    Ok(resolved) => resolved,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if io.exists(&candidate) {
+                            return Err(anyhow!("native execution namespace cannot admit nonregular or dangling header candidate {}", candidate.display()));
+                        }
+                        continue;
+                    },
+                    Err(error) => return Err(error).with_context(|| format!("resolve header search {}", candidate.display())),
+                };
+                if io.metadata_kind(&resolved) != Some(FileKind::File) {
+                    return Err(anyhow!("native execution namespace header is not a regular file: {}", candidate.display()));
+                }
+                if namespace_implicit_sdk_path(&resolved) {
+                    // Drivers may ignore -I entries naming their implicit SDK
+                    // directories. Without a captured driver search profile we
+                    // cannot decide whether a later user root actually wins.
+                    // Refuse that consumed ambiguity instead of omitting its
+                    // possible declared header from the action key.
+                    for later in &candidates[index + 1..] {
+                        namespace_refuse_precompiled_header(later)?;
+                        match tracked::canonicalize(later) {
+                            Ok(path) if !namespace_implicit_sdk_path(&path) => return Err(anyhow!(
+                                "native execution namespace cannot admit ambiguous SDK/user header search: {} before {}",
+                                candidate.display(), later.display())),
+                            Ok(_) => {},
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                if io.exists(later) { return Err(anyhow!(
+                                    "native execution namespace cannot admit nonregular or dangling header candidate {}", later.display())); }
+                            },
+                            Err(error) => return Err(error).context("resolve SDK-shadowing header candidate"),
+                        }
+                    }
+                }
+                if let Some(headers) = identities.get(&resolved) {
+                    selected.extend(headers.iter().cloned());
+                    // Keep the logical spelling: a quoted nested include is
+                    // relative to the farm, not its physical target directory.
+                    queue.push(candidate.clone());
+                } else if !namespace_implicit_sdk_path(&resolved) {
+                    return Err(anyhow!("native execution namespace selected undeclared header {} (resolved to {}); declare it in hdrs/srcs or a CcInfo dependency",
+                        candidate.display(), resolved.display()));
+                }
+                // The first existing candidate shadows every later root.
+                break;
+            }
+        }
+    }
+    let mut selected: Vec<_> = selected.into_iter().collect();
+    selected.sort();
+    Ok(selected)
+}
+
+fn namespace_refuse_precompiled_header(candidate: &Path) -> Result<()> {
+    use rush_incremental::tracked;
+    let mut path = candidate.as_os_str().to_os_string();
+    path.push(".gch");
+    let path = PathBuf::from(path);
+    // GCC tries this sibling before the ordinary candidate, including a .gch
+    // directory of variants. A negative probe is part of every admitted lookup.
+    if tracked::exists(&path) {
+        return Err(anyhow!("native execution namespace does not admit automatic precompiled header {}", path.display()));
+    }
+    match tracked::canonicalize(&path) {
+        Ok(_) => Err(anyhow!("native execution namespace does not admit automatic precompiled header {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("probe automatic precompiled header candidate"),
+    }
+}
+
+fn namespace_implicit_sdk_path(path: &Path) -> bool {
+    // Preserve the existing host-SDK authority; do not reinterpret arbitrary
+    // -isystem paths as trusted/undeclared source repositories.
+    ["/usr/include", "/usr/local/include", "/usr/lib/gcc", "/usr/lib/clang",
+        "/usr/local/lib/clang", "/Library/Developer/CommandLineTools/SDKs"]
+        .iter().any(|root| path.starts_with(root))
+}
+
+fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
+    // Strip comments without treating comment markers in string/character
+    // literals as comments. Reject unadmitted line splicing/raw literals rather
+    // than silently missing directives hidden by lexical preprocessing.
+    if body.contains("??=") || body.contains("??/") || body.contains("%:") || body.contains("##") || body.contains('\0') {
+        return Err(anyhow!("native execution namespace does not admit alternative preprocessor tokens"));
+    }
+    if body.contains("__has_include") || body.contains(".include") || body.contains(".incbin") {
+        return Err(anyhow!("native execution namespace does not admit include-availability builtins or assembler include directives"));
+    }
+    let mut cleaned = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    let mut quote = None;
+    let mut block = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && matches!(chars.peek(), Some('\n' | '\r')) {
+            return Err(anyhow!("native execution namespace does not admit preprocessor line splicing"));
+        }
+        if block {
+            if ch == '*' && chars.peek() == Some(&'/') { chars.next(); block = false; cleaned.push(' '); }
+            else if ch == '\n' { cleaned.push('\n'); }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            cleaned.push(ch);
+            if ch == '\\' { if let Some(escaped) = chars.next() { cleaned.push(escaped); } }
+            else if ch == delimiter { quote = None; }
+            continue;
+        }
+        if ch == 'R' && chars.peek() == Some(&'"') {
+            return Err(anyhow!("native execution namespace does not admit raw-string include scanning"));
+        }
+        if ch == '<' && cleaned.rsplit('\n').next().unwrap_or("").trim_start()
+            .strip_prefix('#').is_some_and(|prefix| prefix.trim_start().strip_prefix("include")
+                .is_some_and(|rest| rest.trim().is_empty())) {
+            // In a header-name token, /* and // are literal filename bytes,
+            // not comments. Refuse them before the comment stripper can alter
+            // which file is selected; quoted header names are protected above.
+            let mut header = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '>' { closed = true; break; }
+                if next == '\n' || next == '\r' { break; }
+                header.push(next);
+            }
+            if !closed || header.contains("/*") || header.contains("//") || header.contains("*/") {
+                return Err(anyhow!("native execution namespace does not admit comment tokens in angle header names"));
+            }
+            cleaned.push('<'); cleaned.push_str(&header); cleaned.push('>');
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') { chars.next(); block = true; cleaned.push(' '); }
+        else if ch == '/' && chars.peek() == Some(&'/') {
+            for rest in chars.by_ref() { if rest == '\n' { cleaned.push('\n'); break; } }
+        } else {
+            if ch == '"' || ch == '\'' { quote = Some(ch); }
+            cleaned.push(ch);
+        }
+    }
+    if block { return Err(anyhow!("unterminated comment during namespace header admission")); }
+    let mut includes = Vec::new();
+    for line in cleaned.lines() {
+        let Some(directive) = line.trim_start().strip_prefix('#') else { continue; };
+        let directive = directive.trim_start();
+        let end = directive.find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).unwrap_or(directive.len());
+        let name = &directive[..end];
+        if matches!(name, "include_next" | "import" | "embed") {
+            return Err(anyhow!("native execution namespace does not admit #{name}"));
+        }
+        if name != "include" { continue; }
+        let operand = directive[end..].trim();
+        let (quoted, rest, closing) = if let Some(rest) = operand.strip_prefix('"') { (true, rest, '"') }
+            else if let Some(rest) = operand.strip_prefix('<') { (false, rest, '>') }
+            else { return Err(anyhow!("native execution namespace does not admit macro #include operands")); };
+        let end = rest.find(closing).ok_or_else(|| anyhow!("unterminated #include operand"))?;
+        if end == 0 || !rest[end + 1..].trim().is_empty() || rest[..end].contains('\\') {
+            return Err(anyhow!("native execution namespace does not admit #include operand {operand:?}"));
+        }
+        includes.push((rest[..end].to_string(), quoted, false));
+    }
+    Ok(includes)
+}
+
+fn analysis_declare_compile(
+    ctx: &mut crate::analysis_context::AnalysisContext,
+    dep_providers: &[std::sync::Arc<ProviderSet>],
+    mnemonic: &str,
+    mut inputs: Vec<rush_action::ids::ArtifactId>,
+    outputs: Vec<rush_action::ids::ArtifactId>,
+    source: &Path,
+    argv: &[String],
+) -> Option<rush_action::ids::DeclaredActionId> {
+    use rush_action::ids::ArtifactKind;
+    if let Some(cwd) = ctx.native_execution_root().map(Path::to_path_buf) {
+        let mut admitted = inputs.clone();
+        for provider in dep_providers {
+            if let Some(cc) = &provider.cc_info {
+                admitted.extend(cc.compilation.headers.iter().chain(cc.compilation.textual_headers.iter()));
+            }
+        }
+        let proof = (|| -> Result<Vec<PathBuf>> {
+            let mut declared = Vec::new();
+            for id in admitted {
+                let data = ctx.registry().artifact(id);
+                let path = ctx.registry().artifact_path(id);
+                if !data.is_source || data.owner_action.is_some() || data.owner_action_declared.is_some() {
+                    return Err(anyhow!("native execution namespace does not admit produced translation-unit/header input {} before post-producer dependency discovery", path.display()));
+                }
+                declared.push(path.to_path_buf());
+            }
+            namespace_compile_headers(source, argv, &cwd, &declared)
+        })();
+        match proof {
+            Ok(headers) => for header in headers {
+                let id = ctx.registry().find_artifact_by_path(&header, ctx.config_id())
+                    .unwrap_or_else(|| ctx.register_source_artifact(&header, ArtifactKind::Header));
+                if !inputs.contains(&id) { inputs.push(id); }
+            },
+            Err(error) => {
+                eprintln!("native execution namespace header admission: {error:#}");
+                ctx.fail_native_namespace_analysis(format!("{error:#}"));
+                let _ = ctx.declare_incomplete_action(mnemonic, inputs, outputs,
+                    "native execution namespace header admission failed; fatal analysis error forbids snapshot adoption and runtime retry");
+                return None;
+            }
+        }
+    }
+    match ctx.declare_action(mnemonic, inputs, outputs) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            if ctx.native_execution_root().is_some() {
+                ctx.fail_native_namespace_analysis(format!("native namespace compile declaration failed: {error}"));
+            }
+            None
+        }
+    }
+}
+
+async fn runtime_namespace_headers(
+    context: &BuildContext,
+    source: &Path,
+    argv: &[String],
+    existing: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let Some(cwd) = context.native_execution_root() else { return Ok(Vec::new()); };
+    let layout = collect_sink_compile_header_inputs(context).await;
+    if let Some(header) = layout.generated.first() {
+        return Err(anyhow!("native execution namespace does not admit produced translation-unit/header input {} before post-producer dependency discovery", header.display()));
+    }
+    if let Some(registry) = &context.artifact_registry {
+        let registry = registry.lock().await;
+        for path in std::iter::once(source).chain(existing.iter().map(PathBuf::as_path)) {
+            if let Some(id) = registry.find_artifact_by_path(path, rush_action::ids::ConfigId::DEFAULT) {
+                let data = registry.artifact(id);
+                if !data.is_source || data.owner_action.is_some() || data.owner_action_declared.is_some() {
+                    return Err(anyhow!("native execution namespace does not admit produced translation-unit/header input {} before post-producer dependency discovery", path.display()));
+                }
+            }
+        }
+    }
+    let mut declared = layout.source;
+    declared.extend(layout.generated);
+    declared.extend_from_slice(existing);
+    namespace_compile_headers(source, argv, cwd, &declared)
+}
+
+async fn extend_runtime_namespace_inputs(
+    context: &BuildContext,
+    source: &Path,
+    command: &Command,
+    inputs: &mut Vec<ActionArtifact>,
+) -> Result<()> {
+    if context.native_execution_root().is_none() { return Ok(()); }
+    let existing: Vec<_> = inputs.iter().filter_map(|input| match input {
+        ActionArtifact::Source(path) => Some(path.clone()),
+        _ => None,
+    }).collect();
+    for header in runtime_namespace_headers(context, source, &command.args, &existing).await? {
+        let artifact = ActionArtifact::Source(header);
+        if !inputs.contains(&artifact) { inputs.push(artifact); }
+    }
+    Ok(())
+}
+
+async fn namespace_compile_spec(
+    context: &BuildContext,
+    source: &Path,
+    mut spec: rush_action::command_spec::NormalizedCommandSpec,
+) -> Result<rush_action::command_spec::NormalizedCommandSpec> {
+    if context.native_execution_root().is_none() { return Ok(spec); }
+    let headers = runtime_namespace_headers(context, source, &spec.argv, &spec.declared_inputs).await?;
+    for header in headers {
+        if !spec.declared_inputs.contains(&header) { spec.declared_inputs.push(header); }
+    }
+    spec.normalize();
+    Ok(spec)
+}
+
 #[cfg(test)]
 mod sink_header_input_tests {
     use super::*;
@@ -1569,14 +1949,14 @@ impl RuleInstance for CcLibraryInstance {
                 let gen_abs = context.output_dir.join("genfiles").join(&pkg).join(src);
                 if gen_abs.exists() {
                     src_path = gen_abs;
-                } else {
+                } else if context.native_execution_root().is_none() {
                     return None;
                 }
             }
             Some(src_path)
         };
-        let source_prune_enabled =
-            !context.materialize_static_libraries() && !context.dirty_paths().is_empty();
+        let source_prune_enabled = context.native_execution_root().is_none()
+            && !context.materialize_static_libraries() && !context.dirty_paths().is_empty();
         let source_prune_enabled = if source_prune_enabled {
             let compilable_sources: HashSet<PathBuf> = expanded_srcs
                 .iter()
@@ -1776,6 +2156,7 @@ impl RuleInstance for CcLibraryInstance {
         ctx: &mut crate::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
+        let native_working_dir = analysis_native_working_dir(ctx);
         use crate::providers::{DirectCcInfo, LinkFragment};
         use rush_action::ids::ArtifactKind;
         use std::path::Path;
@@ -2104,6 +2485,7 @@ impl RuleInstance for CcLibraryInstance {
                             src_path_check = gen_abs;
                             Some(aid)
                         }
+                        None if ctx.native_execution_root().is_some() => None,
                         None => continue,
                     }
                 };
@@ -2192,11 +2574,7 @@ impl RuleInstance for CcLibraryInstance {
                     .unwrap_or(false);
                 let compile_mnemonic =
                     if is_c_source { "CCompile" } else { "CppCompile" };
-                if let Ok(compile_id) = ctx.declare_action(
-                    compile_mnemonic,
-                    compile_inputs,
-                    vec![obj_aid],
-                ) {
+                {
                     // Phase 5.C.4 step 2b: assemble compile argv mirroring
                     // cc_library's compile_source at build time.
 
@@ -2368,6 +2746,9 @@ impl RuleInstance for CcLibraryInstance {
                     let selected_cxx = selected_cxx_for_source(Path::new(&src_path_str));
                     argv_strs.push(src_path_str);
 
+                    let Some(compile_id) = analysis_declare_compile(ctx, dep_providers,
+                        compile_mnemonic, compile_inputs, vec![obj_aid], &src_path_check, &argv_strs)
+                    else { continue; };
                     let exe_pid = if is_cuda_source {
                         ctx.intern_path(&cuda_device_compiler())
                     } else if is_gpu_source {
@@ -2389,7 +2770,7 @@ impl RuleInstance for CcLibraryInstance {
                             executable: exe_pid,
                             argv: argv.into_boxed_slice(),
                             env: Box::new([]),
-                            working_dir: None,
+                            working_dir: native_working_dir,
                             env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                         },
                     );
@@ -2462,7 +2843,7 @@ impl RuleInstance for CcLibraryInstance {
                         executable: ar_path,
                         argv: argv.into_boxed_slice(),
                         env: Box::new([]),
-                        working_dir: None,
+                        working_dir: native_working_dir,
                         env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                     },
                 );
@@ -2685,7 +3066,7 @@ impl RuleInstance for CcLibraryInstance {
                 let gen_abs = context.output_dir.join("genfiles").join(&pkg).join(src);
                 if gen_abs.exists() {
                     src_path = gen_abs;
-                } else {
+                } else if context.native_execution_root().is_none() {
                     continue;
                 }
             }
@@ -2770,7 +3151,7 @@ impl RuleInstance for CcLibraryInstance {
                     selected_cxx_for_source(&src_path)
                         .unwrap_or_else(|| context.toolchain.cxx.clone())
                 },
-                cwd: None,
+                cwd: context.native_execution_root().map(Path::to_path_buf),
                 is_c_source,
                 wants_no_rtti: deps_want_llvm_no_rtti(&self.deps),
                 src_path: src_path.clone(),
@@ -2805,12 +3186,22 @@ impl RuleInstance for CcLibraryInstance {
                 declared_output_paths: vec![obj_path.clone()],
                 toolchain_identity: None,
             };
+            let normalized = match namespace_compile_spec(context, &src_path,
+                compile.to_normalized_command_spec()).await {
+                Ok(spec) => spec,
+                Err(error) => {
+                    // PASS-A records an incomplete action; runtime repeats the
+                    // same check before any action id/cache lookup.
+                    eprintln!("native execution namespace header admission: {error:#}");
+                    return Vec::new();
+                }
+            };
             specs.push((
                 SchedulerActionKey {
                     mnemonic: compile.mnemonic.clone(),
                     primary_output_path: obj_path,
                 },
-                compile.to_normalized_command_spec(),
+                normalized,
             ));
         }
 
@@ -2822,7 +3213,7 @@ impl RuleInstance for CcLibraryInstance {
             let archive = CcArchiveCommandSpec {
                 mnemonic: "CcArchive".to_string(),
                 executable: context.toolchain.ar.clone(),
-                cwd: None,
+                cwd: context.native_execution_root().map(Path::to_path_buf),
                 lib_path: lib_path.clone(),
                 object_paths: object_paths.clone(),
                 declared_input_paths: object_paths.clone(),
@@ -3273,7 +3664,7 @@ impl CcLibraryInstance {
         let command = Command {
             executable,
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -3289,12 +3680,13 @@ impl CcLibraryInstance {
         // resolution cannot break the compile.
         let mut inputs = vec![ActionArtifact::Source(src_path.to_path_buf())];
         for hp in header_inputs {
-            if hp.exists() {
+            if context.native_execution_root().is_some() || hp.exists() {
                 inputs.push(ActionArtifact::Source(hp.clone()));
             }
         }
 
         // Compute action ID
+        extend_runtime_namespace_inputs(context, src_path, &command, &mut inputs).await?;
         let action_id = Action::compute_id(&inputs, &command, &HashMap::new())?;
         let outputs = vec![ActionArtifact::Source(obj_path.to_path_buf())];
 
@@ -3356,7 +3748,7 @@ impl CcLibraryInstance {
         let command = Command {
             executable: PathBuf::from("ar"),
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -4776,11 +5168,14 @@ impl RuleInstance for CcBinaryInstance {
             // Compile the source file
             let mut compile_header_inputs = header_inputs.generated.clone();
             compile_header_inputs.extend(owned_header_paths.iter().cloned());
-            compile_header_inputs
-                .extend(reachable_source_headers_for_sink_source(&src_path, &header_inputs));
+            if context.native_execution_root().is_none() {
+                compile_header_inputs
+                    .extend(reachable_source_headers_for_sink_source(&src_path, &header_inputs));
+            }
             compile_header_inputs.sort();
             compile_header_inputs.dedup();
-            if header_inputs.generated.is_empty()
+            if context.native_execution_root().is_none()
+                && header_inputs.generated.is_empty()
                 && owned_header_paths.is_empty()
                 && !context.dirty_paths().is_empty()
                 && obj_path.exists()
@@ -4841,6 +5236,7 @@ impl RuleInstance for CcBinaryInstance {
         ctx: &mut crate::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
+        let native_working_dir = analysis_native_working_dir(ctx);
         use rush_action::ids::ArtifactKind;
         use std::path::Path;
         if !self.srcs.is_empty() {
@@ -4987,8 +5383,6 @@ impl RuleInstance for CcBinaryInstance {
                     .unwrap_or(false);
                 let compile_mnemonic =
                     if is_c_source { "CCompile" } else { "CppCompile" };
-                if let Ok(compile_id) =
-                    ctx.declare_action(compile_mnemonic, compile_inputs, vec![obj_aid])
                 {
 
                     let pkg = ctx.package();
@@ -5144,6 +5538,9 @@ impl RuleInstance for CcBinaryInstance {
                     argv_strs.push(obj_path_str);
                     argv_strs.push(src_path_str);
 
+                    let Some(compile_id) = analysis_declare_compile(ctx, dep_providers,
+                        compile_mnemonic, compile_inputs, vec![obj_aid], &src_abs_for_reg, &argv_strs)
+                    else { continue; };
                     let exe_pid = if is_cuda_source {
                         ctx.intern_path(&cuda_device_compiler())
                     } else if is_gpu_source {
@@ -5163,7 +5560,7 @@ impl RuleInstance for CcBinaryInstance {
                             executable: exe_pid,
                             argv: argv.into_boxed_slice(),
                             env: Box::new([]),
-                            working_dir: None,
+                            working_dir: native_working_dir,
                             env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                         },
                     );
@@ -5361,7 +5758,7 @@ impl RuleInstance for CcBinaryInstance {
                                 executable: exe_pid,
                                 argv: argv.into_boxed_slice(),
                                 env: Box::new([]),
-                                working_dir: None,
+                                working_dir: native_working_dir,
                                 env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                             },
                         );
@@ -5656,7 +6053,7 @@ impl RuleInstance for CcBinaryInstance {
                 } else {
                     context.toolchain.cxx.clone()
                 },
-                cwd: None,
+                cwd: context.native_execution_root().map(Path::to_path_buf),
                 is_c_source,
                 wants_no_rtti: deps_want_llvm_no_rtti(&self.deps),
                 src_path: src_path.clone(),
@@ -5692,12 +6089,22 @@ impl RuleInstance for CcBinaryInstance {
                 declared_output_paths: vec![obj_path.clone()],
                 toolchain_identity: None,
             };
+            let normalized = match namespace_compile_spec(context, &src_path,
+                compile.to_normalized_command_spec()).await {
+                Ok(spec) => spec,
+                Err(error) => {
+                    // PASS-A records an incomplete action; runtime repeats the
+                    // same check before any action id/cache lookup.
+                    eprintln!("native execution namespace header admission: {error:#}");
+                    return Vec::new();
+                }
+            };
             specs.push((
                 SchedulerActionKey {
                     mnemonic: compile.mnemonic.clone(),
                     primary_output_path: obj_path,
                 },
-                compile.to_normalized_command_spec(),
+                normalized,
             ));
         }
 
@@ -5719,7 +6126,7 @@ impl RuleInstance for CcBinaryInstance {
         let link = CcLinkCommandSpec {
             mnemonic: "CcLink".to_string(),
             executable: context.toolchain.cxx.clone(),
-            cwd: None,
+            cwd: context.native_execution_root().map(Path::to_path_buf),
             object_paths: object_paths.clone(),
             driver_flags: cc_binary_link_driver_flags(
                 &object_paths,
@@ -5976,7 +6383,7 @@ impl CcBinaryInstance {
         let command = Command {
             executable: context.toolchain.cxx.clone(),
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -5993,6 +6400,7 @@ impl CcBinaryInstance {
         }
 
         // Compute action ID
+        extend_runtime_namespace_inputs(context, src_path, &command, &mut inputs).await?;
         let action_id = Action::compute_id(&inputs, &command, &HashMap::new())?;
         let outputs = vec![ActionArtifact::Source(obj_path.to_path_buf())];
 
@@ -6276,7 +6684,7 @@ impl CcBinaryInstance {
         let command = Command {
             executable: context.toolchain.cxx.clone(),
             args: spawn_argv,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
         let action_id = Action::compute_id(&inputs, &command, &action_env)?;
@@ -6307,6 +6715,13 @@ impl CcBinaryInstance {
 mod cc_binary_response_tests {
     use super::*;
     use crate::analysis_context::{AnalysisContext, StubIncludeResolver};
+
+    async fn with_namespace_header_tracking<T>(root: &Path, future: impl std::future::Future<Output = T>) -> T {
+        let io = rush_incremental::tracked::test_scope(root, rush_incremental::tracked::current_required);
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| rush_incremental::tracked::scope(io.clone(), ||
+            std::future::Future::poll(future.as_mut(), cx))).await
+    }
     use crate::context::{ActionManager, Toolchain};
     use crate::nested_set::NestedSet;
     use crate::providers::{DefaultInfo, DirectCcInfo, FilesInfo};
@@ -6523,6 +6938,373 @@ mod cc_binary_response_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_execution_root_cpp_relative_flags_use_main_namespace() {
+        use rush_action::command_spec::NormalizedCommandSpec;
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("external-source");
+        let execution_root = temp.path().join("main-execution");
+        let includes = execution_root.join("namespace-headers");
+        let libraries = execution_root.join("namespace-libraries");
+        for path in [&source_root, &includes, &libraries] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let header = includes.join("namespace_value.h");
+        std::fs::write(&header, "#define NAMESPACE_VALUE 42\n").unwrap();
+        let source = source_root.join("value.cc");
+        std::fs::write(&source, "#include \"namespace_value.h\"\nint namespace_value() { return NAMESPACE_VALUE; }\n").unwrap();
+        let main = source_root.join("main.cc");
+        std::fs::write(&main, "int namespace_value();\nint main() { return namespace_value(); }\n").unwrap();
+
+        with_namespace_header_tracking(temp.path(), async {
+        for namespaced in [false, true] {
+            let native_root = namespaced.then(|| execution_root.clone());
+            let output = temp.path().join(if namespaced { "owned-output" } else { "legacy-output" });
+            std::fs::create_dir_all(&output).unwrap();
+            let include_flag = if namespaced { "-Inamespace-headers".into() }
+                else { format!("-I{}", includes.display()) };
+            let search_flag = if namespaced { "-Lnamespace-libraries".into() }
+                else { format!("-L{}", libraries.display()) };
+            let support_name = if namespaced { "namespace_owned" } else { "namespace_legacy" };
+            let mut library = library_with_compile_options("value.cc", vec![include_flag]);
+            library.hdrs.push(header.display().to_string());
+            let binary = CcBinaryInstance {
+                header_inputs_cache: Default::default(),
+                name: "caller".into(), srcs: vec!["main.cc".into()],
+                deps: vec!["//:support".into()], copts: Vec::new(),
+                linkopts: vec![search_flag, format!("-l{support_name}")],
+                linkshared: false, defines: Vec::new(), data: Vec::new(),
+            };
+            let toolchain = Toolchain::default();
+            // PASS-A and native specs must retain the same cwd before their
+            // command/key consumers, including archive and link actions.
+            for rule in [&library as &dyn RuleInstance, &binary as &dyn RuleInstance] {
+                let mut registry = ArtifactRegistry::new();
+                let resolver = StubIncludeResolver::new(source_root.clone());
+                let extra = Vec::new();
+                {
+                    let mut analysis = AnalysisContext::new(TargetId(1), ConfigId::DEFAULT,
+                        "", None, &output, &mut registry, &resolver, &toolchain,
+                        &source_root, &extra).with_native_execution_root(native_root.as_deref());
+                    let _ = rule.analyze(&mut analysis, &[]);
+                }
+                let scheduler: Vec<_> = registry.declared_actions()
+                    .filter_map(|(id, _)| NormalizedCommandSpec::from_registry_action(&registry, id))
+                    .collect();
+                assert_eq!(scheduler.len(), 2, "fixture must declare compile plus link/archive");
+                for spec in &scheduler { assert_eq!(spec.cwd.as_deref(), native_root.as_deref()); }
+                let context = BuildContext::new(source_root.clone(), output.clone())
+                    .with_toolchain(toolchain.clone())
+                    .with_native_execution_root(native_root.clone())
+                    .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)));
+                let specs = rule.build_legacy_command_specs(&context).await;
+                assert_eq!(specs.len(), 2);
+                for (_, spec) in &specs { assert_eq!(spec.cwd.as_deref(), native_root.as_deref()); }
+                let scheduler_compile: Vec<_> = scheduler.into_iter()
+                    .filter(|spec| spec.mnemonic == "CppCompile").collect();
+                let spec_compile: Vec<_> = specs.into_iter().map(|(_, spec)| spec)
+                    .filter(|spec| spec.mnemonic == "CppCompile").collect();
+                assert_eq!(scheduler_compile, spec_compile);
+            }
+
+            let manager = Arc::new(RecordingExecutingActionManager::default());
+            let mut context = BuildContext::new(source_root.clone(), output.clone())
+                .with_toolchain(toolchain)
+                .with_native_execution_root(native_root.clone())
+                .with_action_manager(manager.clone());
+            assert_eq!(context.workspace_root, source_root, "source ownership must not become execution cwd");
+            let object = output.join("value.o");
+            library.compile_source(&context, &source, &object, &[header.clone()]).await.unwrap();
+            let archive = libraries.join(format!("lib{support_name}.a"));
+            library.create_static_library(&context, &[object], &archive).await.unwrap();
+            // Declare the actual library bytes even though the link also uses
+            // relative -L/-l flags, so the test does not hide a missing input.
+            context = context.with_dependencies(HashMap::from([("//:support".into(),
+                NestedSet::new(vec![Artifact { path: archive.clone(),
+                    artifact_type: ArtifactType::StaticLibrary }], Vec::new()))]), Vec::new());
+            let main_object = output.join("main.o");
+            binary.compile_source(&context, &main, &main_object, &[], &[]).await.unwrap();
+            let executable = output.join("caller");
+            binary.link_binary(&context, &[main_object], &executable).await.unwrap();
+            assert_eq!(std::process::Command::new(&executable).status().unwrap().code(), Some(42));
+            let actions = manager.actions.lock().unwrap();
+            assert_eq!(actions.len(), 4);
+            for action in actions.iter() {
+                assert_eq!(action.command.working_dir.as_deref(), native_root.as_deref());
+                if namespaced {
+                    let mut without_cwd = action.command.clone();
+                    without_cwd.working_dir = None;
+                    assert_ne!(action.id, Action::compute_id(&action.inputs, &without_cwd, &action.env).unwrap(),
+                        "execution cwd must already participate in the action identity");
+                }
+            }
+        }
+        }).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn namespace_header_closure_tracks_raw_search_roots_and_retargets() {
+        use rush_action::command_spec::NormalizedCommandSpec;
+        use rush_incremental::{tracked, Dependency};
+        for flags in [vec!["-Iraw"], vec!["-iquote", "raw"], vec!["-isystemraw"]] {
+            let temp = tempfile::tempdir().unwrap();
+            let source_root = temp.path().join("source");
+            let execution_root = temp.path().join("main");
+            let output = temp.path().join("out");
+            for path in [&source_root, &execution_root.join("raw/api/detail"), &output] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let source = source_root.join("main.cc");
+            let first = source_root.join("exported.h");
+            let second = source_root.join("different-name.h");
+            let value = source_root.join("value.h");
+            let private = source_root.join("private.h");
+            std::fs::write(&source, "#include \"api/public.h\"\nint main() { return VALUE; }\n").unwrap();
+            let header_body = "#include \"detail/value.h\"\n#define VALUE BASE_VALUE\n";
+            std::fs::write(&first, header_body).unwrap();
+            std::fs::write(&second, header_body).unwrap();
+            std::fs::write(&value, "#define BASE_VALUE 42\n").unwrap();
+            std::fs::write(&private, "#define UNRELATED 1\n").unwrap();
+            let alias = execution_root.join("raw/api/public.h");
+            std::os::unix::fs::symlink(&first, &alias).unwrap();
+            std::os::unix::fs::symlink(&value, execution_root.join("raw/api/detail/value.h")).unwrap();
+            let angle_comment = execution_root.join("raw/star/*hidden*/value.h");
+            std::fs::create_dir_all(angle_comment.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&first, &angle_comment).unwrap();
+            let mut registry = ArtifactRegistry::new();
+            let headers = [&first, &second, &value, &private].into_iter().map(|path| {
+                let exec_path = registry.intern_path(path);
+                registry.intern_artifact(ArtifactKey { config: ConfigId::DEFAULT, exec_path },
+                    ArtifactKind::Header, true, TargetId(2), None)
+            }).collect();
+            let cc = CcInfo::from_direct_and_deps(DirectCcInfo { headers, ..Default::default() }, std::iter::empty());
+            let provider = Arc::new(ProviderSet::empty().with_cc_info(cc));
+            let mut binary = binary_with_linkopt(String::new());
+            binary.linkopts.clear();
+            binary.srcs = vec!["main.cc".into()];
+            binary.deps = vec!["//:api".into()];
+            binary.copts = flags.into_iter().map(str::to_string).collect();
+            let admitted_copts = binary.copts.clone();
+            let mut toolchain = Toolchain::default();
+            toolchain.cxxflags.extend(["-iquote".into(), "earlier".into()]);
+            let manager = Arc::new(CachingExecutingActionManager::default());
+            let labeled = vec![("//:api".into(), provider.clone())];
+            let io = tracked::test_scope(temp.path(), tracked::current_required);
+            let scheduler = tracked::scope(io.clone(), || {
+                let resolver = StubIncludeResolver::new(source_root.clone());
+                let extra = Vec::new();
+                let mut analysis = AnalysisContext::new(TargetId(1), ConfigId::DEFAULT,
+                    "", None, &output, &mut registry, &resolver, &toolchain, &source_root, &extra)
+                    .with_native_execution_root(Some(&execution_root)).with_labeled_dep_providers(&labeled);
+                let _ = binary.analyze(&mut analysis, &[provider.clone()]);
+                registry.declared_actions().filter_map(|(id, _)|
+                    NormalizedCommandSpec::from_registry_action(&registry, id))
+                    .find(|spec| spec.mnemonic == "CppCompile").expect("admitted scheduler compile")
+            });
+            assert!(scheduler.declared_inputs.contains(&first));
+            assert!(scheduler.declared_inputs.contains(&value));
+            assert!(!scheduler.declared_inputs.contains(&private));
+            let mut context = BuildContext::new(source_root.clone(), output.clone())
+                .with_toolchain(toolchain).with_native_execution_root(Some(execution_root.clone()))
+                .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+                .with_action_manager(manager.clone());
+            context.dependency_providers.insert("//:api".into(), (*provider).clone());
+            context.dependency_providers_ordered = labeled.iter().map(|(name, provider)|
+                (name.clone(), (**provider).clone())).collect();
+            let mut future = std::pin::pin!(async {
+                let specs = binary.build_legacy_command_specs(&context).await;
+                let spec = specs.into_iter().map(|(_, spec)| spec)
+                    .find(|spec| spec.mnemonic == "CppCompile").unwrap();
+                assert_eq!(scheduler, spec, "PASS-A and spec must declare the same selected headers");
+                let object = output.join("main.o");
+                let executable = output.join("tool");
+                let mut initial_id = None;
+                for stage in 0..6 {
+                    match stage {
+                        2 => std::fs::write(&private, "#define UNRELATED 2\n").unwrap(),
+                        3 => { std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&second, &alias).unwrap(); },
+                        4 => std::fs::write(&second, "#include \"detail/value.h\"\n#define VALUE (BASE_VALUE + 1)\n").unwrap(),
+                        5 => { std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&first, &alias).unwrap(); },
+                        _ => {},
+                    }
+                    binary.compile_source(&context, &source, &object, &[], &[]).await.unwrap();
+                    binary.link_binary(&context, &[object.clone()], &executable).await.unwrap();
+                    assert_eq!(std::process::Command::new(&executable).status().unwrap().code(), Some(if stage == 4 { 43 } else { 42 }));
+                    let requests = manager.requests.lock().unwrap();
+                    let (compile, hit) = &requests[stage * 2];
+                    assert_eq!(*hit, matches!(stage, 1 | 2 | 3), "real compiler cache decision at stage {stage}");
+                    let chosen = if matches!(stage, 3 | 4) { &second } else { &first };
+                    let other = if chosen == &first { &second } else { &first };
+                    assert!(compile.inputs.contains(&ActionArtifact::Source(chosen.clone())));
+                    assert!(compile.inputs.contains(&ActionArtifact::Source(value.clone())));
+                    assert!(!compile.inputs.contains(&ActionArtifact::Source(other.clone())));
+                    assert!(!compile.inputs.contains(&ActionArtifact::Source(private.clone())));
+                    if stage == 0 { initial_id = Some(compile.id.clone()); }
+                    if stage == 3 { assert_eq!(Some(compile.id.clone()), initial_id, "equal-byte alias retarget preserves content identity"); }
+                    if stage == 4 { assert_ne!(Some(compile.id.clone()), initial_id); }
+                }
+                // Real outputs/cache entries exist. Refusal must happen before
+                // the manager sees an action, preserving those exact bytes.
+                let before = std::fs::read(&executable).unwrap();
+                let requests = manager.requests.lock().unwrap().len();
+                let original = std::fs::read(&source).unwrap();
+                for body in ["#define HEADER \"api/public.h\"\n#include HEADER\nint main(){return VALUE;}\n",
+                    "#include <star/*hidden*/value.h>\nint main(){return VALUE;}\n",
+                    "#if __has_include(\"api/optional.h\")\nint main(){return 43;}\n#else\nint main(){return 42;}\n#endif\n",
+                    "#define CAT(a,b) a##b\n#if CAT(__has_,include)(\"api/optional.h\")\nint main(){return 43;}\n#else\nint main(){return 42;}\n#endif\n",
+                    "asm(\".incbin \\\"raw/bytes\\\"\");\nint main(){return 42;}\n",
+                    "#include_next \"api/public.h\"\nint main(){return 0;}\n"] {
+                    std::fs::write(&source, body).unwrap();
+                    let error = binary.compile_source(&context, &source, &object, &[], &[]).await.unwrap_err();
+                    assert!(format!("{error:#}").contains("does not admit"));
+                    if body.contains("__has_include") || body.contains("CAT(__has_,include)") {
+                        let optional = execution_root.join("raw/api/optional.h");
+                        std::os::unix::fs::symlink(&first, &optional).unwrap();
+                        assert!(binary.compile_source(&context, &source, &object, &[], &[]).await.is_err(),
+                            "availability predicates remain refused after a declared header alias appears");
+                        std::fs::remove_file(optional).unwrap();
+                    }
+                    assert_eq!(manager.requests.lock().unwrap().len(), requests);
+                    assert_eq!(std::fs::read(&executable).unwrap(), before);
+                }
+                let mut refused_registry = ArtifactRegistry::new();
+                let resolver = StubIncludeResolver::new(source_root.clone());
+                let extra = Vec::new();
+                let mut refused = AnalysisContext::new(TargetId(3), ConfigId::DEFAULT,
+                    "", None, &output, &mut refused_registry, &resolver, &context.toolchain,
+                    &source_root, &extra).with_native_execution_root(Some(&execution_root));
+                let _ = binary.analyze(&mut refused, &[]);
+                assert!(refused.native_namespace_analysis_error().is_some(),
+                    "incomplete alone must not permit an unproved runtime retry");
+                assert!(refused_registry.declared_actions().any(|(_, action)| matches!(&action.status,
+                    rush_action::ids::ActionDeclarationStatus::Incomplete { reason }
+                    if reason.contains("header admission"))));
+                std::fs::write(&source, &original).unwrap();
+                let before_object = std::fs::read(&object).unwrap();
+                for unsupported in [vec!["@options.rsp"], vec!["--sysroot=/unknown"],
+                    vec!["-dumpbase", "-Ifake", "-Iraw"], vec!["-dumpbase-ext", "-Ifake", "-Iraw"],
+                    vec!["-dumpdir", "-Ifake", "-Iraw"], vec!["--dumpbase", "-Ifake", "-Iraw"],
+                    vec!["--dumpbase-ext", "-Ifake", "-Iraw"], vec!["--dumpdir", "-Ifake", "-Iraw"],
+                    vec!["-dumpbase=ignored", "-Iraw"], vec!["-dumpbase-ext=ignored", "-Iraw"],
+                    vec!["-dumpdir=ignored", "-Iraw"], vec!["--dumpbase=ignored", "-Iraw"],
+                    vec!["--dumpbase-ext=ignored", "-Iraw"], vec!["--dumpdir=ignored", "-Iraw"],
+                    vec!["-Xassembler", "-Ifake", "-Iraw"], vec!["-Xlinker", "-Ifake", "-Iraw"],
+                    vec!["-MF", "-Ifake", "-Iraw"], vec!["-MT", "-Ifake", "-Iraw"],
+                    vec!["-MQ", "-Ifake", "-Iraw"], vec!["-x", "assembler-with-cpp"], vec!["-xassembler"]] {
+                    binary.copts = unsupported.into_iter().map(str::to_string).collect();
+                    assert!(binary.compile_source(&context, &source, &object, &[], &[]).await.is_err());
+                    assert_eq!(manager.requests.lock().unwrap().len(), requests);
+                    assert_eq!(std::fs::read(&object).unwrap(), before_object);
+                    assert_eq!(std::fs::read(&executable).unwrap(), before);
+                }
+                binary.copts = admitted_copts.clone();
+                let assembly = source_root.join("main.S");
+                std::fs::write(&assembly, ".include \"raw/extra.inc\"\n").unwrap();
+                let error = binary.compile_source(&context, &assembly, &object, &[], &[]).await.unwrap_err();
+                assert!(format!("{error:#}").contains("assembler translation units"));
+                // A real PCH is generated by the selected compiler. Its mere
+                // appearance must invalidate negative lookup observations and
+                // refuse before a previously successful cached compile/link.
+                let pch = execution_root.join("raw/api/public.h.gch");
+                let generated = std::process::Command::new(&context.toolchain.cxx)
+                    .args(["-x", "c++-header", "-o"]).arg(&pch).arg(&alias)
+                    .current_dir(&execution_root).output().unwrap();
+                assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+                let pch_bytes = std::fs::read(&pch).unwrap();
+                assert!(!pch_bytes.is_empty());
+                let error = binary.compile_source(&context, &source, &object, &[], &[]).await.unwrap_err();
+                assert!(format!("{error:#}").contains("automatic precompiled header"));
+                std::fs::remove_file(&pch).unwrap();
+                for candidate in [execution_root.join("earlier/api/public.h.gch"),
+                    execution_root.join("raw/api/detail/value.h.gch")] {
+                    std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+                    std::fs::write(&candidate, &pch_bytes).unwrap();
+                    assert!(format!("{:#}", binary.compile_source(&context, &source, &object, &[], &[])
+                        .await.unwrap_err()).contains("automatic precompiled header"));
+                    std::fs::remove_file(candidate).unwrap();
+                }
+                std::fs::create_dir(&pch).unwrap();
+                std::fs::write(pch.join("variant"), &pch_bytes).unwrap();
+                assert!(binary.compile_source(&context, &source, &object, &[], &[]).await.is_err());
+                std::fs::remove_dir_all(&pch).unwrap();
+                let pch_store = execution_root.join("actual.pch");
+                std::fs::write(&pch_store, &pch_bytes).unwrap();
+                std::os::unix::fs::symlink(&pch_store, &pch).unwrap();
+                binary.copts.extend(["-include".into(), "api/public.h".into()]);
+                assert!(binary.compile_source(&context, &source, &object, &[], &[]).await.is_err());
+                std::fs::remove_file(&pch).unwrap();
+                binary.copts = admitted_copts.clone();
+                assert_eq!(manager.requests.lock().unwrap().len(), requests);
+                assert_eq!(std::fs::read(&executable).unwrap(), before);
+                let shadow = execution_root.join("earlier/api/public.h");
+                std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+                std::fs::write(&shadow, "#define VALUE 99\n").unwrap();
+                let error = binary.compile_source(&context, &source, &object, &[], &[]).await.unwrap_err();
+                assert!(format!("{error:#}").contains("selected undeclared header"));
+                assert_eq!(manager.requests.lock().unwrap().len(), requests);
+                assert_eq!(std::fs::read(&executable).unwrap(), before);
+                // Old files are real successful compiler inputs/outputs above.
+                // A newly declared producer still makes the TU/header proof
+                // invalid before it can be rerun or a snapshot adopted.
+                for produced_tu in [false, true] {
+                    let mut produced_registry = ArtifactRegistry::new();
+                    let resolver = StubIncludeResolver::new(source_root.clone());
+                    let extra = Vec::new();
+                    let generated_path = if produced_tu { &source } else { &first };
+                    {
+                        let mut producer = AnalysisContext::new(TargetId(9), ConfigId::DEFAULT,
+                            "", None, &output, &mut produced_registry, &resolver, &context.toolchain,
+                            &source_root, &extra);
+                        let generated = producer.register_generated_artifact(generated_path,
+                            if produced_tu { ArtifactKind::Generated } else { ArtifactKind::Header }, None);
+                        producer.declare_action("Genrule", Vec::new(), vec![generated]).unwrap();
+                    }
+                    let header_ids = [&first, &second, &value, &private].into_iter().map(|path| {
+                        let exec_path = produced_registry.intern_path(path);
+                        produced_registry.intern_artifact(ArtifactKey { config: ConfigId::DEFAULT, exec_path },
+                            ArtifactKind::Header, true, TargetId(2), None)
+                    }).collect();
+                    let generated_provider = ProviderSet::empty().with_cc_info(CcInfo::from_direct_and_deps(
+                        DirectCcInfo { headers: header_ids, ..Default::default() }, std::iter::empty()));
+                    let generated_labeled = vec![("//:api".into(), Arc::new(generated_provider.clone()))];
+                    {
+                        let mut analysis = AnalysisContext::new(TargetId(1), ConfigId::DEFAULT,
+                            "", None, &output, &mut produced_registry, &resolver, &context.toolchain,
+                            &source_root, &extra).with_native_execution_root(Some(&execution_root))
+                            .with_labeled_dep_providers(&generated_labeled);
+                        let _ = binary.analyze(&mut analysis, &[generated_labeled[0].1.clone()]);
+                        assert!(analysis.native_namespace_analysis_error().is_some_and(|error|
+                            error.contains("produced translation-unit/header input")),
+                            "existing generated bytes cannot authorize PASS-A (produced_tu={produced_tu})");
+                    }
+                    let mut generated_context = BuildContext::new(source_root.clone(), output.clone())
+                        .with_toolchain((*context.toolchain).clone())
+                        .with_native_execution_root(Some(execution_root.clone()))
+                        .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(produced_registry)))
+                        .with_action_manager(manager.clone());
+                    generated_context.dependency_providers.insert("//:api".into(), generated_provider.clone());
+                    generated_context.dependency_providers_ordered = vec![("//:api".into(), generated_provider)];
+                    let error = binary.compile_source(&generated_context, &source, &object, &[], &[]).await.unwrap_err();
+                    assert!(format!("{error:#}").contains("produced translation-unit/header input"));
+                    assert_eq!(manager.requests.lock().unwrap().len(), requests);
+                    assert_eq!(std::fs::read(&executable).unwrap(), before);
+                }
+            });
+            std::future::poll_fn(|cx| tracked::scope(io.clone(), ||
+                std::future::Future::poll(future.as_mut(), cx))).await;
+            let manifest = io.manifest();
+            assert!(manifest.deps().iter().any(|dep| matches!(dep,
+                Dependency::FileExistence { path, exists: false, .. } if path == &execution_root.join("earlier"))));
+            assert!(manifest.deps().iter().any(|dep| matches!(dep,
+                Dependency::Symlink { path, .. } if path == &alias)));
+            assert!(manifest.deps().iter().any(|dep| matches!(dep,
+                Dependency::FileExistence { path, exists: false, .. }
+                if path == &execution_root.join("raw/api/public.h.gch"))));
+        }
+    }
+
     #[derive(Default)]
     struct CapturingActionManager {
         actions: Mutex<Vec<Action>>,
@@ -6533,6 +7315,38 @@ mod cc_binary_response_tests {
     #[derive(Default)]
     struct RecordingExecutingActionManager {
         actions: Mutex<Vec<Action>>,
+    }
+
+    #[derive(Default)]
+    struct CachingExecutingActionManager {
+        executor: RecordingExecutingActionManager,
+        entries: Mutex<HashMap<rush_action::ActionId, (ActionResult, Vec<(PathBuf, Vec<u8>)>)>>,
+        requests: Mutex<Vec<(Action, bool)>>,
+    }
+
+    #[async_trait]
+    impl ActionManager for CachingExecutingActionManager {
+        async fn execute(&self, action: Action) -> Result<ActionResult> {
+            assert_eq!(action.id, Action::compute_id(&action.inputs, &action.command, &action.env)?);
+            let saved = self.entries.lock().unwrap().get(&action.id).cloned();
+            if let Some((mut result, outputs)) = saved {
+                if outputs.iter().all(|(path, bytes)| std::fs::read(path).ok().as_ref() == Some(bytes)) {
+                    result.cached = true;
+                    self.requests.lock().unwrap().push((action, true));
+                    return Ok(result);
+                }
+            }
+            let result = self.executor.execute(action.clone()).await?;
+            if result.exit_code == 0 {
+                let outputs = action.outputs.iter().map(|output| match output {
+                    ActionArtifact::Source(path) => Ok((path.clone(), std::fs::read(path)?)),
+                    _ => Err(anyhow!("real compiler fixture requires physical outputs")),
+                }).collect::<Result<Vec<_>>>()?;
+                self.entries.lock().unwrap().insert(action.id.clone(), (result.clone(), outputs));
+            }
+            self.requests.lock().unwrap().push((action, false));
+            Ok(result)
+        }
     }
 
     #[async_trait]
@@ -8867,9 +9681,12 @@ impl RuleInstance for CcTestInstance {
 
             // Compile the source file
             let mut compile_header_inputs = header_inputs.generated.clone();
-            compile_header_inputs
-                .extend(reachable_source_headers_for_sink_source(&src_path, &header_inputs));
-            if header_inputs.generated.is_empty()
+            if context.native_execution_root().is_none() {
+                compile_header_inputs
+                    .extend(reachable_source_headers_for_sink_source(&src_path, &header_inputs));
+            }
+            if context.native_execution_root().is_none()
+                && header_inputs.generated.is_empty()
                 && !context.dirty_paths().is_empty()
                 && obj_path.exists()
                 && !context.path_is_dirty(&src_path)
@@ -8912,6 +9729,7 @@ impl RuleInstance for CcTestInstance {
         ctx: &mut crate::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
+        let native_working_dir = analysis_native_working_dir(ctx);
         use rush_action::ids::ArtifactKind;
         use std::path::Path;
         if !self.srcs.is_empty() {
@@ -9041,11 +9859,7 @@ impl RuleInstance for CcTestInstance {
                 obj_artifacts.push(obj_aid);
                 let mut compile_inputs = vec![src_aid];
                 compile_inputs.extend(generated_header_inputs.iter().copied());
-                if let Ok(compile_id) = ctx.declare_action(
-                    "CppCompile",
-                    compile_inputs,
-                    vec![obj_aid],
-                ) {
+                {
                     let pkg = ctx.package();
                     let src_path_abs = if pkg.is_empty() {
                         ctx.workspace_root().join(src)
@@ -9075,6 +9889,9 @@ impl RuleInstance for CcTestInstance {
                     argv_strs.push("-o".to_string());
                     argv_strs.push(obj_path_str);
 
+                    let Some(compile_id) = analysis_declare_compile(ctx, dep_providers,
+                        "CppCompile", compile_inputs, vec![obj_aid], &src_abs_for_reg, &argv_strs)
+                    else { continue; };
                     let exe_pid = ctx.intern_path(&cxx_pathbuf);
                     let argv: Vec<rush_action::ids::StringId> = argv_strs
                         .iter()
@@ -9086,7 +9903,7 @@ impl RuleInstance for CcTestInstance {
                             executable: exe_pid,
                             argv: argv.into_boxed_slice(),
                             env: Box::new([]),
-                            working_dir: None,
+                            working_dir: native_working_dir,
                             env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                         },
                     );
@@ -9146,7 +9963,7 @@ impl RuleInstance for CcTestInstance {
                         executable: exe_pid,
                         argv: argv.into_boxed_slice(),
                         env: Box::new([]),
-                        working_dir: None,
+                        working_dir: native_working_dir,
                         env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                     },
                 );
@@ -9323,7 +10140,15 @@ impl RuleInstance for CcTestInstance {
                 src_path.clone(),
                 obj_path.clone(),
                 compile_inputs,
+                context.native_execution_root().map(Path::to_path_buf),
             );
+            let spec = match namespace_compile_spec(context, &src_path, spec).await {
+                Ok(spec) => spec,
+                Err(error) => {
+                    eprintln!("native execution namespace header admission: {error:#}");
+                    return Vec::new();
+                }
+            };
             specs.push((
                 SchedulerActionKey {
                     mnemonic: "CppCompile".to_string(),
@@ -9358,7 +10183,7 @@ impl RuleInstance for CcTestInstance {
         let mut link_spec = NormalizedCommandSpec {
             mnemonic: "CcLink".to_string(),
             executable: context.toolchain.cxx.clone(),
-            cwd: None,
+            cwd: context.native_execution_root().map(Path::to_path_buf),
             argv: link_argv,
             env: Vec::new(),
             declared_inputs: link_declared_inputs,
@@ -9498,7 +10323,7 @@ impl CcTestInstance {
                 context.toolchain.cxx.clone()
             },
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -9508,12 +10333,13 @@ impl CcTestInstance {
         // sink key, avoiding root object misses on private header edits.
         let mut inputs = vec![ActionArtifact::Source(src_path.to_path_buf())];
         for hp in header_inputs {
-            if hp.exists() {
+            if context.native_execution_root().is_some() || hp.exists() {
                 inputs.push(ActionArtifact::Source(hp.clone()));
             }
         }
 
         // Compute action ID
+        extend_runtime_namespace_inputs(context, src_path, &command, &mut inputs).await?;
         let action_id = Action::compute_id(&inputs, &command, &HashMap::new())?;
         let outputs = vec![ActionArtifact::Source(obj_path.to_path_buf())];
 
@@ -9765,7 +10591,7 @@ impl CcTestInstance {
         let command = Command {
             executable: context.toolchain.cxx.clone(),
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -10380,6 +11206,7 @@ impl RuleInstance for CcProtoLibraryInstance {
         ctx: &mut crate::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
+        let native_working_dir = analysis_native_working_dir(ctx);
         use rush_action::ids::{ArtifactId, ArtifactKind, ExecutableAction, StringId};
         use std::path::Path;
 
@@ -10614,7 +11441,7 @@ impl RuleInstance for CcProtoLibraryInstance {
                                 executable: exe_pid,
                                 argv: argv.into_boxed_slice(),
                                 env: Box::new([]),
-                                working_dir: None,
+                                working_dir: native_working_dir,
                                 env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                             },
                         );
@@ -10636,11 +11463,7 @@ impl RuleInstance for CcProtoLibraryInstance {
                     let cxxflags: Vec<String> = ctx.toolchain().cxxflags.clone();
                     let cxx_pathbuf = ctx.toolchain().cxx.clone();
 
-                    if let Ok(compile_id) = ctx.declare_action(
-                        "CppCompile",
-                        vec![pb_cc_aid, pb_h_aid],
-                        vec![obj_aid],
-                    ) {
+                    {
                         let mut argv_strs: Vec<String> = Vec::new();
                         argv_strs.push("-c".to_string());
                         argv_strs.push("-fPIC".to_string());
@@ -10683,6 +11506,9 @@ impl RuleInstance for CcProtoLibraryInstance {
                         argv_strs.push(obj_abs.display().to_string());
                         argv_strs.push(pb_cc_abs.display().to_string());
 
+                        let Some(compile_id) = analysis_declare_compile(ctx, dep_providers,
+                            "CppCompile", vec![pb_cc_aid, pb_h_aid], vec![obj_aid], &pb_cc_abs, &argv_strs)
+                        else { continue; };
                         let exe_pid = ctx.intern_path(&cxx_pathbuf);
                         let argv: Vec<StringId> = argv_strs
                             .iter()
@@ -10694,7 +11520,7 @@ impl RuleInstance for CcProtoLibraryInstance {
                                 executable: exe_pid,
                                 argv: argv.into_boxed_slice(),
                                 env: Box::new([]),
-                                working_dir: None,
+                                working_dir: native_working_dir,
                                 env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                             },
                         );
@@ -10741,7 +11567,7 @@ impl RuleInstance for CcProtoLibraryInstance {
                         executable: ar_path,
                         argv: argv.into_boxed_slice(),
                         env: Box::new([]),
-                        working_dir: None,
+                        working_dir: native_working_dir,
                         env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
                     },
                 );
@@ -10878,7 +11704,7 @@ impl RuleInstance for CcProtoLibraryInstance {
             let mut protoc_spec = NormalizedCommandSpec {
                 mnemonic: "ProtocCompile".to_string(),
                 executable: PathBuf::from("protoc"),
-                cwd: None,
+                cwd: context.native_execution_root().map(Path::to_path_buf),
                 argv,
                 env: Vec::new(),
                 declared_inputs: vec![proto_file.clone()],
@@ -10909,13 +11735,22 @@ impl RuleInstance for CcProtoLibraryInstance {
                 obj_path.clone(),
                 vec![pb_cc.clone(), pb_h.clone()],
                 genfiles_dir.clone(),
+                context.native_execution_root().map(Path::to_path_buf),
             );
+            let normalized = match namespace_compile_spec(context, &pb_cc,
+                compile.to_normalized_command_spec()).await {
+                Ok(spec) => spec,
+                Err(error) => {
+                    eprintln!("native execution namespace header admission: {error:#}");
+                    return Vec::new();
+                }
+            };
             specs.push((
                 SchedulerActionKey {
                     mnemonic: "CppCompile".to_string(),
                     primary_output_path: obj_path,
                 },
-                compile.to_normalized_command_spec(),
+                normalized,
             ));
         }
 
@@ -10931,7 +11766,7 @@ impl RuleInstance for CcProtoLibraryInstance {
             let archive = CcArchiveCommandSpec {
                 mnemonic: "CcArchive".to_string(),
                 executable: ar.clone(),
-                cwd: None,
+                cwd: context.native_execution_root().map(Path::to_path_buf),
                 lib_path: lib_path.clone(),
                 object_paths: obj_paths.clone(),
                 declared_input_paths: obj_paths.clone(),
@@ -11048,7 +11883,7 @@ impl CcProtoLibraryInstance {
         let command = Command {
             executable,
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -11168,7 +12003,7 @@ impl CcProtoLibraryInstance {
         let command = Command {
             executable: context.toolchain.cxx.clone(),
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -11189,6 +12024,7 @@ impl CcProtoLibraryInstance {
             inputs.push(ActionArtifact::Source(pb_h));
         }
         let outputs = vec![ActionArtifact::Source(obj_path.to_path_buf())];
+        extend_runtime_namespace_inputs(context, src_path, &command, &mut inputs).await?;
         let action_id = Action::compute_id(&inputs, &command, &HashMap::new())?;
         let action = Action {
             id: action_id,
@@ -11259,7 +12095,7 @@ impl CcProtoLibraryInstance {
         let command = Command {
             executable: PathBuf::from("ar"),
             args,
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
 
@@ -13893,7 +14729,7 @@ impl CcSharedLibraryInstance {
         let command = Command {
             executable: context.toolchain.cxx.clone(),
             args: args.clone(),
-            working_dir: None,
+            working_dir: context.native_execution_root().map(Path::to_path_buf),
             execution_info: ExecutionInfo::default(),
         };
         let inputs: Vec<ActionArtifact> = action_inputs
@@ -13960,7 +14796,7 @@ impl CcSharedLibraryInstance {
             Command {
                 executable: context.toolchain.cxx.clone(),
                 args: spawn_args,
-                working_dir: None,
+                working_dir: context.native_execution_root().map(Path::to_path_buf),
                 execution_info: ExecutionInfo::default(),
             }
         } else {

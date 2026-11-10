@@ -451,6 +451,8 @@ pub struct AnalysisSnapshot {
     pub resolver_repo_paths: HashMap<String, PathBuf>,
     /// The managed output root for this workspace.
     pub output_dir: PathBuf,
+    /// Owned local execution view; repository source roots remain separate.
+    pub(crate) native_execroot: Option<Arc<crate::native_execroot::NativeExecroot>>,
     /// The toolchain selected for this command.
     pub toolchain: Toolchain,
     /// Coherent post-build file state and artifact DAG. `None` until a full
