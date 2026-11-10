@@ -212,7 +212,7 @@ fn grpc_cpp_plugin_searched_paths() -> Vec<String> {
 /// Bazel's `make_default_target_header_only=True` produces a header-only
 /// default `{name}` (alias to a header-only cc_library) PLUS a real
 /// `{name}_cc_impl` that carries the compiled generated `.pb.cc` objects.
-/// rush models that as two `tf_proto_library` instances distinguished by this
+/// rush models the message targets as `tf_proto_library` instances distinguished by this
 /// role (set via the hidden `_rush_tf_proto_role` attr by the macro expander):
 ///   - `Default`: owns the ProtocCompile action; for header-only targets it
 ///     exposes headers/includes only (no object/archive), exactly as before.
@@ -225,7 +225,12 @@ fn grpc_cpp_plugin_searched_paths() -> Vec<String> {
 enum TfProtoRole {
     Default,
     CcImpl,
+    // A real macro sibling whose plugin/runtime route is not implemented.
+    // Keeping it separate lets ordinary message consumers remain usable.
+    GrpcSibling,
 }
+
+const UNSUPPORTED_GRPC_SIBLING: &str = "tf_proto_library C++ gRPC sibling requires its genuine declared plugin/runtime route; native execution is not implemented";
 
 pub struct TfProtoLibraryRule;
 
@@ -279,9 +284,9 @@ impl BuildRule for TfProtoLibraryRule {
             .and_then(|v| v.as_int())
             .unwrap_or(2);
         let make_default_target_header_only = proto_bool(attrs, "make_default_target_header_only")?;
-        // Either attribute triggers grpc codegen. TF's build_config.bzl
-        // gates the `cc_grpc_library(...)` emission on `create_grpc_library`,
-        // but `has_services = 1` is also a signal the proto has services.
+        // Preserve the historical direct-factory grpc contract. The TSL
+        // macro separately projects language/sibling options before parsing
+        // its ordinary C++ message declarations.
         let has_services = proto_bool(attrs, "has_services")?;
         let create_grpc_library = proto_bool(attrs, "create_grpc_library")?;
         // TF's build_config.bzl forwards `use_grpc_namespace=True` into a
@@ -308,6 +313,7 @@ impl BuildRule for TfProtoLibraryRule {
         let role = match attrs.get("_rush_tf_proto_role") {
             None => TfProtoRole::Default,
             Some(Value::String(role)) if role == "cc_impl" => TfProtoRole::CcImpl,
+            Some(Value::String(role)) if role == "grpc_sibling" => TfProtoRole::GrpcSibling,
             Some(_) => return Err(anyhow!("invalid tf_proto_library generation role")),
         };
 
@@ -464,6 +470,10 @@ fn set_proto_payload(
 
 impl TfProtoLibraryInstance {
     fn declared_mode(&self, mode: rush_rules::context::NativeCompileMode) -> Result<()> {
+        anyhow::ensure!(
+            self.role != TfProtoRole::GrpcSibling,
+            UNSUPPORTED_GRPC_SIBLING
+        );
         if self.srcs.is_empty() {
             return Ok(());
         }
@@ -1076,7 +1086,7 @@ impl RuleInstance for TfProtoLibraryInstance {
     }
 
     fn validate_analysis_dependencies(&self, ctx: &rush_rules::analysis_context::AnalysisContext) -> Result<()> {
-        if self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+        if self.protoc.is_some() || self.role != TfProtoRole::Default
             || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             self.declared_mode(ctx.native_compile_mode())?;
         }
@@ -1084,7 +1094,7 @@ impl RuleInstance for TfProtoLibraryInstance {
     }
 
     async fn build(&self, context: &rush_rules::context::BuildContext) -> Result<Vec<Artifact>> {
-        if self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+        if self.protoc.is_some() || self.role != TfProtoRole::Default
             || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             return self.build_declared_proto(context).await;
         }
@@ -1521,7 +1531,7 @@ impl RuleInstance for TfProtoLibraryInstance {
         ctx: &mut rush_rules::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
     ) -> rush_rules::providers::ProviderSet {
-        if self.srcs.is_empty() || self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+        if self.srcs.is_empty() || self.protoc.is_some() || self.role != TfProtoRole::Default
             || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             return self.analyze_declared_proto(ctx, dep_providers);
         }
@@ -1974,6 +1984,10 @@ impl RuleInstance for TfProtoLibraryInstance {
         "tf_proto_library"
     }
 
+    fn configuration_error(&self) -> Option<&str> {
+        (self.role == TfProtoRole::GrpcSibling).then_some(UNSUPPORTED_GRPC_SIBLING)
+    }
+
     /// Phase 5.C.4 commit 31a: shape-gate the grpc path.
     /// tf_proto_library is on SCHEDULER_RULE_ALLOWLIST_REF
     /// (commit 22), but only the non-grpc shape has been
@@ -1991,6 +2005,9 @@ impl RuleInstance for TfProtoLibraryInstance {
     /// `SchedulerEligibilityReason::UnsupportedShape`, which
     /// blocks dispatch and routes the target to legacy.
     fn scheduler_shape_unsupported(&self) -> Option<&'static str> {
+        if self.role == TfProtoRole::GrpcSibling {
+            return Some(UNSUPPORTED_GRPC_SIBLING);
+        }
         if self.generates_grpc() {
             Some(
                 "tf_proto_library GRPC/plugin generation is not supported by \
@@ -2013,7 +2030,10 @@ impl RuleInstance for TfProtoLibraryInstance {
     /// instant grpc lands as scheduler-eligible — no
     /// retrofit needed.
     fn scheduler_required_tools(&self) -> Vec<rush_rules::RequiredTool> {
-        let mut tools = if self.protoc.is_some() || self.role == TfProtoRole::CcImpl || self.srcs.is_empty() {
+        if self.role == TfProtoRole::GrpcSibling {
+            return Vec::new();
+        }
+        let mut tools = if self.protoc.is_some() || self.role != TfProtoRole::Default || self.srcs.is_empty() {
             Vec::new()
         } else {
             vec![rush_rules::RequiredTool::Protoc]
@@ -2035,7 +2055,7 @@ impl RuleInstance for TfProtoLibraryInstance {
         rush_rules::SchedulerActionKey,
         rush_action::command_spec::NormalizedCommandSpec,
     )> {
-        if self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+        if self.protoc.is_some() || self.role != TfProtoRole::Default
             || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             return self.declared_proto_specs(context).await.unwrap_or_default();
         }
@@ -2564,6 +2584,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_proto_grpc_sibling_refuses_even_with_old_outputs_and_empty_sources(
+    ) -> Result<()> {
+        use rush_rules::context::{BuildContext, NativeCompileMode};
+        let temp = TempDir::new()?;
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(output.join("genfiles/pkg"))?;
+        let old_header = output.join("genfiles/pkg/message.grpc.pb.h");
+        std::fs::write(&old_header, "unchanged old output sentinel\n")?;
+        for sources in [Vec::new(), vec![Value::String(":messages_proto".into())]] {
+            let rule = TfProtoLibraryRule.parse_attributes(&HashMap::from([
+                (
+                    "name".into(),
+                    Value::String("messages_cc_grpc_proto".into()),
+                ),
+                (
+                    "_rush_tf_proto_role".into(),
+                    Value::String("grpc_sibling".into()),
+                ),
+                ("srcs".into(), Value::List(sources)),
+                (
+                    "protodeps".into(),
+                    Value::List(vec![Value::String(":messages_proto_cc".into())]),
+                ),
+            ]))?;
+            assert_eq!(rule.configuration_error(), Some(UNSUPPORTED_GRPC_SIBLING));
+            assert_eq!(rule.dependencies(), [":messages_proto_cc"]);
+            assert!(rule.exec_only_dependencies().is_empty());
+            for mode in [
+                NativeCompileMode::Literal,
+                NativeCompileMode::UncachedDiagnosticV1,
+            ] {
+                let resolver = StubIncludeResolver::new(temp.path().into());
+                let toolchain = Toolchain::default();
+                let mut registry = ArtifactRegistry::new();
+                let mut pending = rush_rules::context::PendingCompileDeclarations::default();
+                let mut analysis = AnalysisContext::new(
+                    TargetId(1),
+                    ConfigId::DEFAULT,
+                    "pkg",
+                    None,
+                    &output,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    temp.path(),
+                    &[],
+                )
+                .with_native_compile_discovery(mode, &mut pending);
+                assert!(rule.validate_analysis_dependencies(&analysis).is_err());
+                rule.analyze(&mut analysis, &[]);
+                assert!(analysis.native_namespace_analysis_error().is_some());
+                assert!(analysis.registry().actions_of(TargetId(1)).is_empty());
+                let context = BuildContext::new(temp.path().into(), output.clone())
+                    .with_native_compile_discovery(mode, Arc::new(Default::default()));
+                let error = rule.build(&context).await.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(UNSUPPORTED_GRPC_SIBLING),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&old_header)?,
+                    "unchanged old output sentinel\n"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn declared_proto_grpc_version_refuses_before_output_creation() -> Result<()> {
         let temp = TempDir::new()?;
         let output = temp.path().join("must-not-exist");
@@ -2809,6 +2898,348 @@ mod tests {
         .is_err());
         Ok(())
     }
+    /// Real rule-command execution only: the orchestrator's existing owned
+    /// diagnostic-manager test separately covers depfile/cancellation policy.
+    /// The staged binary is actual protoc, not a fabricated generator.
+    #[tokio::test]
+    #[ignore = "requires RUSH_PROTOC=/absolute/real/protoc, matching /usr/include protobuf headers, C++ compiler and ar; run explicitly"]
+    async fn declared_proto_service_message_cpp_generation_and_sibling_refusal() -> Result<()> {
+        use rush_action::ids::ArtifactKind;
+        use rush_action::{ActionResult, Artifact as Input, Command, ExecutionInfo};
+        use rush_rules::context::{
+            ActionManager, BuildContext, NativeCompileMode, PendingCompileDeclaration,
+            PendingCompileDeclarations,
+        };
+        use rush_rules::providers::DefaultInfo;
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        struct ExecuteReal {
+            actions: Mutex<Vec<Action>>,
+            pending: Mutex<Vec<PendingCompileDeclaration>>,
+        }
+        #[async_trait]
+        impl ActionManager for ExecuteReal {
+            async fn execute(&self, action: Action) -> Result<ActionResult> {
+                assert_eq!(
+                    action.id,
+                    Action::compute_id(&action.inputs, &action.command, &action.env)?
+                );
+                let started = Instant::now();
+                eprintln!(
+                    "real proto fixture command: cwd={:?} executable={:?} argv={:?}",
+                    action.command.working_dir, action.command.executable, action.command.args
+                );
+                let output = tokio::time::timeout(
+                    action.command.execution_info.timeout,
+                    tokio::process::Command::new(&action.command.executable)
+                        .args(&action.command.args)
+                        .envs(&action.env)
+                        .current_dir(
+                            action
+                                .command
+                                .working_dir
+                                .as_ref()
+                                .context("fixture needs an explicit cwd")?,
+                        )
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await??;
+                let mut records = Vec::new();
+                if output.status.success() {
+                    for artifact in &action.outputs {
+                        let Input::Source(path) = artifact else {
+                            anyhow::bail!("unexpected derived fixture output")
+                        };
+                        records.push(rush_action::artifact_value::record_output(path, None)?);
+                    }
+                }
+                self.actions.lock().unwrap().push(action.clone());
+                Ok(ActionResult {
+                    action_id: action.id,
+                    exit_code: output.status.code().unwrap_or(-1),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    outputs: action.outputs,
+                    output_records: records,
+                    duration: started.elapsed(),
+                    cached: false,
+                })
+            }
+            async fn execute_pending_compile(
+                &self,
+                action: Action,
+                pending: PendingCompileDeclaration,
+            ) -> Result<ActionResult> {
+                assert!(action
+                    .inputs
+                    .contains(&Input::Source(pending.source_path().into())));
+                assert!(action
+                    .outputs
+                    .contains(&Input::Source(pending.object_path().into())));
+                assert!(!pending.required_producers().is_empty());
+                self.pending.lock().unwrap().push(pending);
+                self.execute(action).await
+            }
+        }
+
+        let protoc = PathBuf::from(
+            std::env::var_os("RUSH_PROTOC").context("set RUSH_PROTOC to actual matching protoc")?,
+        );
+        anyhow::ensure!(
+            protoc.is_absolute() && protoc.is_file(),
+            "real absolute protoc is required"
+        );
+        anyhow::ensure!(
+            std::path::Path::new("/usr/include/google/protobuf/message.h").is_file(),
+            "matching protobuf development headers are required"
+        );
+        let temp = TempDir::new()?;
+        let root = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(root.join("pkg"))?;
+        std::fs::create_dir_all(&output)?;
+        std::fs::write(
+            root.join("pkg/message.proto"),
+            r#"syntax = "proto3";
+package role_fixture;
+message Request { string text = 1; }
+message Reply { string text = 1; }
+service Echo { rpc Call(Request) returns (Reply); }
+"#,
+        )?;
+        let executor = Arc::new(ExecuteReal {
+            actions: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+        });
+        let tool_path = output.join("declared-protoc");
+        let resolver = StubIncludeResolver::new(root.clone());
+        let toolchain = Toolchain::default();
+        let mut registry = ArtifactRegistry::new();
+        let tool;
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                Some("tools"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            );
+            let source = ctx.register_source_artifact(&protoc, ArtifactKind::Source);
+            tool = ctx.register_generated_artifact(&tool_path, ArtifactKind::Executable, None);
+            ctx.declare_action("GenRule", vec![source], vec![tool])?;
+        }
+        let command = Command {
+            executable: "/bin/cp".into(),
+            args: vec![utf8_path(&protoc)?, utf8_path(&tool_path)?],
+            working_dir: Some(root.clone()),
+            execution_info: ExecutionInfo::default(),
+        };
+        let inputs = vec![Input::Source(protoc)];
+        let env = HashMap::new();
+        let staged = executor
+            .execute(Action {
+                id: Action::compute_id(&inputs, &command, &env)?,
+                command,
+                env,
+                inputs,
+                outputs: vec![Input::Source(tool_path.clone())],
+                mnemonic: "GenRule".into(),
+            })
+            .await?;
+        anyhow::ensure!(
+            staged.exit_code == 0,
+            "real protoc staging failed: {}",
+            String::from_utf8_lossy(&staged.stderr)
+        );
+        let tool_providers = vec![(
+            "@tools//:protoc".into(),
+            Arc::new(ProviderSet::empty().with_default_info(DefaultInfo { files: vec![tool] })),
+        )];
+        // This fixture consumes the selected compiler's installed protobuf
+        // headers. Declare that actual runtime input without moving the SDK's
+        // /usr/include ahead of libstdc++ via an explicit -isystem override.
+        let runtime_header = {
+            let mut ctx = AnalysisContext::new(
+                TargetId(3),
+                ConfigId::DEFAULT,
+                "",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            );
+            ctx.register_source_artifact(
+                std::path::Path::new("/usr/include/google/protobuf/message.h"),
+                ArtifactKind::Header,
+            )
+        };
+        let runtime = Arc::new(
+            ProviderSet::empty().with_cc_info(CcInfo::from_direct_and_deps(
+                DirectCcInfo {
+                    headers: vec![runtime_header],
+                    ..Default::default()
+                },
+                Vec::<Arc<CcInfo>>::new(),
+            )),
+        );
+        // The macro projection is tested in rush-starlark. Its ordinary CC
+        // declaration has no has_services/create_grpc_library plugin flag.
+        let attrs = HashMap::from([
+            ("name".into(), Value::String("messages_proto".into())),
+            (
+                "srcs".into(),
+                Value::List(vec![Value::String("message.proto".into())]),
+            ),
+            ("protoc".into(), Value::String("@@tools//:protoc".into())),
+            (
+                "cc_libs".into(),
+                Value::List(vec![Value::String(":actual_runtime".into())]),
+            ),
+        ]);
+        let ordinary = TfProtoLibraryRule.parse_attributes(&attrs)?;
+        assert!(ordinary.configuration_error().is_none());
+        let mut pending = PendingCompileDeclarations::default();
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(2),
+                ConfigId::DEFAULT,
+                "pkg",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            )
+            .with_labeled_exec_dep_providers(&tool_providers)
+            .with_native_execution_root(Some(&root))
+            .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, &mut pending);
+            ordinary.validate_analysis_dependencies(&ctx)?;
+            ordinary.analyze(&mut ctx, &[runtime.clone()]);
+            assert!(
+                ctx.native_namespace_analysis_error().is_none(),
+                "{:?}",
+                ctx.native_namespace_analysis_error()
+            );
+        }
+        assert_eq!(pending.iter().count(), 1);
+        let context = BuildContext::new(root, output.clone())
+            .with_package("pkg".into())
+            .with_toolchain(toolchain)
+            .with_dependencies(
+                HashMap::new(),
+                vec![
+                    (
+                        "@tools//:protoc".into(),
+                        tool_providers[0].1.as_ref().clone(),
+                    ),
+                    ("//pkg:actual_runtime".into(), runtime.as_ref().clone()),
+                ],
+            )
+            .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+            .with_native_execution_root(Some(temp.path().join("source")))
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                Arc::new(pending),
+            )
+            .with_action_manager(executor.clone());
+        let specs = ordinary.build_legacy_command_specs(&context).await;
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|(_, s)| s.mnemonic == "ProtocCompile")
+                .count(),
+            1
+        );
+        let compile_spec = specs
+            .iter()
+            .find(|(_, spec)| spec.mnemonic == "CppCompile")
+            .context("real fixture must declare the generated C++ compile")?
+            .1
+            .clone();
+        assert!(compile_spec
+            .declared_inputs
+            .contains(&PathBuf::from("/usr/include/google/protobuf/message.h")));
+        assert!(!compile_spec
+            .argv
+            .iter()
+            .any(|arg| arg == "-I/usr/include" || arg == "-isystem/usr/include"));
+        ordinary.build(&context).await?;
+        let header = output.join("genfiles/pkg/message.pb.h");
+        let generated = output.join("genfiles/pkg/message.pb.cc");
+        let archive = output.join("pkg/messages_proto/libmessages_proto.a");
+        assert!(std::fs::read_to_string(&header)?.contains("class Request"));
+        assert!(generated.is_file() && archive.is_file());
+        assert!(!output.join("genfiles/pkg/message.grpc.pb.h").exists());
+        assert!(!output.join("genfiles/pkg/message.grpc.pb.cc").exists());
+        let actions = executor.actions.lock().unwrap();
+        for (name, count) in [
+            ("GenRule", 1),
+            ("ProtocCompile", 1),
+            ("CppCompile", 1),
+            ("CcArchive", 1),
+        ] {
+            assert_eq!(
+                actions.iter().filter(|a| a.mnemonic == name).count(),
+                count,
+                "{name}"
+            );
+        }
+        let compile = actions
+            .iter()
+            .find(|action| action.mnemonic == "CppCompile")
+            .unwrap();
+        assert_eq!(compile.command.executable, compile_spec.executable);
+        assert_eq!(compile.command.args, compile_spec.argv);
+        assert_eq!(compile.command.working_dir, compile_spec.cwd);
+        assert!(compile.inputs.contains(&Input::Source(PathBuf::from(
+            "/usr/include/google/protobuf/message.h"
+        ))));
+        let codegen = actions
+            .iter()
+            .find(|a| a.mnemonic == "ProtocCompile")
+            .unwrap();
+        assert_eq!(codegen.command.executable, tool_path);
+        assert!(codegen
+            .command
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--cpp_out=")));
+        assert!(!codegen
+            .command
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--grpc_") || arg.starts_with("--plugin")));
+        let count = actions.len();
+        drop(actions);
+        let original = std::fs::read(&generated)?;
+        // Actual plugin selections still refuse in front of the same manager,
+        // despite already-present pb outputs from a successful message build.
+        for extra in [
+            ("_rush_tf_proto_role", Value::String("grpc_sibling".into())),
+            ("cc_grpc_version", Value::String("1.0".into())),
+        ] {
+            let mut unsupported = attrs.clone();
+            unsupported.insert(extra.0.into(), extra.1);
+            let rule = TfProtoLibraryRule.parse_attributes(&unsupported)?;
+            assert!(rule.build(&context).await.is_err());
+            assert_eq!(executor.actions.lock().unwrap().len(), count);
+            assert_eq!(std::fs::read(&generated)?, original);
+        }
+        Ok(())
+    }
+
     #[test]
     fn analysis_compile_uses_dependency_proto_include_root() {
         let temp = TempDir::new().unwrap();

@@ -2989,11 +2989,27 @@ fn expand_tf_proto_library(
         _ => return Err(anyhow!("tf_proto_library requires 'name' attribute")),
     };
 
+    // TSL projects these macro options into different language/target roles.
+    // Validate before removing them from the C++ message declaration so a bad
+    // option cannot disappear merely because its sibling is not selected.
+    let flag = |attribute: &str| -> Result<bool> {
+        match kwargs.get(attribute) {
+            None | Some(Value::None) => Ok(false),
+            Some(Value::Bool(value)) => Ok(*value),
+            Some(Value::Int(0)) => Ok(false),
+            Some(Value::Int(1)) => Ok(true),
+            Some(_) => anyhow::bail!("tf_proto_library {attribute} must be a boolean or 0/1"),
+        }
+    };
+    flag("has_services")?; // Python plugin option, not a C++ message option.
+    let create_grpc_library = flag("create_grpc_library")?;
     let mut rule_calls = Vec::new();
     let mut generation_kwargs = kwargs.clone();
-    generation_kwargs.entry("protoc".to_string()).or_insert_with(|| {
-        Value::String("@com_google_protobuf//:protoc".to_string())
-    });
+    generation_kwargs.remove("has_services");
+    generation_kwargs.remove("create_grpc_library");
+    generation_kwargs
+        .entry("protoc".to_string())
+        .or_insert_with(|| Value::String("@com_google_protobuf//:protoc".to_string()));
 
     // Preserve TSL's actual runtime choice as ordinary configuration metadata.
     // No repository-name predicate or unconditional host protobuf is inferred.
@@ -3126,8 +3142,6 @@ fn expand_tf_proto_library(
             Value::String("cc_impl".to_string()),
         );
         for k in [
-            "has_services",
-            "create_grpc_library",
             "cc_grpc_version",
             "use_grpc_namespace",
             "cc_api_version",
@@ -3253,34 +3267,36 @@ fn expand_tf_proto_library(
         kwargs: cc_headers_kwargs,
     });
 
-    // 7. When the macro declared services (`has_services = 1` or
-    // `create_grpc_library = True`), TF's Starlark emits an additional
-    // `{name_sans_proto}_cc_grpc_proto` target via cc_grpc_library (see
-    // third_party/xla/.../build_config.bzl). Rush's TfProtoLibraryInstance
-    // now runs grpc_cpp_plugin alongside the cpp codegen, so the artifacts
-    // exist on the base target — emit an alias that forwards to it.
-    let has_services = matches!(kwargs.get("has_services"), Some(Value::Int(n)) if *n != 0)
-        || matches!(kwargs.get("has_services"), Some(Value::Bool(true)));
-    let create_grpc_library =
-        matches!(kwargs.get("create_grpc_library"), Some(Value::Bool(true)))
-            || matches!(kwargs.get("create_grpc_library"), Some(Value::Int(n)) if *n != 0);
-    if has_services || create_grpc_library {
-        let stripped = name.strip_suffix("_proto").unwrap_or(&name).to_string();
-        let grpc_alias_name = format!("{}_cc_grpc_proto", stripped);
-        let mut grpc_kwargs = HashMap::new();
-        grpc_kwargs.insert("name".to_string(), Value::String(grpc_alias_name));
-        grpc_kwargs.insert("actual".to_string(), Value::String(format!(":{}", name)));
-        grpc_kwargs.insert(
-            "visibility".to_string(),
-            kwargs
-                .get("visibility")
-                .cloned()
-                .unwrap_or(Value::List(vec![Value::String(
-                    "//visibility:public".to_string(),
-                )])),
-        );
+    // TSL's create_grpc_library declares a separate sibling, depending on the
+    // ordinary C++ message library. It does not enable the CC message plugin;
+    // only cc_grpc_version does that. Preserve a selected-only refusal for the
+    // unimplemented sibling instead of aliasing it to pb-only results.
+    if create_grpc_library {
+        let stripped = name.strip_suffix("_proto").unwrap_or(&name);
+        let mut grpc_kwargs = HashMap::from([
+            (
+                "name".to_string(),
+                Value::String(format!("{}_cc_grpc_proto", stripped)),
+            ),
+            (
+                "_rush_tf_proto_role".to_string(),
+                Value::String("grpc_sibling".to_string()),
+            ),
+            (
+                "srcs".to_string(),
+                Value::List(vec![Value::String(format!(":{}", name))]),
+            ),
+            (
+                "protodeps".to_string(),
+                Value::List(vec![Value::String(format!(":{}_cc", name))]),
+            ),
+            ("visibility".to_string(), default_visibility()),
+        ]);
+        if let Some(testonly) = kwargs.get("testonly") {
+            grpc_kwargs.insert("testonly".to_string(), testonly.clone());
+        }
         rule_calls.push(RuleCall {
-            rule_type: "alias".to_string(),
+            rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
             kwargs: grpc_kwargs,
         });
@@ -10878,6 +10894,99 @@ else:
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    #[test]
+    fn tf_proto_macro_separates_cc_message_and_optional_grpc_roles() -> Result<()> {
+        for header_only in [false, true] {
+            for (has_services, create_grpc_library) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let attrs = HashMap::from([
+                    ("name".into(), Value::String("messages_proto".into())),
+                    (
+                        "srcs".into(),
+                        Value::List(vec![Value::String("message.proto".into())]),
+                    ),
+                    (
+                        "protodeps".into(),
+                        Value::List(vec![Value::String(":dependency_proto".into())]),
+                    ),
+                    ("protoc".into(), Value::String("@@tools//:protoc".into())),
+                    (
+                        "make_default_target_header_only".into(),
+                        Value::Bool(header_only),
+                    ),
+                    ("has_services".into(), Value::Bool(has_services)),
+                    (
+                        "create_grpc_library".into(),
+                        Value::Bool(create_grpc_library),
+                    ),
+                ]);
+                let calls = expand_tf_proto_library("tf_proto_library", &[], &attrs)?;
+                let generation_name = if header_only {
+                    "messages_proto_genproto_owner"
+                } else {
+                    "messages_proto"
+                };
+                let generation = find_rule(&calls, generation_name).unwrap();
+                assert_eq!(str_list(generation, "srcs"), ["message.proto"]);
+                assert_eq!(generation.kwargs.get("protoc"), attrs.get("protoc"));
+                for call in calls.iter().filter(|call| {
+                    call.rule_type == "tf_proto_library"
+                        && call.kwargs.get("_rush_tf_proto_role")
+                            != Some(&Value::String("grpc_sibling".into()))
+                }) {
+                    assert!(!call.kwargs.contains_key("has_services"));
+                    assert!(!call.kwargs.contains_key("create_grpc_library"));
+                }
+                assert_eq!(
+                    generation.kwargs.get("cc_grpc_version"),
+                    attrs.get("cc_grpc_version")
+                );
+                if header_only {
+                    let implementation = find_rule(&calls, "messages_proto_cc_impl").unwrap();
+                    assert_eq!(
+                        implementation.kwargs.get("cc_grpc_version"),
+                        attrs.get("cc_grpc_version")
+                    );
+                    assert!(str_list(implementation, "protodeps")
+                        .contains(&":messages_proto_genproto_owner".into()));
+                    assert!(str_list(implementation, "protodeps")
+                        .contains(&":dependency_proto_cc_impl".into()));
+                }
+                let sibling = find_rule(&calls, "messages_cc_grpc_proto");
+                assert_eq!(sibling.is_some(), create_grpc_library);
+                if let Some(sibling) = sibling {
+                    assert_eq!(sibling.rule_type, "tf_proto_library");
+                    assert_eq!(
+                        sibling.kwargs.get("_rush_tf_proto_role"),
+                        Some(&Value::String("grpc_sibling".into()))
+                    );
+                    assert_eq!(str_list(sibling, "srcs"), [":messages_proto"]);
+                    assert_eq!(str_list(sibling, "protodeps"), [":messages_proto_cc"]);
+                    assert!(
+                        !sibling.kwargs.contains_key("actual"),
+                        "gRPC cannot alias pb-only results"
+                    );
+                }
+            }
+        }
+        for attribute in ["has_services", "create_grpc_library"] {
+            for invalid in [
+                Value::Int(2),
+                Value::String("true".into()),
+                Value::List(Vec::new()),
+            ] {
+                let attrs = HashMap::from([
+                    ("name".into(), Value::String("invalid_proto".into())),
+                    (attribute.into(), invalid),
+                ]);
+                let error = expand_tf_proto_library("tf_proto_library", &[], &attrs).unwrap_err();
+                assert!(error.to_string().contains(attribute), "{error:#}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
