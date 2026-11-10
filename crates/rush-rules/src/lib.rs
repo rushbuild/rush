@@ -8,6 +8,7 @@ pub mod python_runtime;
 pub mod registry;
 pub mod rules_cc;
 pub mod rules_config;
+pub mod rules_proto_toolchain;
 pub mod rules_python;
 pub mod rules_sh;
 pub mod rules_system;

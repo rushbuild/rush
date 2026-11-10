@@ -1132,6 +1132,7 @@ impl BuildOrchestrator {
 
         // Register protocol buffer rules
         rule_registry.register(Box::new(rush_rules::rules_cc::ProtoLibraryRule));
+        rule_registry.register(Box::new(rush_rules::rules_proto_toolchain::ProtoLangToolchainRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcSharedLibraryRule));
 
@@ -1339,6 +1340,7 @@ impl BuildOrchestrator {
 
         // Register protocol buffer rules
         rule_registry.register(Box::new(rush_rules::rules_cc::ProtoLibraryRule));
+        rule_registry.register(Box::new(rush_rules::rules_proto_toolchain::ProtoLangToolchainRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcSharedLibraryRule));
 
@@ -1515,6 +1517,7 @@ impl BuildOrchestrator {
 
         // Register protocol buffer rules
         rule_registry.register(Box::new(rush_rules::rules_cc::ProtoLibraryRule));
+        rule_registry.register(Box::new(rush_rules::rules_proto_toolchain::ProtoLangToolchainRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcSharedLibraryRule));
 
@@ -1687,6 +1690,7 @@ impl BuildOrchestrator {
 
         // Register protocol buffer rules
         rule_registry.register(Box::new(rush_rules::rules_cc::ProtoLibraryRule));
+        rule_registry.register(Box::new(rush_rules::rules_proto_toolchain::ProtoLangToolchainRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcSharedLibraryRule));
 
@@ -1850,6 +1854,7 @@ impl BuildOrchestrator {
 
         // Register protocol buffer rules
         rule_registry.register(Box::new(rush_rules::rules_cc::ProtoLibraryRule));
+        rule_registry.register(Box::new(rush_rules::rules_proto_toolchain::ProtoLangToolchainRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
         rule_registry.register(Box::new(rush_rules::rules_cc::CcSharedLibraryRule));
 
@@ -5912,6 +5917,18 @@ cc_library(
                 let inst_ctx = rule_execution::InstantiationContext {
                     bzlmod,
                     configuration_scope: scope.clone(),
+                    // Native cc_proto_library currently has no configured
+                    // ProtoLangToolchainInfo or exec-transition consumer. Once
+                    // an analyzer is selected, refuse that lane explicitly
+                    // rather than substituting global/bootstrap protoc.
+                    native_proto_toolchain_error: if build_file.rules.iter().any(|rule| rule.rule_type == "cc_proto_library"
+                        || (bzlmod && rule.rule_type == "CustomRule" && rule.name.ends_with("_cc_proto"))) {
+                        match rush_starlark::BzlLoader::selected_repository_analysis_binary(&self.workspace_root) {
+                            Ok(Some(_)) => Some(rush_rules::rules_proto_toolchain::UNSUPPORTED_PROTO_TOOLCHAIN.to_string()),
+                            Ok(None) => None,
+                            Err(error) => Some(format!("native cc_proto_library analyzer selection failed: {error:#}")),
+                        }
+                    } else { None },
                     repo_name: effective_repository.clone(),
                     package: package.clone(),
                     main_repository_name: main_repository_name.clone(),

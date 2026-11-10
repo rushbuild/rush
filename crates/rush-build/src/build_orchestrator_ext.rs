@@ -23228,6 +23228,108 @@ cc_binary(
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires genuine pinned Bazel 6.5; set RUSH_TEST_BAZEL6_5"]
+    async fn proto_toolchain_declarations_load_but_selected_consumers_refuse_without_substitution() -> Result<()> {
+        use bytes::Bytes;
+        use rush_protocol::command::v1::{EnvironmentVariable,RunRequest};
+        use std::{collections::BTreeMap,ffi::OsString,os::unix::ffi::{OsStrExt,OsStringExt}};
+        use sha2::Digest;
+        struct Server { binary:PathBuf,root:PathBuf,output:PathBuf,env:BTreeMap<Vec<u8>,Vec<u8>>,stopped:bool }
+        impl Server {
+            fn command(&self)->std::process::Command {
+                let mut c=std::process::Command::new(&self.binary);
+                c.arg("--ignore_all_rc_files").arg(format!("--output_base={}",self.output.display()))
+                    .arg("--max_idle_secs=30").current_dir(&self.root).env_clear();
+                for (k,v) in &self.env { c.env(OsString::from_vec(k.clone()),OsString::from_vec(v.clone())); }
+                c
+            }
+            fn stop(&mut self)->Result<()> {
+                if !self.stopped {
+                    let out=self.command().arg("shutdown").output()?;
+                    anyhow::ensure!(out.status.success(),"own proto-toolchain server shutdown failed: {}",String::from_utf8_lossy(&out.stderr));
+                    self.stopped=true;
+                }
+                Ok(())
+            }
+        }
+        impl Drop for Server { fn drop(&mut self) { if let Err(e)=self.stop() { eprintln!("own proto-toolchain test cleanup failed: {e:#}"); } } }
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        for name in ["RUSH_WORKSPACE_CACHE_ROOT","RUSH_WORKSPACE_OUTPUT_ROOT","RUSH_WORKSPACE_BIN_LINK","RUSH_CACHE_ROOT"] {
+            anyhow::ensure!(std::env::var_os(name).is_none(),"isolated test requires {name} unset");
+        }
+        let binary=PathBuf::from(std::env::var_os("RUSH_TEST_BAZEL6_5").context("set genuine pinned Bazel6.5 binary")?).canonicalize()?;
+        anyhow::ensure!(format!("{:x}",sha2::Sha256::digest(std::fs::read(&binary)?))=="a40ac69263440761199fcb8da47ad4e3f328cbe79ffbf4ecc14e5ba252857307","wrong pinned analyzer bytes");
+        let temp=TempDir::new()?;let root=temp.path();
+        write_file(&root.join("WORKSPACE"),"workspace(name=\"proto_toolchain_declarations\")\n")?;
+        write_file(&root.join(".bazelversion"),"6.5.0\n")?;
+        write_file(&root.join("declare.bzl"),"def declare(**kwargs):\n    native.proto_lang_toolchain(**kwargs)\n")?;
+        write_file(&root.join("library.cc"),"int proto_declaration_sibling() { return 42; }\n")?;
+        write_file(&root.join("compiler.sh"),"#!/bin/sh\nexit 1\n")?;
+        { use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("compiler.sh"),std::fs::Permissions::from_mode(0o700))?;
+        }
+        write_file(&root.join("messages.proto"),"syntax = \"proto3\"; message Example { int32 value = 1; }\n")?;
+        write_file(&root.join("BUILD"),r#"
+load(":declare.bzl","declare")
+cc_library(name="library",srcs=["library.cc"])
+cc_library(name="runtime")
+sh_binary(name="compiler",srcs=["compiler.sh"])
+proto_library(name="messages",srcs=["messages.proto"])
+cc_proto_library(name="native_consumer",deps=[":messages"])
+declare(name="language",command_line="--custom_out=$(OUT)",output_files="multiple",
+    plugin_format_flag="--plugin=protoc-gen-custom=%s",plugin=":compiler",runtime=":runtime",
+    blacklisted_protos=[":messages"],progress_message="Generate %{label}",mnemonic="CustomProto")
+alias(name="alias",actual=":language")
+filegroup(name="through",srcs=[":language"])
+declare(name="runtime_consumer",command_line="--cpp_out=$(OUT)",runtime=":language")
+declare(name="plugin_consumer",command_line="--cpp_out=$(OUT)",plugin=":language")
+filegroup(name="implicit_consumer",srcs=[":native_consumer"])
+"#)?;
+        let mut env:BTreeMap<Vec<u8>,Vec<u8>>=std::env::vars_os().map(|(k,v)|(k.as_os_str().as_bytes().to_vec(),v.as_os_str().as_bytes().to_vec())).collect();
+        env.remove(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes());
+        env.remove(rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes());
+        env.insert(b"HOME".to_vec(),root.join("home").as_os_str().as_bytes().to_vec());
+        std::fs::create_dir(root.join("home"))?;
+        env.insert(b"RUSH_BAZEL_PATH".to_vec(),binary.as_os_str().as_bytes().to_vec());
+        for name in ["CUDA_VISIBLE_DEVICES","HIP_VISIBLE_DEVICES","ROCR_VISIBLE_DEVICES"] { env.insert(name.as_bytes().to_vec(),vec![]); }
+        let mut server=Server {binary,root:root.to_owned(),output:root.join("oracle-output"),env:env.clone(),stopped:false};
+        let output=server.command().args(["cquery","//:library","--output=label","--jobs=8","--noshow_progress"]).output()?;
+        anyhow::ensure!(output.status.success(),"genuine unrelated C++ sibling failed: {}",String::from_utf8_lossy(&output.stderr));
+        let output=server.command().args(["query","//:language","--output=build","--noshow_progress"]).output()?;
+        anyhow::ensure!(output.status.success(),"genuine declaration query failed: {}",String::from_utf8_lossy(&output.stderr));
+        let declaration=String::from_utf8(output.stdout)?;
+        for expected in ["proto_lang_toolchain(","--custom_out=$(OUT)","multiple","//:runtime","//:compiler","//:messages","CustomProto"] {
+            anyhow::ensure!(declaration.contains(expected),"genuine declaration omitted {expected}: {declaration}");
+        }
+        let output=server.command().args(["cquery","//:language","--proto_compiler=//:compiler","--jobs=8","--noshow_progress","--output=starlark",
+            r#"--starlark:expr=json.encode([k for k in providers(target).keys() if k.endswith("ProtoLangToolchainInfo")])"#]).output()?;
+        anyhow::ensure!(output.status.success(),"genuine selected toolchain analysis failed: {}",String::from_utf8_lossy(&output.stderr));
+        let providers:Vec<String>=serde_json::from_slice(&output.stdout)?;
+        anyhow::ensure!(providers.len()==1,"genuine native toolchain must expose one actual ProtoLangToolchainInfo: {providers:?}");
+        let request=|target:&str|->Result<rush_command_core::CommandSemantics> {
+            let mut env=env.clone();
+            env.insert(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes().to_vec(),
+                rush_command_core::build_arguments::encode_with_startup(&["--jobs=8".into()],&[]).into_bytes());
+            env.insert(rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes().to_vec(),b"[]".to_vec());
+            let mut request=RunRequest {argv:vec![Bytes::from_static(b"rush"),Bytes::from_static(b"build"),Bytes::copy_from_slice(target.as_bytes())],
+                working_directory:Bytes::copy_from_slice(root.as_os_str().as_bytes()),environment:env.into_iter().map(|(k,v)|EnvironmentVariable{name:Bytes::from(k),value:Bytes::from(v)}).collect(),
+                protocol_major:rush_protocol::PROTOCOL_MAJOR,protocol_minor:rush_protocol::PROTOCOL_MINOR,..Default::default()};
+            rush_command_core::populate_workspace_config(&mut request,root);
+            Ok(rush_command_core::CommandSemantics::from_run_request(&request)?)
+        };
+        let orchestrator=BuildOrchestrator::with_workspace(root.to_owned());
+        orchestrator.build_with_dependencies_with_semantics(vec!["//:library".into()],request("//:library")?).await?;
+        for target in ["//:language","//:alias","//:through","//:runtime_consumer","//:plugin_consumer","//:native_consumer","//:implicit_consumer"] {
+            let error=orchestrator.build_with_dependencies_with_semantics(vec![target.into()],request(target)?).await
+                .expect_err("unsupported configured toolchain consumer cannot produce an empty success or use global protoc");
+            anyhow::ensure!(format!("{error:#}").contains("ProtoLangToolchainInfo"),"unexpected consumer error: {error:#}");
+        }
+        server.stop()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires genuine pinned Bazel 6.5; set RUSH_TEST_BAZEL6_5"]
     async fn configured_feature_flags_drive_real_orchestrator_requests_and_artifacts() -> Result<()> {
         use bytes::Bytes;
         use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};

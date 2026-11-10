@@ -2471,6 +2471,12 @@ fn builtin_native(_args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value>
         "cc_import".to_string(),
         Value::RuleFunction("cc_import".to_string()),
     );
+    // This records a real declaration. Configured toolchain consumption is
+    // rejected by the native rule until its provider/exec semantics exist.
+    native_module.insert(
+        "proto_lang_toolchain".to_string(),
+        Value::RuleFunction("proto_lang_toolchain".to_string()),
+    );
     native_module.insert(
         "cc_proto_library".to_string(),
         Value::RuleFunction("cc_proto_library".to_string()),

@@ -1257,6 +1257,10 @@ fn convert_parse_attrs_with_platform(
 #[derive(Default)]
 pub struct InstantiationContext {
     pub bzlmod: bool,
+    /// A selected repository analyzer requires real native proto-toolchain
+    /// provider/exec semantics. Keep the refusal on the configured target so
+    /// unrelated declarations in the same BUILD remain loadable.
+    pub native_proto_toolchain_error: Option<String>,
     /// Non-empty workspace configuration registry used by production
     /// analysis. Keeping it explicit prevents select resolution from falling
     /// back to the thread-local compatibility scope after an async boundary.
@@ -1466,6 +1470,13 @@ pub fn parse_rule_to_instance_with_context(
         rule.rule_type.as_str()
     };
 
+    if effective_rule_type == "cc_proto_library" {
+        if let Some(error) = &inst_ctx.native_proto_toolchain_error {
+            return Ok(unconfigurable_target(rule.name.clone(), anyhow!(error.clone()),
+                &rush_attrs, visibility_was_explicit, configuration_conditions));
+        }
+    }
+
     // Get the rule definition from registry
     let rule_def = registry
         .get(effective_rule_type)
@@ -1518,6 +1529,22 @@ mod tests {
     use rush_starlark::Value as StarlarkValue;
 
     const NEVER_CONDITION: &str = "//conditions:rush_select_test_never";
+
+    #[test]
+    fn selected_analyzer_proto_consumers_cannot_fall_back_to_global_protoc() {
+        let mut registry=RuleRegistry::new();
+        registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
+        let rule=Rule { name:"generated".into(),rule_type:"cc_proto_library".into(),attributes:HashMap::from([
+            ("name".into(),ParseValue::String("generated".into())),
+            ("deps".into(),ParseValue::List(vec![ParseValue::String(":messages".into())])),
+        ]) };
+        let legacy=parse_rule_to_instance(&rule,&registry).unwrap();
+        assert!(legacy.configuration_error().is_none());
+        let context=InstantiationContext { native_proto_toolchain_error:Some(
+            rush_rules::rules_proto_toolchain::UNSUPPORTED_PROTO_TOOLCHAIN.into()),..Default::default() };
+        let selected=parse_rule_to_instance_with_context(&rule,&registry,&context).unwrap();
+        assert!(selected.configuration_error().unwrap().contains("no system or bootstrap protoc substitution"));
+    }
 
     fn cc_registry() -> RuleRegistry {
         let mut registry = RuleRegistry::new();

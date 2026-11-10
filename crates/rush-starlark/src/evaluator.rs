@@ -3720,6 +3720,7 @@ impl Evaluator {
             "cc_test",
             "cc_shared_library",
             "proto_library",
+            "proto_lang_toolchain",
             "cc_proto_library",
             "java_proto_library",
             "java_lite_proto_library",
@@ -3864,6 +3865,7 @@ impl Evaluator {
         self.register_rule_function("alias".to_string());
         self.register_rule_function("test_suite".to_string());
         self.register_rule_function("proto_library".to_string());
+        self.register_rule_function("proto_lang_toolchain".to_string());
         self.register_rule_function("cc_proto_library".to_string());
         self.register_rule_function("java_proto_library".to_string());
         self.register_rule_function("java_lite_proto_library".to_string());

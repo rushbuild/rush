@@ -7975,6 +7975,43 @@ impl BzlLoader {
         resolve_bazel_binary_for_fetch(workspace_root)
     }
 
+    /// Detect the analyzer selected by this immutable client without running
+    /// it. A missing implicit PATH tool permits the existing native profile;
+    /// an explicit invalid selection remains an error. Negative candidates
+    /// are observed so a newly installed analyzer invalidates retained native
+    /// analysis rather than silently changing its toolchain contract.
+    pub fn selected_repository_analysis_binary(workspace_root: &Path) -> Result<Option<PathBuf>> {
+        use rush_incremental::tracked;
+        let configured = tracked_command_environment("RUSH_BAZEL_PATH")?;
+        let client_path = if configured.is_none() { tracked_command_environment("PATH")? } else { None };
+        let observe_candidate = |path: &Path| {
+            tracked::metadata_full(path);
+            // The resolver below follows symlinks. Observe the same complete
+            // chain, including the canonical helper's negative component
+            // probes on failure, and the resolved target's executable mode on
+            // success. The link node's lstat alone proves neither property.
+            if let Ok(target) = tracked::canonicalize(path) {
+                tracked::metadata_full(&target);
+            }
+        };
+        if let Some(configured) = &configured {
+            let path = PathBuf::from(configured);
+            let path = if path.is_absolute() { path } else { workspace_root.join(path) };
+            observe_candidate(&path);
+        } else if let Some(path) = &client_path {
+            for directory in std::env::split_paths(OsStr::new(path)) {
+                let directory = if directory.as_os_str().is_empty() { workspace_root.to_path_buf() }
+                    else if directory.is_absolute() { directory } else { workspace_root.join(directory) };
+                for name in BAZEL_EXECUTABLE_NAMES { observe_candidate(&directory.join(name)); }
+            }
+        }
+        match resolve_bazel_binary_from_command_environment(workspace_root, configured.as_deref(), client_path.as_deref()) {
+            Ok(binary) => Ok(Some(binary)),
+            Err(_) if configured.is_none() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Keep explicitly registered built-in sources authoritative. Automatically
     /// supplied bazel_tools roots instead belong to the current analyzer, not
     /// whichever compatibility tree or old installation a mirror remembers.
