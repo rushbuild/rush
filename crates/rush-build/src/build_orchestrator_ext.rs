@@ -5650,8 +5650,11 @@ impl BuildOrchestrator {
                         self.with_tracked_scope(|| -> Result<()> {
                             if let Some(declaration) = node.rule_instance.proto_source_metadata() {
                                 for source in declaration.sources {
+                                    let relative = rush_rules::rules_cc::proto_source_relative_path(
+                                        source, analysis_ctx.package(), analysis_ctx.workspace(),
+                                    )?;
                                     crate::native_proto_source_metadata::check_source_package_boundaries(
-                                        analysis_ctx.workspace_root(), analysis_ctx.package(), Path::new(source),
+                                        analysis_ctx.workspace_root(), analysis_ctx.package(), &relative,
                                     )?;
                                 }
                             }
@@ -22385,9 +22388,9 @@ cc_binary(name="app",srcs=["main.cc"],deps=[":consumer"])
                 "workspace(name='proto_source_facet_driver')\n",
             )?;
             let metadata = if real_tool {
-                "proto_library(name='metadata_any',srcs=['imports/src/google/protobuf/any.proto'],strip_import_prefix='imports/src')\nproto_library(name='metadata_wrappers',srcs=['imports/src/google/protobuf/wrappers.proto'],strip_import_prefix='imports/src')\nproto_library(name='metadata_outer',deps=[':metadata_any',':metadata_wrappers'])\ngenrule(name='protoc_tool',srcs=['compiler.input'],outs=['fixture-protoc'],cmd='cp $(SRCS) $@ && chmod +x $@')\n"
+                "proto_library(name='metadata_any',srcs=['//:imports/src/google/protobuf/any.proto'],strip_import_prefix='imports/src')\nproto_library(name='metadata_wrappers',srcs=['//:imports/src/google/protobuf/wrappers.proto'],strip_import_prefix='imports/src')\nproto_library(name='metadata_outer',deps=[':metadata_any',':metadata_wrappers'])\ngenrule(name='protoc_tool',srcs=['compiler.input'],outs=['fixture-protoc'],cmd='cp $(SRCS) $@ && chmod +x $@')\n"
             } else {
-                "proto_library(name='metadata_leaf',srcs=['schema/common.proto'],strip_import_prefix='schema')\nproto_library(name='metadata_outer',deps=[':metadata_leaf'])\n"
+                "proto_library(name='metadata_leaf',srcs=['//:schema/common.proto'],strip_import_prefix='schema')\nproto_library(name='metadata_outer',deps=[':metadata_leaf'])\n"
             };
             let negative = match shape {
                     Shape::GeneratedCatalog => "genrule(name='actual_proto_producer',srcs=['seed.proto'],outs=['schema/common.proto'],cmd='cp $(SRCS) $@')\n",

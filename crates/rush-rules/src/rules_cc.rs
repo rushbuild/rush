@@ -13039,6 +13039,99 @@ fn proto_literal_relative_path(raw: &str, allow_dot: bool) -> Result<PathBuf> {
         .collect())
 }
 
+/// A syntactically valid source spelling. Repository/package equality is a
+/// contextual decision, never inferred while parsing a rule declaration.
+struct ProtoSourceSyntax<'a> {
+    target: PathBuf,
+    package: Option<&'a str>,
+    repository: Option<&'a str>,
+    explicit_repository: bool,
+}
+
+fn proto_source_syntax(raw: &str) -> Result<ProtoSourceSyntax<'_>> {
+    let (repository, explicit_repository, rest) = if raw.starts_with('@') {
+        let external = raw
+            .strip_prefix("@@")
+            .or_else(|| raw.strip_prefix('@'))
+            .unwrap();
+        let (owner, rest) = external
+            .split_once("//")
+            .context("proto source repository label requires //package:target")?;
+        anyhow::ensure!(
+            owner != "."
+                && owner != ".."
+                && owner
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-+~".contains(&c)),
+            "proto source label has an invalid repository name"
+        );
+        (
+            if owner.is_empty() { None } else { Some(owner) },
+            true,
+            Some(rest),
+        )
+    } else if let Some(rest) = raw.strip_prefix("//") {
+        (None, false, Some(rest))
+    } else {
+        (None, false, None)
+    };
+    let (package, target) = if let Some(rest) = rest {
+        let (package, target) = rest
+            .split_once(':')
+            .context("proto source label requires explicit //package:target syntax")?;
+        if !package.is_empty() {
+            proto_literal_relative_path(package, false)?;
+        }
+        (Some(package), target)
+    } else {
+        (None, raw.strip_prefix(':').unwrap_or(raw))
+    };
+    let target = proto_literal_relative_path(target, false)?;
+    anyhow::ensure!(
+        target.extension() == Some(std::ffi::OsStr::new("proto")),
+        "proto_library source must name a literal .proto file: {raw}"
+    );
+    Ok(ProtoSourceSyntax {
+        target,
+        package,
+        repository,
+        explicit_repository,
+    })
+}
+
+/// Resolve a source spelling within exactly the caller's repository/package.
+///
+/// Supports literal target paths, :target, //package:target and explicit
+/// @@repository//package:target. An unqualified
+/// // label uses the current repository; explicit @// and @@// retain MAIN.
+/// Named apparent @repository labels require the owner's captured mapping;
+/// this context-free path refuses them rather than guessing canonical identity.
+/// This only normalizes a declaration. It does not certify SOURCE origin,
+/// file existence, producer ownership, configuration or filesystem freshness.
+pub fn proto_source_relative_path(
+    raw: &str,
+    package: &str,
+    repository: Option<&str>,
+) -> Result<PathBuf> {
+    if !package.is_empty() {
+        proto_literal_relative_path(package, false)?;
+    }
+    let source = proto_source_syntax(raw)?;
+    anyhow::ensure!(
+        !raw.starts_with('@') || raw.starts_with("@@") || raw.starts_with("@//"),
+        "named apparent proto source repositories require captured owner mapping: {raw}"
+    );
+    anyhow::ensure!(
+        source.package.is_none_or(|declared| declared == package),
+        "proto source label must stay in the current package: {raw}"
+    );
+    anyhow::ensure!(
+        !source.explicit_repository || source.repository == repository,
+        "proto source label must stay in the current repository: {raw}"
+    );
+    Ok(source.target)
+}
+
 #[async_trait]
 impl BuildRule for ProtoLibraryRule {
     fn name(&self) -> &str {
@@ -13049,11 +13142,7 @@ impl BuildRule for ProtoLibraryRule {
         let name = extract_string(attrs, "name")?;
         let srcs = proto_literal_list(attrs, "srcs")?;
         for src in &srcs {
-            let source = proto_literal_relative_path(src, false)?;
-            anyhow::ensure!(
-                source.extension() == Some(std::ffi::OsStr::new("proto")),
-                "proto_library source must be a literal .proto file: {src}"
-            );
+            proto_source_syntax(src)?;
         }
         let deps = proto_literal_list(attrs, "deps")?;
         let strip_import_prefix = match attrs.get("strip_import_prefix") {
@@ -13099,6 +13188,7 @@ impl ProtoLibraryInstance {
         &self,
         workspace: &Path,
         package: &Path,
+        repository: Option<&str>,
     ) -> Result<Vec<(PathBuf, PathBuf, PathBuf)>> {
         use std::path::Component;
         anyhow::ensure!(
@@ -13127,12 +13217,19 @@ impl ProtoLibraryInstance {
                 .join(package)
                 .join(proto_literal_relative_path(prefix, true)?),
         };
+        let package_name = package
+            .to_str()
+            .context("proto source package must be UTF-8")?;
+        let mut sources = HashSet::new();
         self.srcs
             .iter()
             .map(|src| {
-                let physical = workspace
-                    .join(package)
-                    .join(proto_literal_relative_path(src, false)?);
+                let relative = proto_source_relative_path(src, package_name, repository)?;
+                anyhow::ensure!(
+                    sources.insert(relative.clone()),
+                    "proto_library repeats a source through equivalent label spellings: {src}"
+                );
+                let physical = workspace.join(package).join(relative);
                 let logical = physical.strip_prefix(&import_root).with_context(|| {
                     format!("proto_library source {src} is outside strip_import_prefix")
                 })?;
@@ -13189,7 +13286,11 @@ impl ProtoLibraryInstance {
         use crate::providers::{ProtoFilesInfo, ProtoSourceImport};
         use rush_action::ids::ArtifactKind;
         let deps = self.dependency_metadata(ctx)?;
-        let layouts = self.source_layouts(ctx.workspace_root(), Path::new(ctx.package()))?;
+        let layouts = self.source_layouts(
+            ctx.workspace_root(),
+            Path::new(ctx.package()),
+            ctx.workspace(),
+        )?;
         // A preexisting generated artifact cannot become a source because its
         // output happens to exist at analysis time.
         for (physical, _, _) in &layouts {
@@ -13243,7 +13344,11 @@ impl RuleInstance for ProtoLibraryInstance {
         &self,
         ctx: &crate::analysis_context::AnalysisContext,
     ) -> Result<()> {
-        self.source_layouts(ctx.workspace_root(), Path::new(ctx.package()))?;
+        self.source_layouts(
+            ctx.workspace_root(),
+            Path::new(ctx.package()),
+            ctx.workspace(),
+        )?;
         self.dependency_metadata(ctx)?;
         Ok(())
     }
@@ -13255,6 +13360,7 @@ impl RuleInstance for ProtoLibraryInstance {
                 .package_path
                 .as_deref()
                 .unwrap_or_else(|| Path::new("")),
+            context.repository.as_deref(),
         )?
         .into_iter()
         .map(|(path, _, _)| {
@@ -18529,8 +18635,8 @@ mod native_proto_source_metadata_tests {
         .is_err());
         for src in [
             "../p.proto",
-            ":p.proto",
-            "@repo//:p.proto",
+            "::p.proto",
+            "@repo/pkg:p.proto",
             "/p.proto",
             "p.cc",
             "./p.proto",
@@ -18668,6 +18774,235 @@ mod native_proto_source_metadata_tests {
             .contains("generated/virtual"));
         assert_eq!(ctx.registry().artifact_count(), before);
         assert_eq!(ctx.registry().declared_action_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_proto_metadata_same_package_source_labels_reuse_real_config7_source() -> Result<()>
+    {
+        let temporary = tempfile::TempDir::new()?;
+        let workspace = temporary.path().join("repository");
+        let physical = workspace.join("pkg/sub/p.proto");
+        std::fs::create_dir_all(physical.parent().unwrap())?;
+        std::fs::write(&physical, b"syntax=\"proto3\"; message P {}\n")?;
+        let mut registry = ArtifactRegistry::new();
+        let config = ConfigId(7);
+        let id = source(&mut registry, &physical, config, TargetId(1));
+        for (index, raw) in [
+            "sub/p.proto",
+            ":sub/p.proto",
+            "//pkg:sub/p.proto",
+            "@@owner//pkg:sub/p.proto",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                proto_source_relative_path(raw, "pkg", Some("owner"))?,
+                PathBuf::from("sub/p.proto")
+            );
+            let rule =
+                ProtoLibraryRule.parse_attributes(&declaration("p", &[raw], &[], Some("sub")))?;
+            assert_eq!(
+                rule.proto_source_metadata().unwrap().sources,
+                &[raw.to_owned()],
+                "raw descriptor must remain literal"
+            );
+            let providers = analyze(
+                rule.as_ref(),
+                &mut registry,
+                &workspace,
+                "pkg",
+                TargetId(index as u32 + 2),
+                config,
+                &[],
+            )?;
+            let proto = providers.get_proto_files().unwrap();
+            assert_eq!(proto.direct_sources.as_ref(), &[id]);
+            proto.validate_declared_imports(&registry, config)?;
+            assert!(proto
+                .validate_declared_imports(&registry, ConfigId::DEFAULT)
+                .is_err());
+            let layout = proto
+                .declared_imports
+                .as_ref()
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
+            assert_eq!(layout.import_root, workspace.join("pkg/sub"));
+            assert_eq!(layout.import_path, PathBuf::from("p.proto"));
+            assert_eq!(registry.artifact_path(id), physical);
+            let context = BuildContext::new(workspace.clone(), temporary.path().join("output"))
+                .with_package("pkg".into())
+                .with_repository(Some("owner".into()));
+            let artifacts = rule.build(&context).await?;
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(artifacts[0].path, physical);
+            assert_eq!(registry.artifact_count(), 1);
+            assert_eq!(registry.artifact(id).owner_target, TargetId(1));
+            assert!(
+                providers.get_cc_info().is_none()
+                    && providers.get_default_info().is_none()
+                    && providers.get_files().is_none()
+            );
+        }
+        // An external root-package source label must resolve its
+        // full target path, not a guessed protobuf basename/include root.
+        assert_eq!(
+            proto_source_relative_path(
+                "//:src/google/protobuf/duration.proto",
+                "",
+                Some("com_google_protobuf")
+            )?,
+            PathBuf::from("src/google/protobuf/duration.proto")
+        );
+        for raw in ["@//pkg:sub/p.proto", "@@//pkg:sub/p.proto"] {
+            assert_eq!(
+                proto_source_relative_path(raw, "pkg", None)?,
+                PathBuf::from("sub/p.proto")
+            );
+            assert!(
+                proto_source_relative_path(raw, "pkg", Some("owner")).is_err(),
+                "explicit MAIN must stay MAIN"
+            );
+        }
+        assert_eq!(registry.declared_action_count(), 0);
+        assert_eq!(
+            std::fs::read(physical)?,
+            b"syntax=\"proto3\"; message P {}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_proto_metadata_source_labels_refuse_foreign_package_repository_and_producers(
+    ) -> Result<()> {
+        let workspace = Path::new("/source");
+        let mut registry = ArtifactRegistry::new();
+        for raw in [
+            "//other:p.proto",
+            "@foreign//pkg:p.proto",
+            "@owner//pkg:p.proto",
+            "@@foreign//pkg:p.proto",
+            "@//pkg:p.proto",
+            "@@//pkg:p.proto",
+            "@owner//:p.proto",
+        ] {
+            let rule = ProtoLibraryRule.parse_attributes(&declaration("p", &[raw], &[], None))?;
+            assert!(
+                proto_source_relative_path(raw, "pkg", Some("owner")).is_err(),
+                "{raw}"
+            );
+            assert!(
+                analyze(
+                    rule.as_ref(),
+                    &mut registry,
+                    workspace,
+                    "pkg",
+                    TargetId(1),
+                    ConfigId(7),
+                    &[]
+                )
+                .is_err(),
+                "{raw}"
+            );
+            let context = BuildContext::new(workspace.to_owned(), "/output".into())
+                .with_package("pkg".into())
+                .with_repository(Some("owner".into()));
+            assert!(rule.build(&context).await.is_err(), "{raw}");
+        }
+        assert_eq!(
+            registry.artifact_count(),
+            0,
+            "context mismatch must precede registration"
+        );
+        for raw in [
+            "@@@owner//pkg:p.proto",
+            "@owner/pkg:p.proto",
+            "//pkg",
+            "//pkg:",
+            "//pkg:../p.proto",
+            "//pkg:p.proto:other",
+            "@owner///pkg:p.proto",
+            "//pkg/:p.proto",
+            "//pkg:/p.proto",
+            "::p.proto",
+            "pkg:p.proto",
+            "@.//pkg:p.proto",
+            "@..//pkg:p.proto",
+        ] {
+            assert!(
+                ProtoLibraryRule
+                    .parse_attributes(&declaration("bad", &[raw], &[], None))
+                    .is_err(),
+                "{raw}"
+            );
+        }
+        // Distinct raw label spellings must not silently duplicate a source.
+        let duplicate = ProtoLibraryRule.parse_attributes(&declaration(
+            "duplicate",
+            &["p.proto", ":p.proto"],
+            &[],
+            None,
+        ))?;
+        assert!(analyze(
+            duplicate.as_ref(),
+            &mut registry,
+            workspace,
+            "pkg",
+            TargetId(1),
+            ConfigId(7),
+            &[]
+        )
+        .is_err());
+        assert_eq!(registry.artifact_count(), 0);
+        let generated = workspace.join("pkg/p.proto");
+        let exec_path = registry.intern_path(&generated);
+        registry.intern_artifact(
+            ArtifactKey {
+                config: ConfigId(7),
+                exec_path,
+            },
+            ArtifactKind::Generated,
+            false,
+            TargetId(1),
+            None,
+        );
+        for raw in [
+            ":p.proto",
+            "//pkg:p.proto",
+            "@@owner//pkg:p.proto",
+        ] {
+            let rule =
+                ProtoLibraryRule.parse_attributes(&declaration("generated", &[raw], &[], None))?;
+            let resolver = StubIncludeResolver::new(workspace.to_owned());
+            let toolchain = Toolchain::default();
+            let mut ctx = AnalysisContext::new(
+                TargetId(2),
+                ConfigId(7),
+                "pkg",
+                Some("owner"),
+                Path::new("/output"),
+                &mut registry,
+                &resolver,
+                &toolchain,
+                workspace,
+                &[],
+            );
+            assert!(
+                rule.analyze(&mut ctx, &[]).get_proto_files().is_none(),
+                "{raw}"
+            );
+            assert!(
+                ctx.native_namespace_analysis_error()
+                    .unwrap()
+                    .contains("generated/virtual"),
+                "{raw}"
+            );
+            assert_eq!(ctx.registry().artifact_count(), 1);
+            assert_eq!(ctx.registry().declared_action_count(), 0);
+        }
         Ok(())
     }
 

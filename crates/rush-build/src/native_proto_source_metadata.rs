@@ -377,7 +377,9 @@ fn layouts(
         .sources
         .iter()
         .map(|raw| {
-            let relative = relative_literal(raw, false)?;
+            let relative = rush_rules::rules_cc::proto_source_relative_path(
+                raw, &label.package, label.workspace.as_deref(),
+            )?;
             ensure!(
                 relative.extension() == Some(std::ffi::OsStr::new("proto"))
                     && seen.insert(relative.clone()),
@@ -396,7 +398,7 @@ fn layouts(
             let source_label = Label {
                 workspace: label.workspace.clone(),
                 package: label.package.clone(),
-                target: raw.clone(),
+                target: relative.to_str().context("non-UTF8 proto SOURCE target")?.to_owned(),
             };
             Ok((source_label, path, import_root.clone(), import_path))
         })
