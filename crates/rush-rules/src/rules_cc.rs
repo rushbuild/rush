@@ -2885,39 +2885,12 @@ impl RuleInstance for CcLibraryInstance {
                     argv_strs.push("-fPIC".to_string());
                     if !is_c_source {
                         argv_strs.push("-std=c++17".to_string());
-                        // gcc-13+/libstdc++ no longer transitively include
-                        // <cstdint>, so TF/LLVM/MLIR headers using int32_t etc.
-                        // without including it (e.g. stablehlo math_utils.h)
-                        // fail "'int32_t' has not been declared". Force-include
-                        // it for C++ TUs (toolchain workaround, NOT a TF source
-                        // patch). C sources keep their own headers, and
-                        // assembly (.s/.S) is excluded — it cannot include the
-                        // C++ header (e.g. @boringssl//:crypto *-apple.S).
-                        if !crate::cc_command_spec::is_assembly_source_path(
-                            Path::new(src),
-                        ) {
-                            argv_strs.push("-include".to_string());
-                            argv_strs.push("cstdint".to_string());
-                        }
-                        // -fno-rtti for @llvm-project consumers, placed right
-                        // after the cstdint block (inside !is_c_source) so this
+                        // Preserve the existing LLVM no-RTTI selection so this
                         // analyze argv (PASS-A) stays byte-identical to the
                         // CcCompileCommandSpec (PASS-B). Matches LLVM's
                         // -fno-rtti build (converter-gen typeinfo link).
                         if deps_want_llvm_no_rtti(&self.deps) {
                             argv_strs.push("-fno-rtti".to_string());
-                        }
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        argv_strs.push("-D_GNU_SOURCE".to_string());
-                        for extra in [
-                            "/usr/include/jsoncpp",
-                            "/usr/include/x86_64-linux-gnu",
-                        ] {
-                            if std::path::Path::new(extra).exists() {
-                                argv_strs.push(format!("-I{}", extra));
-                            }
                         }
                     }
                     // Automatic language flags precede explicit rule options.
@@ -3291,17 +3264,6 @@ impl RuleInstance for CcLibraryInstance {
             })
             .collect();
 
-        // Linux extra includes — runtime exists() check, same
-        // as compile_source.
-        let mut linux_extra_includes: Vec<std::path::PathBuf> = Vec::new();
-        if cfg!(target_os = "linux") {
-            for extra in ["/usr/include/jsoncpp", "/usr/include/x86_64-linux-gnu"] {
-                if std::path::Path::new(extra).exists() {
-                    linux_extra_includes.push(std::path::PathBuf::from(extra));
-                }
-            }
-        }
-
         let target_output_dir = context.target_output_dir(&self.name);
         // Expand filegroup-label srcs (PASS-B). Same shared
         // dep_label_matches + ordered walk as analyze() (PASS-A) so the
@@ -3445,7 +3407,7 @@ impl RuleInstance for CcLibraryInstance {
                     workspace_root: context.workspace_root.clone(),
                     extra_workspace_paths: context.extra_proto_paths.to_vec(),
                     genfiles_path: context.output_dir.join("genfiles"),
-                    linux_extra_includes: linux_extra_includes.clone(),
+                    linux_extra_includes: Vec::new(),
                 },
                 // Phase 5.C.4 commit 14: declared_input_paths
                 // mirrors what the scheduler analyze() declares
@@ -3645,14 +3607,6 @@ impl CcLibraryInstance {
         args.push("-fPIC".to_string());
         if !is_c_source {
             args.push("-std=c++17".to_string());
-            // Match analyze(): force-include <cstdint> for C++ TUs (gcc-13+
-            // dropped the transitive include; TF/LLVM use int32_t without it).
-            // Kept byte-identical with the analyze path for verifier parity.
-            // Assembly (.s/.S) excluded — it cannot include the C++ header.
-            if !crate::cc_command_spec::is_assembly_source_path(src_path) {
-                args.push("-include".to_string());
-                args.push("cstdint".to_string());
-            }
             // -fno-rtti for @llvm-project consumers (matches the analyze pass +
             // CcCompileCommandSpec + CcBinaryInstance::compile_source) so the
             // non-scheduler build() also produces RTTI-consistent objects.
@@ -3660,28 +3614,6 @@ impl CcLibraryInstance {
                 args.push("-fno-rtti".to_string());
             }
         }
-        // Bazel's default feature set on Linux defines _GNU_SOURCE for both
-        // C and C++ compiles, exposing pthread_rwlock_t, O_CLOEXEC, etc.
-        // Several TF external deps (@boringssl, @curl, …) assume that
-        // presence.
-        #[cfg(target_os = "linux")]
-        {
-            args.push("-D_GNU_SOURCE".to_string());
-            // Debian-specific include dirs the TF dep tree commonly
-            // hard-codes via unqualified `#include "foo/bar.h"` instead
-            // of setting -I in the dep's BUILD (which rush would have
-            // plumbed through CcInfo). These are cheap and harmless
-            // when missing — gcc just ignores unknown -I paths.
-            for extra in [
-                "/usr/include/jsoncpp",        // #include "json/json.h"
-                "/usr/include/x86_64-linux-gnu", // multi-arch: curl, gif, etc.
-            ] {
-                if std::path::Path::new(extra).exists() {
-                    args.push(format!("-I{}", extra));
-                }
-            }
-        }
-
         // Honor strip_include_prefix: headers under <repo>/<prefix>/… are exposed
         // with <prefix> stripped, so the compile needs -I<repo>/<prefix>. Derive
         // the repo root from src_path (= <repo>/<package>/<rest>) by trimming the
@@ -5738,39 +5670,12 @@ impl RuleInstance for CcBinaryInstance {
                     argv_strs.push("-fPIC".to_string());
                     if !is_c_source {
                         argv_strs.push("-std=c++17".to_string());
-                        // gcc-13+/libstdc++ no longer transitively include
-                        // <cstdint>, so TF/LLVM/MLIR headers using int32_t etc.
-                        // without including it (e.g. stablehlo math_utils.h)
-                        // fail "'int32_t' has not been declared". Force-include
-                        // it for C++ TUs (toolchain workaround, NOT a TF source
-                        // patch). C sources keep their own headers, and
-                        // assembly (.s/.S) is excluded — it cannot include the
-                        // C++ header (e.g. @boringssl//:crypto *-apple.S).
-                        if !crate::cc_command_spec::is_assembly_source_path(
-                            Path::new(src),
-                        ) {
-                            argv_strs.push("-include".to_string());
-                            argv_strs.push("cstdint".to_string());
-                        }
-                        // -fno-rtti for @llvm-project consumers, placed right
-                        // after the cstdint block (inside !is_c_source) so this
+                        // Preserve the existing LLVM no-RTTI selection so this
                         // analyze argv (PASS-A) stays byte-identical to the
                         // CcCompileCommandSpec (PASS-B). Matches LLVM's
                         // -fno-rtti build (converter-gen typeinfo link).
                         if deps_want_llvm_no_rtti(&self.deps) {
                             argv_strs.push("-fno-rtti".to_string());
-                        }
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        argv_strs.push("-D_GNU_SOURCE".to_string());
-                        for extra in [
-                            "/usr/include/jsoncpp",
-                            "/usr/include/x86_64-linux-gnu",
-                        ] {
-                            if std::path::Path::new(extra).exists() {
-                                argv_strs.push(format!("-I{}", extra));
-                            }
                         }
                     }
                     if !is_c_source {
@@ -6270,15 +6175,6 @@ impl RuleInstance for CcBinaryInstance {
             }
         }
 
-        let mut linux_extra_includes: Vec<std::path::PathBuf> = Vec::new();
-        if cfg!(target_os = "linux") {
-            for extra in ["/usr/include/jsoncpp", "/usr/include/x86_64-linux-gnu"] {
-                if std::path::Path::new(extra).exists() {
-                    linux_extra_includes.push(std::path::PathBuf::from(extra));
-                }
-            }
-        }
-
         let target_output_dir = context.output_dir.join(format!("{}_objs", self.name));
         let mut object_paths: Vec<std::path::PathBuf> = Vec::new();
         // Expand explicit labels and implicit bare-header labels exactly as
@@ -6409,7 +6305,7 @@ impl RuleInstance for CcBinaryInstance {
                     workspace_root: context.workspace_root.clone(),
                     extra_workspace_paths: context.extra_proto_paths.to_vec(),
                     genfiles_path: context.output_dir.join("genfiles"),
-                    linux_extra_includes: linux_extra_includes.clone(),
+                    linux_extra_includes: Vec::new(),
                 },
                 // Commit 14: include dep generated headers in
                 // declared_inputs so the verifier's declared-
@@ -7616,6 +7512,291 @@ mod cc_binary_response_tests {
         assert_ne!(owner_keys[1], owner_keys[2]);
         assert_eq!(consumer_keys[0], consumer_keys[1]);
         assert_eq!(consumer_keys[1], consumer_keys[2]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn constructor_defaults_cstdint_requires_authored_include_in_real_compiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("source");
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let source = workspace.join("requires_header.cc");
+        std::fs::write(
+            &source,
+            "int main(){std::uint64_t value=42;return static_cast<int>(value);}\n",
+        )
+        .unwrap();
+        let manager = Arc::new(RecordingExecutingActionManager::default());
+        for explicit in [false, true] {
+            let mut toolchain = Toolchain::default();
+            let copts = if explicit {
+                toolchain.cxxflags = vec![
+                    "-include".into(),
+                    "cstdint".into(),
+                    "-DTOOLCHAIN_SEGMENT=1".into(),
+                ];
+                vec![
+                    "-include".into(),
+                    "cstdint".into(),
+                    "-DRULE_SEGMENT=1".into(),
+                ]
+            } else {
+                Vec::new()
+            };
+            let context = BuildContext::new(workspace.clone(), output.clone())
+                .with_toolchain(toolchain.clone())
+                .with_action_manager(manager.clone());
+            let library = library_with_compile_options("requires_header.cc", copts.clone());
+            let mut binary = binary_with_linkopt(String::new());
+            binary.linkopts.clear();
+            binary.copts = copts.clone();
+            let test = CcTestInstance {
+                name: "requires_header".into(),
+                srcs: vec!["requires_header.cc".into()],
+                deps: Vec::new(),
+                copts: copts.clone(),
+                linkopts: Vec::new(),
+                defines: Vec::new(),
+                data: Vec::new(),
+            };
+            for kind in ["library", "binary", "test"] {
+                let object = output.join(format!("{kind}-{explicit}.o"));
+                let result = match kind {
+                    "library" => {
+                        library
+                            .compile_source(&context, &source, &object, &[])
+                            .await
+                    }
+                    "binary" => {
+                        binary
+                            .compile_source(&context, &source, &object, &[], &[])
+                            .await
+                    }
+                    _ => test.compile_source(&context, &source, &object, &[]).await,
+                };
+                let action = manager.actions.lock().unwrap().last().unwrap().clone();
+                let pairs = action
+                    .command
+                    .args
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-include" && pair[1] == "cstdint")
+                    .count();
+                assert_eq!(pairs, if explicit { 2 } else { 0 }, "{kind}");
+                if !explicit {
+                    let error = result
+                        .expect_err("a missing standard include must not be repaired implicitly");
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains("std") || message.contains("uint64_t"),
+                        "{kind}: {message}"
+                    );
+                    assert!(!object.exists());
+                    continue;
+                }
+                result.unwrap();
+                let tool_segment = ["-include", "cstdint", "-DTOOLCHAIN_SEGMENT=1"];
+                let rule_segment = ["-include", "cstdint", "-DRULE_SEGMENT=1"];
+                let tool_index = action
+                    .command
+                    .args
+                    .windows(3)
+                    .position(|w| w == tool_segment)
+                    .unwrap();
+                let rule_index = action
+                    .command
+                    .args
+                    .windows(3)
+                    .position(|w| w == rule_segment)
+                    .unwrap();
+                assert!(tool_index < rule_index, "authored option order for {kind}");
+                let executable = output.join(format!("{kind}-explicit"));
+                let linked = std::process::Command::new(&toolchain.cxx)
+                    .arg(&object)
+                    .arg("-o")
+                    .arg(&executable)
+                    .output()
+                    .unwrap();
+                assert!(
+                    linked.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&linked.stderr)
+                );
+                assert_eq!(
+                    std::process::Command::new(&executable)
+                        .status()
+                        .unwrap()
+                        .code(),
+                    Some(42)
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn constructor_defaults_gnu_source_keeps_authored_order_and_real_cache_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("source");
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let source = workspace.join("feature.c");
+        std::fs::write(&source, "#ifdef _GNU_SOURCE\n#define VALUE 42\n#else\n#define VALUE 43\n#endif\nint main(void){return VALUE;}\n").unwrap();
+        let manager = Arc::new(CachingExecutingActionManager::default());
+        let object = output.join("feature.o");
+        let executable = output.join("feature");
+        let mut initial_id = None;
+        for stage in 0..3 {
+            let (first, last) = if stage == 2 {
+                ("-D_GNU_SOURCE", "-U_GNU_SOURCE")
+            } else {
+                ("-U_GNU_SOURCE", "-D_GNU_SOURCE")
+            };
+            let mut toolchain = Toolchain::default();
+            toolchain.cflags = vec![first.into()];
+            let context = BuildContext::new(workspace.clone(), output.clone())
+                .with_toolchain(toolchain.clone())
+                .with_action_manager(manager.clone());
+            let library = library_with_compile_options("feature.c", vec![last.into()]);
+            library
+                .compile_source(&context, &source, &object, &[])
+                .await
+                .unwrap();
+            let linked = std::process::Command::new(&toolchain.cc)
+                .arg(&object)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                linked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+            assert_eq!(
+                std::process::Command::new(&executable)
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(if stage == 2 { 43 } else { 42 })
+            );
+            let requests = manager.requests.lock().unwrap();
+            let (action, cached) = &requests[stage];
+            assert_eq!(*cached, stage == 1);
+            assert_eq!(
+                action
+                    .command
+                    .args
+                    .iter()
+                    .filter(|a| a.as_str() == "-D_GNU_SOURCE")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                action
+                    .command
+                    .args
+                    .iter()
+                    .filter(|a| a.as_str() == "-U_GNU_SOURCE")
+                    .count(),
+                1
+            );
+            let first_index = action.command.args.iter().position(|a| a == first).unwrap();
+            let last_index = action.command.args.iter().position(|a| a == last).unwrap();
+            assert!(first_index < last_index);
+            if stage == 0 {
+                initial_id = Some(action.id.clone());
+            }
+            if stage == 1 {
+                assert_eq!(Some(action.id.clone()), initial_id);
+            }
+            if stage == 2 {
+                assert_ne!(Some(action.id.clone()), initial_id);
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn constructor_defaults_host_include_is_explicit_data_in_real_compiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("source");
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let host = Path::new("/usr/include/x86_64-linux-gnu");
+        assert!(
+            host.join("bits/wordsize.h").is_file(),
+            "real host-header prerequisite"
+        );
+        let source = workspace.join("wordsize.c");
+        std::fs::write(
+            &source,
+            "#include <bits/wordsize.h>\nint main(void){return __WORDSIZE==64 ? 42 : 99;}\n",
+        )
+        .unwrap();
+        let flag = format!("-I{}", host.display());
+        let manager = Arc::new(RecordingExecutingActionManager::default());
+        for origin in ["none", "toolchain", "rule", "includes"] {
+            let mut toolchain = Toolchain::default();
+            toolchain.cflags = vec!["-nostdinc".into()];
+            let mut library = library_with_compile_options("wordsize.c", Vec::new());
+            match origin {
+                "toolchain" => toolchain.cflags.push(flag.clone()),
+                "rule" => library.copts.push(flag.clone()),
+                "includes" => library.includes.push(host.display().to_string()),
+                _ => {}
+            }
+            let context = BuildContext::new(workspace.clone(), output.clone())
+                .with_toolchain(toolchain.clone())
+                .with_action_manager(manager.clone());
+            let object = output.join(format!("{origin}.o"));
+            let result = library
+                .compile_source(&context, &source, &object, &[])
+                .await;
+            let action = manager.actions.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                action.command.args.iter().filter(|a| *a == &flag).count(),
+                usize::from(origin != "none"),
+                "origin {origin}"
+            );
+            assert!(!action
+                .command
+                .args
+                .iter()
+                .any(|a| a == "-I/usr/include/jsoncpp"));
+            if origin == "none" {
+                let message = format!(
+                    "{:#}",
+                    result.expect_err("host include must not be guessed")
+                );
+                assert!(message.contains("bits/wordsize.h"), "{message}");
+                assert!(!object.exists());
+                continue;
+            }
+            result.unwrap();
+            let executable = output.join(origin);
+            let linked = std::process::Command::new(&toolchain.cc)
+                .arg(&object)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                linked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+            assert_eq!(
+                std::process::Command::new(&executable)
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(42)
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -12103,7 +12284,7 @@ impl RuleInstance for CcTestInstance {
     /// scheduler can dispatch them. cc_test's argv is intentionally
     /// minimal compared to cc_library/cc_binary (just cxxflags +
     /// copts + defines + -c -o -src for compile, no -fPIC /
-    /// -std=c++17 / -D_GNU_SOURCE / transitive includes). Both
+    /// -std=c++17 / transitive includes). Both
     /// scheduler analyze() and legacy compile_source produce the
     /// same minimal shape so the verifier sees zero divergence.
     fn analyze(
@@ -12607,7 +12788,7 @@ impl CcTestInstance {
     ) -> Result<()> {
         // #39 test-corpus: cc_test compiles like cc_binary/cc_library — it needs
         // the FULL TF include layout (workspace-root + dep CcInfo include_dirs +
-        // genfiles + pinned absl/protobuf, -fPIC/-std=c++17/-D_GNU_SOURCE), NOT
+        // genfiles + pinned absl/protobuf, -fPIC/-std=c++17), NOT
         // the old minimal argv (which left every test unable to find even its
         // own package's headers, e.g. "tensorflow/core/platform/enable_tf2_utils.h").
         // Mirrors CcLibraryInstance::compile_source (Codex 019eb36b).
@@ -12621,21 +12802,8 @@ impl CcTestInstance {
         args.push("-fPIC".to_string());
         if !is_c_source {
             args.push("-std=c++17".to_string());
-            if !crate::cc_command_spec::is_assembly_source_path(src_path) {
-                args.push("-include".to_string());
-                args.push("cstdint".to_string());
-            }
             if deps_want_llvm_no_rtti(&self.deps) {
                 args.push("-fno-rtti".to_string());
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            args.push("-D_GNU_SOURCE".to_string());
-            for extra in ["/usr/include/jsoncpp", "/usr/include/x86_64-linux-gnu"] {
-                if std::path::Path::new(extra).exists() {
-                    args.push(format!("-I{}", extra));
-                }
             }
         }
         if !is_c_source {

@@ -136,8 +136,7 @@ fn ensure_pinned_absl_include(argv: &mut Vec<String>) {
 pub enum IncludeLayout {
     /// cc_library / cc_binary: Bazel package-rooted compile.
     /// argv emission appends:
-    ///   - `-D_GNU_SOURCE` (on Linux)
-    ///   - `-I<linux_extra_includes...>` (on Linux, post-exists filter)
+    ///   - `-I<linux_extra_includes...>` (explicit caller data, on Linux)
     ///   - `-I<workspace_root>`
     ///   - `-I<extra_workspace_paths...>`
     ///   - `-I<genfiles_path>`
@@ -153,16 +152,16 @@ pub enum IncludeLayout {
         /// `-I<genfiles>` so generated `.pb.h` / `.h.inc`
         /// resolve through the package-rooted convention.
         genfiles_path: PathBuf,
-        /// Linux extra include dirs (after `Path::exists()`
-        /// check). Caller filters; spec stores the post-filter
-        /// list.
+        /// Explicit extra include dirs for the Linux layout. Native rule
+        /// constructors leave this empty; they never infer fixed host roots.
+        /// Retained as caller data for existing typed constructor users.
         linux_extra_includes: Vec<PathBuf>,
     },
     /// Standalone generated-source compile (cc_proto_library
     /// generated `.pb.cc`, future grpc `.grpc.pb.cc`, etc.). The
     /// only `-I` flags emitted are from `direct_include_paths`
-    /// and `dep_include_paths`. No `-D_GNU_SOURCE`, no linux
-    /// extras, no workspace/genfiles trailers — the compile is
+    /// and `dep_include_paths`. No implicit Linux extras or
+    /// workspace/genfiles trailers — the compile is
     /// not package-rooted and doesn't need the Bazel layout.
     Standalone,
 }
@@ -349,7 +348,7 @@ impl CcCompileCommandSpec {
     /// parallel command builder. The only difference from a
     /// cc_library compile is that the standalone proto compile
     /// does NOT carry `-I<workspace_root>` / `-I<genfiles>` /
-    /// linux extras / `-D_GNU_SOURCE` — `bazel_workspace_includes`
+    /// implicit host extras — `bazel_workspace_includes`
     /// is set to false to gate those off.
     ///
     /// A legacy direct `/usr/include` entry is still assembled here for older
@@ -486,11 +485,8 @@ impl CcCompileCommandSpec {
         let mut argv: Vec<String> = Vec::new();
         argv.push("-c".to_string());
         argv.push("-fPIC".to_string());
-        // Phase 5.C.4 commit 20: linux_extras + -D_GNU_SOURCE
-        // are part of the BazelPackageRooted layout. Standalone
-        // compiles (cc_proto_library generated .pb.cc, etc.)
-        // skip them entirely — only direct/dep include paths
-        // emit for those.
+        // Extra layout roots are explicit caller data, never discovered from
+        // fixed host paths. Standalone compiles have no package-rooted extras.
         let linux_extras: &[PathBuf] = match &self.include_layout {
             IncludeLayout::BazelPackageRooted {
                 linux_extra_includes,
@@ -502,25 +498,8 @@ impl CcCompileCommandSpec {
             matches!(self.include_layout, IncludeLayout::BazelPackageRooted { .. });
         if !self.is_c_source {
             argv.push("-std=c++17".to_string());
-            // Phase 5.C.5h: force-include <cstdint> for C++ TUs under the
-            // bazel-rooted layout, byte-identical to the analyze pass
-            // (rules_cc.rs cc_library@636 / cc_test@1496). gcc-13+/libstdc++
-            // no longer transitively include <cstdint>, so TF/LLVM/MLIR
-            // headers using int32_t etc. without including it (e.g. stablehlo
-            // math_utils.h) fail "'int32_t' has not been declared". Gated on
-            // bazel_layout so Standalone proto .pb.cc compiles — whose analyze
-            // path does NOT add it — stay byte-identical (PASS-A/PASS-B parity).
-            // Toolchain workaround, NOT a TF source patch. Assembly TUs
-            // (.s/.S) are excluded — they cannot include the C++ header
-            // (e.g. @boringssl//:crypto's *-apple.S); is_c_source only
-            // catches .c, so assembly needs an explicit guard.
-            if bazel_layout && !is_assembly_source_path(&self.src_path) {
-                argv.push("-include".to_string());
-                argv.push("cstdint".to_string());
-            }
-            // -fno-rtti for @llvm-project-consuming C++ TUs, placed right after
-            // the cstdint block so PASS-A (analyze inline argv) and PASS-B
-            // (this spec) stay byte-identical. Matches LLVM's -fno-rtti build
+            // Preserve the existing LLVM no-RTTI selection in both PASS-A and
+            // PASS-B. Matches LLVM's -fno-rtti build
             // (else typeinfo for llvm::cl::Option / format_adapter is undefined
             // at link — e.g. //tensorflow/compiler/mlir/lite:converter-gen).
             if self.wants_no_rtti {
@@ -528,7 +507,6 @@ impl CcCompileCommandSpec {
             }
         }
         if cfg!(target_os = "linux") && bazel_layout {
-            argv.push("-D_GNU_SOURCE".to_string());
             for p in linux_extras {
                 argv.push(format!("-I{}", p.display()));
             }
@@ -772,14 +750,8 @@ impl CcLinkCommandSpec {
 /// True for assembly sources (`.s` / `.S`, case-insensitive).
 ///
 /// Assembly TUs ARE compiled (see [`is_compilable_source`]) but must NOT
-/// receive C++-only flags. In particular `-include cstdint` (the gcc-13+
-/// transitive-include workaround, phase 5.C.5h) makes the preprocessor try to
-/// open the C++ `<cstdint>` header for an assembly compile and fails with
-/// "cstdint: No such file or directory" (e.g. @boringssl//:crypto's
-/// chacha-armv4-apple.S). `is_c_source` only excludes `.c`, so assembly would
-/// otherwise be misclassified as C++. Both the analyze pass (rules_cc) and the
-/// legacy spec gate cstdint on `!is_c_source && !is_assembly_source_path(..)`
-/// so PASS-A/PASS-B stay byte-identical.
+/// receive C++-only flags or enter the literal C/C++ header-admission profile.
+/// Keep assembly recognition independent of compiler-default option emission.
 pub fn is_assembly_source_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -1080,6 +1052,98 @@ mod tests {
             .any(|w| w == ["-std=c++17", "-xc", "-std=c11", "-include", "-std=c++11"]));
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn constructor_defaults_spec_keeps_explicit_layout_root_and_authored_flags_real() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = PathBuf::from("/usr/include/x86_64-linux-gnu");
+        assert!(
+            host.join("bits/wordsize.h").is_file(),
+            "real host-header prerequisite"
+        );
+        let source = temp.path().join("wordsize.c");
+        std::fs::write(&source, "#include <bits/wordsize.h>\n#ifndef _GNU_SOURCE\n#error missing explicit GNU option\n#endif\nint main(void){return __WORDSIZE==64 ? 42 : 99;}\n").unwrap();
+        let toolchain = crate::context::Toolchain::default();
+        let flag = format!("-I{}", host.display());
+        for explicit in [false, true] {
+            let mut spec = compile_spec_min(true);
+            spec.executable = toolchain.cc.clone();
+            spec.src_path = source.clone();
+            spec.obj_path = temp.path().join(format!("spec-{explicit}.o"));
+            spec.declared_input_paths = vec![source.clone(), host.join("bits/wordsize.h")];
+            spec.declared_output_paths = vec![spec.obj_path.clone()];
+            spec.cflags = vec!["-nostdinc".into(), "-U_GNU_SOURCE".into()];
+            spec.copts = vec!["-D_GNU_SOURCE".into()];
+            spec.include_layout = IncludeLayout::BazelPackageRooted {
+                workspace_root: temp.path().to_path_buf(),
+                extra_workspace_paths: Vec::new(),
+                genfiles_path: temp.path().join("generated"),
+                linux_extra_includes: if explicit {
+                    vec![host.clone()]
+                } else {
+                    Vec::new()
+                },
+            };
+            let command = spec.to_normalized_command_spec();
+            assert_eq!(
+                command.argv.iter().filter(|a| *a == &flag).count(),
+                usize::from(explicit)
+            );
+            assert_eq!(
+                command
+                    .argv
+                    .iter()
+                    .filter(|a| a.as_str() == "-D_GNU_SOURCE")
+                    .count(),
+                1
+            );
+            let undef = command
+                .argv
+                .iter()
+                .position(|a| a == "-U_GNU_SOURCE")
+                .unwrap();
+            let define = command
+                .argv
+                .iter()
+                .position(|a| a == "-D_GNU_SOURCE")
+                .unwrap();
+            assert!(undef < define);
+            let result = std::process::Command::new(&command.executable)
+                .args(&command.argv)
+                .output()
+                .unwrap();
+            if !explicit {
+                assert!(!result.status.success());
+                assert!(String::from_utf8_lossy(&result.stderr).contains("bits/wordsize.h"));
+                continue;
+            }
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let executable = temp.path().join("spec-program");
+            let linked = std::process::Command::new(&toolchain.cc)
+                .arg(&spec.obj_path)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                linked.status.success(),
+                "{}",
+                String::from_utf8_lossy(&linked.stderr)
+            );
+            assert_eq!(
+                std::process::Command::new(&executable)
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(42)
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn cc_compile_spec_real_compiler_honors_explicit_language_and_standard() {
@@ -1193,7 +1257,7 @@ mod tests {
         // No workspace / extra / genfiles trailers.
         assert!(!n.argv.iter().any(|a| a == "-I/ws"));
         assert!(!n.argv.iter().any(|a| a == "-I/ws/out/genfiles"));
-        // No -D_GNU_SOURCE on Linux (gated on BazelPackageRooted).
+        // No feature-test define unless supplied by the caller.
         assert!(!n.argv.iter().any(|a| a == "-D_GNU_SOURCE"));
     }
 
