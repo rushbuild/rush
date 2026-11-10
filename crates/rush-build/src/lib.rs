@@ -4992,11 +4992,9 @@ cc_library(
                         PathBuf::from(std::ffi::OsStr::from_bytes(value)) }
                     #[cfg(not(unix))] { PathBuf::from(String::from_utf8_lossy(value).into_owned()) }
                 }).unwrap_or_else(|| self.workspace_root.join(".cache/rush"));
-            let native = configured_flag_metadata::NativeCompilerSelection::from_toolchain(
-                &rush_rules::context::Toolchain::default(), &command.semantics)?;
-            let analysis = configured_flag_metadata::ConfiguredFeatureFlagAnalysis::new(
+            let analysis = configured_flag_metadata::ConfiguredFeatureFlagAnalysis::new_with_toolchain(
                 &self.workspace_root, &binary, &cache_root.join("bazel_output_base"),
-                &command.semantics, native)?;
+                &command.semantics, rush_rules::context::Toolchain::default())?;
             let mut slot = self.feature_flag_command.lock()
                 .map_err(|_| anyhow::anyhow!("feature-flag command lock poisoned"))?;
             if let Some(current) = slot.as_mut() {

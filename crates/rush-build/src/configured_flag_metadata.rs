@@ -102,7 +102,9 @@ pub(crate) struct ConfiguredFeatureFlagAnalysis {
     environment_keys: Vec<Vec<u8>>,
     environment: BTreeMap<Vec<u8>, Vec<u8>>,
     fingerprint: [u8; 32],
-    native: NativeCompilerSelection,
+    native: Option<NativeCompilerSelection>,
+    deferred_toolchain: Option<rush_rules::context::Toolchain>,
+    semantics: Option<CommandSemantics>,
 }
 
 impl ConfiguredFeatureFlagAnalysis {
@@ -112,6 +114,21 @@ impl ConfiguredFeatureFlagAnalysis {
         output_base: &Path,
         semantics: &CommandSemantics,
         native: NativeCompilerSelection,
+    ) -> Result<Self> {
+        Self::new_inner(workspace, bazel_binary, output_base, semantics, Some(native), None)
+    }
+
+    pub(crate) fn new_with_toolchain(
+        workspace: &Path, bazel_binary: &Path, output_base: &Path,
+        semantics: &CommandSemantics, toolchain: rush_rules::context::Toolchain,
+    ) -> Result<Self> {
+        Self::new_inner(workspace, bazel_binary, output_base, semantics, None, Some(toolchain))
+    }
+
+    fn new_inner(
+        workspace: &Path, bazel_binary: &Path, output_base: &Path,
+        semantics: &CommandSemantics, native: Option<NativeCompilerSelection>,
+        deferred_toolchain: Option<rush_rules::context::Toolchain>,
     ) -> Result<Self> {
         if !cfg!(unix) {
             bail!("configured FeatureFlagInfo metadata currently requires Unix byte-preserving command IO");
@@ -160,6 +177,8 @@ impl ConfiguredFeatureFlagAnalysis {
             environment,
             fingerprint,
             native,
+            deferred_toolchain,
+            semantics: Some(semantics.clone()),
         };
         let version = context.probe(&context.executable, &[b"--version".to_vec()])?;
         if version.trim_ascii() != b"bazel 6.5.0" {
@@ -186,14 +205,25 @@ impl ConfiguredFeatureFlagAnalysis {
         if first != second {
             bail!("configured FeatureFlagInfo metadata changed between fresh analysis rounds");
         }
-        for compiler in &first.toolchains {
-            self.validate_compiler_agreement(compiler)?;
+        // Raw boolean settings are independent of a C/C++ driver. Preserve
+        // the existing strict CPU compiler contract whenever a string feature
+        // participates, including mixed string/bool conditions.
+        if !first.values.is_empty() {
+            let mut checked = self.clone();
+            if checked.native.is_none() {
+                checked.native = Some(NativeCompilerSelection::from_toolchain(
+                    checked.deferred_toolchain.as_ref().context("string feature proof lacks native toolchain")?,
+                    checked.semantics.as_ref().context("string feature proof lacks immutable command")?,
+                )?);
+            }
+            for compiler in &first.toolchains { checked.validate_compiler_agreement(compiler)?; }
         }
-        config_defines::install_verified_feature_flag_condition(
+        config_defines::install_verified_configured_flag_condition(
             scope,
             generation,
             expected,
             first.values,
+            first.bool_values,
         )
         .map_err(anyhow::Error::msg)
     }
@@ -230,6 +260,7 @@ impl ConfiguredFeatureFlagAnalysis {
             bail!("configured provider query omitted the condition target");
         }
         let mut values = BTreeMap::new();
+        let mut bool_values = BTreeMap::new();
         let mut producers = BTreeSet::new();
         for declared in expected.flag_values.keys() {
             let actual = declaration.resolve_alias(declared)?;
@@ -245,16 +276,25 @@ impl ConfiguredFeatureFlagAnalysis {
             if !producers.insert(actual.clone()) {
                 bail!("condition references one producer through duplicate flag aliases");
             }
-            let value = observed.features.get(&actual).with_context(|| {
-                format!("flag {declared} lacks a configured string FeatureFlagInfo")
-            })?;
-            values.insert(declared.clone(), (actual, value.clone()));
+            if let Some(value) = observed.features.get(&actual) {
+                // Native ConfigSetting checks FeatureFlagInfo before raw build
+                // settings, even if this producer also has a bool default.
+                values.insert(declared.clone(), (actual, value.clone()));
+            } else {
+                if declared != &actual {
+                    bail!("Bazel 6.5 bool flag_values aliases are not supported: {declared}");
+                }
+                config_defines::parse_bazel_bool_predicate(&expected.flag_values[declared]).map_err(anyhow::Error::msg)?;
+                bool_values.insert(declared.clone(), configured_bool_value(&declaration, &observed, &expected.label, &actual)?);
+            }
         }
         Ok(SemanticRound {
             metadata: declaration.metadata,
             raw_occurrences: declaration.raw_occurrences,
             domains: declaration.domains,
             values,
+            bool_values,
+            options: observed.options,
             toolchains: observed.toolchains.into_iter().collect(),
         })
     }
@@ -313,12 +353,13 @@ impl ConfiguredFeatureFlagAnalysis {
             &self.workspace,
             &self.environment,
         )?;
+        let native = self.native.as_ref().context("compiler agreement lacks native compiler authority")?;
         let mut drivers = vec![
-            (self.native.cc.clone(), "c"),
-            (self.native.cxx.clone(), "c++"),
+            (native.cc.clone(), "c"),
+            (native.cxx.clone(), "c++"),
         ];
         drivers.extend(
-            self.native
+            native
                 .additional_cxx
                 .iter()
                 .cloned()
@@ -353,7 +394,7 @@ impl ConfiguredFeatureFlagAnalysis {
 
 // This expression always emits a JSON record, including source files whose
 // providers() is None. Errors/empty/missing records cannot silently become false.
-const PROVIDER_EXPRESSION: &str = r#"json.encode({"label":str(target.label),"feature":{"type":type(providers(target)["FeatureFlagInfo"].value),"value":providers(target)["FeatureFlagInfo"].value} if "FeatureFlagInfo" in (providers(target) or {}) else None,"toolchain":{"compiler":providers(target)["CcToolchainInfo"].compiler,"executable":providers(target)["CcToolchainInfo"].compiler_executable,"cpu":providers(target)["CcToolchainInfo"].cpu,"toolchain_id":providers(target)["CcToolchainInfo"].toolchain_id} if "CcToolchainInfo" in (providers(target) or {}) else None})"#;
+const PROVIDER_EXPRESSION: &str = r#"json.encode({"label":str(target.label),"options":[{"label":str(k),"type":type(v),"value":v} for k,v in (build_options(target) or {}).items() if not str(k).startswith("//command_line_option:")],"feature":{"type":type(providers(target)["FeatureFlagInfo"].value),"value":providers(target)["FeatureFlagInfo"].value} if "FeatureFlagInfo" in (providers(target) or {}) else None,"toolchain":{"compiler":providers(target)["CcToolchainInfo"].compiler,"executable":providers(target)["CcToolchainInfo"].compiler_executable,"cpu":providers(target)["CcToolchainInfo"].cpu,"toolchain_id":providers(target)["CcToolchainInfo"].toolchain_id} if "CcToolchainInfo" in (providers(target) or {}) else None})"#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct CompilerMetadata {
@@ -368,6 +409,8 @@ struct SemanticRound {
     raw_occurrences: BTreeMap<(String, String), usize>,
     domains: BTreeMap<String, BTreeMap<String, usize>>,
     values: BTreeMap<String, (String, String)>,
+    bool_values: BTreeMap<String, config_defines::VerifiedBoolBuildSetting>,
+    options: BTreeMap<(String, String), BTreeMap<String, RawSettingOption>>,
     toolchains: Vec<CompilerMetadata>,
 }
 struct ConfiguredDeclaration {
@@ -553,7 +596,12 @@ impl ConfiguredDeclaration {
         configuration: &str,
         bytes: &[u8],
     ) -> Result<ProviderObservations> {
-        let observed = ProviderObservations::parse_in_configuration(bytes, configuration)?;
+        let mut observed = ProviderObservations::parse_in_configuration(bytes, configuration)?;
+        for ((label, checksum), rule) in &self.metadata {
+            if checksum == configuration && boolean_default(rule)?.is_some() {
+                observed.relevant_labels.insert(self.resolve_alias(label)?);
+            }
+        }
         for ((label, checksum), count) in &self.raw_occurrences {
             if checksum == configuration
                 && *count > 1
@@ -582,7 +630,57 @@ impl ConfiguredDeclaration {
         Ok(current)
     }
 }
+/// The native condition query is the build-setting-kind authority. A BOOLEAN
+/// attribute alone is deliberately insufficient: ordinary rules may declare it.
+fn boolean_default(rule: &Value) -> Result<Option<bool>> {
+    let attrs = attributes(rule)?;
+    let Some(attr) = attrs.get("build_setting_default") else { return Ok(None); };
+    if string(attr, "type")? != "BOOLEAN" { return Ok(None); }
+    let value = attr.get("booleanValue").and_then(Value::as_bool)
+        .context("BOOLEAN default lacks typed boolean value")?;
+    if attr.get("intValue").is_some_and(|v| v.as_i64() != Some(i64::from(value)))
+        || attr.get("stringValue").is_some_and(|v| v.as_str() != Some(if value { "true" } else { "false" })) {
+        bail!("BOOLEAN default has contradictory typed encodings");
+    }
+    Ok(Some(value))
+}
+
+fn configured_bool_value(
+    declaration: &ConfiguredDeclaration, observed: &ProviderObservations,
+    condition: &str, producer: &str,
+) -> Result<config_defines::VerifiedBoolBuildSetting> {
+    let mut result = None;
+    for ((label, checksum), rule) in &declaration.metadata {
+        if label != producer { continue; }
+        // An actual configured condition and its producer must share this
+        // configuration, not merely occur somewhere in the query result.
+        if !declaration.metadata.contains_key(&(condition.to_owned(), checksum.clone())) {
+            bail!("bool producer is outside the condition configuration");
+        }
+        let default = boolean_default(rule)?.context("flag has no string FeatureFlagInfo or typed BOOLEAN build-setting default")?;
+        let options = observed.options.get(&(producer.to_owned(), checksum.clone()))
+            .context("bool producer lacks complete typed build_options receipt")?;
+        let condition_options = observed.options.get(&(condition.to_owned(), checksum.clone()))
+            .context("bool condition lacks complete typed build_options receipt")?;
+        if options != condition_options { bail!("condition and bool producer options disagree within configuration"); }
+        let value = if let Some(option) = options.get(producer) {
+            if option.kind != "bool" { bail!("configured bool option has wrong Starlark type"); }
+            option.value.as_bool().context("configured bool option lacks boolean value")?
+        } else { default };
+        let candidate = config_defines::VerifiedBoolBuildSetting { producer: producer.to_owned(), default, value };
+        if result.as_ref().is_some_and(|old| old != &candidate) {
+            bail!("bool setting has conflicting defaults/values across actual configurations");
+        }
+        result = Some(candidate);
+    }
+    result.context("bool producer is absent from authoritative configured rules")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawSettingOption { kind: String, value: Value }
+
 struct ProviderObservations {
+    options: BTreeMap<(String, String), BTreeMap<String, RawSettingOption>>,
     relevant_labels: BTreeSet<String>,
     counts: BTreeMap<String, usize>,
     labels: BTreeSet<String>,
@@ -592,6 +690,7 @@ struct ProviderObservations {
 impl ProviderObservations {
     fn empty() -> Self {
         Self {
+            options: BTreeMap::new(),
             relevant_labels: BTreeSet::new(),
             counts: BTreeMap::new(),
             labels: BTreeSet::new(),
@@ -600,6 +699,11 @@ impl ProviderObservations {
         }
     }
     fn merge(&mut self, other: Self) -> Result<()> {
+        for (key, value) in other.options {
+            if self.options.insert(key, value.clone()).is_some_and(|old| old != value) {
+                bail!("conflicting configured raw build-setting options");
+            }
+        }
         self.labels.extend(other.labels);
         self.relevant_labels.extend(other.relevant_labels);
         self.toolchains.extend(other.toolchains);
@@ -631,6 +735,19 @@ impl ProviderObservations {
                 }
             }
             let label = canonical(string(&record, "label")?)?;
+            if let Some(options) = record.get("options") {
+                let options = options.as_array().context("raw build-setting options are not a complete list")?;
+                let mut values = BTreeMap::new();
+                for option in options {
+                    let name = canonical(string(option, "label")?)?;
+                    let value = RawSettingOption { kind: string(option, "type")?.to_owned(), value: option.get("value").context("raw option lacks value")?.clone() };
+                    if values.insert(name, value).is_some() { bail!("duplicate raw build-setting option"); }
+                }
+                let key = (label.clone(), configuration.unwrap_or_default().to_owned());
+                if result.options.insert(key, values.clone()).is_some_and(|old| old != values) {
+                    bail!("conflicting raw build-setting options within configuration");
+                }
+            }
             *result.counts.entry(label.clone()).or_default() += 1;
             result.labels.insert(label.clone());
             records += 1;
@@ -898,6 +1015,15 @@ fn project_build_arguments(tokens: &[String]) -> Result<Vec<String>> {
             index += 1;
             continue;
         }
+        if joined.is_none() && (name.starts_with("--//") || name.starts_with("--@")
+            || name.starts_with("--no//") || name.starts_with("--no@")) {
+            let raw = name.strip_prefix("--no").filter(|v| v.starts_with("//") || v.starts_with('@'))
+                .unwrap_or_else(|| &name[2..]);
+            query_label(raw)?;
+            result.push(token.clone());
+            index += 1;
+            continue;
+        }
         let valued = matches!(
             name,
             "-j" | "--jobs"
@@ -1049,6 +1175,90 @@ mod tests {
         ));
         metadata
     }
+    fn bool_metadata(default: bool) -> (Value, FeatureFlagPredicate) {
+        let mut value = metadata();
+        value["results"].as_array_mut().unwrap().remove(1);
+        value["results"][0]["target"]["rule"]["attribute"][2]["labelKeyedStringDictValue"] = json!([{"key":"//cfg:mode","value":"True"}]);
+        value["results"][1]["target"]["rule"]["ruleClass"] = json!("custom_bool");
+        value["results"][1]["target"]["rule"]["attribute"] = json!([{
+            "name":"build_setting_default","type":"BOOLEAN", "booleanValue":default,
+            "intValue":i64::from(default),"stringValue":if default { "true" } else { "false" }
+        }]);
+        let mut predicate = predicate();
+        predicate.flag_values = BTreeMap::from([("//cfg:mode".into(), "True".into())]);
+        (value, predicate)
+    }
+
+    fn bool_observed(options: Value) -> ProviderObservations {
+        let rows = ["//cfg:enabled", "//cfg:mode"].map(|label| json!({
+            "label":label,"configuration":"a".repeat(64),"feature":null,"toolchain":null,"options":options
+        }).to_string()).join("\n");
+        ProviderObservations::parse_in_configuration(rows.as_bytes(), &"a".repeat(64)).unwrap()
+    }
+
+    #[test]
+    fn configured_bool_metadata_uses_typed_options_or_authoritative_default() {
+        for default in [false, true] {
+            let (raw, predicate) = bool_metadata(default);
+            let declaration = ConfiguredDeclaration::parse(&serde_json::to_vec(&raw).unwrap(), &predicate).unwrap();
+            let observed = bool_observed(json!([]));
+            let proof = configured_bool_value(&declaration, &observed, "//cfg:enabled", "//cfg:mode").unwrap();
+            assert_eq!((proof.default, proof.value), (default, default));
+            for value in [false, true] {
+                let observed = bool_observed(json!([{"label":"//cfg:mode","type":"bool","value":value}]));
+                let proof = configured_bool_value(&declaration, &observed, "//cfg:enabled", "//cfg:mode").unwrap();
+                assert_eq!((proof.default, proof.value), (default, value));
+            }
+        }
+    }
+
+    #[test]
+    fn configured_bool_metadata_refuses_incomplete_conflicting_and_malformed_values() {
+        let (raw, predicate) = bool_metadata(false);
+        let declaration = ConfiguredDeclaration::parse(&serde_json::to_vec(&raw).unwrap(), &predicate).unwrap();
+        let checksum = "a".repeat(64);
+        let mut missing = bool_observed(json!([]));
+        missing.options.remove(&("//cfg:mode".into(), checksum.clone()));
+        let mut conflict = bool_observed(json!([]));
+        conflict.options.get_mut(&("//cfg:enabled".into(), checksum.clone())).unwrap().insert("//cfg:mode".into(), RawSettingOption { kind:"bool".into(), value:json!(true) });
+        for observed in [missing, conflict,
+            bool_observed(json!([{"label":"//cfg:mode","type":"string","value":"true"}])),
+            bool_observed(json!([{"label":"//cfg:mode","type":"bool","value":"true"}]))] {
+            assert!(configured_bool_value(&declaration, &observed, "//cfg:enabled", "//cfg:mode").is_err());
+        }
+        for (field, wrong) in [("booleanValue", json!("false")), ("intValue", json!(1)), ("stringValue", json!("true"))] {
+            let mut bad = raw.clone();
+            bad["results"][1]["target"]["rule"]["attribute"][0][field] = wrong;
+            let bad = ConfiguredDeclaration::parse(&serde_json::to_vec(&bad).unwrap(), &predicate).unwrap();
+            assert!(configured_bool_value(&bad, &bool_observed(json!([])), "//cfg:enabled", "//cfg:mode").is_err());
+        }
+        let mut transitioned = ConfiguredDeclaration::parse(&serde_json::to_vec(&raw).unwrap(), &predicate).unwrap();
+        let other = "b".repeat(64);
+        let rule = transitioned.metadata[&("//cfg:mode".into(), checksum.clone())].clone();
+        transitioned.metadata.insert(("//cfg:mode".into(),other.clone()),rule);
+        let mut observed = bool_observed(json!([]));
+        observed.options.insert(("//cfg:mode".into(),other.clone()),BTreeMap::new());
+        assert!(configured_bool_value(&transitioned,&observed,"//cfg:enabled","//cfg:mode").is_err());
+        transitioned.metadata.insert(("//cfg:enabled".into(),other.clone()),
+            transitioned.metadata[&("//cfg:enabled".into(),checksum.clone())].clone());
+        let different = BTreeMap::from([("//cfg:mode".into(),RawSettingOption {kind:"bool".into(),value:json!(true)})]);
+        observed.options.insert(("//cfg:mode".into(),other.clone()),different.clone());
+        observed.options.insert(("//cfg:enabled".into(),other),different);
+        assert!(configured_bool_value(&transitioned,&observed,"//cfg:enabled","//cfg:mode").is_err());
+        let duplicate = json!({"label":"//cfg:mode","configuration":checksum,"feature":null,"toolchain":null,
+            "options":[{"label":"//cfg:mode","type":"bool","value":false},{"label":"//cfg:mode","type":"bool","value":false}]});
+        assert!(ProviderObservations::parse_in_configuration(duplicate.to_string().as_bytes(), &checksum).is_err());
+    }
+
+    #[test]
+    fn configured_bool_projection_preserves_unary_options_and_refuses_malformed_labels() {
+        let tokens = ["--//:enabled", "--no//:enabled", "--@repo//cfg:enabled", "--no@repo//cfg:enabled", "--//:enabled=false"].map(str::to_owned);
+        assert_eq!(project_build_arguments(&tokens).unwrap(), tokens);
+        for invalid in ["--//:bad label", "--@repo//:bad'quote", "--no//:bad,label"] {
+            assert!(project_build_arguments(&[invalid.into()]).is_err());
+        }
+    }
+
     #[test]
     fn configured_flag_metadata_preserves_actual_predicates_and_alias_identity() {
         let parsed =
@@ -1278,11 +1488,13 @@ mod tests {
                 environment_keys: vec![],
                 environment: BTreeMap::new(),
                 fingerprint: tracked::config_fingerprint(),
-                native: NativeCompilerSelection {
+                native: Some(NativeCompilerSelection {
                     cc: wrapper.clone(),
                     cxx: wrapper.clone(),
                     additional_cxx: vec![],
-                },
+                }),
+                deferred_toolchain: None,
+                semantics: None,
             };
             let metadata = CompilerMetadata {
                 compiler: "observed-family".into(),
@@ -1291,7 +1503,7 @@ mod tests {
                 toolchain_id: "observed-toolchain".into(),
             };
             analysis.validate_compiler_agreement(&metadata).unwrap();
-            analysis.native.additional_cxx.push(wrong);
+            analysis.native.as_mut().unwrap().additional_cxx.push(wrong);
             assert!(analysis.validate_compiler_agreement(&metadata).is_err());
         });
     }
@@ -1308,11 +1520,13 @@ mod tests {
                 environment_keys: vec![],
                 environment: BTreeMap::new(),
                 fingerprint: tracked::config_fingerprint(),
-                native: NativeCompilerSelection {
+                native: Some(NativeCompilerSelection {
                     cc: PathBuf::new(),
                     cxx: PathBuf::new(),
                     additional_cxx: vec![],
-                },
+                }),
+                deferred_toolchain: None,
+                semantics: None,
             };
             assert!(analysis
                 .probe(
@@ -1538,11 +1752,13 @@ mod tests {
                 environment_keys: vec![],
                 environment: BTreeMap::new(),
                 fingerprint: tracked::config_fingerprint(),
-                native: NativeCompilerSelection {
+                native: Some(NativeCompilerSelection {
                     cc: PathBuf::new(),
                     cxx: PathBuf::new(),
                     additional_cxx: vec![],
-                },
+                }),
+                deferred_toolchain: None,
+                semantics: None,
             };
             assert_eq!(analysis.probe(&tool, &[]).unwrap(), b"same stdout\n");
             let io = tracked::current().unwrap();

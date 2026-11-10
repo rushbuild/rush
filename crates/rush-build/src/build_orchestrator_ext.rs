@@ -2440,9 +2440,18 @@ impl BuildOrchestrator {
             defs.extend(native_configuration.defines.clone());
             let defs: Vec<_> = defs.into_iter().collect();
             let scope = self.config_registry_scope();
+            // Legacy native requests need no expanded stream until a
+            // configured flag is consumed. Missing authority still blocks a
+            // raw Bool getter from silently serving a potentially overridden
+            // default; the metadata constructor reports the precise error.
+            let setting_arguments = rush_command_core::build_arguments::from_command(&semantics);
             self.with_tracked_scope(|| {
                 rush_starlark::config_defines::with_configuration_scope(&scope, || {
                     rush_starlark::config_defines::begin_command_with_native_options(&defs, native_configuration.clone());
+                    match &setting_arguments {
+                        Ok(arguments) => rush_starlark::config_defines::note_command_build_setting_overrides(&scope, arguments),
+                        Err(_) => rush_starlark::config_defines::note_command_build_setting_arguments_unavailable(&scope),
+                    }
                 });
             });
         }
@@ -23437,6 +23446,127 @@ filegroup(name = "bad", srcs = select({{":wrong": ["gcc.txt"], "//conditions:def
         anyhow::ensure!(message.contains("absent") && message.contains("configured metadata probe failed"), "{message}");
         anyhow::ensure!(orchestrator.snapshot_cache.get(&key).is_none(), "missing producer published a snapshot");
         drop(oracle_artifact);
+        // Genuine raw bool build settings deliberately return an opposite
+        // custom provider. Native flag_values must use the configured raw
+        // option/default, never that arbitrary implementation's value.
+        write_file(&root.join("bools/flags.bzl"), r#"
+RawInfo = provider()
+OppositeInfo = provider()
+def _raw(ctx):
+    return [RawInfo(value=ctx.build_setting_value), OppositeInfo(value=not ctx.build_setting_value)]
+def _mixed(ctx):
+    return _raw(ctx) + [config_common.FeatureFlagInfo(value="feature")]
+def _ordinary(ctx):
+    return [config_common.FeatureFlagInfo(value="feature")]
+raw_bool = rule(implementation=_raw, build_setting=config.bool(flag=True))
+mixed = rule(implementation=_mixed, build_setting=config.bool(flag=True))
+ordinary_feature = rule(implementation=_ordinary, attrs={"build_setting_default":attr.bool()})
+"#)?;
+        // A separate fake without FeatureFlagInfo cannot acquire build-setting
+        // authority merely by naming a BOOLEAN attribute build_setting_default.
+        write_file(&root.join("bools/fake.bzl"), "def _impl(ctx):\n    return []\nfake = rule(implementation=_impl, attrs={\"build_setting_default\":attr.bool()})\n")?;
+        write_file(&root.join("bools/BUILD"), r#"
+load(":flags.bzl", "raw_bool", "mixed", "ordinary_feature")
+load(":fake.bzl", "fake")
+raw_bool(name="raw_false",build_setting_default=False)
+raw_bool(name="raw_true",build_setting_default=True)
+mixed(name="mixed",build_setting_default=False)
+ordinary_feature(name="ordinary_feature",build_setting_default=False)
+fake(name="fake",build_setting_default=False)
+alias(name="raw_alias",actual=":raw_false")
+config_setting(name="false_enabled",flag_values={":raw_false":"True"})
+config_setting(name="true_enabled",flag_values={":raw_true":"yes"})
+config_setting(name="alias_enabled",flag_values={":raw_alias":"True"})
+config_setting(name="mixed_feature",flag_values={":mixed":"feature"})
+config_setting(name="mixed_bool",flag_values={":mixed":"True"})
+config_setting(name="ordinary_feature_condition",flag_values={":ordinary_feature":"feature"})
+config_setting(name="fake_condition",flag_values={":fake":"True"})
+config_setting(name="malformed",flag_values={":raw_false":" true"})
+filegroup(name="false_selected",srcs=select({":false_enabled":["on.txt"],"//conditions:default":["off.txt"]}))
+filegroup(name="true_selected",srcs=select({":true_enabled":["on.txt"],"//conditions:default":["off.txt"]}))
+filegroup(name="mixed_selected",srcs=select({":mixed_feature":["on.txt"],"//conditions:default":["off.txt"]}))
+filegroup(name="mixed_bool_selected",srcs=select({":mixed_bool":["on.txt"],"//conditions:default":["off.txt"]}))
+filegroup(name="ordinary_selected",srcs=select({":ordinary_feature_condition":["on.txt"],"//conditions:default":["off.txt"]}))
+"#)?;
+        for name in ["on.txt", "off.txt"] { write_file(&root.join("bools").join(name), name)?; }
+        let bool_request = |target: &str, flags: &[&str]| -> Result<rush_command_core::CommandSemantics> {
+            let mut captured = environment.clone();
+            let mut tokens = vec!["--jobs=8".to_string()];
+            tokens.extend(flags.iter().map(|v| (*v).to_owned()));
+            captured.insert(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes().to_vec(),
+                rush_command_core::build_arguments::encode_with_startup(&tokens, &["--windows_enable_symlinks".into()]).into_bytes());
+            captured.insert(rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes().to_vec(), b"[]".to_vec());
+            let mut request = RunRequest {
+                argv: vec![Bytes::from_static(b"rush"),Bytes::from_static(b"build"),Bytes::copy_from_slice(target.as_bytes())],
+                working_directory: Bytes::copy_from_slice(root.as_os_str().as_bytes()),
+                environment: captured.into_iter().map(|(name,value)| EnvironmentVariable { name:Bytes::from(name),value:Bytes::from(value) }).collect(),
+                protocol_major:rush_protocol::PROTOCOL_MAJOR,protocol_minor:rush_protocol::PROTOCOL_MINOR,..Default::default()
+            };
+            rush_command_core::populate_workspace_config(&mut request, root);
+            Ok(rush_command_core::CommandSemantics::from_run_request(&request)?)
+        };
+        for (target, flags, expected, raw) in [
+            ("//bools:false_selected",vec![],false,Some(false)),
+            ("//bools:false_selected",vec!["--//bools:raw_false"],true,Some(true)),
+            ("//bools:false_selected",vec!["--//bools:raw_false=false"],false,Some(false)),
+            ("//bools:false_selected",vec!["--no//bools:raw_false"],false,Some(false)),
+            ("//bools:true_selected",vec![],true,Some(true)),
+            ("//bools:true_selected",vec!["--//bools:raw_true=false"],false,Some(false)),
+            ("//bools:mixed_selected",vec!["--//bools:mixed=true"],true,None),
+            ("//bools:mixed_bool_selected",vec!["--//bools:mixed=true"],false,None),
+            ("//bools:ordinary_selected",vec![],true,None),
+            ("//bools:false_selected",vec![],false,Some(false)),
+        ] {
+            let request = bool_request(target,&flags)?;
+            let output = server.command().args(["cquery",target,"--output=files","--noshow_progress"])
+                .args(&flags).output()?;
+            anyhow::ensure!(output.status.success(), "genuine bool branch oracle failed: {}",String::from_utf8_lossy(&output.stderr));
+            let expected_path = root.join("bools").join(if expected { "on.txt" } else { "off.txt" });
+            anyhow::ensure!(String::from_utf8(output.stdout)?.trim() == expected_path.strip_prefix(root)?.to_str().unwrap(), "unexpected genuine bool selection");
+            let key = crate::analysis_snapshot::AnalysisKey::new(&request,root.canonicalize()?,vec![target.into()]);
+            orchestrator.build_with_dependencies_with_semantics(vec![target.into()],request).await?;
+            let snapshot = orchestrator.snapshot_cache.get(&key).context("bool command snapshot missing")?;
+            let state = snapshot.retained_execution_state().context("bool command artifacts missing")?;
+            let artifacts = state.artifact_forest.get(target).context("bool filegroup missing")?.flatten();
+            anyhow::ensure!(artifacts.len()==1 && artifacts[0].path==expected_path,"native bool selected wrong artifact: {artifacts:?}");
+            if let Some(raw) = raw {
+                let producer = if target.contains("true_selected") { "//bools:raw_true" } else { "//bools:raw_false" };
+                anyhow::ensure!(rush_starlark::config_defines::typed_build_setting_value_in_scope(&scope,producer)
+                    == Some(rush_starlark::config_defines::BuildSettingValue::Bool(raw)),"native raw getter differs from configured option");
+                let output=server.command().args(["cquery",producer,"--output=starlark",
+                    r#"--starlark:expr=json.encode([p.value for k,p in providers(target).items() if k.endswith("%RawInfo")])"#,"--noshow_progress"])
+                    .args(&flags).output()?;
+                anyhow::ensure!(output.status.success(),"genuine ctx.build_setting_value query failed: {}",String::from_utf8_lossy(&output.stderr));
+                let values:serde_json::Value=serde_json::from_slice(&output.stdout)?;
+                anyhow::ensure!(values==serde_json::json!([raw]),"native raw getter differs from actual Bazel ctx.build_setting_value: {values}");
+            }
+        }
+        // An actual source/default edit must invalidate the configured raw
+        // value even in the retained orchestrator and unchanged command flags.
+        let bool_build = std::fs::read_to_string(root.join("bools/BUILD"))?;
+        write_file(&root.join("bools/BUILD"), &bool_build.replace(
+            "raw_bool(name=\"raw_true\",build_setting_default=True)",
+            "raw_bool(name=\"raw_true\",build_setting_default=False)"))?;
+        let target="//bools:true_selected";
+        let request=bool_request(target,&[])?;
+        let key=crate::analysis_snapshot::AnalysisKey::new(&request,root.canonicalize()?,vec![target.into()]);
+        orchestrator.build_with_dependencies_with_semantics(vec![target.into()],request).await?;
+        let snapshot=orchestrator.snapshot_cache.get(&key).context("edited bool snapshot missing")?;
+        let state=snapshot.retained_execution_state().context("edited bool artifacts missing")?;
+        let outputs=state.artifact_forest.get(target).context("edited bool target missing")?.flatten();
+        anyhow::ensure!(outputs.len()==1 && outputs[0].path==root.join("bools/off.txt"),"source edit retained an old bool branch");
+        anyhow::ensure!(rush_starlark::config_defines::typed_build_setting_value_in_scope(&scope,"//bools:raw_true")
+            == Some(rush_starlark::config_defines::BuildSettingValue::Bool(false)),"source edit retained an old raw default");
+        for (target,flags,needle) in [
+            ("//bools:alias_enabled",vec![],"bool flag_values aliases are not supported"),
+            ("//bools:fake_condition",vec![],"must be build settings or feature flags"),
+            ("//bools:malformed",vec![],"cannot be converted"),
+            ("//bools:false_selected",vec!["--//bools:raw_alias=true"],"configured metadata probe failed"),
+        ] {
+            let error=orchestrator.build_with_dependencies_with_semantics(vec![target.into()],bool_request(target,&flags)?).await
+                .expect_err("unsupported bool evidence must not publish a configured result");
+            anyhow::ensure!(format!("{error:#}").contains(needle),"unexpected bool refusal: {error:#}");
+        }
         server.stop()?;
         Ok(())
     }

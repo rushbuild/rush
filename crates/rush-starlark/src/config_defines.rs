@@ -97,6 +97,16 @@ struct VerifiedFeatureFlags {
     predicate: FeatureFlagPredicate,
     // Declared canonical flag -> (actual alias-resolved producer, value).
     values: std::collections::BTreeMap<String, (String, String)>,
+    bool_values: std::collections::BTreeMap<String, VerifiedBoolBuildSetting>,
+}
+
+/// Raw configured value of a genuine bool build setting. This is not the
+/// result of executing its arbitrary Starlark provider implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBoolBuildSetting {
+    pub producer: String,
+    pub default: bool,
+    pub value: bool,
 }
 
 static FEATURE_FLAG_GENERATIONS: Lazy<RwLock<HashMap<String, u64>>> =
@@ -167,19 +177,62 @@ pub fn install_verified_feature_flag_condition(
     scope: &str, generation: u64, predicate: FeatureFlagPredicate,
     values: std::collections::BTreeMap<String, (String, String)>,
 ) -> Result<(), String> {
-    if generation == 0 || feature_flag_generation(scope) != generation
+    install_verified_configured_flag_condition(scope, generation, predicate, values, Default::default())
+}
+
+/// Publish typed configured values only after genuine condition analysis.
+/// String FeatureFlagInfo and raw bool build settings remain separate types.
+pub fn install_verified_configured_flag_condition(
+    scope: &str, generation: u64, predicate: FeatureFlagPredicate,
+    values: std::collections::BTreeMap<String, (String, String)>,
+    bool_values: std::collections::BTreeMap<String, VerifiedBoolBuildSetting>,
+) -> Result<(), String> {
+    let mut keys = values.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    for key in bool_values.keys() {
+        if !keys.insert(key.clone()) { return Err("configured flag has two competing value kinds".into()); }
+    }
+    let generations = FEATURE_FLAG_GENERATIONS.read().unwrap();
+    if generation == 0
         || feature_flag_predicate(scope, &predicate.label).as_ref() != Some(&predicate)
-        || values.keys().collect::<Vec<_>>() != predicate.flag_values.keys().collect::<Vec<_>>() {
+        || generations.get(scope).copied() != Some(generation)
+        || keys != predicate.flag_values.keys().cloned().collect() {
         return Err("configured feature-flag command/declaration changed during analysis".into());
     }
     let mut producers = HashSet::new();
     if values.values().any(|(producer,_)| !producers.insert(producer.clone())) {
         return Err("configured condition references one producer through duplicate aliases".into());
     }
-    VERIFIED_FEATURE_FLAGS.write().unwrap().insert(
-        (scope.to_owned(), predicate.label.clone()),
-        VerifiedFeatureFlags { generation, predicate, values },
-    );
+    for (declared, value) in &bool_values {
+        if declared != &value.producer {
+            return Err("Bazel 6.5 bool flag_values aliases are not supported".into());
+        }
+        if !producers.insert(value.producer.clone()) {
+            return Err("configured condition references one producer through duplicate aliases".into());
+        }
+        parse_bazel_bool_predicate(&predicate.flag_values[declared])?;
+        if declared_build_setting_default_in_scope(scope, &value.producer) != Some(BuildSettingValue::Bool(value.default)) {
+            return Err("configured bool default disagrees with the native declared build setting".into());
+        }
+    }
+    {
+        let mut proofs = VERIFIED_FEATURE_FLAGS.write().unwrap();
+        for ((owner, condition), proof) in proofs.iter() {
+            if owner != scope || condition == &predicate.label || proof.generation != generation { continue; }
+            for value in bool_values.values() {
+                if proof.values.values().any(|(producer, _)| producer == &value.producer)
+                    || proof.bool_values.values().any(|old| old.producer == value.producer && old != value) {
+                    return Err("configured bool setting has conflicting values across consumed conditions".into());
+                }
+            }
+            if values.values().any(|(producer, _)| proof.bool_values.values().any(|old| &old.producer == producer)) {
+                return Err("configured flag has conflicting string/bool kinds across consumed conditions".into());
+            }
+        }
+        proofs.insert((scope.to_owned(), predicate.label.clone()),
+            VerifiedFeatureFlags { generation, predicate, values, bool_values });
+    }
+    drop(generations);
+    recompute_build_setting_values(scope);
     with_configuration_scope(scope, recompute_active_config_settings_public);
     Ok(())
 }
@@ -187,7 +240,9 @@ pub fn install_verified_feature_flag_condition(
 fn verified_feature_flags(scope: &str, predicate: &FeatureFlagPredicate) -> Option<VerifiedFeatureFlags> {
     let proof = VERIFIED_FEATURE_FLAGS.read().unwrap()
         .get(&(scope.to_owned(), predicate.label.clone())).cloned()?;
-    (proof.generation == feature_flag_generation(scope) && proof.predicate == *predicate).then_some(proof)
+    (proof.generation == feature_flag_generation(scope) && proof.predicate == *predicate
+        && proof.bool_values.values().all(|value| declared_build_setting_default_in_scope(scope, &value.producer)
+            == Some(BuildSettingValue::Bool(value.default)))).then_some(proof)
 }
 
 pub fn feature_flag_condition_is_verified(scope: &str, label: &str) -> bool {
@@ -264,9 +319,18 @@ impl BuildSettingValue {
     fn matches_predicate(&self, expected: &str) -> bool {
         match self {
             Self::String(value) => value == expected,
-            Self::Bool(value) => expected.parse::<bool>().ok() == Some(*value),
+            Self::Bool(value) => parse_bazel_bool_predicate(expected).ok() == Some(*value),
             Self::Int(value) => expected.parse::<i64>().ok() == Some(*value),
         }
+    }
+}
+
+/// Bazel 6.5 BooleanConverter: ASCII case-folding, without whitespace trimming.
+pub fn parse_bazel_bool_predicate(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "t" | "y" => Ok(true),
+        "false" | "0" | "no" | "f" | "n" => Ok(false),
+        _ => Err(format!("{value:?} cannot be converted to a boolean build-setting predicate")),
     }
 }
 
@@ -275,6 +339,26 @@ static SEEN_BUILD_SETTINGS: Lazy<RwLock<HashMap<ScopedRuleKey, SeenBuildSetting>
 static SCOPED_BUILD_SETTING_VALUES: Lazy<
     RwLock<HashMap<(String, String), BuildSettingValue>>,
 > = Lazy::new(|| RwLock::new(HashMap::new()));
+
+static SCOPED_VERIFIED_BOOL_LABELS: Lazy<RwLock<HashSet<(String, String)>>> = Lazy::new(|| RwLock::new(HashSet::new()));
+
+static COMMAND_HAS_STARLARK_OVERRIDES: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
+
+/// A legacy/malformed request has no authoritative expanded argument stream.
+/// Unrelated native builds can proceed, but a raw bool consumer must not infer
+/// that the absent stream means there were no overrides. Actual configured
+/// metadata consumption reports the missing/invalid snapshot error.
+pub fn note_command_build_setting_arguments_unavailable(scope: &str) {
+    COMMAND_HAS_STARLARK_OVERRIDES.write().unwrap().insert(scope.to_string());
+}
+
+/// Do not let a value consumer silently read a default when this command has
+/// unverified Starlark options. Repository/target aliases need actual analysis.
+pub fn note_command_build_setting_overrides(scope: &str, tokens: &[String]) {
+    let present = tokens.iter().take_while(|token| token.as_str() != "--").any(|token| ["--//", "--@", "--no//", "--no@"].iter().any(|prefix| token.starts_with(prefix)));
+    let mut scopes = COMMAND_HAS_STARLARK_OVERRIDES.write().unwrap();
+    if present { scopes.insert(scope.to_string()); } else { scopes.remove(scope); }
+}
 static SEEN_CONFIG_ALIASES: Lazy<RwLock<HashMap<ScopedRuleKey, SeenConfigAlias>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 static SEEN_CONSTRAINT_VALUES: Lazy<RwLock<HashMap<ScopedRuleKey, Vec<String>>>> =
@@ -770,48 +854,55 @@ pub fn consider_typed_build_setting_default(
     recompute_composed_config_settings();
 }
 
+pub fn declared_build_setting_default_in_scope(scope: &str, label: &str) -> Option<BuildSettingValue> {
+    let canonical = canonical_configuration_label(label);
+    SEEN_BUILD_SETTINGS.read().unwrap().iter()
+        .filter(|(key, setting)| key.0 == scope && setting.labels.iter().any(|name| canonical_configuration_label(name) == canonical))
+        .map(|(_, setting)| setting.value.clone()).next()
+}
+
 fn recompute_build_setting_values(scope: &str) {
-    let seen = SEEN_BUILD_SETTINGS.read().unwrap();
-    let aliases: Vec<SeenConfigAlias> = SEEN_CONFIG_ALIASES
-        .read()
-        .unwrap()
-        .iter()
-        .filter(|(key, _)| key.0 == scope)
-        .map(|(_, alias)| alias.clone())
-        .collect();
+    // Snapshot independent registries before taking a value-map write lock.
+    // In particular, never hold a proof read while waiting for a value writer.
+    let seen = SEEN_BUILD_SETTINGS.read().unwrap().iter()
+        .filter(|(key, _)| key.0 == scope).map(|(_, setting)| setting.clone()).collect::<Vec<_>>();
+    let aliases = SEEN_CONFIG_ALIASES.read().unwrap().iter()
+        .filter(|(key, _)| key.0 == scope).map(|(_, alias)| alias.clone()).collect::<Vec<_>>();
+    let proofs = VERIFIED_FEATURE_FLAGS.read().unwrap().iter()
+        .filter(|((owner, _), _)| owner == scope).map(|(_, proof)| proof.clone()).collect::<Vec<_>>();
+    let mut bindings = HashMap::new();
+    for proof in proofs {
+        if feature_flag_predicate(scope, &proof.predicate.label).as_ref() != Some(&proof.predicate)
+            || verified_feature_flags(scope, &proof.predicate).is_none() { continue; }
+        for value in proof.bool_values.values() {
+            bindings.insert(value.producer.clone(), value.value);
+        }
+    }
     let mut values = SCOPED_BUILD_SETTING_VALUES.write().unwrap();
-    values.retain(|(value_scope, _), _| value_scope != scope);
-    for setting in seen
-        .iter()
-        .filter(|(key, _)| key.0 == scope)
-        .map(|(_, setting)| setting)
-    {
+    let mut verified = SCOPED_VERIFIED_BOOL_LABELS.write().unwrap();
+    values.retain(|(owner, _), _| owner != scope);
+    verified.retain(|(owner, _)| owner != scope);
+    for setting in &seen {
+        let configured = setting.labels.iter().find_map(|label| bindings.get(&canonical_configuration_label(label))).copied();
         for label in &setting.labels {
-            values.insert((scope.to_string(), label.clone()), setting.value.clone());
+            let value = configured.map(BuildSettingValue::Bool).unwrap_or_else(|| setting.value.clone());
+            values.insert((scope.to_string(), label.clone()), value);
+            if configured.is_some() { verified.insert((scope.to_string(), label.clone())); }
         }
     }
     loop {
         let mut changed = false;
         for alias in &aliases {
-            let actual = alias.actual_labels.iter().find_map(|label| {
-                values
-                    .get(&(scope.to_string(), label.clone()))
-                    .cloned()
-            });
-            let Some(actual) = actual else {
-                continue;
-            };
+            let actual = alias.actual_labels.iter().find_map(|label| values.get(&(scope.to_string(), label.clone())).cloned());
+            let Some(actual) = actual else { continue; };
+            let has_proof = alias.actual_labels.iter().any(|label| verified.contains(&(scope.to_string(), label.clone())));
             for label in &alias.labels {
                 let key = (scope.to_string(), label.clone());
-                if values.get(&key) != Some(&actual) {
-                    values.insert(key, actual.clone());
-                    changed = true;
-                }
+                if values.get(&key) != Some(&actual) { values.insert(key.clone(), actual.clone()); changed = true; }
+                if has_proof && verified.insert(key) { changed = true; }
             }
         }
-        if !changed {
-            break;
-        }
+        if !changed { break; }
     }
 }
 
@@ -825,11 +916,19 @@ pub fn build_setting_value(label: &str) -> Option<String> {
 /// Async rule execution must use this form because thread-local analysis scope
 /// does not cross an `.await` or worker-thread boundary.
 pub fn build_setting_value_in_scope(scope: &str, label: &str) -> Option<String> {
-    SCOPED_BUILD_SETTING_VALUES
-        .read()
-        .unwrap()
-        .get(&(scope.to_string(), label.to_string()))
-        .map(BuildSettingValue::display)
+    typed_build_setting_value_in_scope(scope, label).map(|value| value.display())
+}
+
+/// Raw typed setting value for native consumers. Explicit unverified Starlark
+/// options must not silently degrade to a bool default. A verified alias value
+/// is a value lookup, not proof of Bazel 6.5 alias flag_values matching.
+pub fn typed_build_setting_value_in_scope(scope: &str, label: &str) -> Option<BuildSettingValue> {
+    let key = (scope.to_string(), label.to_string());
+    let value = SCOPED_BUILD_SETTING_VALUES.read().unwrap().get(&key).cloned()?;
+    if matches!(value, BuildSettingValue::Bool(_))
+        && COMMAND_HAS_STARLARK_OVERRIDES.read().unwrap().contains(scope)
+        && !SCOPED_VERIFIED_BOOL_LABELS.read().unwrap().contains(&key) { return None; }
+    Some(value)
 }
 
 /// Register a `config_setting(flag_values = {...})`.
@@ -969,6 +1068,9 @@ pub fn begin_command_with_native_options(
         *generation = generation.checked_add(1).expect("feature-flag generation exhausted");
     }
     VERIFIED_FEATURE_FLAGS.write().unwrap().retain(|(owner,_),_| owner != &scope);
+    COMMAND_HAS_STARLARK_OVERRIDES.write().unwrap().remove(&scope);
+    SCOPED_VERIFIED_BOOL_LABELS.write().unwrap().retain(|(owner, _)| owner != &scope);
+    recompute_build_setting_values(&scope);
     CONFIGURATION_REQUEST_ROOTS.write().unwrap().remove(&scope);
     PYCROSS_METADATA_ORIGINS.write().unwrap().retain(|(owner,_),_| owner != &scope);
     for (key, value) in defines {
@@ -1028,6 +1130,7 @@ pub fn clear_configuration_registry_for_command() {
         .write()
         .unwrap()
         .retain(|(value_scope, _), _| value_scope != &scope);
+    SCOPED_VERIFIED_BOOL_LABELS.write().unwrap().retain(|(owner, _)| owner != &scope);
     ACTIVE_CONFIG_SETTINGS
         .write()
         .unwrap()
@@ -1105,9 +1208,12 @@ fn recompute_active_config_settings() {
         let verified_flags = verified_feature_flags(&scope, &feature_flag_predicate_for_setting(setting));
         let flag_values_match = setting.flag_values.iter().all(|(labels, expected)| {
             if let Some(proof) = &verified_flags {
-                return labels.iter().any(|label| proof.values
-                    .get(&canonical_configuration_label(label))
-                    .is_some_and(|(_, actual)| actual == expected));
+                return labels.iter().any(|label| {
+                    let label = canonical_configuration_label(label);
+                    proof.values.get(&label).is_some_and(|(_, actual)| actual == expected)
+                        || proof.bool_values.get(&label).is_some_and(|actual|
+                            parse_bazel_bool_predicate(expected).ok() == Some(actual.value))
+                });
             }
             labels.iter().any(|label| {
                 build_settings
@@ -1927,6 +2033,80 @@ mod tests {
                         ("//cfg:second".into(),("//cfg:same".into(),"a".into()))])).is_err());
             });
         });
+    }
+
+    #[test]
+    fn verified_bool_values_survive_defaults_and_aliases_but_not_commands_or_edits() {
+        let _guard = isolate_config_state();
+        let temp = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(temp.path(), || {
+            let scope = "verified-bool-values";
+            with_configuration_scope(scope, || {
+                begin_command(&[]);
+                consider_typed_build_setting_default(None, "cfg", "enabled", BuildSettingValue::Bool(false));
+                note_command_build_setting_arguments_unavailable(scope);
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), None,
+                    "an absent expanded request cannot certify a raw default");
+                note_command_build_setting_overrides(scope, &[]);
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), Some(BuildSettingValue::Bool(false)),
+                    "an actual empty stream proves no override");
+                note_command_build_setting_overrides(scope, &["--//cfg:enabled".into()]);
+                consider_config_setting_predicates(None, "cfg", "condition", &HashMap::new(),
+                    &HashMap::new(), &[], &HashMap::from([("//cfg:enabled".into(), "True".into())]));
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), None);
+                let predicate = feature_flag_predicate(scope, "//cfg:condition").unwrap();
+                let generation = feature_flag_generation(scope);
+                let proof = std::collections::BTreeMap::from([("//cfg:enabled".into(), VerifiedBoolBuildSetting {
+                    producer: "//cfg:enabled".into(), default: false, value: true,
+                })]);
+                install_verified_configured_flag_condition(scope, generation, predicate.clone(), Default::default(), proof.clone()).unwrap();
+                assert!(is_active_config_setting("//cfg:condition"));
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), Some(BuildSettingValue::Bool(true)));
+                // Replaying native declarations cannot overwrite a configured raw value.
+                consider_typed_build_setting_default(None, "cfg", "enabled", BuildSettingValue::Bool(false));
+                consider_config_alias(None, "cfg", "alias", ":enabled");
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:alias"), Some(BuildSettingValue::Bool(true)));
+                assert_eq!(typed_build_setting_value_in_scope("other-bool-scope", "//cfg:enabled"), None);
+                consider_typed_build_setting_default(None, "cfg", "enabled", BuildSettingValue::Bool(true));
+                assert!(!feature_flag_condition_is_verified(scope, "//cfg:condition"));
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), None);
+                begin_command(&[]);
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), Some(BuildSettingValue::Bool(true)));
+                assert!(install_verified_configured_flag_condition(scope, generation, predicate, Default::default(), proof).is_err());
+                clear_configuration_package(None, "cfg");
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), None);
+            });
+        });
+    }
+
+    #[test]
+    fn verified_bool_publication_refuses_aliases_conflicts_and_malformed_predicates() {
+        let _guard = isolate_config_state();
+        let temp = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(temp.path(), || {
+            let scope = "verified-bool-negative";
+            with_configuration_scope(scope, || {
+                begin_command(&[]);
+                consider_typed_build_setting_default(None, "cfg", "enabled", BuildSettingValue::Bool(false));
+                for name in ["one", "two", "bad"] {
+                    consider_config_setting_predicates(None, "cfg", name, &HashMap::new(), &HashMap::new(), &[],
+                        &HashMap::from([("//cfg:enabled".into(), if name == "bad" { " true" } else { "true" }.into())]));
+                }
+                let generation = feature_flag_generation(scope);
+                let make = |producer: &str, value| std::collections::BTreeMap::from([("//cfg:enabled".into(), VerifiedBoolBuildSetting {
+                    producer: producer.into(), default: false, value,
+                })]);
+                let predicate = |name| feature_flag_predicate(scope, name).unwrap();
+                assert!(install_verified_configured_flag_condition(scope, generation, predicate("//cfg:one"), Default::default(), make("//cfg:other", true)).is_err());
+                install_verified_configured_flag_condition(scope, generation, predicate("//cfg:one"), Default::default(), make("//cfg:enabled", true)).unwrap();
+                assert!(install_verified_configured_flag_condition(scope, generation, predicate("//cfg:two"), Default::default(), make("//cfg:enabled", false)).is_err());
+                assert!(install_verified_configured_flag_condition(scope, generation, predicate("//cfg:bad"), Default::default(), make("//cfg:enabled", true)).is_err());
+                assert_eq!(typed_build_setting_value_in_scope(scope, "//cfg:enabled"), Some(BuildSettingValue::Bool(true)));
+            });
+        });
+        for truth in ["TRUE", "true", "1", "yes", "T", "y"] { assert_eq!(parse_bazel_bool_predicate(truth), Ok(true)); }
+        for falsehood in ["FALSE", "false", "0", "no", "F", "n"] { assert_eq!(parse_bazel_bool_predicate(falsehood), Ok(false)); }
+        for invalid in ["", " true", "false ", "2", "on", "off"] { assert!(parse_bazel_bool_predicate(invalid).is_err()); }
     }
 
     #[test]
