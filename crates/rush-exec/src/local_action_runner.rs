@@ -284,9 +284,250 @@ impl Default for DefaultLocalActionRunner {
     }
 }
 
-#[async_trait]
-impl LocalActionRunner for DefaultLocalActionRunner {
-    async fn execute(&self, request: ExecutionRequest) -> Result<ActionExecutionResult> {
+// The scope is deliberately not released by an unwinding/aborted worker once a
+// child exists. Only the completed process-group proof permits its release.
+struct OwnedExecutionControl {
+    cancellation: tokio::sync::watch::Receiver<bool>,
+    abandoned: tokio::sync::watch::Receiver<bool>,
+    scope: Option<Box<dyn Send>>,
+    child_started: bool,
+}
+
+impl OwnedExecutionControl {
+    fn cancelled(&self) -> bool {
+        *self.cancellation.borrow()
+            || self.cancellation.has_changed().is_err()
+            || self.abandoned.has_changed().is_err()
+    }
+}
+
+impl Drop for OwnedExecutionControl {
+    fn drop(&mut self) {
+        if self.child_started {
+            // Unknown cleanup must not unlock a workspace with live writers.
+            // The caller can acknowledge confirmed scope Drop separately when
+            // retiring an async-only resource permit; Err alone is insufficient.
+            if let Some(scope) = self.scope.take() {
+                std::mem::forget(scope);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn owned_child_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // Leave the direct child waitable until group cleanup is complete: its PID
+    // pins the process-group number, preventing an unrelated reused PID from
+    // becoming a target of our final group kill.
+    loop {
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(unsafe { info.si_pid() } == pid);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_owned_process_group(pid: libc::pid_t) -> std::io::Result<()> {
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn owned_group_has_live_writers(group: libc::pid_t) -> Result<bool> {
+    for entry in std::fs::read_dir("/proc").context("inspect owned process group")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.as_encoded_bytes().is_empty()
+            || !name.as_encoded_bytes().iter().all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error).context("read process-group membership"),
+        };
+        let (process_group, live) = owned_process_stat(&stat)?;
+        if process_group != group {
+            continue;
+        }
+        if live {
+            return Ok(true);
+        }
+        // An exited thread-group leader can be a zombie while other threads
+        // still execute. /proc's top-level listing hides those thread IDs.
+        let tasks = match std::fs::read_dir(entry.path().join("task")) {
+            Ok(tasks) => tasks,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("inspect owned group threads"),
+        };
+        for task in tasks {
+            let task = task?;
+            let stat = match std::fs::read(task.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error).context("read owned group thread state"),
+            };
+            let (thread_group, live) = owned_process_stat(&stat)?;
+            if thread_group == group && live {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn owned_process_stat(stat: &[u8]) -> Result<(libc::pid_t, bool)> {
+    // comm may contain spaces, parentheses or newlines. Numeric stat fields
+    // begin only after its final closing parenthesis.
+    let close = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .context("process stat omits command boundary")?;
+    let tail = std::str::from_utf8(&stat[close + 1..])
+        .context("process stat has invalid numeric fields")?;
+    let mut fields = tail.split_ascii_whitespace();
+    let state = fields.next().context("process stat omits state")?;
+    let _parent = fields.next().context("process stat omits parent")?;
+    let group = fields.next().context("process stat omits group")?.parse()?;
+    Ok((group, !matches!(state, "Z" | "X" | "x")))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_owned_process_group(
+    child: &mut tokio::process::Child,
+    timeout: Option<Duration>,
+    control: &mut OwnedExecutionControl,
+    group_guard: &mut ProcessGroupKillGuard,
+) -> Result<std::process::ExitStatus> {
+    let pid = child.id().context("owned child has no process identity")? as libc::pid_t;
+    let started = Instant::now();
+    let mut stopped_at = None;
+    let mut refusal = None;
+    loop {
+        if refusal.is_none() && control.cancelled() {
+            refusal = Some("owned local execution cancelled");
+        }
+        if refusal.is_none() && timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            refusal = Some("owned local execution exceeded timeout");
+        }
+        if refusal.is_some() {
+            kill_owned_process_group(pid).context("terminate owned process group")?;
+            let stopped = stopped_at.get_or_insert_with(Instant::now);
+            anyhow::ensure!(
+                stopped.elapsed() < Duration::from_secs(5),
+                "owned child did not exit after SIGKILL; owning scope retained"
+            );
+        }
+        if owned_child_has_exited(pid).context("observe owned child without reaping")? {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let cleanup_started = Instant::now();
+    let mut empty_scans = 0;
+    while empty_scans < 2 {
+        let live = owned_group_has_live_writers(pid)?;
+        if live {
+            refusal.get_or_insert("owned local execution left live process-group descendants");
+            kill_owned_process_group(pid).context("terminate remaining owned group writers")?;
+            empty_scans = 0;
+        } else {
+            empty_scans += 1;
+        }
+        anyhow::ensure!(
+            cleanup_started.elapsed() < Duration::from_secs(5),
+            "owned process group did not drain; owning scope retained"
+        );
+        if empty_scans < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    // No further group signal may target the number after reaping releases it.
+    group_guard.disarm();
+    // Reap only our direct child; orphan descendants are not ours to waitpid.
+    let status = child.wait().await.context("reap owned direct child")?;
+    control.child_started = false;
+    if let Some(refusal) = refusal {
+        anyhow::bail!("{refusal}");
+    }
+    Ok(status)
+}
+
+impl DefaultLocalActionRunner {
+    /// Execute a local diagnostic writer while retaining its opaque owning scope.
+    /// Cancellation, a closed signal, or dropping this future requests group
+    /// termination; a private worker keeps the scope until the direct child is
+    /// reaped, pipes drain, and no live process-group writer remains. Linux only.
+    ///
+    /// This is cooperative process-group cleanup, not a sandbox: descendants
+    /// must not escape with setsid/setpgid. The Tokio runtime must remain alive
+    /// to drive cleanup. Unconfirmable cleanup intentionally retains the scope
+    /// instead of unlocking a workspace whose writers may still be running.
+    pub async fn execute_owned(
+        request: ExecutionRequest,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+        scope: Box<dyn Send>,
+    ) -> Result<ActionExecutionResult> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (request, cancellation, scope);
+            anyhow::bail!("owned local execution requires Linux process-group observation");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Refuse an unavailable observation substrate before any child writes.
+            owned_group_has_live_writers(std::process::id() as libc::pid_t)?;
+            let (abandon, abandoned) = tokio::sync::watch::channel(false);
+            let control = OwnedExecutionControl {
+                cancellation,
+                abandoned,
+                scope: Some(scope),
+                child_started: false,
+            };
+            let worker = tokio::spawn(Self::execute_inner(request, Some(control)));
+            let result = worker.await.context("owned local execution worker failed");
+            drop(abandon);
+            result?
+        }
+    }
+
+    async fn execute_inner(
+        request: ExecutionRequest,
+        mut owned: Option<OwnedExecutionControl>,
+    ) -> Result<ActionExecutionResult> {
         use crate::{
             apply_compile_memory_cap, drain_into, open_log_file_for_id, output_log_dir,
             output_ring_cap, BoundedCapture,
@@ -294,6 +535,10 @@ impl LocalActionRunner for DefaultLocalActionRunner {
         use std::process::Stdio;
 
         let start = Instant::now();
+        if owned.as_ref().is_some_and(OwnedExecutionControl::cancelled) {
+            anyhow::bail!("owned local execution cancelled before spawn");
+        }
+        let owned_execution = owned.is_some();
 
         let mut cmd = tokio::process::Command::new(&request.command.executable);
         cmd.args(&request.command.argv)
@@ -328,7 +573,7 @@ impl LocalActionRunner for DefaultLocalActionRunner {
         if let Some(d) = &request.command.working_dir {
             cmd.current_dir(d);
         }
-        if request.terminate_process_group_on_drop {
+        if request.terminate_process_group_on_drop || owned_execution {
             cmd.kill_on_drop(true);
             #[cfg(unix)]
             cmd.process_group(0);
@@ -373,6 +618,9 @@ impl LocalActionRunner for DefaultLocalActionRunner {
         // objects. The output is argv[1] by CcArchiveCommandSpec /
         // declare_action construction (["rcs", <lib>, <objs>...]); argv
         // itself is unchanged, so PASS-B verifier parity is preserved.
+        if owned.as_ref().is_some_and(OwnedExecutionControl::cancelled) {
+            anyhow::bail!("owned local execution cancelled before spawn");
+        }
         if request.remove_stale_archive_before_execute && request.mnemonic == "CcArchive" {
             if let Some(lib) = request.command.argv.get(1) {
                 let _ = std::fs::remove_file(lib);
@@ -380,10 +628,15 @@ impl LocalActionRunner for DefaultLocalActionRunner {
         }
 
         let mut child = cmd.spawn()?;
+        if let Some(control) = &mut owned {
+            control.child_started = true;
+        }
         let rss_monitor = start_rss_monitor(child.id(), resource_trace_path().is_some());
         #[cfg(unix)]
-        let mut process_group_guard =
-            ProcessGroupKillGuard::new(request.terminate_process_group_on_drop, child.id());
+        let mut process_group_guard = ProcessGroupKillGuard::new(
+            request.terminate_process_group_on_drop || owned_execution,
+            child.id(),
+        );
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -411,8 +664,25 @@ impl LocalActionRunner for DefaultLocalActionRunner {
         // multi-GB.
         let stdout_drain = drain_into(stdout, &mut stdout_cap);
         let stderr_drain = drain_into(stderr, &mut stderr_cap);
-        let wait = child.wait();
-        let (status, _, _) = if let Some(timeout) = request.timeout {
+        let (status, _, _) = if let Some(control) = &mut owned {
+            #[cfg(target_os = "linux")]
+            {
+                let wait = wait_owned_process_group(
+                    &mut child,
+                    request.timeout,
+                    control,
+                    &mut process_group_guard,
+                );
+                let (status, out, err) = tokio::join!(wait, stdout_drain, stderr_drain);
+                (status?, out, err)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = control;
+                unreachable!("owned execution is refused before spawning outside Linux");
+            }
+        } else if let Some(timeout) = request.timeout {
+            let wait = child.wait();
             let combined = async { tokio::join!(wait, stdout_drain, stderr_drain) };
             match tokio::time::timeout(timeout, combined).await {
                 Ok((s, o, e)) => (s?, o, e),
@@ -428,6 +698,7 @@ impl LocalActionRunner for DefaultLocalActionRunner {
                 }
             }
         } else {
+            let wait = child.wait();
             let (s, o, e) = tokio::join!(wait, stdout_drain, stderr_drain);
             (s?, o, e)
         };
@@ -451,6 +722,14 @@ impl LocalActionRunner for DefaultLocalActionRunner {
             duration,
             peak_rss_kb,
         })
+    }
+
+}
+
+#[async_trait]
+impl LocalActionRunner for DefaultLocalActionRunner {
+    async fn execute(&self, request: ExecutionRequest) -> Result<ActionExecutionResult> {
+        Self::execute_inner(request, None).await
     }
 
     async fn execute_observed(
@@ -1263,6 +1542,199 @@ mod tests {
             credentials: None,
             isolation: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct OwnedScopeProbe {
+        group: Arc<std::sync::atomic::AtomicI32>,
+        released: Arc<AtomicBool>,
+        released_with_writer: Arc<AtomicBool>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedScopeProbe {
+        fn drop(&mut self) {
+            let group = self.group.load(Ordering::SeqCst);
+            if group > 0 {
+                self.released_with_writer.store(
+                    owned_group_has_live_writers(group).unwrap_or(true)
+                        || Path::new(&format!("/proc/{group}")).exists(),
+                    Ordering::SeqCst,
+                );
+            }
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn owned_writer_cleanup_control(kind: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("writer.out");
+        let pids = temp.path().join("writer.pids");
+        let group = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let released_with_writer = Arc::new(AtomicBool::new(false));
+        let scope = OwnedScopeProbe {
+            group: Arc::clone(&group),
+            released: Arc::clone(&released),
+            released_with_writer: Arc::clone(&released_with_writer),
+        };
+        let mut request = req(205, "OwnedWriter");
+        request.command.executable = PathBuf::from("/bin/sh");
+        request.command.argv = vec![
+            "-c".into(),
+            "(while :; do printf x >> \"$1\"; sleep 0.01; done) & writer=$!; printf '%s %s' \"$$\" \"$writer\" > \"$2\"; wait".into(),
+            "owned-writer".into(),
+            output.to_str().unwrap().into(),
+            pids.to_str().unwrap().into(),
+        ];
+        request.stdin_null = true;
+        if kind == "timeout" {
+            request.timeout = Some(Duration::from_secs(1));
+        }
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(DefaultLocalActionRunner::execute_owned(
+            request,
+            cancellation,
+            Box::new(scope),
+        ));
+        let (root_pid, writer_pid) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = std::fs::read_to_string(&pids) {
+                    let ids = bytes
+                        .split_whitespace()
+                        .map(str::parse::<i32>)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap();
+                    if ids.len() == 2 && std::fs::metadata(&output).is_ok_and(|meta| meta.len() > 0)
+                    {
+                        break (ids[0], ids[1]);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real forked writer did not announce its running state");
+        group.store(root_pid, Ordering::SeqCst);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "scope released while writer was running"
+        );
+        assert!(owned_group_has_live_writers(root_pid).unwrap());
+        assert_ne!(
+            root_pid, writer_pid,
+            "control must include an actual forked writer"
+        );
+        if kind == "drop" {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            if kind == "cancel" {
+                cancel.send(true).unwrap();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("owned cleanup did not finish")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if kind == "timeout" {
+                    "timeout"
+                } else {
+                    "cancelled"
+                }),
+                "{error:#}"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !released.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("confirmed cleanup never released the owning scope");
+        assert!(
+            !released_with_writer.load(Ordering::SeqCst),
+            "scope released before direct-child reap or group writer exit"
+        );
+        assert!(!owned_group_has_live_writers(root_pid).unwrap());
+        let bytes = std::fs::read(&output).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            bytes,
+            "late output after scope release"
+        );
+        drop(cancel);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_runner_cancellation_reaps_and_retains_scope_until_forked_writer_stops() {
+        owned_writer_cleanup_control("cancel").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_runner_future_drop_still_drains_forked_writer_before_scope_release() {
+        owned_writer_cleanup_control("drop").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_runner_timeout_reaps_forked_writer_before_scope_release() {
+        owned_writer_cleanup_control("timeout").await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_runner_success_and_pre_spawn_error_release_the_scope() {
+        let released = Arc::new(AtomicBool::new(false));
+        let bad_release = Arc::new(AtomicBool::new(false));
+        let scope = || {
+            Box::new(OwnedScopeProbe {
+                group: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+                released: Arc::clone(&released),
+                released_with_writer: Arc::clone(&bad_release),
+            }) as Box<dyn Send>
+        };
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            DefaultLocalActionRunner::execute_owned(
+                req(206, "OwnedTrue"),
+                cancellation.clone(),
+                scope()
+            )
+            .await
+            .unwrap()
+            .exit_code,
+            0
+        );
+        assert!(released.load(Ordering::SeqCst));
+        released.store(false, Ordering::SeqCst);
+        let mut missing = req(207, "OwnedMissing");
+        missing.command.executable =
+            PathBuf::from("/nonexistent/rush-owned-runner-test-executable");
+        assert!(
+            DefaultLocalActionRunner::execute_owned(missing, cancellation.clone(), scope())
+                .await
+                .is_err()
+        );
+        assert!(released.load(Ordering::SeqCst));
+        released.store(false, Ordering::SeqCst);
+        cancel.send(true).unwrap();
+        assert!(DefaultLocalActionRunner::execute_owned(
+            req(208, "OwnedCancelled"),
+            cancellation,
+            scope()
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cancelled before spawn"));
+        assert!(released.load(Ordering::SeqCst));
+        assert!(!bad_release.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
