@@ -173,6 +173,12 @@ pub trait RuleInstance: Send + Sync {
         None
     }
 
+    /// Native generation-input metadata lane, separate from runtime/C++ deps.
+    /// This does not grant execution admission to the consumer or prerequisites.
+    fn generation_only_proto_dependencies(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Literal options-consumer declaration, when implemented by this rule.
     /// The orchestrator separately qualifies source and configured providers.
     fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {
@@ -578,6 +584,10 @@ impl RuleInstance for RuleMetadataInstance {
 
     fn proto_source_metadata(&self) -> Option<ProtoSourceMetadataDeclaration<'_>> {
         self.inner.proto_source_metadata()
+    }
+
+    fn generation_only_proto_dependencies(&self) -> Vec<String> {
+        self.inner.generation_only_proto_dependencies()
     }
 
     fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {

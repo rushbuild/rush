@@ -293,6 +293,7 @@ impl BuildRule for TfProtoLibraryRule {
         let name = extract_string(attrs, "name")?;
         let srcs = proto_string_list(attrs, "srcs")?;
         let protodeps = proto_string_list(attrs, "protodeps")?;
+        let generation_imports = proto_string_list(attrs, "_rush_tf_proto_imports")?;
         let cc_api_version = attrs
             .get("cc_api_version")
             .and_then(|v| v.as_int())
@@ -330,11 +331,14 @@ impl BuildRule for TfProtoLibraryRule {
             Some(Value::String(role)) if role == "grpc_sibling" => TfProtoRole::GrpcSibling,
             Some(_) => return Err(anyhow!("invalid tf_proto_library generation role")),
         };
+        anyhow::ensure!(role != TfProtoRole::CcImpl || generation_imports.is_empty(),
+            "C++ implementation targets must not own generation-only proto imports");
 
         Ok(Box::new(TfProtoLibraryInstance {
             name,
             srcs,
             protodeps,
+            generation_imports,
             cc_api_version,
             make_default_target_header_only,
             has_services,
@@ -353,6 +357,9 @@ struct TfProtoLibraryInstance {
     name: String,
     srcs: Vec<String>,
     protodeps: Vec<String>,
+    /// Source-only native proto dependencies supplied by the TSL generation
+    /// projection. Keep them separate from implementation/runtime deps.
+    generation_imports: Vec<String>,
     #[allow(dead_code)]
     cc_api_version: i64,
     #[allow(dead_code)]
@@ -400,7 +407,93 @@ struct ProtoLayout {
     source: PathBuf,
     header: PathBuf,
     generated: PathBuf,
+    dependencies: PathBuf,
     object: PathBuf,
+}
+
+// The pinned protoc manifest writes raw path tokens, without Make escaping.
+// Admit only unambiguous spellings rather than guessing at its dependency list.
+fn protoc_manifest_path(path: &std::path::Path) -> Result<()> {
+    let value = utf8_path(path)?;
+    anyhow::ensure!(path.is_absolute() && value.bytes().all(|byte|
+        byte.is_ascii_alphanumeric() || b"/._-+@".contains(&byte)),
+        "declared protoc dependency manifests require unambiguous absolute paths: {}", path.display());
+    Ok(())
+}
+
+fn validate_protoc_dependencies(
+    manifest: &std::path::Path,
+    outputs: &[PathBuf],
+    inputs: &std::collections::HashSet<PathBuf>,
+    source: &std::path::Path,
+) -> Result<()> {
+    use std::collections::HashSet;
+    let bytes = read_protoc_dependency_manifest(manifest)?;
+    anyhow::ensure!(!bytes.contains(&0),
+        "invalid/oversized protoc dependency manifest");
+    let text = std::str::from_utf8(&bytes)?.replace("\\\n", " ");
+    let (targets, dependencies) = text.split_once(':')
+        .context("protoc dependency manifest has no target separator")?;
+    anyhow::ensure!(!dependencies.contains(':') && !text.contains('\\'),
+        "ambiguous protoc dependency manifest");
+    let paths = |words: &str| -> Result<Vec<PathBuf>> {
+        words.split_ascii_whitespace().map(|word| {
+            let path = PathBuf::from(word);
+            protoc_manifest_path(&path)?;
+            Ok(path)
+        }).collect()
+    };
+    let targets = paths(targets)?;
+    anyhow::ensure!(targets.len() == outputs.len()
+        && targets.iter().collect::<HashSet<_>>() == outputs.iter().collect(),
+        "protoc dependency manifest names different generated outputs");
+    let dependencies = paths(dependencies)?;
+    anyhow::ensure!(!dependencies.is_empty() && dependencies.iter().any(|path| path == source),
+        "protoc dependency manifest omits its declared source");
+    for dependency in dependencies {
+        anyhow::ensure!(inputs.contains(&dependency),
+            "protoc read an undeclared import: {}", dependency.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_protoc_dependency_manifest(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let parent = path.parent().context("protoc dependency manifest has no parent")?;
+    anyhow::ensure!(std::fs::canonicalize(parent)?.as_path() == parent,
+        "protoc dependency output parent must be canonical");
+    let parent_before = std::fs::symlink_metadata(parent)?;
+    let mut file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)
+        .with_context(|| format!("open current protoc dependencies {}", path.display()))?;
+    let before = file.metadata()?;
+    anyhow::ensure!(parent_before.is_dir() && before.is_file() && before.nlink() == 1
+        && before.uid() == parent_before.uid() && before.len() <= LIMIT,
+        "protoc dependency manifest must be an owned single-link bounded regular file");
+    let mut bytes = Vec::new();
+    (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let named = std::fs::symlink_metadata(path)?;
+    let parent_after = std::fs::symlink_metadata(parent)?;
+    let signature = |metadata: &std::fs::Metadata| (
+        metadata.dev(), metadata.ino(), metadata.mode(), metadata.uid(), metadata.gid(),
+        metadata.nlink(), metadata.len(), metadata.mtime(), metadata.mtime_nsec(),
+        metadata.ctime(), metadata.ctime_nsec(),
+    );
+    anyhow::ensure!(bytes.len() as u64 <= LIMIT && bytes.len() as u64 == before.len()
+        && signature(&before) == signature(&after) && signature(&before) == signature(&named)
+        && parent_after.is_dir() && parent_before.dev() == parent_after.dev()
+        && parent_before.ino() == parent_after.ino(),
+        "protoc dependency manifest changed during its descriptor/path read bracket");
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_protoc_dependency_manifest(_: &std::path::Path) -> Result<Vec<u8>> {
+    anyhow::bail!("declared protoc dependency validation requires Unix descriptor identity")
 }
 
 fn utf8_path(path: &std::path::Path) -> Result<String> {
@@ -546,6 +639,9 @@ impl TfProtoLibraryInstance {
                 generated: output
                     .join("genfiles")
                     .join(relative.with_extension("pb.cc")),
+                dependencies: output
+                    .join("genfiles")
+                    .join(relative.with_extension("pb.protoc.d")),
                 object: output
                     .join(package)
                     .join(&self.name)
@@ -588,7 +684,7 @@ impl TfProtoLibraryInstance {
     ) -> Result<rush_rules::providers::ProviderSet> {
         use rush_action::ids::{ArtifactKind, ConfigId};
         use rush_rules::providers::{
-            CcInfo, DefaultInfo, DirectCcInfo, ProtoFilesInfo, ProviderSet,
+            CcInfo, DefaultInfo, DirectCcInfo, ProtoFilesInfo, ProtoSourceImport, ProviderSet,
         };
         self.declared_mode(ctx.native_compile_mode())?;
         anyhow::ensure!(
@@ -596,14 +692,26 @@ impl TfProtoLibraryInstance {
             "declared proto bootstrap only admits the explicit legacy configuration"
         );
         let layouts = self.layouts(ctx.workspace_root(), ctx.output_dir(), ctx.package())?;
-        let proto_files = ProtoFilesInfo::from_direct_and_deps(
-            layouts
-                .iter()
-                .map(|layout| ctx.register_source_artifact(&layout.source, ArtifactKind::Source))
-                .collect(),
+        let source_root = ctx.workspace_root().to_owned();
+        let mut direct_imports = Vec::new();
+        for layout in &layouts {
+            let import_path = layout.source.strip_prefix(&source_root)
+                .context("declared proto source is outside its repository import root")?
+                .to_owned();
+            direct_imports.push(ProtoSourceImport {
+                artifact: ctx.register_source_artifact(&layout.source, ArtifactKind::Source),
+                import_root: source_root.clone(),
+                import_path,
+            });
+        }
+        let proto_files = ProtoFilesInfo::from_declared_sources_and_deps(
+            direct_imports,
             deps.iter()
                 .filter_map(|provider| provider.get_proto_files().cloned()),
-        );
+        )?;
+        proto_files.validate_declared_imports(ctx.registry(), ctx.config_id())?;
+        let import_roots = proto_files.ordered_import_roots()
+            .context("declared proto source import layout is unknown")?;
         let cc_deps = rush_rules::providers::extract_cc_infos(deps);
         let mut headers = Vec::new();
         let mut generated = Vec::new();
@@ -693,10 +801,19 @@ impl TfProtoLibraryInstance {
                         inputs.push(id);
                     }
                 }
+                for id in &inputs {
+                    protoc_manifest_path(ctx.registry().artifact_path(*id))?;
+                }
+                for path in [&layout.header, &layout.generated, &layout.dependencies] {
+                    protoc_manifest_path(path)?;
+                }
+                let dependencies = ctx.register_generated_artifact(
+                    &layout.dependencies, ArtifactKind::Generated, None,
+                );
                 let action = ctx.declare_action(
                     "ProtocCompile",
                     inputs,
-                    vec![headers[index], generated[index]],
+                    vec![headers[index], generated[index], dependencies],
                 )?;
                 let executable = ctx.registry().artifact_path(tool).to_owned();
                 let mut argv = vec![
@@ -705,9 +822,9 @@ impl TfProtoLibraryInstance {
                         "--cpp_out={}",
                         utf8_path(&ctx.output_dir().join("genfiles"))?
                     ),
-                    format!("--proto_path={}", utf8_path(ctx.workspace_root())?),
+                    format!("--dependency_out={}", utf8_path(&layout.dependencies)?),
                 ];
-                for root in ctx.extra_proto_paths() {
+                for root in &import_roots {
                     argv.push(format!("--proto_path={}", utf8_path(root)?));
                 }
                 argv.push(utf8_path(&layout.source)?);
@@ -1003,6 +1120,30 @@ impl TfProtoLibraryInstance {
         let specs = self.declared_proto_specs(context).await?;
         let mut artifacts = Vec::new();
         for (_, spec) in specs {
+            let proto_dependencies = if spec.mnemonic == "ProtocCompile" {
+                let paths = spec.argv.iter().filter_map(|arg|
+                    arg.strip_prefix("--dependency_out=")).collect::<Vec<_>>();
+                anyhow::ensure!(paths.len() == 1,
+                    "declared protoc requires one current dependency manifest");
+                let path = PathBuf::from(paths[0]);
+                anyhow::ensure!(spec.declared_outputs.contains(&path),
+                    "protoc dependency manifest is not an owned declared output");
+                let outputs = spec.declared_outputs.iter()
+                    .filter(|output| **output != path).cloned().collect::<Vec<_>>();
+                let inputs = spec.declared_inputs.iter()
+                    .filter(|input| **input != spec.executable).cloned().collect();
+                let source = PathBuf::from(spec.argv.last().context("missing protoc source")?);
+                for input in &spec.declared_inputs { protoc_manifest_path(input)?; }
+                for output in &spec.declared_outputs { protoc_manifest_path(output)?; }
+                // Old generated files and old manifests cannot discharge a
+                // current command's actual import report.
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(error) => return Err(error.into()),
+                }
+                Some((path, outputs, inputs, source))
+            } else { None };
             if spec.mnemonic == "ProtocCompile" {
                 anyhow::ensure!(
                     is_executable_file(&spec.executable),
@@ -1052,6 +1193,9 @@ impl TfProtoLibraryInstance {
                 self.name,
                 String::from_utf8_lossy(&result.stderr)
             );
+            if let Some((path, outputs, inputs, source)) = proto_dependencies {
+                validate_protoc_dependencies(&path, &outputs, &inputs, &source)?;
+            }
             for output in spec.declared_outputs {
                 anyhow::ensure!(
                     std::fs::metadata(&output).is_ok_and(|metadata| metadata.is_file()),
@@ -1066,6 +1210,8 @@ impl TfProtoLibraryInstance {
                     .extension()
                     .is_some_and(|extension| extension == "cc")
                 {
+                    ArtifactType::Generated
+                } else if output.extension().is_some_and(|extension| extension == "d") {
                     ArtifactType::Generated
                 } else if output.extension().is_some_and(|extension| extension == "o") {
                     ArtifactType::Object
@@ -1089,6 +1235,11 @@ impl RuleInstance for TfProtoLibraryInstance {
 
     fn dependencies(&self) -> Vec<String> {
         let mut dependencies = self.protodeps.clone();
+        for import in &self.generation_imports {
+            if !dependencies.contains(import) {
+                dependencies.push(import.clone());
+            }
+        }
         for runtime in &self.cc_libs {
             if !dependencies.contains(runtime) {
                 dependencies.push(runtime.clone());
@@ -1104,6 +1255,10 @@ impl RuleInstance for TfProtoLibraryInstance {
         dependencies
     }
 
+    fn generation_only_proto_dependencies(&self) -> Vec<String> {
+        self.generation_imports.clone()
+    }
+
     fn exec_only_dependencies(&self) -> Vec<String> {
         if self.role == TfProtoRole::Default && !self.srcs.is_empty() {
             self.protoc.iter().cloned().collect()
@@ -1116,6 +1271,18 @@ impl RuleInstance for TfProtoLibraryInstance {
         reject_framework_include_roots(
             ctx.labeled_dep_providers().iter().map(|(_, provider)| provider.as_ref()),
         )?;
+        for label in &self.generation_imports {
+            let provider = exact_provider(
+                ctx.labeled_dep_providers().iter()
+                    .map(|(label, provider)| (label.as_str(), provider.as_ref())),
+                label, ctx.package(), ctx.workspace(),
+            )?;
+            anyhow::ensure!(provider.get_cc_info().is_none(),
+                "generation-only proto import must not supply C++ runtime metadata: {label}");
+            provider.get_proto_files()
+                .with_context(|| format!("generation-only import has no ProtoFilesInfo: {label}"))?
+                .validate_declared_imports(ctx.registry(), ctx.config_id())?;
+        }
         if self.protoc.is_some() || self.role != TfProtoRole::Default
             || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             self.declared_mode(ctx.native_compile_mode())?;
@@ -2720,7 +2887,7 @@ mod tests {
             ),
             ("protoc".into(), Value::String("@@tools//:protoc".into())),
         ]);
-        for attribute in ["srcs", "protodeps", "cc_libs"] {
+        for attribute in ["srcs", "protodeps", "cc_libs", "_rush_tf_proto_imports"] {
             for invalid in [
                 Value::List(vec![Value::Int(1)]),
                 Value::Dict(HashMap::new()),
@@ -2763,6 +2930,66 @@ mod tests {
             ("has_services".into(), Value::None),
         ]))?;
         assert_eq!(aggregate.dependencies(), vec![":real_dependency"]);
+        Ok(())
+    }
+
+    #[test]
+    fn declared_proto_keeps_generation_imports_separate_from_impl_and_runtime() -> Result<()> {
+        let attributes = HashMap::from([
+            ("name".into(), Value::String("messages".into())),
+            ("srcs".into(), Value::List(vec![Value::String("message.proto".into())])),
+            ("protodeps".into(), Value::List(vec![Value::String(":message_dependency".into())])),
+            ("cc_libs".into(), Value::List(vec![Value::String(":runtime".into())])),
+            ("protoc".into(), Value::String("@@tools//:protoc".into())),
+            ("_rush_tf_proto_imports".into(), Value::List(vec![
+                Value::String("@@protobuf//:any_proto".into()),
+                Value::String("@@protobuf//:wrappers_proto".into()),
+            ])),
+        ]);
+        let generator = rush_rules::with_visibility(
+            TfProtoLibraryRule.parse_attributes(&attributes)?, None,
+        );
+        assert_eq!(generator.generation_only_proto_dependencies(), [
+            "@@protobuf//:any_proto", "@@protobuf//:wrappers_proto",
+        ]);
+        let dependencies = generator.dependencies();
+        for label in [":message_dependency", ":runtime", "@@protobuf//:any_proto", "@@protobuf//:wrappers_proto"] {
+            assert!(dependencies.contains(&label.to_owned()));
+        }
+        assert!(!dependencies.iter().any(|label| label.ends_with("_proto_cc_impl")));
+        let mut implementation = attributes;
+        implementation.insert("_rush_tf_proto_role".into(), Value::String("cc_impl".into()));
+        implementation.insert("_rush_tf_proto_generation_owner".into(), Value::String(":owner".into()));
+        assert!(TfProtoLibraryRule.parse_attributes(&implementation).err()
+            .context("implementation must not own generation imports")?
+            .to_string().contains("generation-only"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_proto_manifest_reader_rejects_special_and_oversized_files() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = TempDir::new()?;
+        let regular = temporary.path().join("current.d");
+        std::fs::write(&regular, b"target: input.proto")?;
+        assert_eq!(read_protoc_dependency_manifest(&regular)?, b"target: input.proto");
+        let link = temporary.path().join("link.d");
+        std::os::unix::fs::symlink(&regular, &link)?;
+        assert!(read_protoc_dependency_manifest(&link).is_err());
+        let fifo = temporary.path().join("fifo.d");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        // SAFETY: CString owns a NUL-terminated valid pathname for this call.
+        anyhow::ensure!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) } == 0,
+            "create owned depfile FIFO: {}", std::io::Error::last_os_error());
+        assert!(read_protoc_dependency_manifest(&fifo).is_err(),
+            "nonblocking descriptor check must refuse a FIFO without a writer");
+        let large = temporary.path().join("large.d");
+        std::fs::File::create(&large)?.set_len(16 * 1024 * 1024 + 1)?;
+        assert!(read_protoc_dependency_manifest(&large).is_err());
+        let directory = temporary.path().join("directory.d");
+        std::fs::create_dir(&directory)?;
+        assert!(read_protoc_dependency_manifest(&directory).is_err());
         Ok(())
     }
 
@@ -3139,6 +3366,348 @@ mod tests {
         .is_err());
         Ok(())
     }
+    /// Rule-layer SOURCE import/generation control, not a descriptor-set,
+    /// C++ runtime, loaded macro or whole-driver qualification.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires independently pinned RUSH_WKT_PROTOBUF_ROOT, RUSH_WKT_PROTOC_BIN and RUSH_WKT_PROTOC_SHA256; root runs explicitly"]
+    async fn declared_proto_real_wkt_sources_match_action_layout_and_refuse_bad_inputs() -> Result<()> {
+        use rush_action::command_spec::NormalizedCommandSpec;
+        use rush_action::ids::{ArtifactKind, DeclaredActionId};
+        use rush_action::{ActionResult, Artifact as Input, Command, ExecutionInfo};
+        use rush_rules::context::{ActionManager, BuildContext, NativeCompileMode, PendingCompileDeclarations};
+        use rush_rules::providers::DefaultInfo;
+        use rush_rules::BuildRule;
+        use std::os::unix::fs::PermissionsExt;
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        fn sha256(path: &std::path::Path) -> Result<String> {
+            let output = std::process::Command::new("/usr/bin/sha256sum")
+                .args(["--binary", "--"])
+                .arg(path)
+                .output()?;
+            anyhow::ensure!(output.status.success(), "sha256sum failed for {}", path.display());
+            let text = std::str::from_utf8(&output.stdout)?;
+            let value = text.split_whitespace().next().context("missing SHA256")?
+                .trim_start_matches('\\');
+            anyhow::ensure!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+                "malformed SHA256 for {}", path.display());
+            Ok(value.to_ascii_lowercase())
+        }
+
+        struct RealWktCommands {
+            results: Mutex<Vec<(Action, i32)>>,
+        }
+        #[async_trait]
+        impl ActionManager for RealWktCommands {
+            async fn execute(&self, action: Action) -> Result<ActionResult> {
+                anyhow::ensure!(matches!(action.mnemonic.as_str(), "GenRule" | "ProtocCompile"),
+                    "SOURCE import test must not run C++ compilation/runtime substitutes");
+                assert_eq!(action.id, Action::compute_id(&action.inputs, &action.command, &action.env)?);
+                let started = Instant::now();
+                eprintln!("real WKT command: cwd={:?} executable={:?} argv={:?}",
+                    action.command.working_dir, action.command.executable, action.command.args);
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    tokio::process::Command::new(&action.command.executable)
+                        .args(&action.command.args)
+                        .envs(&action.env)
+                        .current_dir(action.command.working_dir.as_ref().context("explicit fixture cwd")?)
+                        .kill_on_drop(true)
+                        .output(),
+                ).await??;
+                let exit_code = output.status.code().unwrap_or(-1);
+                if output.status.success() {
+                    for artifact in &action.outputs {
+                        let Input::Source(path) = artifact else { anyhow::bail!("unexpected derived fixture output") };
+                        anyhow::ensure!(path.is_file(), "actual command omitted output {}", path.display());
+                    }
+                }
+                self.results.lock().unwrap().push((action.clone(), exit_code));
+                Ok(ActionResult {
+                    action_id: action.id, exit_code,
+                    stdout: output.stdout, stderr: output.stderr,
+                    outputs: action.outputs, output_records: Vec::new(),
+                    duration: started.elapsed(), cached: false,
+                })
+            }
+        }
+        fn action_for_spec(spec: &NormalizedCommandSpec) -> Result<Action> {
+            let inputs = spec.declared_inputs.iter().cloned().map(Input::Source).collect::<Vec<_>>();
+            let command = Command {
+                executable: spec.executable.clone(), args: spec.argv.clone(),
+                working_dir: spec.cwd.clone(), execution_info: ExecutionInfo::default(),
+            };
+            let env = spec.env.iter().cloned().collect();
+            Ok(Action {
+                id: Action::compute_id(&inputs, &command, &env)?, command, env, inputs,
+                outputs: spec.declared_outputs.iter().cloned().map(Input::Source).collect(),
+                mnemonic: spec.mnemonic.clone(),
+            })
+        }
+
+        let protobuf = std::fs::canonicalize(PathBuf::from(
+            std::env::var_os("RUSH_WKT_PROTOBUF_ROOT").context("set pinned protobuf root")?))?;
+        let protoc = std::fs::canonicalize(PathBuf::from(
+            std::env::var_os("RUSH_WKT_PROTOC_BIN").context("set independently qualified real protoc")?))?;
+        let expected_tool = std::env::var("RUSH_WKT_PROTOC_SHA256")?.to_ascii_lowercase();
+        anyhow::ensure!(expected_tool.len() == 64 && expected_tool.bytes().all(|b| b.is_ascii_hexdigit()),
+            "supply the independent qualified protoc SHA256, not a newly bootstrapped value");
+        assert_eq!(sha256(&protoc)?, expected_tool);
+        let version = std::process::Command::new(&protoc).arg("--version").output()?;
+        anyhow::ensure!(version.status.success(), "pinned protoc version probe failed");
+        assert_eq!(std::str::from_utf8(&version.stdout)?.trim(), "libprotoc 3.21.9");
+        assert_eq!(sha256(&protobuf.join("BUILD.bazel"))?,
+            "3b12950a879e76b3abf5ef6b7cd69dcfab3df04d0b38039b821a9bf23c403d28");
+        let originals = [
+            ("any_proto", "any.proto", "1aa80cf90ddbd380b73b1422bae51d76d99b82a4cdf0b183f21a802f72aafe8b"),
+            ("wrappers_proto", "wrappers.proto", "020c88776e814647da13c1cd5675031a3ffd35b016e64f721c5e066d375d4f43"),
+        ].into_iter().map(|(label, name, expected)| -> Result<_> {
+            let path = protobuf.join("src/google/protobuf").join(name);
+            assert_eq!(sha256(&path)?, expected);
+            Ok((label, name, expected, path.clone(), std::fs::read(path)?))
+        }).collect::<Result<Vec<_>>>()?;
+
+        let temp = TempDir::new()?;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
+        let root = temp.path().join("source");
+        let output = temp.path().join("output");
+        let imported_repo = temp.path().join("protobuf-source-copy");
+        let imported_root = imported_repo.join("src");
+        std::fs::create_dir_all(root.join("pkg"))?;
+        std::fs::create_dir_all(&output)?;
+        std::fs::create_dir_all(imported_root.join("google/protobuf"))?;
+        for (_, name, expected, _, bytes) in &originals {
+            let copy = imported_root.join("google/protobuf").join(name);
+            std::fs::write(&copy, bytes)?;
+            assert_eq!(sha256(&copy)?, *expected);
+        }
+        let consumer_source = root.join("pkg/message.proto");
+        std::fs::write(&consumer_source, r#"syntax = "proto3";
+package real_wkt_fixture;
+import "google/protobuf/any.proto";
+import "google/protobuf/wrappers.proto";
+message WktEnvelope {
+  google.protobuf.Any payload = 1;
+  google.protobuf.StringValue text = 2;
+}
+"#)?;
+        let resolver = StubIncludeResolver::new(root.clone());
+        let toolchain = Toolchain::default();
+        let mut registry = ArtifactRegistry::new();
+        let staged_tool = output.join("declared-protoc");
+        let (tool, tool_producer): (_, DeclaredActionId) = {
+            let mut ctx = AnalysisContext::new(TargetId(1), ConfigId::DEFAULT, "", Some("tools"),
+                &output, &mut registry, &resolver, &toolchain, &root, &[])
+                .with_native_execution_root(Some(&root));
+            let input = ctx.register_source_artifact(&protoc, ArtifactKind::Source);
+            let tool = ctx.register_generated_artifact(&staged_tool, ArtifactKind::Executable, None);
+            let producer = ctx.declare_action("GenRule", vec![input], vec![tool])?;
+            set_proto_payload(&mut ctx, producer, std::path::Path::new("/bin/cp"),
+                &[utf8_path(&protoc)?, utf8_path(&staged_tool)?]);
+            (tool, producer)
+        };
+        let tool_provider = Arc::new(ProviderSet::empty().with_default_info(DefaultInfo { files: vec![tool] }));
+        let executor = Arc::new(RealWktCommands { results: Mutex::new(Vec::new()) });
+        let stage_spec = NormalizedCommandSpec::from_registry_action(&registry, tool_producer)
+            .context("real tool producer has no payload")?;
+        let staged = executor.execute(action_for_spec(&stage_spec)?).await?;
+        anyhow::ensure!(staged.exit_code == 0, "real protoc staging: {}", String::from_utf8_lossy(&staged.stderr));
+        assert_eq!(sha256(&staged_tool)?, expected_tool);
+
+        let mut source_providers = Vec::new();
+        let mut wkt_ids = Vec::new();
+        for (offset, (name, filename, _, _, _)) in originals.iter().enumerate() {
+            let rule = rush_rules::rules_cc::ProtoLibraryRule.parse_attributes(&HashMap::from([
+                ("name".into(), Value::String((*name).into())),
+                ("srcs".into(), Value::List(vec![Value::String(format!("src/google/protobuf/{filename}"))])),
+                ("strip_import_prefix".into(), Value::String("src".into())),
+            ]))?;
+            let declaration = rule.proto_source_metadata().context("native SOURCE facet missing")?;
+            assert_eq!(declaration.sources, &[format!("src/google/protobuf/{filename}")]);
+            assert_eq!(declaration.strip_import_prefix, Some("src"));
+            assert!(declaration.dependencies.is_empty());
+            let target = TargetId(2 + offset as u32);
+            let provider = {
+                let mut ctx = AnalysisContext::new(target, ConfigId::DEFAULT, "", Some("com_google_protobuf"),
+                    &output, &mut registry, &resolver, &toolchain, &imported_repo, &[]);
+                rule.validate_analysis_dependencies(&ctx)?;
+                let provider = rule.analyze(&mut ctx, &[]);
+                anyhow::ensure!(ctx.native_namespace_analysis_error().is_none(), "source-only metadata refused");
+                provider
+            };
+            assert!(provider.get_cc_info().is_none());
+            assert!(provider.get_default_info().is_none());
+            assert!(registry.actions_of(target).is_empty());
+            let proto = provider.get_proto_files().context("native source lost ProtoFilesInfo")?;
+            proto.validate_declared_imports(&registry, ConfigId::DEFAULT)?;
+            assert_eq!(proto.ordered_import_roots(), Some(vec![imported_root.clone()]));
+            assert_eq!(proto.direct_sources.len(), 1);
+            let id = proto.direct_sources[0];
+            assert_eq!(registry.artifact_path(id), imported_root.join("google/protobuf").join(filename));
+            assert!(registry.artifact(id).is_source);
+            assert_eq!(registry.producer(id), None);
+            wkt_ids.push(id);
+            source_providers.push((format!("@com_google_protobuf//:{name}"), Arc::new(provider)));
+        }
+        let labels = source_providers.iter().map(|(label, _)| Value::String(label.clone())).collect();
+        let rule = TfProtoLibraryRule.parse_attributes(&HashMap::from([
+            ("name".into(), Value::String("wkt_message".into())),
+            ("srcs".into(), Value::List(vec![Value::String("message.proto".into())])),
+            ("protoc".into(), Value::String("@@tools//:protoc".into())),
+            ("make_default_target_header_only".into(), Value::Bool(true)),
+            ("_rush_tf_proto_imports".into(), Value::List(labels)),
+        ]))?;
+        assert_eq!(rule.generation_only_proto_dependencies(), source_providers.iter().map(|(label, _)| label.clone()).collect::<Vec<_>>());
+        assert_eq!(rule.exec_only_dependencies(), vec!["@@tools//:protoc"]);
+        let tools = vec![("@tools//:protoc".into(), tool_provider.clone())];
+        let mut pending = PendingCompileDeclarations::default();
+        let unrelated_roots = vec![temp.path().join("unrelated-not-a-proto-root")];
+        let provider = {
+            let mut ctx = AnalysisContext::new(TargetId(4), ConfigId::DEFAULT, "pkg", None,
+                &output, &mut registry, &resolver, &toolchain, &root, &unrelated_roots)
+                .with_labeled_dep_providers(&source_providers)
+                .with_labeled_exec_dep_providers(&tools)
+                .with_native_execution_root(Some(&root))
+                .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, &mut pending);
+            rule.validate_analysis_dependencies(&ctx)?;
+            let provider = rule.analyze(&mut ctx, &source_providers.iter().map(|(_, provider)| provider.clone()).collect::<Vec<_>>());
+            anyhow::ensure!(ctx.native_namespace_analysis_error().is_none(), "WKT analysis refused: {:?}", ctx.native_namespace_analysis_error());
+            provider
+        };
+        assert_eq!(pending.iter().count(), 0, "source-only control must not fabricate a C++ runtime");
+        let proto = provider.get_proto_files().context("consumer proto metadata missing")?;
+        proto.validate_declared_imports(&registry, ConfigId::DEFAULT)?;
+        assert_eq!(proto.ordered_import_roots(), Some(vec![root.clone(), imported_root.clone()]));
+        assert_eq!(proto.transitive_sources.iter().collect::<HashSet<_>>(),
+            [proto.direct_sources[0], wkt_ids[0], wkt_ids[1]].into_iter().collect::<HashSet<_>>());
+        let actions = registry.actions_of(TargetId(4));
+        assert_eq!(actions.len(), 1);
+        let action_id = actions[0];
+        let declared = registry.declared_action(action_id);
+        assert_eq!(registry.strings().str(declared.mnemonic), "ProtocCompile");
+        assert_eq!(declared.inputs.len(), 4);
+        for id in [proto.direct_sources[0], wkt_ids[0], wkt_ids[1], tool] {
+            assert!(declared.inputs.contains(&id));
+        }
+        assert_eq!(registry.producer(tool), Some(tool_producer));
+        let spec = NormalizedCommandSpec::from_registry_action(&registry, action_id)
+            .context("generation payload missing")?;
+        assert_eq!(spec.executable, staged_tool);
+        assert_eq!(spec.cwd, Some(root.clone()));
+        assert_eq!(spec.argv.iter().filter_map(|arg| arg.strip_prefix("--proto_path=")).collect::<Vec<_>>(),
+            vec![utf8_path(&root)?, utf8_path(&imported_root)?]);
+        assert!(!spec.argv.iter().any(|arg| arg.contains("unrelated-not-a-proto-root")));
+        let mut dependencies = source_providers.iter().map(|(label, provider)| (label.clone(), provider.as_ref().clone())).collect::<Vec<_>>();
+        dependencies.push(("@tools//:protoc".into(), tool_provider.as_ref().clone()));
+        let context = BuildContext::new(root.clone(), output.clone())
+            .with_package("pkg".into()).with_toolchain(toolchain)
+            .with_dependencies(HashMap::new(), dependencies)
+            .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+            .with_native_execution_root(Some(root.clone()))
+            .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, Arc::new(pending))
+            .with_action_manager(executor.clone());
+        let runtime_specs = rule.build_legacy_command_specs(&context).await;
+        assert_eq!(runtime_specs.len(), 1);
+        assert_eq!(runtime_specs[0].1, spec);
+        let header = output.join("genfiles/pkg/message.pb.h");
+        let generated = output.join("genfiles/pkg/message.pb.cc");
+        for _ in 0..2 {
+            rule.build(&context).await?;
+            let header_text = std::fs::read_to_string(&header)?;
+            assert!(header_text.contains("class WktEnvelope"));
+            assert!(header_text.contains("google/protobuf/any.pb.h"));
+            assert!(header_text.contains("google/protobuf/wrappers.pb.h"));
+            assert!(!std::fs::read(&generated)?.is_empty());
+        }
+        {
+            let results = executor.results.lock().unwrap();
+            assert_eq!(results.iter().filter(|(action, code)| action.mnemonic == "GenRule" && *code == 0).count(), 1);
+            let generation = results.iter().filter(|(action, _)| action.mnemonic == "ProtocCompile").collect::<Vec<_>>();
+            assert_eq!(generation.len(), 2);
+            assert_eq!(generation[0].0.id, generation[1].0.id);
+            for (action, code) in generation {
+                assert_eq!(*code, 0);
+                assert_eq!(action.command.executable, spec.executable);
+                assert_eq!(action.command.args, spec.argv);
+                assert_eq!(action.command.working_dir, spec.cwd);
+                let mut environment = action.env.iter().map(|(key, value)| (key.clone(), value.clone())).collect::<Vec<_>>();
+                environment.sort();
+                let mut expected_environment = spec.env.clone();
+                expected_environment.sort();
+                assert_eq!(environment, expected_environment);
+                assert_eq!(action.outputs.len(), spec.declared_outputs.len());
+                for output in &spec.declared_outputs { assert!(action.outputs.contains(&Input::Source(output.clone()))); }
+                assert_eq!(action.inputs.len(), spec.declared_inputs.len());
+                for input in &spec.declared_inputs { assert!(action.inputs.contains(&Input::Source(input.clone()))); }
+            }
+        }
+        let good_header = std::fs::read(&header)?;
+        let good_generated = std::fs::read(&generated)?;
+        let any = imported_root.join("google/protobuf/any.proto");
+        let wrappers = imported_root.join("google/protobuf/wrappers.proto");
+        let mut invalid = originals[0].4.clone();
+        invalid.extend_from_slice(b"\nthis is deliberately invalid protobuf syntax\n");
+        std::fs::write(&any, invalid)?;
+        let error = rule.build(&context).await.expect_err("changed imported syntax must fail despite old generated outputs");
+        assert!(format!("{error:#}").contains("any.proto"), "{error:#}");
+        assert_eq!(std::fs::read(&header)?, good_header);
+        assert_eq!(std::fs::read(&generated)?, good_generated);
+        {
+            let results = executor.results.lock().unwrap();
+            let (failed, code) = results.last().context("actual failed protoc was not observed")?;
+            assert_eq!(failed.mnemonic, "ProtocCompile");
+            assert_ne!(*code, 0);
+            assert_ne!(failed.id, results[1].0.id, "changed real import bytes must change the command's input identity");
+        }
+        std::fs::write(&any, &originals[0].4)?;
+        let before_missing = executor.results.lock().unwrap().len();
+        std::fs::remove_file(&wrappers)?;
+        let error = rule.build(&context).await.expect_err("missing SOURCE import must fail despite old generated outputs");
+        assert!(format!("{error:#}").contains("wrappers.proto"), "{error:#}");
+        assert_eq!(executor.results.lock().unwrap().len(), before_missing,
+            "missing actual input must not be replaced by a previous generated output");
+        assert_eq!(std::fs::read(&header)?, good_header);
+        assert_eq!(std::fs::read(&generated)?, good_generated);
+        std::fs::write(&wrappers, &originals[1].4)?;
+        // Protoc can find an undeclared file in a real search root. Its actual
+        // manifest must reject that read before reporting a successful build.
+        let consumer_bytes = std::fs::read(&consumer_source)?;
+        let undeclared = root.join("undeclared.proto");
+        std::fs::write(&undeclared, "syntax = \"proto3\"; message Hidden {}\n")?;
+        let changed = std::str::from_utf8(&consumer_bytes)?.replace(
+            "import \"google/protobuf/any.proto\";",
+            "import \"google/protobuf/any.proto\";\nimport \"undeclared.proto\";",
+        );
+        std::fs::write(&consumer_source, changed)?;
+        let error = rule.build(&context).await.expect_err(
+            "actual undeclared import must fail even when protoc exits successfully");
+        assert!(format!("{error:#}").contains("undeclared import"), "{error:#}");
+        {
+            let results = executor.results.lock().unwrap();
+            let (action, code) = results.last().context("missing actual protoc dependency report")?;
+            assert_eq!(action.mnemonic, "ProtocCompile");
+            assert_eq!(*code, 0, "the driver, rather than protoc parsing, rejects the undeclared read");
+        }
+        std::fs::write(&consumer_source, &consumer_bytes)?;
+        std::fs::remove_file(undeclared)?;
+        rule.build(&context).await?;
+        assert_eq!(std::fs::read(&header)?, good_header);
+        assert_eq!(std::fs::read(&generated)?, good_generated);
+        for (_, name, expected, original, bytes) in &originals {
+            assert_eq!(std::fs::read(original)?, *bytes);
+            assert_eq!(sha256(original)?, *expected);
+            assert_eq!(sha256(&imported_root.join("google/protobuf").join(name))?, *expected);
+        }
+        assert_eq!(sha256(&protoc)?, expected_tool);
+        assert_eq!(sha256(&staged_tool)?, expected_tool);
+        assert_eq!(sha256(&protobuf.join("BUILD.bazel"))?,
+            "3b12950a879e76b3abf5ef6b7cd69dcfab3df04d0b38039b821a9bf23c403d28");
+        Ok(())
+    }
+
     /// Real rule-command execution only: the orchestrator's existing owned
     /// diagnostic-manager test separately covers depfile/cancellation policy.
     /// The staged binary is actual protoc, not a fabricated generator.
@@ -3674,6 +4243,7 @@ service Echo { rpc Call(Request) returns (Reply); }
             name: name.to_string(),
             srcs: vec!["foo.proto".to_string()],
             protodeps: Vec::new(),
+            generation_imports: Vec::new(),
             cc_api_version: 2,
             make_default_target_header_only: false,
             has_services,

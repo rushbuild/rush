@@ -3108,6 +3108,18 @@ fn expand_tf_proto_library(
     generation_kwargs
         .entry("protoc".to_string())
         .or_insert_with(|| Value::String("@com_google_protobuf//:protoc".to_string()));
+    // TSL's C++ generation macro always depends on cc_wkt_protos_genproto.
+    // Inline that pinned protobuf source adapter's twelve native proto_library
+    // dependencies in a distinct generation-input lane. They are source/import
+    // metadata, never C++ implementation or runtime library dependencies.
+    anyhow::ensure!(!kwargs.contains_key("_rush_tf_proto_imports"),
+        "_rush_tf_proto_imports is reserved for the native TSL macro projection");
+    generation_kwargs.insert("_rush_tf_proto_imports".into(), Value::List([
+        "any_proto", "api_proto", "compiler_plugin_proto", "descriptor_proto",
+        "duration_proto", "empty_proto", "field_mask_proto", "source_context_proto",
+        "struct_proto", "timestamp_proto", "type_proto", "wrappers_proto",
+    ].into_iter().map(|name|
+        Value::String(format!("@com_google_protobuf//:{name}"))).collect()));
 
     // Preserve TSL's actual runtime choice as ordinary configuration metadata.
     // No repository-name predicate or unconditional host protobuf is inferred.
@@ -11052,6 +11064,35 @@ else:
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    #[test]
+    fn tf_proto_macro_keeps_well_known_imports_on_generation_owner_only() -> Result<()> {
+        let expected: Vec<String> = [
+            "any_proto", "api_proto", "compiler_plugin_proto", "descriptor_proto",
+            "duration_proto", "empty_proto", "field_mask_proto", "source_context_proto",
+            "struct_proto", "timestamp_proto", "type_proto", "wrappers_proto",
+        ].into_iter().map(|name| format!("@com_google_protobuf//:{name}")).collect();
+        for header_only in [false, true] {
+            let calls = expand_proto("messages_proto", header_only);
+            let owner = find_rule(&calls, if header_only {
+                "messages_proto_genproto_owner"
+            } else { "messages_proto" }).unwrap();
+            assert_eq!(str_list(owner, "_rush_tf_proto_imports"), expected);
+            assert!(str_list(owner, "protodeps").is_empty());
+            for call in calls.iter().filter(|call| !std::ptr::eq(*call, owner)) {
+                assert!(!call.kwargs.contains_key("_rush_tf_proto_imports"));
+                assert!(!str_list(call, "protodeps").iter()
+                    .any(|label| label.starts_with("@com_google_protobuf//:")));
+            }
+        }
+        let attrs = HashMap::from([
+            ("name".into(), Value::String("forged_proto".into())),
+            ("_rush_tf_proto_imports".into(), Value::List(Vec::new())),
+        ]);
+        assert!(expand_tf_proto_library("tf_proto_library", &[], &attrs)
+            .unwrap_err().to_string().contains("reserved"));
+        Ok(())
     }
 
     #[test]

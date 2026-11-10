@@ -451,6 +451,10 @@ pub struct AnalysisSnapshot {
         String,
         Arc<rush_rules::providers::VerifiedOptionsHeaderInputs>,
     >,
+    /// Non-source declaration routes from complete proto prerequisite packages.
+    /// Includes unselected producers: an old file cannot become source metadata
+    /// merely because its declared writer is outside this requested graph.
+    pub(crate) proto_source_output_owners: HashMap<Label, Label>,
     /// Cached pruned PASS-B planner index. Populated after the first full
     /// successful PASS-B run, when legacy rules have declared their actions.
     pub pass_b_prune_index: Mutex<Option<Arc<PassBPruneIndex>>>,

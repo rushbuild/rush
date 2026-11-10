@@ -4406,6 +4406,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "libc",
  "rush-action",
  "rush-rules",
  "rush-verified-core",

@@ -15,5 +15,8 @@ async-trait = "0.1"
 blake3 = { workspace = true }
 tokio = { version = "1.35", features = ["full"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile = "3.8"

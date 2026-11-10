@@ -5377,6 +5377,47 @@ impl BuildOrchestrator {
             self.admit_options_header_constructor_source().await?;
         }
         let resolver_repo_paths = self.external_repo_paths.lock().await.clone();
+        let proto_source_output_owners = self.with_tracked_scope(|| -> Result<HashMap<Label, Label>> {
+            let mut owners = HashMap::new();
+            if !build_order.iter().any(|label| graph.get(label).is_some_and(|node|
+                !node.rule_instance.generation_only_proto_dependencies().is_empty())) {
+                return Ok(owners);
+            }
+            let packages: std::collections::BTreeSet<_> = build_order.iter()
+                .filter(|label| graph.get(label).is_some_and(|node|
+                    node.rule_instance.proto_source_metadata().is_some()
+                        || !node.rule_instance.generation_only_proto_dependencies().is_empty()))
+                .map(|label| (label.workspace.clone(), label.package.clone())).collect();
+            for (repository, package) in packages {
+                let root = match repository.as_deref() {
+                    Some(name) => resolver_repo_paths.get(name)
+                        .ok_or_else(|| anyhow!("proto prerequisite repository is not registered: {name}"))?,
+                    None => &self.workspace_root,
+                };
+                let build_path = Self::build_path_for_package(root, &package)
+                    .ok_or_else(|| anyhow!("proto prerequisite package has no BUILD file: {package}"))?;
+                let parsed = self.parse_build_file_cached_for_repository(
+                    &build_path, Some(root), repository.as_deref(),
+                )?;
+                let catalog = Self::package_declaration_catalog(
+                    &parsed, repository.as_deref(), &package,
+                )?;
+                let source_names: HashSet<_> = parsed.rules.iter()
+                    .filter(|rule| rule.rule_type == "source_file")
+                    .map(|rule| rule.name.as_str()).collect();
+                for (name, producer) in &catalog.producers {
+                    if source_names.contains(name.as_str()) && name == producer { continue; }
+                    let output = graph.canonicalize_label(Label {
+                        workspace: repository.clone(), package: package.clone(), target: name.clone(),
+                    });
+                    let owner = graph.canonicalize_label(Label {
+                        workspace: repository.clone(), package: package.clone(), target: producer.clone(),
+                    });
+                    owners.insert(output, owner);
+                }
+            }
+            Ok(owners)
+        })?;
         let mut options_header_inputs = HashMap::new();
         if diagnostic_mode {
             for label in &build_order {
@@ -5597,6 +5638,50 @@ impl BuildOrchestrator {
                         if let Some(error) = analysis_ctx.native_namespace_analysis_error() {
                             anyhow::bail!("native execution namespace analysis refused for {label}: {error}");
                         }
+                    }
+                    if !proto_source_output_owners.is_empty()
+                        && (node.rule_instance.proto_source_metadata().is_some()
+                            || !node.rule_instance.generation_only_proto_dependencies().is_empty()) {
+                        let proto = providers.get_proto_files()
+                            .ok_or_else(|| anyhow!("native proto source declaration has no analyzed metadata: {label}"))?;
+                        // Record actual source bytes before the analysis manifest
+                        // is frozen. Execution separately checks complete source
+                        // facet admission, including unselected producer routes.
+                        self.with_tracked_scope(|| -> Result<()> {
+                            if let Some(declaration) = node.rule_instance.proto_source_metadata() {
+                                for source in declaration.sources {
+                                    crate::native_proto_source_metadata::check_source_package_boundaries(
+                                        analysis_ctx.workspace_root(), analysis_ctx.package(), Path::new(source),
+                                    )?;
+                                }
+                            }
+                            if !node.rule_instance.generation_only_proto_dependencies().is_empty() {
+                                let package = analysis_ctx.workspace_root().join(analysis_ctx.package());
+                                for id in &proto.direct_sources {
+                                    let path = analysis_ctx.registry().artifact_path(*id);
+                                    let relative = path.strip_prefix(&package)
+                                        .context("generation proto SOURCE is outside its package")?;
+                                    crate::native_proto_source_metadata::check_source_package_boundaries(
+                                        analysis_ctx.workspace_root(), analysis_ctx.package(), relative,
+                                    )?;
+                                    let source = graph.canonicalize_label(Label {
+                                        workspace: label.workspace.clone(), package: label.package.clone(),
+                                        target: relative.to_str().context("non-UTF8 generation source")?.to_owned(),
+                                    });
+                                    anyhow::ensure!(!proto_source_output_owners.contains_key(&source),
+                                        "declared producer/non-SOURCE target collides with generation proto SOURCE: {source}");
+                                }
+                            }
+                            crate::native_proto_source_metadata::check_proto_import_search(
+                                proto, analysis_ctx.registry(), analysis_ctx.config_id(),
+                            )?;
+                            for id in &proto.direct_sources {
+                                crate::native_proto_source_metadata::observe_tracked_source(
+                                    analysis_ctx.registry().artifact_path(*id),
+                                )?;
+                            }
+                            Ok(())
+                        })?;
                     }
                     Ok(providers)
                 };
@@ -6846,6 +6931,7 @@ impl BuildOrchestrator {
                 artifact_registry,
                 analysis_providers: built_providers,
                 options_header_inputs,
+                proto_source_output_owners,
                 pass_b_prune_index: std::sync::Mutex::new(None),
                 static_archive_materialization,
                 target_id_by_label,
@@ -7138,6 +7224,21 @@ impl BuildOrchestrator {
             .map(|s| Label::parse(s, None, None))
             .map(|label| label.map(|label| graph.canonicalize_label(label)))
             .collect::<Result<Vec<_>>>()?;
+        let pending_forwarder_targets: HashSet<_> = diagnostic.as_ref()
+            .map(|build| build.declarations.iter().map(|pending| pending.target()).collect())
+            .unwrap_or_default();
+        // This bounded facet supplies real source files to native generators.
+        // Audit it even when action demand leaves its metadata nodes inactive.
+        let proto_source_facets = {
+            let registry = snapshot.artifact_registry.lock().await;
+            self.with_tracked_scope(|| crate::native_proto_source_metadata::admit_generation_sources(
+                snapshot, &root_labels, &registry, &pending_forwarder_targets,
+                rush_action::ids::ConfigId::DEFAULT, &snapshot.proto_source_output_owners,
+                crate::native_proto_source_metadata::observe_tracked_source,
+            ))?
+        };
+        anyhow::ensure!(proto_source_facets.is_empty() || diagnostic_mode,
+            "native proto generation inputs currently require the uncached diagnostic profile");
         let execution_demand = {
             let registry = snapshot.artifact_registry.lock().await;
             let mut pending_producers: HashMap<rush_action::ids::TargetId, Vec<rush_action::ids::DeclaredActionId>> = HashMap::new();
@@ -7155,9 +7256,6 @@ impl BuildOrchestrator {
         // projection prerequisites remain analysis-only; demanded generators
         // and complete ordinary roots still require their real writer lifecycle.
         let mut identity_forwarders = HashMap::new();
-        let pending_forwarder_targets: HashSet<_> = diagnostic.as_ref()
-            .map(|build| build.declarations.iter().map(|pending| pending.target()).collect())
-            .unwrap_or_default();
         if let Some(build) = &diagnostic {
             let registry = snapshot.artifact_registry.lock().await;
             for (index, label) in build_order.iter().enumerate() {
@@ -7179,7 +7277,7 @@ impl BuildOrchestrator {
                 let inline_options = kind == "tf_gen_options_header"
                     && snapshot.options_header_inputs.contains_key(&label.to_string());
                 let writer = inline_options || matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
-                anyhow::ensure!(writer || identity_forwarders.contains_key(&index) || node.rule_instance.cc_projection_kind().is_some() || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
+                anyhow::ensure!(writer || identity_forwarders.contains_key(&index) || proto_source_facets.contains_key(&index) || node.rule_instance.cc_projection_kind().is_some() || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
                     |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
                     "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
                 let target = *snapshot.target_id_by_label.get(&label.to_string()).ok_or_else(||anyhow!("diagnostic target identity missing: {label}"))?;
@@ -8376,6 +8474,7 @@ impl BuildOrchestrator {
                     !materialize_static_libraries
                         && static_archive_producer_rule_kind(node.rule_instance.rule_type());
                 let use_scheduler = node.rule_instance.cc_projection_kind().is_none()
+                    && !proto_source_facets.contains_key(&cur)
                     && !execution_demand.as_ref().is_some_and(|plan| plan.selected_actions.contains_key(&cur))
                     && !archive_elided_for_legacy && target_id_for_dispatch
                     .map(|t| scheduler_eligible_after_allowlist.contains(&t))
@@ -8447,9 +8546,20 @@ impl BuildOrchestrator {
 
                 let execution_io = if snapshot.native_execroot.is_some() { self.tracked_io_shared() } else { None };
                 let identity_forwarder = identity_forwarders.contains_key(&cur);
+                let proto_source_artifacts = if let Some(facet) = proto_source_facets.get(&cur) {
+                    let registry = artifact_registry.lock().await;
+                    Some(facet.direct_sources.iter().map(|id| Artifact {
+                        path: registry.artifact_path(*id).to_owned(),
+                        artifact_type: rush_rules::ArtifactType::Source,
+                    }).collect::<Vec<_>>())
+                } else { None };
                 running.push(crate::native_execroot::scope_future(execution_io.clone(), async move {
                     let _target_span = profiler_target.scope_on_lane(&label_s, "target");
-                    let artifacts = if identity_forwarder {
+                    let artifacts = if let Some(sources) = proto_source_artifacts {
+                        // No metadata rule body or scheduler receives dispatch.
+                        // These are the actual admitted source paths, not outputs.
+                        sources
+                    } else if identity_forwarder {
                         // A structurally admitted identity alias never invokes
                         // a rule body or the action scheduler. Commit the real
                         // actual target's current state below, after rechecking.
@@ -8713,6 +8823,15 @@ impl BuildOrchestrator {
             };
 
             // Store artifacts as a depset DAG node (identity aliases forward by Arc).
+            if proto_source_facets.contains_key(&cur) {
+                let registry = artifact_registry.lock().await;
+                self.with_tracked_scope(|| crate::native_proto_source_metadata::recheck_generation_sources(
+                    &proto_source_facets, snapshot, &root_labels, &registry,
+                    &pending_forwarder_targets, rush_action::ids::ConfigId::DEFAULT,
+                    &snapshot.proto_source_output_owners,
+                    crate::native_proto_source_metadata::observe_tracked_source,
+                ))?;
+            }
             if let Some(actual) = identity_forwarders.get(&cur) {
                 anyhow::ensure!(artifacts.is_empty(), "identity forwarder returned own artifacts");
                 let registry = artifact_registry.lock().await;
@@ -21985,6 +22104,631 @@ cc_binary(name="app",srcs=["main.cc"],deps=[":consumer"])
                 assert!(
                     crate::compiler_discovery::take_completed_diagnostic_processes(root).is_empty(),
                     "{shape:?}: no real process may complete before structural refusal"
+                );
+            }
+            Ok(())
+        }
+    }
+
+    /// Whole-driver SOURCE-facet controls. This factory seam preserves actual
+    /// native analysis; no successful provider or generated bytes are invented.
+    mod proto_source_facet_driver_controls {
+        use super::*;
+        use rush_action::ids::ArtifactKind;
+        use rush_rules::providers::FilesInfo;
+        use rush_rules::{BuildRule, RuleInstance, Value as Attr};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Shape {
+            Pure,
+            OwnAction,
+            OwnProvider,
+            WrongRoot,
+            MissingHook,
+            GeneratedCatalog,
+            NonSourceCatalog,
+        }
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Kind {
+            Metadata,
+            Messages,
+            Tool,
+        }
+        #[derive(Clone, Debug)]
+        struct ProtocRecord {
+            executable: PathBuf,
+            argv: Vec<String>,
+            inputs: Vec<PathBuf>,
+            outputs: Vec<PathBuf>,
+        }
+        type Audit = Arc<std::sync::Mutex<Vec<ProtocRecord>>>;
+        struct FixtureLibrary {
+            root: PathBuf,
+            shape: Shape,
+            real_tool: bool,
+            audit: Audit,
+            registered_kind: &'static str,
+        }
+        struct FixtureRule {
+            inner: Box<dyn RuleInstance>,
+            root: PathBuf,
+            shape: Shape,
+            kind: Kind,
+            audit: Audit,
+        }
+
+        impl BuildRule for FixtureLibrary {
+            fn name(&self) -> &str {
+                self.registered_kind
+            }
+            fn parse_attributes(
+                &self,
+                attributes: &HashMap<String, Attr>,
+            ) -> Result<Box<dyn RuleInstance>> {
+                let name = attributes
+                    .get("name")
+                    .and_then(Attr::as_string)
+                    .context("fixture target name")?;
+                let (inner, kind) = if name.starts_with("metadata_") {
+                    (
+                        rush_rules::rules_cc::ProtoLibraryRule.parse_attributes(attributes)?,
+                        Kind::Metadata,
+                    )
+                } else if name == "messages" {
+                    let mut attrs = HashMap::from([
+                        ("name".into(), Attr::String(name.into())),
+                        (
+                            "srcs".into(),
+                            Attr::List(if self.real_tool {
+                                vec![Attr::String("message.proto".into())]
+                            } else {
+                                Vec::new()
+                            }),
+                        ),
+                        ("make_default_target_header_only".into(), Attr::Bool(true)),
+                        (
+                            "_rush_tf_proto_imports".into(),
+                            Attr::List(vec![Attr::String(":metadata_outer".into())]),
+                        ),
+                    ]);
+                    if self.real_tool {
+                        attrs.insert("protoc".into(), Attr::String("//:protoc_tool".into()));
+                    }
+                    (
+                        tensorflow_rules::tf_proto_library::TfProtoLibraryRule
+                            .parse_attributes(&attrs)?,
+                        Kind::Messages,
+                    )
+                } else if name == "protoc_tool" && self.real_tool {
+                    // Real cp producer; the wrapper supplies only the truthful
+                    // executable output role that generic genrule lacks.
+                    (
+                        tensorflow_rules::genrule::GenruleRule.parse_attributes(attributes)?,
+                        Kind::Tool,
+                    )
+                } else if self.registered_kind == "genrule" {
+                    return tensorflow_rules::genrule::GenruleRule.parse_attributes(attributes);
+                } else if self.registered_kind == "proto_library" {
+                    return rush_rules::rules_cc::ProtoLibraryRule.parse_attributes(attributes);
+                } else {
+                    return rush_rules::rules_cc::CcLibraryRule.parse_attributes(attributes);
+                };
+                Ok(Box::new(FixtureRule {
+                    inner,
+                    kind,
+                    root: self.root.clone(),
+                    shape: self.shape,
+                    audit: self.audit.clone(),
+                }))
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RuleInstance for FixtureRule {
+            fn target_name(&self) -> &str {
+                self.inner.target_name()
+            }
+            fn rule_type(&self) -> &str {
+                self.inner.rule_type()
+            }
+            fn dependencies(&self) -> Vec<String> {
+                self.inner.dependencies()
+            }
+            fn generation_only_proto_dependencies(&self) -> Vec<String> {
+                self.inner.generation_only_proto_dependencies()
+            }
+            fn exec_only_dependencies(&self) -> Vec<String> {
+                self.inner.exec_only_dependencies()
+            }
+            fn declared_outputs(&self) -> Vec<String> {
+                self.inner.declared_outputs()
+            }
+            fn undeclared_source_inputs(&self) -> Vec<String> {
+                self.inner.undeclared_source_inputs()
+            }
+            fn proto_source_metadata(&self) -> Option<rush_rules::ProtoSourceMetadataDeclaration<'_>> {
+                if self.kind == Kind::Metadata && self.shape == Shape::MissingHook {
+                    None
+                } else {
+                    self.inner.proto_source_metadata()
+                }
+            }
+            fn validate_analysis_dependencies(
+                &self,
+                ctx: &rush_rules::analysis_context::AnalysisContext,
+            ) -> Result<()> {
+                self.inner.validate_analysis_dependencies(ctx)
+            }
+            fn scheduler_shape_unsupported(&self) -> Option<&'static str> {
+                self.inner.scheduler_shape_unsupported()
+            }
+            fn scheduler_required_tools(&self) -> Vec<rush_rules::RequiredTool> {
+                self.inner.scheduler_required_tools()
+            }
+            fn providers(&self) -> ProviderSet {
+                self.inner.providers()
+            }
+            fn analyze(
+                &self,
+                ctx: &mut rush_rules::analysis_context::AnalysisContext,
+                deps: &[Arc<ProviderSet>],
+            ) -> ProviderSet {
+                if self.kind == Kind::Tool {
+                    ctx.register_generated_artifact(
+                        Path::new("genfiles/fixture-protoc"),
+                        ArtifactKind::Executable,
+                        None,
+                    );
+                }
+                let mut providers = self.inner.analyze(ctx, deps);
+                if self.kind == Kind::Metadata && self.target_name() == "metadata_leaf" {
+                    match self.shape {
+                        Shape::OwnAction => {
+                            let output = ctx.register_generated_artifact(
+                                Path::new("metadata-must-not-write"),
+                                ArtifactKind::Generated,
+                                None,
+                            );
+                            if let Err(error) = ctx.declare_incomplete_action(
+                                "GenRule",
+                                Vec::new(),
+                                vec![output],
+                                "negative metadata fixture owns a writer",
+                            ) {
+                                ctx.fail_native_namespace_analysis(error.to_string());
+                            }
+                        }
+                        Shape::OwnProvider => {
+                            // Invalid extra provider only in a negative case.
+                            providers =
+                                providers.with_files(FilesInfo::new(vec![self.root.join("extra.txt")]));
+                        }
+                        Shape::WrongRoot => {
+                            if let Some(info) = providers.proto_files.as_ref() {
+                                let mut bad = (**info).clone();
+                                let mut layouts = bad
+                                    .declared_imports
+                                    .as_ref()
+                                    .unwrap()
+                                    .iter()
+                                    .collect::<Vec<_>>();
+                                for layout in &mut layouts {
+                                    layout.import_root = self.root.join("wrong-unadmitted-root");
+                                }
+                                bad.declared_imports =
+                                    Some(rush_rules::nested_set::NestedSet::new(layouts, Vec::new()));
+                                providers.proto_files = Some(Arc::new(bad));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if self.kind == Kind::Messages {
+                    for id in ctx.registry().actions_of(ctx.target()) {
+                        let action = ctx.registry().declared_action(*id);
+                        if ctx.registry().strings().str(action.mnemonic) != "ProtocCompile" {
+                            continue;
+                        }
+                        let command = ctx
+                            .registry()
+                            .executable_action(*id)
+                            .expect("real protoc action payload")
+                            .materialize(ctx.registry());
+                        self.audit.lock().unwrap().push(ProtocRecord {
+                            executable: command.executable,
+                            argv: command.argv,
+                            inputs: action
+                                .inputs
+                                .iter()
+                                .map(|id| ctx.registry().artifact_path(*id).to_owned())
+                                .collect(),
+                            outputs: action
+                                .outputs
+                                .iter()
+                                .map(|id| ctx.registry().artifact_path(*id).to_owned())
+                                .collect(),
+                        });
+                    }
+                }
+                providers
+            }
+            async fn build(&self, ctx: &rush_rules::context::BuildContext) -> Result<Vec<Artifact>> {
+                if self.kind == Kind::Metadata {
+                    std::fs::write(
+                        self.root.join("PROTO_METADATA_BUILD_MUST_NEVER_RUN"),
+                        b"called",
+                    )?;
+                    anyhow::bail!("native proto SOURCE metadata build body must be skipped");
+                }
+                self.inner.build(ctx).await
+            }
+            async fn build_legacy_command_specs(
+                &self,
+                ctx: &rush_rules::context::BuildContext,
+            ) -> Vec<(
+                rush_rules::SchedulerActionKey,
+                rush_action::command_spec::NormalizedCommandSpec,
+            )> {
+                self.inner.build_legacy_command_specs(ctx).await
+            }
+        }
+
+        fn fixture(
+            root: &Path,
+            shape: Shape,
+            real_tool: bool,
+            audit: Audit,
+        ) -> Result<BuildOrchestrator> {
+            once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+            write_file(
+                &root.join("WORKSPACE"),
+                "workspace(name='proto_source_facet_driver')\n",
+            )?;
+            let metadata = if real_tool {
+                "proto_library(name='metadata_any',srcs=['imports/src/google/protobuf/any.proto'],strip_import_prefix='imports/src')\nproto_library(name='metadata_wrappers',srcs=['imports/src/google/protobuf/wrappers.proto'],strip_import_prefix='imports/src')\nproto_library(name='metadata_outer',deps=[':metadata_any',':metadata_wrappers'])\ngenrule(name='protoc_tool',srcs=['compiler.input'],outs=['fixture-protoc'],cmd='cp $(SRCS) $@ && chmod +x $@')\n"
+            } else {
+                "proto_library(name='metadata_leaf',srcs=['schema/common.proto'],strip_import_prefix='schema')\nproto_library(name='metadata_outer',deps=[':metadata_leaf'])\n"
+            };
+            let negative = match shape {
+                    Shape::GeneratedCatalog => "genrule(name='actual_proto_producer',srcs=['seed.proto'],outs=['schema/common.proto'],cmd='cp $(SRCS) $@')\n",
+                    Shape::NonSourceCatalog => "filegroup(name='schema/common.proto',srcs=['extra.txt'])\n",
+                    _ => "",
+                };
+            write_file(&root.join("BUILD"), &format!("{metadata}{negative}cc_library(name='messages')\ncc_binary(name='app',srcs=['main.cc'],deps=[':messages'])\n"))?;
+            if !real_tool {
+                write_file(
+                    &root.join("schema/common.proto"),
+                    "syntax=\"proto3\"; message Common {}\n",
+                )?;
+            }
+            write_file(
+                &root.join("seed.proto"),
+                "syntax=\"proto3\"; message Generated {}\n",
+            )?;
+            write_file(&root.join("extra.txt"), "negative extra provider input\n")?;
+            write_file(
+                &root.join("main.cc"),
+                "#include <stdio.h>\nint main(){printf(\"42\\n\");return 0;}\n",
+            )?;
+            let mut orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+            Arc::get_mut(&mut orchestrator.rule_registry)
+                .context("fixture registry is shared")?
+                .register(Box::new(FixtureLibrary {
+                    root: root.to_owned(),
+                    shape,
+                    real_tool,
+                    audit: audit.clone(),
+                    registered_kind: "cc_library",
+                }));
+            Arc::get_mut(&mut orchestrator.rule_registry)
+                .context("fixture registry is shared")?
+                .register(Box::new(FixtureLibrary {
+                    root: root.to_owned(), shape, real_tool, audit: audit.clone(),
+                    registered_kind: "genrule",
+                }));
+            Arc::get_mut(&mut orchestrator.rule_registry)
+                .context("fixture registry is shared")?
+                .register(Box::new(FixtureLibrary {
+                    root: root.to_owned(), shape, real_tool, audit,
+                    registered_kind: "proto_library",
+                }));
+            Ok(orchestrator)
+        }
+
+        fn command(root: &Path, target: &str) -> Result<rush_command_core::CommandSemantics> {
+            let expanded = rush_command_core::build_arguments::encode(&[
+                "--define=fixture=proto_source_facet".into(),
+            ]);
+            semantics_with_define_and_environment(
+                root,
+                target,
+                "fixture",
+                "proto_source_facet",
+                &[
+                    ("RUSH_CPP_DISCOVERY", "uncached-diagnostic-v1"),
+                    ("PATH", "/usr/bin:/bin"),
+                    ("PROTOC", "/absent/poison-protoc"),
+                    ("RUSH_PROTOC", "/absent/poison-protoc"),
+                    (
+                        rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV,
+                        expanded.as_str(),
+                    ),
+                ],
+            )
+        }
+        fn counts(root: &Path) -> std::collections::BTreeMap<String, usize> {
+            let mut counts = std::collections::BTreeMap::new();
+            for (name, _) in crate::compiler_discovery::take_completed_diagnostic_processes(root) {
+                *counts.entry(name).or_insert(0) += 1;
+            }
+            counts
+        }
+        fn assert_no_publication(
+            orchestrator: &BuildOrchestrator,
+            root: &Path,
+            targets: Vec<String>,
+            request: &rush_command_core::CommandSemantics,
+        ) -> Result<()> {
+            let key =
+                crate::analysis_snapshot::AnalysisKey::new(request, root.canonicalize()?, targets);
+            assert!(orchestrator.snapshot_cache.get(&key).is_none());
+            assert!(crate::cold_noop_cache::load(root, &key).is_none());
+            assert!(!root.join("PROTO_METADATA_BUILD_MUST_NEVER_RUN").exists());
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn proto_source_facet_driver_skips_metadata_and_refuses_explicit_mixed_roots(
+        ) -> Result<()> {
+            let temporary = TempDir::new()?;
+            let root = temporary.path();
+            let orchestrator = fixture(root, Shape::Pure, false, Audit::default())?;
+            let targets = vec!["//:app".to_owned()];
+            let request = command(root, &targets[0])?;
+            let executable = cache_paths::workspace_output_root(root).join("app");
+            for _ in 0..2 {
+                orchestrator
+                    .build_with_dependencies_with_semantics(targets.clone(), request.clone())
+                    .await?;
+                let result = std::process::Command::new(&executable).output()?;
+                anyhow::ensure!(result.status.success(), "real consumer executable failed");
+                assert_eq!(result.stdout, b"42\n");
+                assert_eq!(
+                    counts(root),
+                    std::collections::BTreeMap::from([("CppCompile".into(), 1), ("CppLink".into(), 1)])
+                );
+                assert_no_publication(&orchestrator, root, targets.clone(), &request)?;
+            }
+            let old = std::fs::read(&executable)?;
+            for roots in [
+                vec!["//:metadata_leaf".to_owned()],
+                vec!["//:app".to_owned(), "//:metadata_leaf".to_owned()],
+            ] {
+                let request = command(root, &roots[0])?;
+                let error = orchestrator
+                    .build_with_dependencies_with_semantics(roots.clone(), request.clone())
+                    .await
+                    .expect_err("SOURCE facet must not certify native proto descriptor roots");
+                assert!(format!("{error:#}").contains("proto"), "{error:#}");
+                assert_eq!(std::fs::read(&executable)?, old);
+                assert!(counts(root).is_empty());
+                assert_no_publication(&orchestrator, root, roots, &request)?;
+            }
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn proto_source_facet_driver_refuses_unaudited_metadata_before_writers() -> Result<()> {
+            for shape in [
+                Shape::OwnAction,
+                Shape::OwnProvider,
+                Shape::WrongRoot,
+                Shape::MissingHook,
+                Shape::GeneratedCatalog,
+                Shape::NonSourceCatalog,
+            ] {
+                let temporary = TempDir::new()?;
+                let root = temporary.path();
+                let audit = Audit::default();
+                let good = fixture(root, Shape::Pure, false, audit.clone())?;
+                let targets = vec!["//:app".to_owned()];
+                let request = command(root, &targets[0])?;
+                good.build_with_dependencies_with_semantics(targets.clone(), request.clone())
+                    .await?;
+                assert_eq!(
+                    counts(root),
+                    std::collections::BTreeMap::from([("CppCompile".into(), 1), ("CppLink".into(), 1)])
+                );
+                let executable = cache_paths::workspace_output_root(root).join("app");
+                let old = std::fs::read(&executable)?;
+                let bad = fixture(root, shape, false, audit)?;
+                let error = bad
+                    .build_with_dependencies_with_semantics(targets.clone(), request.clone())
+                    .await
+                    .expect_err("invalid metadata must refuse before any process");
+                assert!(
+                    format!("{error:#}").contains("proto"),
+                    "{shape:?}: {error:#}"
+                );
+                assert!(
+                    counts(root).is_empty(),
+                    "{shape:?}: writer completed before rejection"
+                );
+                assert_eq!(std::fs::read(&executable)?, old, "{shape:?}");
+                assert!(!cache_paths::workspace_output_root(root)
+                    .join("metadata-must-not-write")
+                    .exists());
+                assert_no_publication(&bad, root, targets, &request)?;
+            }
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        #[ignore = "requires root-pinned RUSH_WKT_PROTOBUF_ROOT, RUSH_WKT_PROTOC_BIN and RUSH_WKT_PROTOC_SHA256"]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn proto_source_facet_driver_generates_with_real_declared_wkt_inputs() -> Result<()> {
+            use sha2::{Digest, Sha256};
+            let protobuf = std::fs::canonicalize(
+                std::env::var_os("RUSH_WKT_PROTOBUF_ROOT").context("real pinned protobuf root")?,
+            )?;
+            let compiler = std::fs::canonicalize(
+                std::env::var_os("RUSH_WKT_PROTOC_BIN")
+                    .context("independently qualified source-built protoc")?,
+            )?;
+            let expected = std::env::var("RUSH_WKT_PROTOC_SHA256")
+                .context("independent real protoc receipt SHA256")?;
+            anyhow::ensure!(
+                expected.len() == 64 && expected.bytes().all(|c| c.is_ascii_hexdigit()),
+                "invalid independent protoc digest"
+            );
+            let digest = |path: &Path| -> Result<String> {
+                Ok(format!("{:x}", Sha256::digest(std::fs::read(path)?)))
+            };
+            assert_eq!(digest(&compiler)?, expected.to_lowercase());
+            assert_eq!(
+                digest(&protobuf.join("BUILD.bazel"))?,
+                "3b12950a879e76b3abf5ef6b7cd69dcfab3df04d0b38039b821a9bf23c403d28"
+            );
+            let pinned = [
+                (
+                    "any.proto",
+                    "1aa80cf90ddbd380b73b1422bae51d76d99b82a4cdf0b183f21a802f72aafe8b",
+                ),
+                (
+                    "wrappers.proto",
+                    "020c88776e814647da13c1cd5675031a3ffd35b016e64f721c5e066d375d4f43",
+                ),
+            ];
+            let temporary = TempDir::new()?;
+            let root = temporary.path();
+            for (file, hash) in pinned {
+                let source = protobuf.join("src/google/protobuf").join(file);
+                assert_eq!(digest(&source)?, hash);
+                let destination = root.join("imports/src/google/protobuf").join(file);
+                std::fs::create_dir_all(destination.parent().unwrap())?;
+                std::fs::copy(source, destination)?;
+            }
+            std::fs::copy(&compiler, root.join("compiler.input"))?;
+            write_file(&root.join("message.proto"),"syntax=\"proto3\"; package fixture; import \"google/protobuf/any.proto\"; import \"google/protobuf/wrappers.proto\"; message Message { google.protobuf.Any value=1; google.protobuf.DoubleValue number=2; }\n")?;
+            let audit = Audit::default();
+            let orchestrator = fixture(root, Shape::Pure, true, audit.clone())?;
+            let targets = vec!["//:messages".to_owned()];
+            let request = command(root, &targets[0])?;
+            let output = cache_paths::workspace_output_root(root);
+            let header = output.join("genfiles/message.pb.h");
+            let generated = output.join("genfiles/message.pb.cc");
+            for _ in 0..2 {
+                orchestrator
+                    .build_with_dependencies_with_semantics(targets.clone(), request.clone())
+                    .await?;
+                assert!(std::fs::read(&header)?
+                    .windows(b"class Message".len())
+                    .any(|w| w == b"class Message"));
+                assert!(!std::fs::read(&generated)?.is_empty());
+                assert_eq!(
+                    counts(root),
+                    std::collections::BTreeMap::from([
+                        ("GenRule".into(), 1),
+                        ("ProtocCompile".into(), 1)
+                    ])
+                );
+                let records = std::mem::take(&mut *audit.lock().unwrap());
+                assert_eq!(records.len(), 1);
+                let record = &records[0];
+                assert_eq!(record.executable, output.join("genfiles/fixture-protoc"));
+                assert_eq!(
+                    record.inputs.iter().cloned().collect::<HashSet<_>>(),
+                    [
+                        root.join("message.proto"),
+                        root.join("imports/src/google/protobuf/any.proto"),
+                        root.join("imports/src/google/protobuf/wrappers.proto"),
+                        output.join("genfiles/fixture-protoc")
+                    ]
+                    .into_iter()
+                    .collect()
+                );
+                assert_eq!(record.inputs.len(), 4);
+                assert_eq!(
+                    record.outputs.iter().cloned().collect::<HashSet<_>>(),
+                    [header.clone(), generated.clone(), output.join("genfiles/message.pb.protoc.d")]
+                        .into_iter().collect()
+                );
+                assert_eq!(
+                    record
+                        .argv
+                        .iter()
+                        .filter(|arg| arg.starts_with("--proto_path="))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    [
+                        format!("--proto_path={}", root.display()),
+                        format!("--proto_path={}", root.join("imports/src").display())
+                    ]
+                );
+                assert_eq!(
+                    digest(&output.join("genfiles/fixture-protoc"))?,
+                    expected.to_lowercase()
+                );
+                assert_no_publication(&orchestrator, root, targets.clone(), &request)?;
+            }
+            let old_header = std::fs::read(&header)?;
+            let old_source = std::fs::read(&generated)?;
+            let shadow = root.join("google/protobuf/any.proto");
+            std::fs::create_dir_all(shadow.parent().unwrap())?;
+            std::fs::copy(root.join("imports/src/google/protobuf/any.proto"), &shadow)?;
+            let error = orchestrator.build_with_dependencies_with_semantics(
+                targets.clone(), request.clone(),
+            ).await.expect_err("undeclared earlier-root shadow must refuse before protoc");
+            assert!(format!("{error:#}").contains("shadows declared SOURCE"), "{error:#}");
+            assert!(counts(root).is_empty());
+            assert_eq!(std::fs::read(&header)?, old_header);
+            assert_eq!(std::fs::read(&generated)?, old_source);
+            std::fs::remove_file(shadow)?;
+            let boundary = root.join("imports/src/google/BUILD.bazel");
+            write_file(&boundary, "genrule(name='writer',outs=['protobuf/any.proto'],cmd='false')\n")?;
+            let error = orchestrator.build_with_dependencies_with_semantics(
+                targets.clone(), request.clone(),
+            ).await.expect_err("nested package producer must not use old source bytes");
+            assert!(format!("{error:#}").contains("proto"), "{error:#}");
+            assert!(counts(root).is_empty());
+            assert_eq!(std::fs::read(&header)?, old_header);
+            assert_eq!(std::fs::read(&generated)?, old_source);
+            std::fs::remove_file(boundary)?;
+            for roots in [
+                vec!["//:metadata_any".to_owned()],
+                vec!["//:messages".to_owned(), "//:metadata_any".to_owned()],
+            ] {
+                let error = orchestrator
+                    .build_with_dependencies_with_semantics(roots.clone(), command(root, &roots[0])?)
+                    .await
+                    .expect_err("explicit SOURCE facet is not a descriptor target");
+                assert!(format!("{error:#}").contains("proto"), "{error:#}");
+                assert!(counts(root).is_empty());
+                assert_eq!(std::fs::read(&header)?, old_header);
+                assert_eq!(std::fs::read(&generated)?, old_source);
+            }
+            assert!(!root.join("PROTO_METADATA_BUILD_MUST_NEVER_RUN").exists());
+            // Prior generated files cannot satisfy a missing actual import.
+            std::fs::remove_file(root.join("imports/src/google/protobuf/wrappers.proto"))?;
+            let error = orchestrator
+                .build_with_dependencies_with_semantics(targets, request)
+                .await
+                .expect_err("missing declared WKT source must refuse despite old .pb files");
+            assert!(format!("{error:#}").contains("wrappers.proto"), "{error:#}");
+            assert!(counts(root).is_empty());
+            assert_eq!(std::fs::read(&header)?, old_header);
+            assert_eq!(std::fs::read(&generated)?, old_source);
+            assert_eq!(digest(&compiler)?, expected.to_lowercase());
+            assert_eq!(
+                digest(&protobuf.join("BUILD.bazel"))?,
+                "3b12950a879e76b3abf5ef6b7cd69dcfab3df04d0b38039b821a9bf23c403d28"
+            );
+            for (file, hash) in pinned {
+                assert_eq!(
+                    digest(&protobuf.join("src/google/protobuf").join(file))?,
+                    hash
                 );
             }
             Ok(())

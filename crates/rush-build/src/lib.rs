@@ -87,6 +87,7 @@ pub mod output_tree;
 pub(crate) mod native_execroot;
 mod native_execution_demand;
 mod native_identity_forwarder;
+mod native_proto_source_metadata;
 pub mod persistent_workers;
 pub mod profile;
 pub mod profiling;
