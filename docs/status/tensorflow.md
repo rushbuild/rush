@@ -38,6 +38,9 @@ for exact source, binary, probe and evidence digests.
 
 ## Use the default compiler policy
 
+Follow the [compiler execution paths](../design/compiler-discovery.html)
+to choose a policy and understand repeated builds.
+
 Leave `RUSH_CPP_DISCOVERY` unset. C records `ConditionalIncludes` at `@fft2d//:fft2d`.
 D records `ConditionalIncludes` at `@fft2d//:fft2d`. Rush analyzes the same
 request afresh and runs the whole selected invocation locally with reuse

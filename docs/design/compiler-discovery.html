@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en" data-engine="ad87da5188201534d443c40481aba6b57ecc30d6">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="rush-engine" content="ad87da5188201534d443c40481aba6b57ecc30d6">
+  <meta name="description" content="Use Rush Auto for normal builds, understand its literal and always-run execution paths, and choose an explicit compiler policy.">
+  <title>Build C and C++ with Auto — Rush</title>
+  <style>
+    :root {
+      --page: #f5f7fb; --panel: #ffffff; --ink: #182638;
+      --muted: #44546a; --line: #c8d1df; --accent: #174ea6;
+      --soft: #eaf1fc; --code: #edf1f7; --focus: #174ea6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #101722; --panel: #192333; --ink: #eef3fc;
+        --muted: #bbc9dc; --line: #4a5b72; --accent: #a8c8ff;
+        --soft: #21334f; --code: #243247; --focus: #a8c8ff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--page); color: var(--ink);
+      font: 1rem/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 69rem; margin: 0 auto; padding: clamp(1.1rem, 4vw, 3rem); }
+    header { max-width: 50rem; margin-bottom: 2rem; }
+    h1, h2, h3 { line-height: 1.25; }
+    h1 { font-size: clamp(2rem, 5vw, 3.1rem); letter-spacing: -.025em; margin: .35rem 0 1rem; }
+    h2 { font-size: 1.45rem; margin: 0 0 .8rem; }
+    h3 { font-size: 1.04rem; margin: 0 0 .7rem; }
+    p { max-width: 68ch; margin: .7rem 0; }
+    .eyebrow { margin: 0; color: var(--muted); font-size: .9rem; font-weight: 650; }
+    .lead { font-size: 1.1rem; }
+    a { color: var(--accent); text-underline-offset: .18em; }
+    a:focus-visible, summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 4px; }
+    .skip { position: absolute; left: -10000px; }
+    .skip:focus { left: 1rem; top: 1rem; padding: .7rem; background: var(--panel); z-index: 2; }
+    nav { display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; margin: 1.2rem 0; }
+    section { margin: 2.5rem 0; scroll-margin-top: 1rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+    code { font-size: .91em; overflow-wrap: anywhere; }
+    p code, td code, h3 code, summary code { background: var(--code); padding: .08rem .25rem; border-radius: .2rem; }
+    pre {
+      max-width: 48rem; margin: 1rem 0; padding: 1rem 1.2rem;
+      background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+      border-radius: .4rem; overflow-x: auto; font-size: .98rem; line-height: 1.7;
+    }
+    figure { margin: 1.2rem 0; }
+    .start {
+      max-width: 34rem; margin: 0 auto; padding: 1rem 1.2rem;
+      border: 1px solid var(--line); border-radius: .5rem; background: var(--soft); text-align: center;
+    }
+    .start strong { display: block; }
+    .routes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+    .route { display: flex; flex-direction: column; align-items: center; }
+    .arrow { display: block; font-size: 1.5rem; line-height: 1.5; color: var(--muted); }
+    .route-card {
+      width: 100%; flex: 1; padding: 1.1rem; background: var(--panel);
+      border: 1px solid var(--line); border-radius: .5rem;
+    }
+    .route-card p { margin: .5rem 0 0; }
+    .route-card .result { border-top: 1px solid var(--line); padding-top: .7rem; margin-top: .8rem; font-weight: 600; }
+    .route-number { display: block; color: var(--muted); font-size: .8rem; margin-bottom: .5rem; }
+    figcaption, .small { color: var(--muted); font-size: .92rem; }
+    figcaption { max-width: 75ch; margin: 1rem auto 0; }
+    .repeat { border-left: 3px solid var(--accent); padding: .15rem 0 .15rem 1rem; margin-top: 1.3rem; }
+    .table-wrap { max-width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); }
+    caption { text-align: left; font-weight: 600; padding-bottom: .6rem; }
+    th, td { border: 1px solid var(--line); text-align: left; vertical-align: top; padding: .8rem 1rem; }
+    th { background: var(--soft); }
+    td:first-child { width: 30%; }
+    .checks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.3rem; }
+    .checks p { margin-top: .3rem; }
+    details { margin: 1rem 0; max-width: 75ch; border: 1px solid var(--line); border-radius: .4rem; padding: .8rem 1rem; }
+    summary { cursor: pointer; font-weight: 600; }
+    footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .85rem; }
+    @media (max-width: 48rem) {
+      .routes, .checks { grid-template-columns: 1fr; }
+      .route .arrow { display: none; }
+      .routes { margin-top: 1rem; }
+      .start { max-width: none; }
+      td:first-child { width: 36%; }
+      th, td { padding: .65rem; }
+    }
+    @media print {
+      :root { --page: #fff; --panel: #fff; --ink: #000; --muted: #333; --line: #888; --accent: #000; --soft: #f2f2f2; --code: #f2f2f2; }
+      main { padding: 0; max-width: none; }
+      nav, .skip { display: none; }
+      section, figure, .route-card { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#build">Skip to the build command</a>
+  <main>
+    <header>
+      <p class="eyebrow">Rush 2026-11-10 · Compiler execution</p>
+      <h1>Build C and C++ with Auto</h1>
+      <p class="lead">Use your normal build command. Rush starts with its supported literal analysis and selects the execution path for this invocation.</p>
+      <nav aria-label="On this page">
+        <a href="#build">Build normally</a>
+        <a href="#routes">Follow the path</a>
+        <a href="#policies">Choose a policy</a>
+        <a href="#ownership">Understand the boundary</a>
+      </nav>
+    </header>
+
+    <section id="build" aria-labelledby="build-heading">
+      <h2 id="build-heading">Build normally</h2>
+      <p>Leave <code>RUSH_CPP_DISCOVERY</code> unset to use Auto:</p>
+      <pre><code>unset RUSH_CPP_DISCOVERY
+rush build //app:app</code></pre>
+      <p>Start with supported literal analysis and normal reuse. When analysis reports conditional includes (<code>ConditionalIncludes</code>) or token pasting (<code>TokenPasting</code>, <code>##</code>) that needs compiler execution, let Auto start one fresh analysis attempt and run the whole selected invocation locally with reuse disabled.</p>
+      <p>Expect header guards with nested includes to select this path in many header-heavy builds. The selected invocation includes your requested targets and the actions needed to build them. Rush reports the switch before those build actions run.</p>
+    </section>
+
+    <section id="routes" aria-labelledby="routes-heading">
+      <h2 id="routes-heading">Follow one path for this build</h2>
+      <figure aria-labelledby="flow-caption">
+        <div class="start"><strong>Analyze the usual build request</strong>Keep the same selected targets and authored flags.</div>
+        <div class="routes">
+          <div class="route">
+            <span class="arrow" aria-hidden="true">↓</span>
+            <div class="route-card">
+              <span class="route-number">Path A</span>
+              <h3>Supported literal analysis</h3>
+              <p>Use the normal execution and reuse path.</p>
+              <p class="result">Reuse valid work and execute required actions.</p>
+            </div>
+          </div>
+          <div class="route">
+            <span class="arrow" aria-hidden="true">↓</span>
+            <div class="route-card">
+              <span class="route-number">Path B</span>
+              <h3>Conditional includes or token pasting</h3>
+              <p>Finish the first attempt and analyze the same request afresh for either supported compiler-execution reason.</p>
+              <p class="result">Execute the whole selected invocation locally, with reuse disabled.</p>
+            </div>
+          </div>
+          <div class="route">
+            <span class="arrow" aria-hidden="true">↓</span>
+            <div class="route-card">
+              <span class="route-number">Error</span>
+              <h3>Input or admission failure</h3>
+              <p>Keep ownership, declared-input, producer and configuration checks in force.</p>
+              <p class="result">Report the build error so you can correct it.</p>
+            </div>
+          </div>
+        </div>
+        <figcaption id="flow-caption">Switch on a reported <code>ConditionalIncludes</code> or <code>TokenPasting</code> result before native action execution or output restoration. Keep other admission failures as build errors.</figcaption>
+      </figure>
+      <div class="repeat">
+        <p><strong>Run the build again normally.</strong> Auto starts its analysis again. If either supported reason recurs, expect the whole selected invocation to execute afresh, including unchanged repeats.</p>
+        <p>Supported literal builds and pure Mojo builds keep their existing execution and reuse behavior.</p>
+      </div>
+    </section>
+
+    <section id="policies" aria-labelledby="policies-heading">
+      <h2 id="policies-heading">Choose an explicit build policy when needed</h2>
+      <div class="table-wrap">
+        <table>
+          <caption>Leave the variable unset for normal Auto builds, or set one of these exact policies.</caption>
+          <thead><tr><th scope="col">RUSH_CPP_DISCOVERY</th><th scope="col">Build behavior</th></tr></thead>
+          <tbody>
+            <tr><td>Unset the variable</td><td>Start with literal analysis; switch once for a supported conditional-include or token-pasting reason.</td></tr>
+            <tr><td><code>literal</code></td><td>Require supported literal analysis and report unsupported constructs as errors.</td></tr>
+            <tr><td><code>always-run-local-v1</code></td><td>Choose whole-invocation, always-run local execution directly.</td></tr>
+            <tr><td><code>uncached-diagnostic-v1</code></td><td>Use the same always-run execution mechanism with the existing diagnostic label.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>For strict literal analysis on one build:</p>
+      <pre><code>RUSH_CPP_DISCOVERY=literal rush build //app:app</code></pre>
+      <p>Use local Linux execution and supported native rules for the always-run modes. Leave <code>--use-scheduler</code> off and unset <code>RUSH_USE_SCHEDULER</code>.</p>
+      <p>Use <code>rush build</code> for the automatic transition. The nested builds in <code>rush test</code> keep strict literal analysis; the always-run modes are build-only.</p>
+    </section>
+
+    <section id="ownership" aria-labelledby="ownership-heading">
+      <h2 id="ownership-heading">Keep one coherent invocation</h2>
+      <div class="checks">
+        <div>
+          <h3>Fresh analysis</h3>
+          <p>Rush finishes the first attempt and discards its temporary analysis state. The fresh attempt checks the same request with current inputs and producers.</p>
+        </div>
+        <div>
+          <h3>Execution ownership</h3>
+          <p>The switch releases the first attempt’s shared workspace lease, then takes exclusive ownership and retires earlier reusable plans before native actions begin.</p>
+        </div>
+        <div>
+          <h3>Cancellation and errors</h3>
+          <p>The request’s cancellation state carries into the retry. Started work keeps its execution ownership through cleanup. Execution failures return as build errors.</p>
+        </div>
+      </div>
+      <details>
+        <summary>Inspect the analysis boundary</summary>
+        <p>This boundary is before native actions or cached-output restoration. Analysis can prepare its owned include paths. The fresh attempt stages and validates its paths again.</p>
+        <p>Treat compiler dependency records as observations. Require a separately validated input closure before admitting cached reuse.</p>
+      </details>
+    </section>
+
+    <footer>
+      <p>Execution policy reference · Rush 2026-11-10 · Engine <code>ad87da5188201534d443c40481aba6b57ecc30d6</code></p>
+    </footer>
+  </main>
+</body>
+</html>
