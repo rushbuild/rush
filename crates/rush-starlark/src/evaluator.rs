@@ -376,7 +376,7 @@ pub enum Value {
     Dict(HashMap<String, Value>),
     ImmutableMapping(Arc<ImmutableMapping>),
     Function {
-        params: Vec<(String, Option<Expr>)>, // (name, default_value)
+        params: Vec<(String, Option<Value>)>, // definition-time default values
         varargs_param: Option<String>,       // *args parameter
         kwargs_param: Option<String>,
         body: Vec<Stmt>,
@@ -452,7 +452,7 @@ pub enum Value {
     },
     /// Lambda function (anonymous function with single expression body)
     Lambda {
-        params: Vec<(String, Option<Box<Expr>>)>, // (name, default_value)
+        params: Vec<(String, Option<Value>)>, // creation-time default values
         varargs_param: Option<String>,
         kwargs_param: Option<String>,
         body: Box<Expr>,
@@ -843,7 +843,22 @@ fn same_value_representation(left: &Value, right: &Value) -> bool {
                     .is_some_and(|other| same_value_representation(value, other))
             })
     };
+    let parameters = |left: &[(String, Option<Value>)], right: &[(String, Option<Value>)]| {
+        left.len() == right.len() && left.iter().zip(right).all(|((ln, lv), (rn, rv))| {
+            ln == rn && match (lv, rv) {
+                (None, None) => true,
+                (Some(left), Some(right)) => same_value_representation(left, right),
+                _ => false,
+            }
+        })
+    };
     match (left, right) {
+        (Value::Function { params: lp, varargs_param: lv, kwargs_param: lk, body: lb, closure: lc },
+         Value::Function { params: rp, varargs_param: rv, kwargs_param: rk, body: rb, closure: rc }) =>
+            parameters(lp, rp) && lv == rv && lk == rk && lb == rb && lc == rc,
+        (Value::Lambda { params: lp, varargs_param: lv, kwargs_param: lk, body: lb, closure: lc },
+         Value::Lambda { params: rp, varargs_param: rv, kwargs_param: rk, body: rb, closure: rc }) =>
+            parameters(lp, rp) && lv == rv && lk == rk && lb == rb && lc == rc,
         (Value::ImmutableMapping(left), Value::ImmutableMapping(right)) => Arc::ptr_eq(left, right),
         (Value::ImmutableMapping(_), Value::Dict(_)) | (Value::Dict(_), Value::ImmutableMapping(_)) => false,
         (Value::FrozenList(left), Value::FrozenList(right)) => sequence(left, right),
@@ -1251,7 +1266,9 @@ impl Value {
                 };
 
                 size_of::<Value>()
-                    + params.iter().map(|(name, _)| name.len()).sum::<usize>()
+                    + params.capacity() * size_of::<(String, Option<Value>)>()
+                    + params.iter().map(|(name, default)| name.len()
+                        + default.as_ref().map(|value| value.estimate_size_internal(visited)).unwrap_or(0)).sum::<usize>()
                     + varargs_param.as_ref().map(|s| s.len()).unwrap_or(0)
                     + kwargs_param.as_ref().map(|s| s.len()).unwrap_or(0)
                     + body.len() * 128  // Rough estimate for AST nodes
@@ -1335,10 +1352,11 @@ impl Value {
                 bzl_label,
                 symbol_name,
             } => size_of::<Value>() + bzl_label.len() + symbol_name.len(),
-            Value::Lambda { params, body, .. } => {
-                // Estimate size: base + params + body (approximated)
+            Value::Lambda { params, .. } => {
                 size_of::<Value>()
-                    + params.iter().map(|(name, _)| name.len()).sum::<usize>()
+                    + params.capacity() * size_of::<(String, Option<Value>)>()
+                    + params.iter().map(|(name, default)| name.len()
+                        + default.as_ref().map(|value| value.estimate_size_internal(visited)).unwrap_or(0)).sum::<usize>()
                     + size_of::<Box<Expr>>() // body expression
             }
         }
@@ -1453,13 +1471,15 @@ impl ValueCensus {
                     self.walk_value(val, seen_envs);
                 }
             }
-            Value::Function { body, closure, .. } => {
+            Value::Function { params, body, closure, .. } => {
                 self.function_count += 1;
                 self.function_body_stmts += body.len();
+                for (_, value) in params { if let Some(value) = value { self.walk_value(value, seen_envs); } }
                 self.walk_env(closure, seen_envs);
             }
-            Value::Lambda { closure, .. } => {
+            Value::Lambda { params, closure, .. } => {
                 self.lambda_count += 1;
+                for (_, value) in params { if let Some(value) = value { self.walk_value(value, seen_envs); } }
                 self.walk_env(closure, seen_envs);
             }
             Value::BoundMethod { object, .. } => self.walk_value(object, seen_envs),
@@ -6196,8 +6216,15 @@ impl Evaluator {
                 kwargs_param,
                 body,
             } => {
+                // Starlark evaluates defaults left-to-right at definition,
+                // even when this function is never called or a caller supplies
+                // every argument. Store Values; never rerun the AST in a
+                // caller's phase, package, or environment.
+                let params = params.iter().map(|(name, default)| {
+                    Ok((name.clone(), default.as_ref().map(|expr| self.eval_expression(expr)).transpose()?))
+                }).collect::<Result<Vec<_>>>()?;
                 let func = Value::Function {
-                    params: params.clone(),
+                    params,
                     varargs_param: varargs_param.clone(),
                     kwargs_param: kwargs_param.clone(),
                     body: body.clone(),
@@ -7210,9 +7237,14 @@ impl Evaluator {
                 kwargs_param,
                 body,
             } => {
-                // Create a lambda value that captures the current environment
+                // Lambda defaults use the same definition-time value
+                // contract as named functions. Container binding retains the
+                // evaluator's existing owned-Value cloning semantics.
+                let params = params.iter().map(|(name, default)| {
+                    Ok((name.clone(), default.as_ref().map(|expr| self.eval_expression(expr)).transpose()?))
+                }).collect::<Result<Vec<_>>>()?;
                 Ok(Value::Lambda {
-                    params: params.clone(),
+                    params,
                     varargs_param: varargs_param.clone(),
                     kwargs_param: kwargs_param.clone(),
                     body: body.clone(),
@@ -8178,39 +8210,13 @@ impl Evaluator {
                     }
                 }
 
-                // Bind default values for unbound parameters
-                for (param_name, default_expr) in &params {
+                // Bind the values captured at definition. Cloning a Value
+                // keeps the existing list/dict ownership model; this timing
+                // repair does not introduce shared mutable container identity.
+                for (param_name, default) in &params {
                     if !bound_params.contains(param_name) {
-                        if let Some(default) = default_expr {
-                            // CRITICAL: Evaluate default parameters in the function's closure environment,
-                            // not the caller's environment. This is essential for cross-module function calls.
-                            //
-                            // Example: tsl.bzl defines `tsl_gpu_library(copts = tsl_copts())`
-                            // When called from a BUILD file, `tsl_copts()` must be evaluated in tsl.bzl's
-                            // environment (where tsl_copts is defined), not in the BUILD file's environment.
-                            //
-                            // Create a temporary evaluator with the function's closure environment
-                            let mut closure_evaluator = Evaluator {
-                                env: (*closure).clone(),
-                                return_value: None,
-                                break_flag: false,
-                                continue_flag: false,
-                                platform_config: self.platform_config.clone(),
-                                builtins: self.builtins.clone(),
-                                rule_calls: Vec::new(),
-                                package_default_visibility: None,
-                                package_called: false,
-                                bzl_loader: self.bzl_loader.clone(),
-                                current_package: self.current_package.clone(),
-                                macro_expanders: self.macro_expanders.clone(),
-                                disable_parallel_batch_load: self.disable_parallel_batch_load,
-                                current_repository: self.current_repository.clone(),
-                                current_package_dir: self.current_package_dir.clone(),
-                                rule_call_callback: self.rule_call_callback.clone(),
-                            };
-
-                            let default_val = closure_evaluator.eval_expression(default)?;
-                            func_env.define(param_name.clone(), default_val);
+                        if let Some(value) = default {
+                            func_env.define(param_name.clone(), value.clone());
                         } else {
                             return Err(anyhow!("Missing required parameter: {}", param_name));
                         }
@@ -9516,15 +9522,11 @@ impl Evaluator {
                     func_env.define(kwargs_name.clone(), Value::Dict(extra_kwargs));
                 }
 
-                // Bind default values for unbound parameters
-                for (param_name, default_expr) in &params {
+                // Reuse the value captured when the lambda was created.
+                for (param_name, default) in &params {
                     if !bound_params.contains(param_name) {
-                        if let Some(default) = default_expr {
-                            let saved_env = std::mem::replace(&mut self.env, (*closure).clone());
-                            let default_value = self.eval_expression(default);
-                            self.env = saved_env;
-                            let default_val = default_value?;
-                            func_env.define(param_name.clone(), default_val);
+                        if let Some(value) = default {
+                            func_env.define(param_name.clone(), value.clone());
                         } else {
                             return Err(anyhow!("Missing required parameter: {}", param_name));
                         }
