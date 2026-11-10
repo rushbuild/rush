@@ -505,6 +505,125 @@ pub(crate) fn qualify_analysis_key(
     key.daemon_compat_fingerprint = *hash.finalize().as_bytes();
 }
 
+/// One coherent read of the private depfile. This is historical observation
+/// data only: neither these bytes nor positive names certify compiler reads.
+#[derive(Debug)]
+pub(crate) struct DiagnosticDepfileObservation {
+    bytes: std::sync::Arc<[u8]>,
+    digest: [u8; 32],
+    identity: DiagnosticDepfileIdentity,
+}
+
+/// Descriptor/named metadata compared around the SAME byte read. No field is
+/// a content-version or a substitute for observed file values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiagnosticDepfileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) mode: u32,
+    pub(crate) user: u32,
+    pub(crate) group: u32,
+    pub(crate) links: u64,
+    pub(crate) bytes: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl DiagnosticDepfileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            user: metadata.uid(),
+            group: metadata.gid(),
+            links: metadata.nlink(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+impl DiagnosticDepfileObservation {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    pub(crate) fn identity(&self) -> DiagnosticDepfileIdentity {
+        self.identity
+    }
+}
+
+/// Opaque per-pending request identity plus one immutable completion slot.
+/// It is minted once per DiagnosticBuild and is never serialized or keyed.
+/// The observation points back weakly, so this ownership graph has no cycle.
+#[derive(Debug)]
+pub(crate) struct DiagnosticObservationRequest {
+    declaration: PendingCompileDeclaration,
+    observation: std::sync::OnceLock<std::sync::Arc<DiagnosticCompileObservation>>,
+}
+
+impl DiagnosticObservationRequest {
+    pub(crate) fn new(declaration: PendingCompileDeclaration) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            declaration,
+            observation: std::sync::OnceLock::new(),
+        })
+    }
+    pub(crate) fn declaration(&self) -> &PendingCompileDeclaration {
+        &self.declaration
+    }
+}
+
+/// Immutable, NON-REUSABLE evidence for one successfully executed diagnostic
+/// compile. There is deliberately no Serialize/Hash/key/certificate API. Names
+/// retain parser spelling/order/duplicates; none is registered as a source or
+/// identified with SDK, producer, failed lookup or read-time values.
+#[derive(Debug)]
+pub(crate) struct DiagnosticCompileObservation {
+    request_owner: std::sync::Weak<DiagnosticObservationRequest>,
+    declaration: PendingCompileDeclaration,
+    request: rush_action::compiler_discovery::PendingCompileDiscovery,
+    executed_command: rush_action::ids::MaterializedCommand,
+    positive_names: Vec<std::path::PathBuf>,
+    depfile: DiagnosticDepfileObservation,
+}
+
+impl DiagnosticCompileObservation {
+    pub(crate) fn declaration(&self) -> &PendingCompileDeclaration {
+        &self.declaration
+    }
+    pub(crate) fn request(&self) -> &rush_action::compiler_discovery::PendingCompileDiscovery {
+        &self.request
+    }
+    pub(crate) fn executed_command(&self) -> &rush_action::ids::MaterializedCommand {
+        &self.executed_command
+    }
+    pub(crate) fn positive_names(&self) -> &[std::path::PathBuf] {
+        &self.positive_names
+    }
+    pub(crate) fn depfile(&self) -> &DiagnosticDepfileObservation {
+        &self.depfile
+    }
+}
+
+/// Private owned-manager result, before registry completion. Public ActionResult
+/// and all cache schemas stay unchanged. The optional observation has no reuse
+/// authority and cannot by itself declare its producer complete.
+pub(crate) struct DiagnosticOwnedExecution {
+    pub(crate) result: rush_action::ActionResult,
+    pub(crate) compile_observation: Option<std::sync::Arc<DiagnosticCompileObservation>>,
+}
+
 /// Execution state exists for one diagnostic invocation only. Successful actual
 /// actions/targets add completion facts; the table never leaves this build.
 pub(crate) struct DiagnosticBuild {
@@ -513,11 +632,19 @@ pub(crate) struct DiagnosticBuild {
     pub(crate) declarations: std::sync::Arc<rush_rules::context::PendingCompileDeclarations>,
     pub(crate) registry: std::sync::Arc<tokio::sync::Mutex<ArtifactRegistry>>,
     completed: std::sync::Arc<std::sync::Mutex<Vec<DeclaredActionId>>>,
+    // One slot per real pending declaration in THIS request, never a global map.
+    // Mutable completion state is not part of command/action/snapshot identity.
+    compile_observations: Vec<std::sync::Arc<DiagnosticObservationRequest>>,
     manager: std::sync::Arc<crate::action_manager::RushActionManager>,
     pub(crate) lease: std::sync::Arc<WorkspaceLease>,
     environment: Vec<(String, String)>,
     command: CommandSemantics,
     workspace: std::path::PathBuf,
+    #[cfg(test)]
+    owned_finished: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    compile_before_completion_hook:
+        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>>>,
     #[cfg(test)]
     inline_finished: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
@@ -547,7 +674,12 @@ impl DiagnosticBuild {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let compile_observations = declarations
+            .iter()
+            .map(|pending| DiagnosticObservationRequest::new(pending.clone()))
+            .collect();
         Ok(std::sync::Arc::new(Self {
+            compile_observations,
             declarations: std::sync::Arc::new(declarations),
             registry,
             completed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -556,6 +688,10 @@ impl DiagnosticBuild {
             environment,
             command: command.clone(),
             workspace,
+            #[cfg(test)]
+            owned_finished: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            compile_before_completion_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             inline_finished: tokio::sync::watch::channel(0).0,
             #[cfg(test)]
@@ -601,7 +737,32 @@ impl DiagnosticBuild {
         }
         Ok(())
     }
-    async fn note_action(&self, id: DeclaredActionId) -> Result<()> {
+    /// Read-only access to this invocation's committed positive-name evidence.
+    /// Cancellation before publication leaves the slot empty. A later unrelated
+    /// build failure does not turn historical completed compile data into reuse.
+    pub(crate) fn positive_observation(
+        &self,
+        id: DeclaredActionId,
+    ) -> Option<std::sync::Arc<DiagnosticCompileObservation>> {
+        // Pair the read with the same completion critical section as publication.
+        // A reader cannot see a set slot before its completed-action insertion.
+        let completed = self.completed.lock().ok()?;
+        if !completed.contains(&id) {
+            return None;
+        }
+        self.compile_observations
+            .iter()
+            .find(|request| request.declaration.action() == id)?
+            .observation
+            .get()
+            .cloned()
+    }
+
+    async fn note_action(
+        &self,
+        id: DeclaredActionId,
+        observation: Option<std::sync::Arc<DiagnosticCompileObservation>>,
+    ) -> Result<()> {
         let registry = self.registry.lock().await;
         let action = registry.declared_action(id);
         for &output in action.outputs.iter() {
@@ -611,7 +772,65 @@ impl DiagnosticBuild {
                 registry.artifact_path(output).display()
             );
         }
+        let slot = if let Some(observation) = observation.as_ref() {
+            let pending = observation.declaration();
+            ensure!(
+                pending.action() == id,
+                "observation belongs to another pending action"
+            );
+            ensure!(
+                self.declarations.get(id) == Some(pending),
+                "observation belongs to another diagnostic request"
+            );
+            let current = PendingCompileDeclaration::from_registry(
+                &registry,
+                id,
+                pending.target(),
+                pending.config(),
+                pending.source(),
+                pending.object(),
+            )?;
+            ensure!(
+                &current == pending,
+                "observation declaration changed before completion"
+            );
+            let slot = self
+                .compile_observations
+                .iter()
+                .find(|request| request.declaration.action() == id)
+                .ok_or_else(|| anyhow!("observation has no request-local slot"))?;
+            let owner = observation
+                .request_owner
+                .upgrade()
+                .ok_or_else(|| anyhow!("diagnostic observation request has retired"))?;
+            ensure!(
+                std::sync::Arc::ptr_eq(slot, &owner),
+                "observation belongs to another diagnostic invocation"
+            );
+            Some(slot)
+        } else {
+            ensure!(
+                self.declarations.get(id).is_none(),
+                "pending compile cannot complete without its diagnostic observation"
+            );
+            None
+        };
         let mut completed = self.completed.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(slot) = slot {
+            ensure!(
+                !*self.cancelled.borrow(),
+                "diagnostic compile cancelled before observation completion"
+            );
+            ensure!(
+                !completed.contains(&id),
+                "diagnostic compile completed more than once"
+            );
+            // Both publication and completion are synchronous under the existing
+            // registry->completed order; no await after the cancellation check.
+            slot.observation
+                .set(observation.expect("slot requires an observation"))
+                .map_err(|_| anyhow!("diagnostic observation was already published"))?;
+        }
         if !completed.contains(&id) {
             completed.push(id);
         }
@@ -805,6 +1024,10 @@ impl rush_rules::context::ActionManager for DiagnosticManager {
                 .unwrap_or_else(|p| p.into_inner());
             validate_reported_producer_order(&registry, &pending, &completed)?;
             ensure!(
+                !completed.contains(&pending.action()),
+                "pending compile already completed in this diagnostic request"
+            );
+            ensure!(
                 self.build.declarations.get(pending.action()) == Some(&pending),
                 "pending compile is not part of this diagnostic build"
             );
@@ -851,6 +1074,20 @@ impl DiagnosticManager {
         if let Some(pending) = &pending {
             ensure!(pending.action() == id, "pending action identity mismatch");
         }
+        let observation_request = if let Some(declaration) = pending.as_ref() {
+            Some(
+                self.build
+                    .compile_observations
+                    .iter()
+                    .find(|request| request.declaration() == declaration)
+                    .ok_or_else(|| {
+                        anyhow!("pending compile has no request-local observation slot")
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
         let cancelled = self.build.cancelled.clone();
         let mut cancel_on_drop = CancelOwnedExecution::new(self.build.cancel.clone());
         let build = self.build.clone();
@@ -859,25 +1096,51 @@ impl DiagnosticManager {
         // Cancellation signals it; its owned scope keeps the lease until the
         // runner has killed/reaped its owned writers and drained both pipes.
         let task = tokio::spawn(async move {
-            let result = build
-                .manager
-                .execute_diagnostic_owned(
-                    action,
-                    pending,
-                    id,
-                    target,
-                    declared_inputs,
-                    declared_outputs,
-                    build.environment.clone(),
-                    build.workspace.clone(),
-                    cancelled,
-                    Box::new(build.lease.clone()),
-                )
-                .await?;
-            if result.exit_code == 0 {
-                build.note_action(id).await?;
+            #[cfg(test)]
+            let finished = build.owned_finished.clone();
+            let outcome = async {
+                let result = build
+                    .manager
+                    .execute_diagnostic_owned(
+                        action,
+                        pending,
+                        observation_request,
+                        id,
+                        target,
+                        declared_inputs,
+                        declared_outputs,
+                        build.environment.clone(),
+                        build.workspace.clone(),
+                        cancelled,
+                        Box::new(build.lease.clone()),
+                    )
+                    .await?;
+                if result.result.exit_code == 0 {
+                    #[cfg(test)]
+                    if result.compile_observation.is_some() {
+                        let hook = build
+                            .compile_before_completion_hook
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(hook) = hook {
+                            hook()?;
+                        }
+                    }
+                    build.note_action(id, result.compile_observation).await?;
+                } else {
+                    ensure!(
+                        result.compile_observation.is_none(),
+                        "failed compile returned an observation"
+                    );
+                }
+                Ok::<_, anyhow::Error>(result.result)
             }
-            Ok::<_, anyhow::Error>(result)
+            .await;
+            drop(build);
+            #[cfg(test)]
+            finished.send_modify(|count| *count += 1);
+            outcome
         });
         let result = task
             .await
@@ -1035,9 +1298,39 @@ fn create_private_depfile(path: &std::path::Path) -> Result<()> {
 
 pub(crate) fn read_diagnostic_depfile(
     pending: &rush_action::compiler_discovery::PendingCompileDiscovery,
-) -> Result<()> {
-    let bytes = read_private_depfile(pending.depfile_request().path(), || Ok(()))?;
-    let entry = pending.depfile_request().parse(&bytes)?;
+    request_owner: &std::sync::Arc<DiagnosticObservationRequest>,
+    executed_command: rush_action::ids::MaterializedCommand,
+) -> Result<DiagnosticCompileObservation> {
+    let declaration = request_owner.declaration();
+    ensure!(
+        pending.source().as_os_str() == declaration.source_path().as_os_str()
+            && pending.object_output().as_os_str() == declaration.object_path().as_os_str(),
+        "diagnostic observation source/object do not match the real declaration"
+    );
+    let snapshot = pending.command_snapshot();
+    let mut expected_argv = snapshot.argv.clone();
+    expected_argv.extend(
+        pending
+            .depfile_request()
+            .dependency_arguments()
+            .into_iter()
+            .map(|arg| {
+                arg.into_string()
+                    .map_err(|_| anyhow!("non-UTF8 diagnostic transport"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    ensure!(
+        executed_command.executable == snapshot.executable
+            && executed_command.argv0.is_none()
+            && executed_command.argv == expected_argv
+            && executed_command.env == snapshot.env
+            && executed_command.working_dir == snapshot.cwd
+            && executed_command.env_policy == snapshot.env_policy,
+        "diagnostic observation does not describe the actual finalized request"
+    );
+    let depfile = read_private_depfile(pending.depfile_request().path(), || Ok(()))?;
+    let entry = pending.depfile_request().parse(depfile.bytes())?;
     ensure!(
         entry
             .dependencies
@@ -1053,14 +1346,21 @@ pub(crate) fn read_diagnostic_depfile(
         "compiler discovery diagnostic: {} positive names; no cache/read certificate",
         entry.dependencies.len()
     );
-    Ok(())
+    Ok(DiagnosticCompileObservation {
+        request_owner: std::sync::Arc::downgrade(request_owner),
+        declaration: declaration.clone(),
+        request: pending.clone(),
+        executed_command,
+        positive_names: entry.dependencies,
+        depfile,
+    })
 }
 
 #[cfg(unix)]
 fn read_private_depfile(
     path: &std::path::Path,
     after_read: impl FnOnce() -> Result<()>,
-) -> Result<Vec<u8>> {
+) -> Result<DiagnosticDepfileObservation> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = std::fs::symlink_metadata(
@@ -1100,31 +1400,24 @@ fn read_private_depfile(
     after_read()?;
     let after = file.metadata()?;
     let named = std::fs::symlink_metadata(path)?;
-    let signature = |m: &std::fs::Metadata| {
-        (
-            m.dev(),
-            m.ino(),
-            m.mode(),
-            m.uid(),
-            m.gid(),
-            m.nlink(),
-            m.len(),
-            m.mtime(),
-            m.mtime_nsec(),
-            m.ctime(),
-            m.ctime_nsec(),
-        )
-    };
+    let identity = DiagnosticDepfileIdentity::from_metadata(&before);
     ensure!(
         bytes.len() as u64 == before.len()
-            && signature(&before) == signature(&after)
-            && signature(&before) == signature(&named),
+            && identity == DiagnosticDepfileIdentity::from_metadata(&after)
+            && identity == DiagnosticDepfileIdentity::from_metadata(&named),
         "diagnostic depfile changed during its descriptor/named read bracket"
     );
-    Ok(bytes)
+    Ok(DiagnosticDepfileObservation {
+        digest: *blake3::hash(&bytes).as_bytes(),
+        bytes: bytes.into(),
+        identity,
+    })
 }
 #[cfg(not(unix))]
-fn read_private_depfile(_: &std::path::Path, _: impl FnOnce() -> Result<()>) -> Result<Vec<u8>> {
+fn read_private_depfile(
+    _: &std::path::Path,
+    _: impl FnOnce() -> Result<()>,
+) -> Result<DiagnosticDepfileObservation> {
     anyhow::bail!("private compiler depfile reads require Unix")
 }
 
@@ -1924,14 +2217,127 @@ cc_binary(name="app",srcs=["main.cc"],deps=[":generated"])
 
     #[cfg(unix)]
     #[test]
+    fn diagnostic_positive_observation_reader_preserves_raw_names_and_refuses_bad_requests(
+    ) -> Result<()> {
+        use rush_action::command_spec::NormalizedCommandSpec;
+        use rush_action::compiler_discovery::{
+            CompilerFamily, DepfileRequest, PendingCompileDiscovery,
+        };
+        use rush_action::ids::{ActionEnvPolicy, MaterializedCommand};
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let f = fixture(root.to_str().unwrap());
+        let declaration = pending(&f);
+        std::fs::create_dir_all(declaration.source_path().parent().unwrap())?;
+        // Reader/parser fixture only, deliberately not execution/completion proof.
+        std::fs::write(declaration.source_path(), b"reader source fixture\n")?;
+        std::fs::write(declaration.object_path(), b"reader object fixture\n")?;
+        let private = private_depfile_directory()?;
+        let depfile = private.path().join("observed.d");
+        create_private_depfile(&depfile)?;
+        let request = DepfileRequest::new(depfile.clone(), [3; 32])?;
+        let snapshot = NormalizedCommandSpec {
+            mnemonic: "CppCompile".into(),
+            executable: PathBuf::from("/fixture/compiler"),
+            cwd: Some(root.clone()),
+            argv: vec![
+                "-c".into(),
+                declaration.source_path().display().to_string(),
+                "-o".into(),
+                declaration.object_path().display().to_string(),
+            ],
+            env: vec![("LANG".into(), "C.UTF-8".into())],
+            declared_inputs: vec![declaration.source_path().to_owned()],
+            declared_outputs: vec![declaration.object_path().to_owned()],
+            toolchain_identity: None,
+            param_files: Vec::new(),
+            env_policy: ActionEnvPolicy::ExplicitOnly,
+        };
+        let ready = PendingCompileDiscovery::new(
+            CompilerFamily::Gcc,
+            snapshot.clone(),
+            declaration.source_path().to_owned(),
+            declaration.object_path().to_owned(),
+            request.clone(),
+        )?;
+        let owner = DiagnosticObservationRequest::new(declaration.clone());
+        let mut argv = snapshot.argv.clone();
+        argv.extend(
+            request
+                .dependency_arguments()
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap()),
+        );
+        let command = MaterializedCommand {
+            executable: snapshot.executable.clone(),
+            argv0: None,
+            argv,
+            env: snapshot.env.clone(),
+            working_dir: snapshot.cwd.clone(),
+            env_policy: snapshot.env_policy,
+        };
+        let bytes = format!(
+            "{}: {} raw/../kept.h raw/../kept.h no_extension\n",
+            request.target_marker(),
+            declaration.source_path().display()
+        );
+        std::fs::write(&depfile, &bytes)?;
+        let observed = read_diagnostic_depfile(&ready, &owner, command.clone())?;
+        assert_eq!(
+            observed.positive_names(),
+            &[
+                declaration.source_path().to_owned(),
+                PathBuf::from("raw/../kept.h"),
+                PathBuf::from("raw/../kept.h"),
+                PathBuf::from("no_extension")
+            ]
+        );
+        assert_eq!(observed.depfile().bytes(), bytes.as_bytes());
+        assert_eq!(
+            observed.depfile().digest(),
+            *blake3::hash(bytes.as_bytes()).as_bytes()
+        );
+        assert_eq!(observed.request(), &ready);
+        assert!(
+            owner.observation.get().is_none(),
+            "reading alone must not publish completion"
+        );
+        let mut wrong_command = command.clone();
+        wrong_command.argv.push("-DUNREQUESTED=1".into());
+        assert!(read_diagnostic_depfile(&ready, &owner, wrong_command).is_err());
+        for malformed in [
+            format!("wrong_marker: {}\n", declaration.source_path().display()),
+            format!("{}: omitted-source.h\n", request.target_marker()),
+            format!(
+                "{}: {}\nother: second-rule.h\n",
+                request.target_marker(),
+                declaration.source_path().display()
+            ),
+        ] {
+            std::fs::write(&depfile, malformed)?;
+            assert!(read_diagnostic_depfile(&ready, &owner, command.clone()).is_err());
+            assert!(owner.observation.get().is_none());
+        }
+        std::fs::remove_file(&depfile)?;
+        assert!(read_diagnostic_depfile(&ready, &owner, command).is_err());
+        assert!(owner.observation.get().is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn compiler_discovery_depfile_rejects_same_size_mutation_replacement_and_aliases() -> Result<()>
     {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
         let temp = private_depfile_directory()?;
         let path = temp.path().join("owned.d");
         create_private_depfile(&path)?;
         std::fs::write(&path, b"target: old.h\n")?;
-        assert_eq!(read_private_depfile(&path, || Ok(()))?, b"target: old.h\n");
+        let observed = read_private_depfile(&path, || Ok(()))?;
+        assert_eq!(observed.bytes(), b"target: old.h\n");
+        assert_eq!(observed.digest(), *blake3::hash(observed.bytes()).as_bytes());
+        assert_eq!(observed.identity().bytes, observed.bytes().len() as u64);
+        assert_eq!(observed.identity().inode, std::fs::metadata(&path)?.ino());
         assert!(
             read_private_depfile(&path, || {
                 std::fs::write(&path, b"target: new.h\n")?;
@@ -2859,12 +3265,210 @@ cc_binary(name="app",srcs=["main.cc"],deps=[":writer"])
         );
         assert!(!result.cached && result.output_records.is_empty());
         assert!(root.join("consumer.o").is_file());
+        let observation = fixture
+            .build
+            .positive_observation(fixture.pending.action())
+            .ok_or_else(|| anyhow!("actual compile did not retain positive observation"))?;
+        assert_eq!(observation.declaration(), &fixture.pending);
+        assert!(observation
+            .positive_names()
+            .iter()
+            .any(|path| path.as_os_str() == fixture.pending.source_path().as_os_str()));
+        assert!(observation
+            .positive_names()
+            .iter()
+            .any(|path| path.as_os_str() == fixture.action.output_path().as_os_str()));
+        assert!(Arc::ptr_eq(
+            &observation,
+            &fixture
+                .build
+                .positive_observation(fixture.pending.action())
+                .unwrap()
+        ));
+        let completed = fixture.build.completed.lock().unwrap().clone();
+        assert!(
+            fixture
+                .build
+                .note_action(fixture.pending.action(), Some(observation.clone()))
+                .await
+                .is_err(),
+            "a once-only observation cannot publish twice"
+        );
+        assert_eq!(*fixture.build.completed.lock().unwrap(), completed);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let later = DiagnosticBuild::new(
+            (*fixture.build.declarations).clone(),
+            fixture.build.registry.clone(),
+            fixture.build.manager.clone(),
+            fixture.build.lease.clone(),
+            &fixture.build.command,
+            root.clone(),
+            cancel,
+            cancelled,
+        )?;
+        assert_eq!(
+            later.declarations.get(fixture.pending.action()),
+            Some(&fixture.pending)
+        );
+        let stale = later
+            .note_action(fixture.pending.action(), Some(observation.clone()))
+            .await
+            .expect_err("same IDs/paths must not admit another invocation's observation");
+        assert!(
+            stale.to_string().contains("another diagnostic invocation"),
+            "{stale:#}"
+        );
+        assert!(later
+            .positive_observation(fixture.pending.action())
+            .is_none());
+        assert!(later.completed.lock().unwrap().is_empty());
+        let weak_owner = observation.request_owner.clone();
+        let compile_id = fixture.pending.action();
+        drop(compiler);
+        drop(context);
+        drop(absent_config);
+        drop(wrong_config);
+        drop(later);
+        drop(fixture);
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "retained data must not form a request cycle"
+        );
         let processes = take_completed_diagnostic_processes(&root);
         assert_eq!(
             processes,
-            vec![("CppCompile".to_owned(), fixture.pending.action())],
+            vec![("CppCompile".to_owned(), compile_id)],
             "inline expansion must not invent a completed process"
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostic_positive_observation_cancel_at_final_registry_wait_never_publishes(
+    ) -> Result<()> {
+        use std::time::Duration;
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let fixture = inline_options_fixture(&root)?;
+        fixture
+            .build
+            .manager_for(TargetId(1))
+            .execute_inline_options_header(fixture.action.clone())
+            .await?;
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = Arc::new(std::sync::Mutex::new(resume_rx));
+        *fixture.build.compile_before_completion_hook.lock().unwrap() = Some(Arc::new(move || {
+            entered
+                .send(())
+                .map_err(|_| anyhow!("compile pause receiver dropped"))?;
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| anyhow!("compile pause was not released"))?;
+            Ok(())
+        }));
+        let mut finished = fixture.build.owned_finished.subscribe();
+        let manager = fixture.build.manager_for(TargetId(2));
+        let action = fixture.compile.clone();
+        let pending = fixture.pending.clone();
+        let caller =
+            tokio::spawn(async move { manager.execute_pending_compile(action, pending).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(20)))
+            .await??;
+        assert!(
+            root.join("consumer.o").is_file(),
+            "the actual compiler must finish first"
+        );
+        assert!(fixture
+            .build
+            .positive_observation(fixture.pending.action())
+            .is_none());
+        let registry = fixture.build.registry.lock().await;
+        resume.send(())?;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(*fixture.build.cancelled.borrow());
+        drop(registry);
+        tokio::time::timeout(Duration::from_secs(20), finished.changed()).await??;
+        assert!(fixture
+            .build
+            .positive_observation(fixture.pending.action())
+            .is_none());
+        assert!(!fixture
+            .build
+            .completed
+            .lock()
+            .unwrap()
+            .contains(&fixture.pending.action()));
+        // Cancellation is not rollback: real bytes may exist, without completion/data publication.
+        assert!(root.join("consumer.o").is_file());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostic_positive_observation_real_compiler_failure_cannot_reuse_old_completion(
+    ) -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let fixture = inline_options_fixture(&root)?;
+        fixture
+            .build
+            .manager_for(TargetId(1))
+            .execute_inline_options_header(fixture.action.clone())
+            .await?;
+        let first = fixture
+            .build
+            .manager_for(TargetId(2))
+            .execute_pending_compile(fixture.compile.clone(), fixture.pending.clone())
+            .await?;
+        assert_eq!(first.exit_code, 0);
+        assert!(root.join("consumer.o").is_file());
+        assert!(fixture
+            .build
+            .positive_observation(fixture.pending.action())
+            .is_some());
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let later = DiagnosticBuild::new(
+            (*fixture.build.declarations).clone(),
+            fixture.build.registry.clone(),
+            fixture.build.manager.clone(),
+            fixture.build.lease.clone(),
+            &fixture.build.command,
+            root.clone(),
+            cancel,
+            cancelled,
+        )?;
+        // A new invocation genuinely reruns its inline producer; never copy completion facts.
+        later
+            .manager_for(TargetId(1))
+            .execute_inline_options_header(fixture.action.clone())
+            .await?;
+        std::fs::write(
+            fixture.pending.source_path(),
+            "#error deliberate actual compiler failure\n",
+        )?;
+        let failure = later
+            .manager_for(TargetId(2))
+            .execute_pending_compile(fixture.compile.clone(), fixture.pending.clone())
+            .await?;
+        assert_ne!(failure.exit_code, 0);
+        assert!(!failure.cached && failure.output_records.is_empty());
+        assert!(
+            !root.join("consumer.o").exists(),
+            "the old real object must not satisfy failure"
+        );
+        assert!(later
+            .positive_observation(fixture.pending.action())
+            .is_none());
+        assert!(!later
+            .completed
+            .lock()
+            .unwrap()
+            .contains(&fixture.pending.action()));
         Ok(())
     }
 

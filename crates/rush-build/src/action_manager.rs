@@ -93,6 +93,7 @@ impl RushActionManager {
         &self,
         mut action: Action,
         pending: Option<rush_rules::context::PendingCompileDeclaration>,
+        observation_request: Option<Arc<crate::compiler_discovery::DiagnosticObservationRequest>>,
         declared_id: rush_action::ids::DeclaredActionId,
         target: rush_action::ids::TargetId,
         declared_inputs: Vec<rush_action::ids::ArtifactId>,
@@ -101,7 +102,7 @@ impl RushActionManager {
         workspace: std::path::PathBuf,
         cancellation: tokio::sync::watch::Receiver<bool>,
         scope: Box<dyn Send>,
-    ) -> Result<ActionResult> {
+    ) -> Result<crate::compiler_discovery::DiagnosticOwnedExecution> {
         anyhow::ensure!(
             cfg!(target_os = "linux"),
             "owned diagnostic execution requires Linux"
@@ -110,6 +111,18 @@ impl RushActionManager {
             !*cancellation.borrow(),
             "diagnostic execution cancelled before preparation"
         );
+        anyhow::ensure!(
+            pending.as_ref().is_some() == observation_request.as_ref().is_some(),
+            "diagnostic pending compile and observation request must be paired"
+        );
+        if let (Some(declaration), Some(request)) = (&pending, &observation_request) {
+            anyhow::ensure!(
+                request.declaration() == declaration
+                    && declaration.action() == declared_id
+                    && declaration.target() == target,
+                "diagnostic observation request does not match its execution declaration"
+            );
+        }
         // Diagnostic discovery admits the original direct translation unit,
         // not synthetic source shards or a shell command. Keep driver selection
         // before transport; ordinary native preparation still owns sharding.
@@ -188,6 +201,10 @@ impl RushActionManager {
             credentials: None,
             isolation: None,
         };
+        // Clone the final request AFTER overrides and private -MD transport.
+        // This is historical command evidence, never a semantic key mutation.
+        let executed_command = transport.as_ref().map(|_| request.command.clone());
+        let cancellation_after = cancellation.clone();
         let permit = self
             .resource_manager
             .acquire(self.resource_request_for_action(&action))
@@ -209,9 +226,14 @@ impl RushActionManager {
         // This worker is not aborted by caller cancellation. If the runner
         // cannot confirm cleanup it retains scope, hence this permit and the
         // workspace lease also remain withheld instead of authorizing writers.
-        let _ = cleanup.await;
+        let cleanup_confirmed = cleanup.await.is_ok();
         permit.release_async().await;
+        anyhow::ensure!(
+            cleanup_confirmed,
+            "diagnostic writer cleanup was not acknowledged"
+        );
         let result = result?;
+        let mut compile_observation = None;
         if result.exit_code == 0 {
             for path in &paths {
                 anyhow::ensure!(
@@ -220,8 +242,34 @@ impl RushActionManager {
                     path.display()
                 );
             }
-            if let Some((_, pending)) = &transport {
-                crate::compiler_discovery::read_diagnostic_depfile(pending)?;
+            if let Some((_, transport_request)) = &transport {
+                anyhow::ensure!(
+                    !*cancellation_after.borrow(),
+                    "diagnostic compile cancelled before positive observation"
+                );
+                let declaration = pending.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("diagnostic observation has no real pending declaration")
+                })?;
+                anyhow::ensure!(
+                    declaration.action() == declared_id && declaration.target() == target,
+                    "diagnostic observation declaration differs from actual execution owner"
+                );
+                let observation = crate::compiler_discovery::read_diagnostic_depfile(
+                    transport_request,
+                    observation_request
+                        .as_ref()
+                        .filter(|request| request.declaration() == declaration)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("observation request does not own actual declaration")
+                        })?,
+                    executed_command
+                        .ok_or_else(|| anyhow::anyhow!("missing final executed command"))?,
+                )?;
+                anyhow::ensure!(
+                    !*cancellation_after.borrow(),
+                    "diagnostic compile cancelled before returning positive observation"
+                );
+                compile_observation = Some(Arc::new(observation));
             }
             #[cfg(test)]
             crate::compiler_discovery::record_completed_diagnostic_process(
@@ -230,15 +278,18 @@ impl RushActionManager {
                 declared_id,
             );
         }
-        Ok(ActionResult {
-            action_id: action.id,
-            exit_code: result.exit_code,
-            stdout: result.stdout_tail,
-            stderr: result.stderr_tail,
-            outputs: action.outputs,
-            output_records: Vec::new(),
-            duration: result.duration,
-            cached: false,
+        Ok(crate::compiler_discovery::DiagnosticOwnedExecution {
+            result: ActionResult {
+                action_id: action.id,
+                exit_code: result.exit_code,
+                stdout: result.stdout_tail,
+                stderr: result.stderr_tail,
+                outputs: action.outputs,
+                output_records: Vec::new(),
+                duration: result.duration,
+                cached: false,
+            },
+            compile_observation,
         })
     }
 
@@ -1497,7 +1548,7 @@ mod diagnostic_direct_translation_unit_tests {
             object,
         )
     }
-    async fn owned(
+    async fn owned_observed(
         manager: &RushActionManager,
         registry: &ArtifactRegistry,
         id: DeclaredActionId,
@@ -1506,13 +1557,17 @@ mod diagnostic_direct_translation_unit_tests {
         pending: Option<PendingCompileDeclaration>,
         root: &Path,
         lease: &Arc<crate::compiler_discovery::WorkspaceLease>,
-    ) -> Result<ActionResult> {
+    ) -> Result<crate::compiler_discovery::DiagnosticOwnedExecution> {
         let declaration = registry.declared_action(id);
         let (_cancel, receiver) = tokio::sync::watch::channel(false);
+        let observation_request = pending.as_ref().map(|pending| {
+            crate::compiler_discovery::DiagnosticObservationRequest::new(pending.clone())
+        });
         manager
             .execute_diagnostic_owned(
                 action,
                 pending,
+                observation_request,
                 id,
                 target,
                 declaration.inputs.to_vec(),
@@ -1529,6 +1584,23 @@ mod diagnostic_direct_translation_unit_tests {
                 Box::new(lease.clone()),
             )
             .await
+    }
+
+    async fn owned(
+        manager: &RushActionManager,
+        registry: &ArtifactRegistry,
+        id: DeclaredActionId,
+        target: TargetId,
+        action: Action,
+        pending: Option<PendingCompileDeclaration>,
+        root: &Path,
+        lease: &Arc<crate::compiler_discovery::WorkspaceLease>,
+    ) -> Result<ActionResult> {
+        Ok(
+            owned_observed(manager, registry, id, target, action, pending, root, lease)
+                .await?
+                .result,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1671,10 +1743,20 @@ extern "C" int actual_value() { return CopyElementToLargerSlice(); }
         assert!(cache.get(&main.id).is_none());
         let mut first_object = Vec::new();
         for value in [42, 43] {
-            std::fs::write(&header, format!("#define VALUE {value}\n"))?;
+            let extra = source.parent().unwrap().join("extra-positive.h");
+            let text = if value == 43 {
+                std::fs::write(
+                    &extra,
+                    "// Actual new positive dependency, not a registered source.\n",
+                )?;
+                format!("#include \"extra-positive.h\"\n#define VALUE {value}\n")
+            } else {
+                format!("#define VALUE {value}\n")
+            };
+            std::fs::write(&header, text)?;
             let action = compile(&source, &object, first.inputs.clone(), &root)?;
             let id = action.id.clone();
-            let result = owned(
+            let observed = owned_observed(
                 &manager,
                 &registry,
                 pending.action(),
@@ -1685,6 +1767,48 @@ extern "C" int actual_value() { return CopyElementToLargerSlice(); }
                 &lease,
             )
             .await?;
+            let observation = observed.compile_observation.ok_or_else(|| {
+                anyhow::anyhow!("successful real compile omitted positive observation")
+            })?;
+            assert_eq!(observation.declaration(), &pending);
+            assert_eq!(observation.request().source(), source.as_path());
+            assert_eq!(observation.request().object_output(), object.as_path());
+            assert!(observation.positive_names().contains(&source));
+            assert!(observation.positive_names().contains(&header));
+            assert_eq!(observation.positive_names().contains(&extra), value == 43);
+            assert!(
+                registry
+                    .find_artifact_by_path(&extra, ConfigId::DEFAULT)
+                    .is_none(),
+                "positive names must not register arbitrary source artifacts"
+            );
+            assert_eq!(
+                observation.depfile().digest(),
+                *blake3::hash(observation.depfile().bytes()).as_bytes()
+            );
+            assert_eq!(
+                observation.depfile().identity().bytes,
+                observation.depfile().bytes().len() as u64
+            );
+            assert_eq!(
+                observation.executed_command().argv,
+                observation
+                    .request()
+                    .command_snapshot()
+                    .argv
+                    .iter()
+                    .cloned()
+                    .chain(
+                        observation
+                            .request()
+                            .depfile_request()
+                            .dependency_arguments()
+                            .into_iter()
+                            .map(|arg| arg.into_string().unwrap())
+                    )
+                    .collect::<Vec<_>>()
+            );
+            let result = observed.result;
             anyhow::ensure!(
                 result.exit_code == 0,
                 "original direct TU failed: {}",
