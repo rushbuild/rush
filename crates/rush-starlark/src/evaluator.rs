@@ -8041,10 +8041,23 @@ impl Evaluator {
 
         // Check if this is a function identifier (for built-ins and rule functions)
         if let Expr::Ident(name) = function {
-            // Check for built-in functions
-            if let Some(builtin) = self.builtins.get(name).copied().filter(|_| {
-                (name != "module_extension" && name != "rule") || self.env.get(name).is_none()
-            }) {
+            // Loaded/local bindings take precedence, as Ident evaluation does.
+            // Keep native fastpaths, rule/module_extension alias dispatch, and
+            // legacy None rule placeholders. User None and a registered
+            // placeholder need a separate representation to distinguish them.
+            if let Some(builtin) =
+                self.builtins
+                    .get(name)
+                    .copied()
+                    .filter(|_| match self.env.get(name) {
+                        None => true,
+                        Some(Value::NativeFunction(bound)) => {
+                            bound == *name && name != "module_extension" && name != "rule"
+                        }
+                        Some(Value::None) => name != "module_extension" && name != "rule",
+                        _ => false,
+                    })
+            {
                 if name == "module_extension" {
                     if !self.env.bzl_definition_scope {
                         return Err(anyhow!("Undefined variable: module_extension (available only in .bzl definitions)"));
