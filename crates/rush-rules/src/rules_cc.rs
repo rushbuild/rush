@@ -1297,24 +1297,79 @@ fn namespace_implicit_sdk_path(path: &Path) -> bool {
         .iter().any(|root| path.starts_with(root))
 }
 
-fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
-    // Strip comments without treating comment markers in string/character
-    // literals as comments. Reject unadmitted line splicing/raw literals rather
-    // than silently missing directives hidden by lexical preprocessing.
-    if body.contains("??=") || body.contains("??/") || body.contains("%:") || body.contains("##") || body.contains('\0') {
-        return Err(anyhow!("native execution namespace does not admit alternative preprocessor tokens"));
+fn namespace_refuse_unsupported_preprocessor_tokens(body: &str) -> Result<()> {
+    if body.contains("??=")
+        || body.contains("??/")
+        || body.contains("%:")
+        || body.contains("##")
+        || body.contains('\0')
+    {
+        return Err(anyhow!(
+            "native execution namespace does not admit alternative preprocessor tokens"
+        ));
     }
     if body.contains("__has_include") || body.contains(".include") || body.contains(".incbin") {
         return Err(anyhow!("native execution namespace does not admit include-availability builtins or assembler include directives"));
     }
+    Ok(())
+}
+
+/// Perform only admitted translation-phase-2 joining on original physical
+/// bytes. A newly adjacent backslash/newline is not visited a second time.
+fn namespace_phase2_logical_lines(body: &str) -> Result<String> {
+    let bytes = body.as_bytes();
+    let mut joined = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) != Some(&b'\n') {
+            return Err(anyhow!(
+                "native execution namespace does not admit bare-CR source lines"
+            ));
+        }
+        if bytes[index] == b'\\' {
+            match bytes.get(index + 1) {
+                Some(b'\n') => {
+                    index += 2;
+                    continue;
+                }
+                Some(b'\r') if bytes.get(index + 2) == Some(&b'\n') => {
+                    index += 3;
+                    continue;
+                }
+                _ => {}
+            }
+            // GCC also continues backslash + horizontal space + newline.
+            // Do not silently miss a directive formed by that extension.
+            let mut next = index + 1;
+            while bytes
+                .get(next)
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t' | 0x0b | 0x0c))
+            {
+                next += 1;
+            }
+            if next > index + 1 && matches!(bytes.get(next), Some(b'\n' | b'\r')) {
+                return Err(anyhow!("native execution namespace does not admit whitespace before a continued newline"));
+            }
+        }
+        joined.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(joined).context("namespace logical-line UTF-8")
+}
+
+fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
+    // Guard both raw and joined bytes: joining can reveal unsupported tokens.
+    namespace_refuse_unsupported_preprocessor_tokens(body)?;
+    let logical = namespace_phase2_logical_lines(body)?;
+    namespace_refuse_unsupported_preprocessor_tokens(&logical)?;
+    let body = logical.as_str();
+    // Phase 2 precedes comment, quote, and directive recognition. This remains
+    // a literal-include profile, not macro expansion or conditional evaluation.
     let mut cleaned = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
     let mut quote = None;
     let mut block = false;
     while let Some(ch) = chars.next() {
-        if ch == '\\' && matches!(chars.peek(), Some('\n' | '\r')) {
-            return Err(anyhow!("native execution namespace does not admit preprocessor line splicing"));
-        }
         if block {
             if ch == '*' && chars.peek() == Some(&'/') { chars.next(); block = false; cleaned.push(' '); }
             else if ch == '\n' { cleaned.push('\n'); }
@@ -7857,6 +7912,58 @@ mod cc_binary_response_tests {
         }).await;
     }
 
+    #[test]
+    fn phase2_literal_directives_comments_quotes_and_physical_backslashes() {
+        let body = concat!(
+            "#inc\\\nlude \"quo\\\nted.h\"\n",
+            "#inc\\\r\nlude <an\\\r\ngle.h>\r\n",
+            "// continued line comment\\\n#include \"hidden-line.h\"\n",
+            "/\\\n* block comment\n#include \"hidden-block.h\"\n*\\\n/\n",
+            "const char *message = \"escaped quote: \\\"#include <fake.h>\\\"\";\n",
+            "#include \"kept.h\"\n",
+        );
+        assert_eq!(
+            namespace_literal_includes(body).unwrap(),
+            vec![
+                ("quoted.h".into(), true, false),
+                ("angle.h".into(), false, false),
+                ("kept.h".into(), true, false),
+            ]
+        );
+        // Only the last backslash of the original physical line is eligible.
+        // A repeated string-replace implementation would erase the second pair.
+        assert_eq!(namespace_phase2_logical_lines("\\\\\n\n").unwrap(), "\\\n");
+        assert!(namespace_literal_includes("#include \"path\\\\\nname.h\"\n").is_err());
+    }
+
+    #[test]
+    fn phase2_refuses_raw_and_joined_unsupported_preprocessor_shapes() {
+        for body in [
+            "#inc\\\nlude_next \"value.h\"\n",
+            "#im\\\nport \"value.h\"\n",
+            "#em\\\nbed \"value.h\"\n",
+            "#include HEA\\\nDER\n",
+            "#if __has_\\\ninclude(\"value.h\")\n#endif\n",
+            "#define CAT(a,b) a#\\\n#b\n",
+            "%\\\n:include \"value.h\"\n",
+            "R\\\n\"tag(#include \"value.h\")tag\";\n",
+            "asm(\".inc\\\nbin value\");\n",
+            "??/\n",
+            "##\n",
+            "#include \"value.h\"\0",
+            "#include \"value.h\"\r",
+        ] {
+            assert!(namespace_literal_includes(body).is_err(), "{body:?}");
+        }
+        for whitespace in [" ", "\t", "\u{b}", "\u{c}"] {
+            for newline in ["\n", "\r\n"] {
+                let body = format!("#inc\\{whitespace}{newline}lude \"value.h\"\n");
+                let error = namespace_literal_includes(&body).unwrap_err();
+                assert!(format!("{error:#}").contains("does not admit"), "{body:?}");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn native_library_srcs_headers_are_declared_but_only_consumed_headers_key_compiles() {
@@ -8106,6 +8213,101 @@ mod cc_binary_response_tests {
             );
         })
         .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn phase2_real_compiler_tracks_spliced_header_and_preserves_refused_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        with_namespace_header_tracking(temp.path(), async {
+            let workspace = temp.path().join("source");
+            let output = temp.path().join("out");
+            std::fs::create_dir_all(workspace.join("raw")).unwrap();
+            std::fs::create_dir_all(&output).unwrap();
+            let source = workspace.join("main.cc");
+            let header = workspace.join("declared_value.h");
+            let logical = workspace.join("raw/value.h");
+            std::fs::write(&header, "#define VALUE 42\n").unwrap();
+            std::os::unix::fs::symlink(&header, &logical).unwrap();
+            let original = "#inc\\\nlude \"val\\\nue.h\"\n#define RESULT() ( \\\n VALUE \\\n)\nint main(){return RESULT();}\n";
+            std::fs::write(&source, original).unwrap();
+            // The header provider is produced by the actual native header-only
+            // cc_library analyzer; no fake successful provider/tool output.
+            let header_rule = CcLibraryRule.parse_attributes(&HashMap::from([
+                ("name".into(), Value::String("headers".into())),
+                ("hdrs".into(), Value::List(vec![Value::String("declared_value.h".into())])),
+            ])).unwrap();
+            let resolver = StubIncludeResolver::new(workspace.clone());
+            let toolchain = Toolchain::default();
+            let mut registry = ArtifactRegistry::new();
+            let provider = Arc::new({
+                let mut context = AnalysisContext::new(TargetId(2), ConfigId::DEFAULT,
+                    "", None, &output, &mut registry, &resolver, &toolchain, &workspace, &[]);
+                header_rule.analyze(&mut context, &[])
+            });
+            let mut binary = binary_with_linkopt(String::new());
+            binary.linkopts.clear();
+            binary.srcs = vec!["main.cc".into()];
+            binary.deps = vec![":headers".into()];
+            binary.copts = vec!["-Iraw".into()];
+            let labeled = vec![(":headers".into(), provider.clone())];
+            {
+                let mut context = AnalysisContext::new(TargetId(1), ConfigId::DEFAULT,
+                    "", None, &output, &mut registry, &resolver, &toolchain, &workspace, &[])
+                    .with_native_execution_root(Some(&workspace))
+                    .with_labeled_dep_providers(&labeled);
+                let _ = binary.analyze(&mut context, &[provider.clone()]);
+                assert!(context.native_namespace_analysis_error().is_none());
+            }
+            let compile = registry.declared_actions().find_map(|(id, action)| {
+                (action.owner_target == TargetId(1)
+                    && registry.strings().str(action.mnemonic) == "CppCompile")
+                    .then(|| rush_action::command_spec::NormalizedCommandSpec::from_registry_action(&registry, id).unwrap())
+            }).expect("real phase2 source must declare an admitted compile");
+            assert!(compile.declared_inputs.contains(&header));
+            let manager = Arc::new(CachingExecutingActionManager::default());
+            let mut context = BuildContext::new(workspace.clone(), output.clone())
+                .with_toolchain(toolchain)
+                .with_native_execution_root(Some(workspace.clone()))
+                .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+                .with_action_manager(manager.clone());
+            context.dependency_providers.insert(":headers".into(), (*provider).clone());
+            context.dependency_providers_ordered = vec![(":headers".into(), (*provider).clone())];
+            let object = output.join("main.o");
+            let executable = output.join("program");
+            let mut initial_id = None;
+            for stage in 0..3 {
+                if stage == 2 { std::fs::write(&header, "#define VALUE 43\n").unwrap(); }
+                binary.compile_source(&context, &source, &object, &[], &[]).await.unwrap();
+                binary.link_binary(&context, &[object.clone()], &executable).await.unwrap();
+                assert_eq!(std::process::Command::new(&executable).status().unwrap().code(),
+                    Some(if stage == 2 { 43 } else { 42 }));
+                assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+                let requests = manager.requests.lock().unwrap();
+                let (action, cached) = &requests[stage * 2];
+                assert_eq!(*cached, stage == 1, "real compiler reuse at stage {stage}");
+                assert!(action.inputs.contains(&ActionArtifact::Source(header.clone())));
+                if stage == 0 { initial_id = Some(action.id.clone()); }
+                if stage == 1 { assert_eq!(Some(action.id.clone()), initial_id); }
+                if stage == 2 { assert_ne!(Some(action.id.clone()), initial_id); }
+            }
+            let old_object = std::fs::read(&object).unwrap();
+            let old_executable = std::fs::read(&executable).unwrap();
+            let request_count = manager.requests.lock().unwrap().len();
+            for refused in [
+                "#inc\\ \nlude \"value.h\"\nint main(){return VALUE;}\n",
+                "#inc\\\nlude HEA\\\nDER\nint main(){return 99;}\n",
+                "#if __has_\\\ninclude(\"value.h\")\n#endif\nint main(){return 99;}\n",
+                "#define CAT(a,b) a#\\\n#b\nint main(){return 99;}\n",
+            ] {
+                std::fs::write(&source, refused).unwrap();
+                assert!(binary.compile_source(&context, &source, &object, &[], &[]).await.is_err());
+                assert_eq!(manager.requests.lock().unwrap().len(), request_count);
+                assert_eq!(std::fs::read(&object).unwrap(), old_object);
+                assert_eq!(std::fs::read(&executable).unwrap(), old_executable);
+                assert_eq!(std::process::Command::new(&executable).status().unwrap().code(), Some(43));
+            }
+        }).await;
     }
 
     #[cfg(target_os = "linux")]
