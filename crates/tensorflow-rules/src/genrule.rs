@@ -49,6 +49,133 @@ struct GenruleInstance {
     testonly: bool,
 }
 
+// Only spellings with known repository identity can grant a NEW equivalent
+// reference. Named @repo is apparent; BuildContext has no mapping authority.
+fn canonical_tool_reference(raw: &str, package: &str, repository: Option<&str>) -> Option<String> {
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix("@@") {
+        let (owner, _) = rest.split_once("//")?;
+        if owner.contains('@') {
+            return None;
+        }
+        return Some(raw.to_owned());
+    }
+    if let Some(rest) = raw.strip_prefix("@//") {
+        return Some(format!("@@//{rest}"));
+    }
+    if raw.starts_with('@') {
+        return None;
+    }
+    let owner = repository.unwrap_or("");
+    if raw.starts_with("//") {
+        Some(format!("@@{owner}{raw}"))
+    } else if raw.starts_with(':') {
+        Some(format!("@@{owner}//{package}{raw}"))
+    } else if !raw.contains(':') {
+        Some(format!("@@{owner}//{package}:{raw}"))
+    } else {
+        None
+    }
+}
+
+fn expand_equivalent_tool_references(
+    command: &mut String,
+    declarations: &[String],
+    tool_paths: &mut HashMap<String, std::path::PathBuf>,
+    context: &BuildContext,
+    package: &str,
+) -> Result<()> {
+    use rush_rules::providers::dep_label_matches_repository_exact;
+    for keyword in ["location", "execpath"] {
+        let prefix = format!("$({keyword} ");
+        let mut offset = 0;
+        while let Some(relative) = command[offset..].find(&prefix) {
+            let start = offset + relative;
+            let argument = start + prefix.len();
+            let Some(end) = command[argument..].find(')').map(|end| argument + end) else {
+                break;
+            };
+            let requested = &command[argument..end];
+            // Preserve the existing literal-declaration resolution path,
+            // including legacy mappings for which this context has no proof.
+            if declarations.iter().any(|label| label == requested) {
+                offset = end + 1;
+                continue;
+            }
+            let Some(identity) =
+                canonical_tool_reference(requested, package, context.repository.as_deref())
+            else {
+                offset = end + 1;
+                continue;
+            };
+            let declared: Vec<_> = declarations
+                .iter()
+                .filter_map(|label| {
+                    let declared =
+                        canonical_tool_reference(label, package, context.repository.as_deref())?;
+                    dep_label_matches_repository_exact(
+                        &declared,
+                        &identity,
+                        package,
+                        context.repository.as_deref(),
+                    )
+                    .then_some(label)
+                })
+                .collect();
+            if declared.is_empty() {
+                offset = end + 1;
+                continue;
+            }
+            anyhow::ensure!(
+                declared.len() == 1,
+                "Genrule equivalent tool reference {requested:?} has ambiguous declared identities"
+            );
+            // Stored dependency-map labels are canonical by the driver contract.
+            // Never use direct_artifacts' legacy basename/suffix fallback to
+            // authorize an equivalent spelling or a different repository.
+            let matches: Vec<_> = context
+                .dependency_artifacts
+                .iter()
+                .filter(|(label, _)| {
+                    (label.starts_with("//") || label.starts_with('@'))
+                        && label.contains(':')
+                        && dep_label_matches_repository_exact(
+                            label,
+                            &identity,
+                            package,
+                            context.repository.as_deref(),
+                        )
+                })
+                .collect();
+            anyhow::ensure!(matches.len() == 1,
+                "Genrule tool reference {requested:?} requires one exact canonical dependency identity");
+            let executables: Vec<_> = matches[0]
+                .1
+                .direct()
+                .iter()
+                .filter(|artifact| artifact.artifact_type == ArtifactType::Executable)
+                .collect();
+            anyhow::ensure!(
+                executables.len() == 1,
+                "Genrule tool reference {requested:?} requires exactly one direct executable"
+            );
+            let path = &executables[0].path;
+            // Also replace any legacy-mapped value for this declaration so the
+            // actual bound executable, rather than an alias name, is an input.
+            tool_paths.insert(declared[0].clone(), path.clone());
+            let replacement = path
+                .to_str()
+                .ok_or_else(|| anyhow!("Genrule equivalent tool path must be UTF-8"))?
+                .to_owned();
+            command.replace_range(start..=end, &replacement);
+            offset = start + replacement.len();
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl RuleInstance for GenruleInstance {
     fn target_name(&self) -> &str {
@@ -227,6 +354,12 @@ impl RuleInstance for GenruleInstance {
         // quantized_function_library header), so without this the literal
         // `$(RULEDIR)` reaches the shell as a failed command substitution.
         expanded_cmd = expanded_cmd.replace("$(RULEDIR)", &gendir.display().to_string());
+
+        // Resolve equivalent tool references against declared, exact canonical
+        // dependency identities before preserving literal legacy substitutions.
+        expand_equivalent_tool_references(
+            &mut expanded_cmd, &self.tools, &mut tool_paths, context, &package_str,
+        )?;
 
         // $(location //path:target) / $(execpath //path:target) - path to a
         // tool executable. Bazel's `execpath` is the exec-root-relative path;
@@ -556,5 +689,355 @@ mod tests {
         let artifacts = rule.build(&context).await.unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(tokio::fs::read(&artifacts[0].path).await.unwrap(), payload);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tool_reference_identity_tests {
+    use super::*;
+    use rush_rules::context::{ActionManager, NativeCompileMode, PendingCompileDeclarations};
+    use rush_rules::nested_set::NestedSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct ExecuteReal {
+        requests: Mutex<Vec<(Vec<PathBuf>, Vec<String>)>>,
+    }
+    #[async_trait]
+    impl ActionManager for ExecuteReal {
+        async fn execute(&self, action: rush_action::Action) -> Result<rush_action::ActionResult> {
+            let inputs = action
+                .inputs
+                .iter()
+                .map(|artifact| match artifact {
+                    rush_action::Artifact::Source(path) => path.clone(),
+                    rush_action::Artifact::Derived { output_path, .. } => output_path.clone(),
+                })
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                inputs.iter().all(|path| path.is_file()),
+                "real fixture input missing"
+            );
+            self.requests
+                .lock()
+                .unwrap()
+                .push((inputs, action.command.args.clone()));
+            let start = std::time::Instant::now();
+            let mut command = tokio::process::Command::new(&action.command.executable);
+            command.args(&action.command.args).envs(&action.env);
+            if let Some(cwd) = &action.command.working_dir {
+                command.current_dir(cwd);
+            }
+            let output = command.output().await?;
+            Ok(rush_action::ActionResult {
+                action_id: action.id,
+                exit_code: output.status.code().unwrap_or(-1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+                outputs: action.outputs,
+                output_records: Vec::new(),
+                duration: start.elapsed(),
+                cached: false,
+            })
+        }
+    }
+
+    fn actual_tool(root: &Path, name: &str, value: i32) -> Result<PathBuf> {
+        let source = root.join(format!("{name}.c"));
+        let executable = root.join(name);
+        std::fs::write(
+            &source,
+            format!("#include <stdio.h>\nint main(void){{puts(\"tool{value}\");return 0;}}\n"),
+        )?;
+        let output = std::process::Command::new("/usr/bin/cc")
+            .args([
+                source.as_os_str(),
+                std::ffi::OsStr::new("-o"),
+                executable.as_os_str(),
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "actual tool fixture compiler failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(executable.is_file(), "compiler produced no real executable");
+        Ok(executable)
+    }
+
+    fn context(
+        root: &Path,
+        package: &str,
+        repository: Option<&str>,
+        entries: Vec<(&str, Vec<Artifact>)>,
+        manager: Arc<ExecuteReal>,
+    ) -> BuildContext {
+        let mut result = BuildContext::new(root.to_owned(), root.join("output"))
+            .with_package(package.into())
+            .with_repository(repository.map(str::to_owned))
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                Arc::new(PendingCompileDeclarations::default()),
+            )
+            .with_action_manager(manager);
+        result.dependency_artifacts = entries
+            .into_iter()
+            .map(|(label, artifacts)| (label.to_owned(), NestedSet::new(artifacts, Vec::new())))
+            .collect();
+        result
+    }
+    fn executable(path: &Path) -> Artifact {
+        Artifact {
+            path: path.to_owned(),
+            artifact_type: ArtifactType::Executable,
+        }
+    }
+    fn rule(tools: &[&str], cmd: &str) -> GenruleInstance {
+        GenruleInstance {
+            name: "generate".into(),
+            srcs: Vec::new(),
+            outs: vec!["out.txt".into()],
+            tools: tools.iter().map(|label| (*label).to_owned()).collect(),
+            cmd: cmd.into(),
+            testonly: false,
+        }
+    }
+    fn output(ctx: &BuildContext) -> PathBuf {
+        ctx.output_dir
+            .join("genfiles")
+            .join(ctx.package_path.as_deref().unwrap())
+            .join("out.txt")
+    }
+
+    #[tokio::test]
+    async fn canonical_main_and_relative_tool_refs_execute_real_declared_tool() -> Result<()> {
+        let temporary = tempfile::TempDir::new()?;
+        let root = temporary.path();
+        let tool = actual_tool(root, "real-tool", 42)?;
+        let manager = Arc::new(ExecuteReal::default());
+        let ctx = context(
+            root,
+            "tools",
+            None,
+            vec![("//tools:gen", vec![executable(&tool)])],
+            manager.clone(),
+        );
+        for requested in ["//tools:gen", "@//tools:gen", ":gen", "gen"] {
+            let command = format!(
+                "\"$(location {requested})\" > \"$@\"; \"$(execpath {requested})\" >> \"$@\""
+            );
+            rule(&["@@//tools:gen"], &command).build(&ctx).await?;
+            assert_eq!(std::fs::read(output(&ctx))?, b"tool42\ntool42\n");
+            let records = manager.requests.lock().unwrap();
+            let (inputs, argv) = records.last().unwrap();
+            assert_eq!(
+                inputs,
+                &[tool.clone()],
+                "the strict bound executable must be the actual input"
+            );
+            assert!(argv.iter().any(|arg| arg.contains(tool.to_str().unwrap())));
+            assert!(!argv
+                .iter()
+                .any(|arg| arg.contains("$(location ") || arg.contains("$(execpath ")));
+        }
+        // Legacy named/apparent and remapped exact-declaration strings remain
+        // a compatibility path; they do not acquire new canonical equivalences.
+        let remapped = context(
+            root,
+            "consumer",
+            None,
+            vec![("@implib_so//:make_stub", vec![executable(&tool)])],
+            manager.clone(),
+        );
+        rule(
+            &["//third_party/implib_so:make_stub"],
+            "\"$(location //third_party/implib_so:make_stub)\" > \"$@\"",
+        )
+        .build(&remapped)
+        .await?;
+        assert_eq!(std::fs::read(output(&remapped))?, b"tool42\n");
+        let named = context(
+            root,
+            "consumer",
+            Some("owner"),
+            vec![("@canonical//:gen", vec![executable(&tool)])],
+            manager.clone(),
+        );
+        rule(
+            &["@apparent//:gen"],
+            "\"$(location @apparent//:gen)\" > \"$@\"",
+        )
+        .build(&named)
+        .await?;
+        assert_eq!(std::fs::read(output(&named))?, b"tool42\n");
+        rule(
+            &["@@//tools:gen"],
+            "printf '%s' '$$(location //tools:gen)' > \"$@\"",
+        )
+        .build(&ctx)
+        .await?;
+        assert_eq!(std::fs::read(output(&ctx))?, b"$(location //tools:gen)");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_external_tool_refs_bind_current_owner_without_foreign_fallback() -> Result<()>
+    {
+        let temporary = tempfile::TempDir::new()?;
+        let root = temporary.path();
+        let tool = actual_tool(root, "owner-tool", 42)?;
+        let foreign = actual_tool(root, "foreign-tool", 99)?;
+        let manager = Arc::new(ExecuteReal::default());
+        let ctx = context(
+            root,
+            "pkg",
+            Some("owner"),
+            vec![
+                ("@owner//pkg:gen", vec![executable(&tool)]),
+                ("//pkg:gen", vec![executable(&foreign)]),
+            ],
+            manager.clone(),
+        );
+        for requested in ["//pkg:gen", ":gen", "gen"] {
+            rule(
+                &["@@owner//pkg:gen"],
+                &format!("\"$(location {requested})\" > \"$@\""),
+            )
+            .build(&ctx)
+            .await?;
+            assert_eq!(std::fs::read(output(&ctx))?, b"tool42\n");
+            let records = manager.requests.lock().unwrap();
+            assert_eq!(records.last().unwrap().0, [tool.clone()]);
+        }
+        let before = manager.requests.lock().unwrap().len();
+        let old = std::fs::read(output(&ctx))?;
+        for requested in [
+            "@//pkg:gen",
+            "@@//pkg:gen",
+            "@@foreign//pkg:gen",
+            "@owner//pkg:gen",
+            "//other:gen",
+        ] {
+            let error = rule(
+                &["@@owner//pkg:gen"],
+                &format!("\"$(location {requested})\" > \"$@\""),
+            )
+            .build(&ctx)
+            .await
+            .expect_err("foreign/unproved reference must not select tempting same-basename tool");
+            assert!(error.to_string().contains("Genrule"), "{error:#}");
+            assert_eq!(manager.requests.lock().unwrap().len(), before);
+            assert_eq!(std::fs::read(output(&ctx))?, old);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn equivalent_tool_refs_refuse_missing_ambiguous_and_unlisted_before_execution(
+    ) -> Result<()> {
+        let temporary = tempfile::TempDir::new()?;
+        let root = temporary.path();
+        let tool = actual_tool(root, "real-tool", 42)?;
+        let other = root.join("other-real-tool");
+        std::fs::copy(&tool, &other)?;
+        let manager = Arc::new(ExecuteReal::default());
+        let base = context(
+            root,
+            "pkg",
+            None,
+            vec![("//pkg:gen", vec![executable(&tool)])],
+            manager.clone(),
+        );
+        rule(&["@@//pkg:gen"], "\"$(location :gen)\" > \"$@\"")
+            .build(&base)
+            .await?;
+        let old = std::fs::read(output(&base))?;
+        let before = manager.requests.lock().unwrap().len();
+        let cases = vec![
+            (
+                vec!["@@//pkg:gen"],
+                "//pkg:gen",
+                vec![("@foreign//pkg:gen", vec![executable(&tool)])],
+            ),
+            (
+                vec!["@@//pkg:gen"],
+                "//pkg:gen",
+                vec![("//other:gen", vec![executable(&tool)])],
+            ),
+            (
+                vec!["@@//pkg:gen"],
+                "//pkg:gen",
+                vec![("//pkg:gen", Vec::new())],
+            ),
+            (
+                vec!["@@//pkg:gen"],
+                "//pkg:gen",
+                vec![("//pkg:gen", vec![executable(&tool), executable(&other)])],
+            ),
+            (
+                vec!["@@//pkg:gen", "//pkg:gen"],
+                ":gen",
+                vec![("//pkg:gen", vec![executable(&tool)])],
+            ),
+            (
+                vec!["@@//pkg:gen"],
+                ":gen",
+                vec![
+                    ("//pkg:gen", vec![executable(&tool)]),
+                    ("@@//pkg:gen", vec![executable(&other)]),
+                ],
+            ),
+            (
+                vec!["@@//pkg:gen"],
+                "//pkg:unlisted",
+                vec![("//pkg:gen", vec![executable(&tool)])],
+            ),
+            (
+                vec!["@apparent//:gen"],
+                "@@canonical//:gen",
+                vec![("@canonical//:gen", vec![executable(&tool)])],
+            ),
+            (
+                vec!["//third_party/implib_so:make_stub"],
+                "@@//third_party/implib_so:make_stub",
+                vec![("@implib_so//:make_stub", vec![executable(&tool)])],
+            ),
+        ];
+        for (declared, requested, entries) in cases {
+            let ctx = context(root, "pkg", None, entries, manager.clone());
+            let error = rule(&declared, &format!("\"$(location {requested})\" > \"$@\""))
+                .build(&ctx)
+                .await
+                .expect_err("unsupported reference must not execute");
+            assert!(error.to_string().contains("Genrule"), "{error:#}");
+            assert_eq!(manager.requests.lock().unwrap().len(), before);
+            assert_eq!(std::fs::read(output(&ctx))?, old);
+        }
+        for command in [
+            "$(location  //pkg:gen) > $@",
+            "$(location //pkg:gen > $@",
+            "$(execpath //pkg:missing) > $@",
+        ] {
+            assert!(rule(&["@@//pkg:gen"], command).build(&base).await.is_err());
+            assert_eq!(manager.requests.lock().unwrap().len(), before);
+            assert_eq!(std::fs::read(output(&base))?, old);
+        }
+        // A transitive executable is not the declared tool's direct output.
+        let mut transitive = context(root, "pkg", None, Vec::new(), manager.clone());
+        transitive.dependency_artifacts.insert(
+            "//pkg:gen".into(),
+            NestedSet::new(
+                Vec::new(),
+                vec![NestedSet::new(vec![executable(&tool)], Vec::new())],
+            ),
+        );
+        assert!(rule(&["@@//pkg:gen"], "$(location :gen) > $@")
+            .build(&transitive)
+            .await
+            .is_err());
+        assert_eq!(manager.requests.lock().unwrap().len(), before);
+        assert_eq!(std::fs::read(output(&transitive))?, old);
+        Ok(())
     }
 }
