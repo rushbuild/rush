@@ -2116,22 +2116,6 @@ fn expand_tf_kernel_library(
     Ok(vec![rule_call])
 }
 
-fn expand_tf_generate_proto_text_sources(
-    _name: &str,
-    _args: &[Value],
-    kwargs: &HashMap<String, Value>,
-) -> Result<Vec<RuleCall>> {
-    // Route through rush's native TfGenerateProtoTextSourcesRule, which
-    // emits a shim .pb_text.h per proto src that wraps protobuf's own
-    // DebugString / TextFormat::ParseFromString API under the
-    // `namespace tensorflow` names TF's hand-written .cc files call.
-    Ok(vec![RuleCall {
-        rule_type: "tf_generate_proto_text_sources".to_string(),
-        args: Vec::new(),
-        kwargs: kwargs.clone(),
-    }])
-}
-
 fn expand_gentbl_cc_library(
     _name: &str,
     _args: &[Value],
@@ -3373,10 +3357,6 @@ impl Evaluator {
         macro_expanders.insert(
             "tf_proto_library".to_string(),
             expand_tf_proto_library as MacroExpander,
-        );
-        macro_expanders.insert(
-            "tf_generate_proto_text_sources".to_string(),
-            expand_tf_generate_proto_text_sources as MacroExpander,
         );
         macro_expanders.insert(
             "tf_gen_options_header".to_string(),
@@ -8022,10 +8002,6 @@ impl Evaluator {
             // correct shape for our native proto compilation path to apply.
             const MACRO_PRIORITY_OVERRIDE: &[&str] = &[
                 "tf_proto_library",
-                // Starlark emits a cc_library whose srcs are .pb_text.cc
-                // files rush has no generator for; route instead to the
-                // native expander which emits template-header shims.
-                "tf_generate_proto_text_sources",
                 // Starlark invokes a template-rendering codegen binary;
                 // route instead to the native expander which does the
                 // `.tpl` → `options.h` substitution directly.
@@ -10495,6 +10471,110 @@ dict_value = {"base": "yes"} | select({
         };
         assert!(format!("{configurable_float:#}")
             .contains("configurable + to float and float"));
+    }
+
+    #[test]
+    fn loaded_proto_text_macro_keeps_generator_and_compilation_targets() -> Result<()> {
+        let definitions = r#"
+def clean_dep(label):
+    return label
+
+def cc_library(**kwargs):
+    native.cc_library(**kwargs)
+
+def tf_generate_proto_text_sources(name, srcs_relative_dir, srcs, protodeps = [], deps = [], visibility = None, compatible_with = None):
+    out_hdrs = (
+        [p.replace(".proto", ".pb_text.h") for p in srcs] +
+        [p.replace(".proto", ".pb_text-impl.h") for p in srcs]
+    )
+    out_srcs = [p.replace(".proto", ".pb_text.cc") for p in srcs]
+    native.genrule(
+        name = name + "_srcs",
+        srcs = srcs + protodeps + [clean_dep("//tensorflow/tools/proto_text:placeholder.txt")],
+        outs = out_hdrs + out_srcs,
+        visibility = visibility,
+        cmd = "$(location //tensorflow/tools/proto_text:gen_proto_text_functions) " + "$(@D) " + srcs_relative_dir + " $(SRCS)",
+        tools = [clean_dep("//tensorflow/tools/proto_text:gen_proto_text_functions")],
+        compatible_with = compatible_with,
+    )
+    native.filegroup(
+        name = name + "_hdrs",
+        srcs = out_hdrs,
+        visibility = visibility,
+        compatible_with = compatible_with,
+    )
+    cc_library(
+        compatible_with = compatible_with,
+        name = name,
+        srcs = out_srcs,
+        hdrs = out_hdrs,
+        visibility = visibility,
+        deps = deps,
+        alwayslink = 1,
+    )
+"#;
+        for lazy in [false, true] {
+            let evaluator = eval_loaded_build(
+                definitions,
+                r#"
+load("//pkg:defs.bzl", "tf_generate_proto_text_sources")
+tf_generate_proto_text_sources(name="text",srcs_relative_dir="pkg/",srcs=["nested/value.proto"],protodeps=["//imports:other.proto"],deps=[":real_proto"])
+"#,
+                lazy,
+            )?;
+            let calls = evaluator.get_rule_calls();
+            assert_eq!(
+                calls.len(),
+                3,
+                "execute the loaded macro instead of a native source replacement"
+            );
+            let generator = calls
+                .iter()
+                .find(|call| call.rule_type == "genrule")
+                .unwrap();
+            assert_eq!(generator.kwargs["name"], Value::String("text_srcs".into()));
+            assert_eq!(
+                generator.kwargs["tools"],
+                Value::List(vec![Value::String(
+                    "//tensorflow/tools/proto_text:gen_proto_text_functions".into()
+                )])
+            );
+            assert_eq!(
+                generator.kwargs["srcs"],
+                Value::List(vec![
+                    Value::String("nested/value.proto".into()),
+                    Value::String("//imports:other.proto".into()),
+                    Value::String("//tensorflow/tools/proto_text:placeholder.txt".into())
+                ])
+            );
+            assert_eq!(
+                generator.kwargs["outs"],
+                Value::List(vec![
+                    Value::String("nested/value.pb_text.h".into()),
+                    Value::String("nested/value.pb_text-impl.h".into()),
+                    Value::String("nested/value.pb_text.cc".into())
+                ])
+            );
+            let library = calls
+                .iter()
+                .find(|call| call.rule_type == "cc_library")
+                .unwrap();
+            assert_eq!(
+                library.kwargs["deps"],
+                Value::List(vec![Value::String(":real_proto".into())])
+            );
+            assert_eq!(library.kwargs["alwayslink"], Value::Int(1));
+            assert_eq!(
+                library.kwargs["srcs"],
+                Value::List(vec![Value::String("nested/value.pb_text.cc".into())])
+            );
+            assert!(calls.iter().any(|call| call.rule_type == "filegroup"
+                && call.kwargs["name"] == Value::String("text_hdrs".into())));
+            assert!(!calls
+                .iter()
+                .any(|call| call.rule_type == "tf_generate_proto_text_sources"));
+        }
+        Ok(())
     }
 
     #[test]
