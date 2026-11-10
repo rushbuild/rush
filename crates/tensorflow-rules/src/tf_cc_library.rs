@@ -7,6 +7,26 @@ use rush_rules::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+// Framework search roots are represented in CcInfo, but this native consumer
+// has no framework compiler implementation. Never silently omit this bucket.
+fn reject_framework_include_roots<'a>(
+    providers: impl IntoIterator<Item = &'a ProviderSet>,
+) -> Result<()> {
+    for provider in providers {
+        if let Some(cc) = provider.get_cc_info() {
+            anyhow::ensure!(
+                cc.compilation
+                    .framework_include_dirs
+                    .iter()
+                    .next()
+                    .is_none(),
+                "native C++ compilation does not support nonempty typed framework include roots"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a tf_cc_library source/header attribute against the target's
 /// package. Artifact paths must be package-qualified: the registry interns by
 /// `(config, path)`, so registering a bare `foo.h` or `foo.cc` aliases every
@@ -331,7 +351,19 @@ impl RuleInstance for TfCcLibraryInstance {
         deps
     }
 
+    fn validate_analysis_dependencies(
+        &self,
+        ctx: &rush_rules::analysis_context::AnalysisContext,
+    ) -> Result<()> {
+        reject_framework_include_roots(
+            ctx.labeled_dep_providers().iter().map(|(_, provider)| provider.as_ref()),
+        )
+    }
+
     async fn build(&self, context: &BuildContext) -> Result<Vec<Artifact>> {
+        reject_framework_include_roots(
+            context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
+        )?;
         let mut artifacts = Vec::new();
 
         // Compile flags
@@ -567,6 +599,12 @@ impl RuleInstance for TfCcLibraryInstance {
         ctx: &mut rush_rules::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
     ) -> ProviderSet {
+        if let Err(error) = reject_framework_include_roots(
+            dep_providers.iter().map(|provider| provider.as_ref()),
+        ) {
+            ctx.fail_native_namespace_analysis(error.to_string());
+            return ProviderSet::empty();
+        }
         use rush_action::ids::ArtifactKind;
         use rush_rules::providers::{CcInfo, DirectCcInfo, LinkFragment};
         use std::path::Path;
@@ -851,7 +889,7 @@ impl RuleInstance for TfCcLibraryInstance {
             link_fragments: direct_link_fragments,
             ..DirectCcInfo::default()
         };
-        let cc_info = CcInfo::from_direct_and_deps(
+        let cc_info = CcInfo::from_native_direct_and_deps(
             direct,
             rush_rules::providers::extract_cc_infos(dep_providers).into_iter(),
         );
@@ -888,6 +926,12 @@ impl RuleInstance for TfCcLibraryInstance {
         rush_rules::SchedulerActionKey,
         rush_action::command_spec::NormalizedCommandSpec,
     )> {
+        if let Err(error) = reject_framework_include_roots(
+            context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
+        ) {
+            eprintln!("native C++ command specification refused: {error:#}");
+            return Vec::new();
+        }
         use rush_action::command_spec::NormalizedCommandSpec;
         use rush_rules::SchedulerActionKey;
         let mut specs = Vec::new();
@@ -1707,5 +1751,191 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].path, workspace.join("pkg/public.h"));
         assert_eq!(artifacts[0].artifact_type, ArtifactType::Header);
+    }
+}
+
+#[cfg(test)]
+mod framework_projection_tests {
+    use super::*;
+    use rush_action::ids::{ArtifactRegistry, ConfigId, TargetId};
+    use rush_rules::analysis_context::{AnalysisContext, StubIncludeResolver};
+    use rush_rules::context::Toolchain;
+    use rush_rules::providers::{CcInfo, DirectCcInfo};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn typed_framework_dependency_refuses_before_actions_or_writes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(workspace.join("main.cc"), "#error must never compile\n").unwrap();
+        let old_output = output.join("old-output");
+        std::fs::write(&old_output, b"retained").unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let framework = registry.intern_path(Path::new("/frameworks"));
+        let provider = ProviderSet::empty().with_cc_info(CcInfo::from_declared_direct_and_deps(
+            DirectCcInfo {
+                framework_include_dirs: vec![framework],
+                ..Default::default()
+            },
+            std::iter::empty(),
+        ));
+        let labeled = vec![("//dep:framework".to_owned(), Arc::new(provider.clone()))];
+        let attrs = HashMap::from([
+            ("name".to_owned(), Value::String("consumer".into())),
+            (
+                "srcs".to_owned(),
+                Value::List(vec![Value::String("main.cc".into())]),
+            ),
+            (
+                "deps".to_owned(),
+                Value::List(vec![Value::String("//dep:framework".into())]),
+            ),
+        ]);
+        let rule = TfCcLibraryRule.parse_attributes(&attrs).unwrap();
+        let resolver = StubIncludeResolver::new(workspace.clone());
+        let toolchain = Toolchain::default();
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &workspace,
+                &[],
+            )
+            .with_labeled_dep_providers(&labeled);
+            assert!(rule
+                .validate_analysis_dependencies(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("framework"));
+            let providers = rule.analyze(&mut ctx, &[Arc::clone(&labeled[0].1)]);
+            assert!(providers.get_cc_info().is_none());
+            assert!(ctx
+                .native_namespace_analysis_error()
+                .unwrap()
+                .contains("framework"));
+        }
+        assert_eq!(registry.declared_actions().count(), 0);
+        let mut context = BuildContext::new(workspace, output.clone())
+            .with_dependencies(HashMap::new(), vec![("//dep:framework".into(), provider)]);
+        assert!(rule.build_legacy_command_specs(&context).await.is_empty());
+        assert!(rule
+            .build(&context)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("framework"));
+        context.dependency_providers_ordered.clear();
+        assert!(rule.build_legacy_command_specs(&context).await.is_empty());
+        assert!(rule
+            .build(&context)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("framework"));
+        assert_eq!(std::fs::read(&old_output).unwrap(), b"retained");
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod native_header_view_tests {
+    use super::*;
+    use rush_action::ids::{ArtifactKind, ArtifactRegistry, ConfigId, TargetId};
+    use rush_rules::analysis_context::{AnalysisContext, StubIncludeResolver};
+    use rush_rules::context::Toolchain;
+    use rush_rules::providers::FilesInfo;
+    use std::sync::Arc;
+
+    #[test]
+    fn native_library_header_view_retains_generated_textual_producer() {
+        let mut registry = ArtifactRegistry::new();
+        let workspace = Path::new("/source");
+        let output = Path::new("/out");
+        let resolver = StubIncludeResolver::new(workspace.into());
+        let toolchain = Toolchain::default();
+        let generated;
+        let producer;
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "pkg",
+                None,
+                output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                workspace,
+                &[],
+            );
+            generated = ctx.register_generated_artifact(
+                Path::new("generated.inc"),
+                ArtifactKind::Header,
+                None,
+            );
+            producer = ctx
+                .declare_action("GenRule", vec![], vec![generated])
+                .unwrap();
+        }
+        let path = registry.artifact_path(generated).to_path_buf();
+        let labels = vec![(
+            ":generated".into(),
+            Arc::new(ProviderSet::empty().with_files(FilesInfo::new(vec![path]))),
+        )];
+        let attrs = HashMap::from([
+            ("name".into(), Value::String("library".into())),
+            (
+                "hdrs".into(),
+                Value::List(vec![Value::String("public.h".into())]),
+            ),
+            (
+                "textual_hdrs".into(),
+                Value::List(vec![Value::String(":generated".into())]),
+            ),
+        ]);
+        let rule = TfCcLibraryRule.parse_attributes(&attrs).unwrap();
+        let providers = {
+            let mut ctx = AnalysisContext::new(
+                TargetId(2),
+                ConfigId::DEFAULT,
+                "pkg",
+                None,
+                output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                workspace,
+                &[],
+            )
+            .with_labeled_dep_providers(&labels);
+            rule.analyze(&mut ctx, &[Arc::clone(&labels[0].1)])
+        };
+        let cc = providers.get_cc_info().unwrap();
+        let view: Vec<_> = cc
+            .compilation
+            .bazel_headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(view.len(), 2);
+        assert!(view.contains(&generated));
+        assert_eq!(registry.producer(generated), Some(producer));
+        assert!(cc
+            .compilation
+            .textual_headers
+            .iter()
+            .any(|id| id == generated));
+        assert!(cc.compilation.headers.iter().all(|id| id != generated));
+        assert_eq!(registry.declared_actions().count(), 1);
     }
 }

@@ -21,6 +21,20 @@ use rush_rules::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+fn reject_framework_include_roots<'a>(
+    providers: impl IntoIterator<Item = &'a rush_rules::providers::ProviderSet>,
+) -> Result<()> {
+    for provider in providers {
+        if let Some(cc) = provider.get_cc_info() {
+            anyhow::ensure!(
+                cc.compilation.framework_include_dirs.iter().next().is_none(),
+                "native C++ compilation does not support nonempty typed framework include roots"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Phase 5.C.4 commit 28: locate the `grpc_cpp_plugin` binary
 /// for tf_proto_library's grpc-codegen path.
 ///
@@ -814,7 +828,7 @@ impl TfProtoLibraryInstance {
         }
         Ok(ProviderSet::empty()
             .with_proto_files(proto_files)
-            .with_cc_info(CcInfo::from_direct_and_deps(direct, cc_deps))
+            .with_cc_info(CcInfo::from_native_direct_and_deps(direct, cc_deps))
             .with_default_info(DefaultInfo {
                 files: default_files,
             }))
@@ -1086,6 +1100,9 @@ impl RuleInstance for TfProtoLibraryInstance {
     }
 
     fn validate_analysis_dependencies(&self, ctx: &rush_rules::analysis_context::AnalysisContext) -> Result<()> {
+        reject_framework_include_roots(
+            ctx.labeled_dep_providers().iter().map(|(_, provider)| provider.as_ref()),
+        )?;
         if self.protoc.is_some() || self.role != TfProtoRole::Default
             || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             self.declared_mode(ctx.native_compile_mode())?;
@@ -1094,6 +1111,9 @@ impl RuleInstance for TfProtoLibraryInstance {
     }
 
     async fn build(&self, context: &rush_rules::context::BuildContext) -> Result<Vec<Artifact>> {
+        reject_framework_include_roots(
+            context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
+        )?;
         if self.protoc.is_some() || self.role != TfProtoRole::Default
             || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             return self.build_declared_proto(context).await;
@@ -1531,6 +1551,12 @@ impl RuleInstance for TfProtoLibraryInstance {
         ctx: &mut rush_rules::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
     ) -> rush_rules::providers::ProviderSet {
+        if let Err(error) = reject_framework_include_roots(
+            dep_providers.iter().map(|provider| provider.as_ref()),
+        ) {
+            ctx.fail_native_namespace_analysis(error.to_string());
+            return rush_rules::providers::ProviderSet::empty();
+        }
         if self.srcs.is_empty() || self.protoc.is_some() || self.role != TfProtoRole::Default
             || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             return self.analyze_declared_proto(ctx, dep_providers);
@@ -1967,7 +1993,7 @@ impl RuleInstance for TfProtoLibraryInstance {
             link_fragments: direct_link_fragments,
             ..DirectCcInfo::default()
         };
-        let cc_info = CcInfo::from_direct_and_deps(
+        let cc_info = CcInfo::from_native_direct_and_deps(
             direct,
             rush_rules::providers::extract_cc_infos(dep_providers).into_iter(),
         );
@@ -2055,6 +2081,12 @@ impl RuleInstance for TfProtoLibraryInstance {
         rush_rules::SchedulerActionKey,
         rush_action::command_spec::NormalizedCommandSpec,
     )> {
+        if let Err(error) = reject_framework_include_roots(
+            context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
+        ) {
+            eprintln!("native C++ command specification refused: {error:#}");
+            return Vec::new();
+        }
         if self.protoc.is_some() || self.role != TfProtoRole::Default
             || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
             return self.declared_proto_specs(context).await.unwrap_or_default();

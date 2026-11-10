@@ -610,7 +610,7 @@ impl RuleInstance for GentblCcLibraryInstance {
             include_dirs: direct_include_dirs,
             ..DirectCcInfo::default()
         };
-        let cc_info = CcInfo::from_direct_and_deps(direct, rush_rules::providers::extract_cc_infos(dep_providers).into_iter());
+        let cc_info = CcInfo::from_native_direct_and_deps(direct, rush_rules::providers::extract_cc_infos(dep_providers).into_iter());
         ProviderSet::empty().with_cc_info(cc_info)
     }
 
@@ -689,5 +689,75 @@ mod tests {
             instance.declared_outputs(),
             vec!["ops.h.inc", "ops.cc.inc"]
         );
+    }
+}
+
+#[cfg(test)]
+mod native_header_view_tests {
+    use super::*;
+    use rush_action::ids::{ArtifactRegistry, ConfigId, TargetId};
+    use rush_rules::analysis_context::{AnalysisContext, StubIncludeResolver};
+    use rush_rules::context::Toolchain;
+    use std::path::Path;
+
+    #[test]
+    fn native_tablegen_textual_view_keeps_each_declared_output_producer() {
+        let attrs = HashMap::from([
+            ("name".into(), Value::String("table".into())),
+            ("td_file".into(), Value::String("ops.td".into())),
+            (
+                "tbl_outs".into(),
+                Value::List(vec![
+                    Value::List(vec![
+                        Value::List(vec![Value::String("-gen-op-decls".into())]),
+                        Value::String("ops.h.inc".into()),
+                    ]),
+                    Value::List(vec![
+                        Value::List(vec![Value::String("-gen-op-defs".into())]),
+                        Value::String("ops.cc.inc".into()),
+                    ]),
+                ]),
+            ),
+        ]);
+        let rule = GentblCcLibraryRule.parse_attributes(&attrs).unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let resolver = StubIncludeResolver::new("/source".into());
+        let toolchain = Toolchain::default();
+        let providers = {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "pkg",
+                None,
+                Path::new("/out"),
+                &mut registry,
+                &resolver,
+                &toolchain,
+                Path::new("/source"),
+                &[],
+            );
+            rule.analyze(&mut ctx, &[])
+        };
+        let cc = providers.get_cc_info().unwrap();
+        let view: Vec<_> = cc
+            .compilation
+            .bazel_headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(view.len(), 2);
+        assert_eq!(
+            view,
+            cc.compilation.textual_headers.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(cc.compilation.headers.iter().count(), 0);
+        for header in view {
+            let producer = registry.producer(header).unwrap();
+            let action = registry.declared_action(producer);
+            assert_eq!(registry.strings().str(action.mnemonic), "MlirTblgen");
+            assert_eq!(action.outputs.as_ref(), &[header]);
+        }
+        assert_eq!(registry.declared_actions().count(), 2);
     }
 }

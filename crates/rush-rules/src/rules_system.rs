@@ -231,7 +231,12 @@ impl RuleInstance for SystemCcLibraryInstance {
             link_fragments: direct_link_fragments,
             ..DirectCcInfo::default()
         };
-        let cc_info = CcInfo::from_direct_and_deps(direct, crate::providers::extract_cc_infos(dep_providers).into_iter());
+        // This adapter declares include/link search metadata, not header files.
+        // Legacy directory-marker artifacts are not a Bazel header declaration.
+        let cc_info = CcInfo::from_declared_direct_and_deps(
+            direct,
+            crate::providers::extract_cc_infos(dep_providers).into_iter(),
+        );
         ProviderSet::empty().with_cc_info(cc_info)
     }
 

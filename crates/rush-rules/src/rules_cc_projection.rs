@@ -524,6 +524,65 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn parameters_keep_postorder_define_overrides_and_declared_root_order() -> Result<()> {
+        let mut registry = ArtifactRegistry::new();
+        let shared = registry.intern_string("SHARED=1");
+        let first = registry.intern_string("OVERRIDE=1");
+        let second = registry.intern_string("OVERRIDE=2");
+        let local = registry.intern_string("PRIVATE=1");
+        let leaf = CcInfo::from_native_direct_and_deps(
+            DirectCcInfo {
+                defines: vec![shared],
+                local_defines: vec![local],
+                ..Default::default()
+            },
+            Vec::<Arc<CcInfo>>::new(),
+        );
+        let left = CcInfo::from_native_direct_and_deps(
+            DirectCcInfo {
+                defines: vec![first, shared],
+                ..Default::default()
+            },
+            vec![leaf.clone()],
+        );
+        let right = CcInfo::from_native_direct_and_deps(
+            DirectCcInfo {
+                defines: vec![second, shared],
+                ..Default::default()
+            },
+            vec![leaf],
+        );
+        let rule = CcProjectionInstance {
+            name: "parameters".into(),
+            kind: CcProjectionKind::CompilationParametersV1,
+            dependencies: Vec::new(),
+        };
+        for (roots, expected) in [
+            (
+                vec![left.clone(), right.clone()],
+                vec![shared, first, second],
+            ),
+            (vec![right, left], vec![shared, second, first]),
+        ] {
+            let projected = rule.project(&roots, &registry, ConfigId::DEFAULT)?;
+            let cc = projected.get_cc_info().unwrap();
+            assert_eq!(cc.compilation.defines.iter().collect::<Vec<_>>(), expected);
+            let ordinary = crate::providers::flatten_transitive_defines(
+                registry.strings(),
+                roots.iter().map(|cc| cc.compilation.defines.inner()),
+            );
+            let projected = crate::providers::flatten_transitive_defines(
+                registry.strings(),
+                [cc.compilation.defines.inner()],
+            );
+            assert_eq!(projected, ordinary);
+            assert!(!cc.compilation.defines.iter().any(|id| id == local));
+            assert!(cc.compilation.local_defines.is_empty());
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn headers_distinguish_native_textual_view_and_forward_real_generated_producer(
     ) -> Result<()> {

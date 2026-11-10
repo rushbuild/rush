@@ -7,6 +7,26 @@ use rush_rules::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+// Framework search roots are represented in CcInfo, but this native consumer
+// has no framework compiler implementation. Never silently omit this bucket.
+fn reject_framework_include_roots<'a>(
+    providers: impl IntoIterator<Item = &'a ProviderSet>,
+) -> Result<()> {
+    for provider in providers {
+        if let Some(cc) = provider.get_cc_info() {
+            anyhow::ensure!(
+                cc.compilation
+                    .framework_include_dirs
+                    .iter()
+                    .next()
+                    .is_none(),
+                "native C++ compilation does not support nonempty typed framework include roots"
+            );
+        }
+    }
+    Ok(())
+}
+
 const EMPTY_LINK_UNSUPPORTED: &str = "empty tf_cc_binary link shape is not scheduler-verified";
 
 /// Resolve a source/header entry against the package that owns this binary.
@@ -342,7 +362,19 @@ impl RuleInstance for TfCcBinaryInstance {
         deps
     }
 
+    fn validate_analysis_dependencies(
+        &self,
+        ctx: &rush_rules::analysis_context::AnalysisContext,
+    ) -> Result<()> {
+        reject_framework_include_roots(
+            ctx.labeled_dep_providers().iter().map(|(_, provider)| provider.as_ref()),
+        )
+    }
+
     async fn build(&self, context: &BuildContext) -> Result<Vec<Artifact>> {
+        reject_framework_include_roots(
+            context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
+        )?;
         let mut artifacts = Vec::new();
 
         // Compile flags
@@ -523,6 +555,12 @@ impl RuleInstance for TfCcBinaryInstance {
         ctx: &mut rush_rules::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
     ) -> ProviderSet {
+        if let Err(error) = reject_framework_include_roots(
+            dep_providers.iter().map(|provider| provider.as_ref()),
+        ) {
+            ctx.fail_native_namespace_analysis(error.to_string());
+            return ProviderSet::empty();
+        }
         use rush_action::ids::{ArtifactKind, ExecutableAction, StringId};
         use std::path::Path;
         // A deps-only tf_cc_binary can link from typed dependency libraries,
@@ -722,6 +760,12 @@ impl RuleInstance for TfCcBinaryInstance {
         rush_rules::SchedulerActionKey,
         rush_action::command_spec::NormalizedCommandSpec,
     )> {
+        if let Err(error) = reject_framework_include_roots(
+            context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
+        ) {
+            eprintln!("native C++ command specification refused: {error:#}");
+            return Vec::new();
+        }
         use rush_action::command_spec::NormalizedCommandSpec;
         use rush_rules::SchedulerActionKey;
         let mut specs = Vec::new();
@@ -1845,5 +1889,97 @@ mod tests {
                 if *reason == EMPTY_LINK_UNSUPPORTED
         ));
         assert!(registry.executable_action(link_id).is_none());
+    }
+}
+
+#[cfg(test)]
+mod framework_projection_tests {
+    use super::*;
+    use rush_action::ids::{ArtifactRegistry, ConfigId, TargetId};
+    use rush_rules::analysis_context::{AnalysisContext, StubIncludeResolver};
+    use rush_rules::context::Toolchain;
+    use rush_rules::providers::{CcInfo, DirectCcInfo};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn typed_framework_dependency_refuses_before_actions_or_writes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(workspace.join("main.cc"), "#error must never compile\n").unwrap();
+        let old_output = output.join("old-output");
+        std::fs::write(&old_output, b"retained").unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let framework = registry.intern_path(Path::new("/frameworks"));
+        let provider = ProviderSet::empty().with_cc_info(CcInfo::from_declared_direct_and_deps(
+            DirectCcInfo {
+                framework_include_dirs: vec![framework],
+                ..Default::default()
+            },
+            std::iter::empty(),
+        ));
+        let labeled = vec![("//dep:framework".to_owned(), Arc::new(provider.clone()))];
+        let attrs = HashMap::from([
+            ("name".to_owned(), Value::String("consumer".into())),
+            (
+                "srcs".to_owned(),
+                Value::List(vec![Value::String("main.cc".into())]),
+            ),
+            (
+                "deps".to_owned(),
+                Value::List(vec![Value::String("//dep:framework".into())]),
+            ),
+        ]);
+        let rule = TfCcBinaryRule.parse_attributes(&attrs).unwrap();
+        let resolver = StubIncludeResolver::new(workspace.clone());
+        let toolchain = Toolchain::default();
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &workspace,
+                &[],
+            )
+            .with_labeled_dep_providers(&labeled);
+            assert!(rule
+                .validate_analysis_dependencies(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("framework"));
+            let providers = rule.analyze(&mut ctx, &[Arc::clone(&labeled[0].1)]);
+            assert!(providers.get_cc_info().is_none());
+            assert!(ctx
+                .native_namespace_analysis_error()
+                .unwrap()
+                .contains("framework"));
+        }
+        assert_eq!(registry.declared_actions().count(), 0);
+        let mut context = BuildContext::new(workspace, output.clone())
+            .with_dependencies(HashMap::new(), vec![("//dep:framework".into(), provider)]);
+        assert!(rule.build_legacy_command_specs(&context).await.is_empty());
+        assert!(rule
+            .build(&context)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("framework"));
+        context.dependency_providers_ordered.clear();
+        assert!(rule.build_legacy_command_specs(&context).await.is_empty());
+        assert!(rule
+            .build(&context)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("framework"));
+        assert_eq!(std::fs::read(&old_output).unwrap(), b"retained");
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 1);
     }
 }
