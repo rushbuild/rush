@@ -3401,6 +3401,14 @@ impl Evaluator {
     /// evaluated, so `glob()` resolves against the real package tree (incl.
     /// external repos) instead of a CWD-relative scan from the workspace root.
     pub fn set_current_package_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        if dir.is_some() && self.env.get("repository_name").is_none() {
+            // A bare native repository_name is predeclared in BUILD only;
+            // loaded modules receive native.repository_name instead. Its
+            // value is resolved at call time, not captured from this scope.
+            self.env.define("repository_name".into(), Value::NativeFunction("repository_name".into()));
+        } else if dir.is_none() && matches!(self.env.get("repository_name"), Some(Value::NativeFunction(name)) if name == "repository_name") {
+            self.env.vars.write().unwrap().remove("repository_name");
+        }
         self.current_package_dir = dir;
     }
 
@@ -3686,6 +3694,8 @@ impl Evaluator {
             Value::NativeFunction("register_execution_platforms".to_string()),
         );
 
+        native_attrs.insert("repository_name".into(), Value::NativeFunction("repository_name".into()));
+
         // Register rule query functions
         native_attrs.insert(
             "existing_rule".to_string(),
@@ -3703,6 +3713,7 @@ impl Evaluator {
     ///
     /// Provides native.http_archive, native.git_repository, etc. for use in WORKSPACE .bzl files
     pub fn register_workspace_native_namespace(&mut self) {
+        self.set_current_package_dir(None);
         let native_attrs = Self::workspace_native_bindings();
         self.env
             .define("native".to_string(), Value::Namespace(native_attrs));
@@ -3712,6 +3723,7 @@ impl Evaluator {
     /// module does not resolve or run Bazel; only reading bazel_version probes
     /// the repository analyzer selected by the current tracked client context.
     pub fn set_workspace_repository_context(&mut self, workspace_root: std::path::PathBuf) {
+        self.set_current_package_dir(None);
         let attrs = match self.env.get("native") {
             Some(Value::Namespace(attrs)) | Some(Value::WorkspaceNativeNamespace { attrs, .. }) => {
                 attrs.clone()
@@ -8314,6 +8326,20 @@ impl Evaluator {
                 Ok(Value::None)
             }
             Value::NativeFunction(func_name) => {
+                if func_name == "repository_name" {
+                    let args = merge_args(args, args_unpack, self)?;
+                    let kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                    if !args.is_empty() || !kwargs.is_empty() {
+                        anyhow::bail!("native.repository_name() accepts no arguments");
+                    }
+                    // This is the BUILD caller, independently of a loaded
+                    // function's definition Label context or physical root.
+                    // A module initializer/WORKSPACE has no BUILD package.
+                    if self.current_package_dir.is_none() {
+                        anyhow::bail!("native.repository_name() requires a BUILD loading context; it is unavailable during module initialization, WORKSPACE evaluation, or rule analysis");
+                    }
+                    return Ok(Value::String(format!("@{}", self.current_repository.as_deref().unwrap_or("").trim_start_matches('@'))));
+                }
                 if func_name == "module_extension" {
                     let args = merge_args(args, args_unpack, self)?;
                     let kwargs = extension_kwargs(kwargs, kwargs_unpack, self)?;

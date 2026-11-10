@@ -2432,6 +2432,7 @@ fn builtin_existing_rules(_args: &[Value], _kwargs: &[(String, Value)]) -> Resul
 /// ```
 fn builtin_native(_args: &[Value], _kwargs: &[(String, Value)]) -> Result<Value> {
     let mut native_module = HashMap::new();
+    native_module.insert("repository_name".into(), Value::NativeFunction("repository_name".into()));
 
     // Add native functions to the module
     native_module.insert(

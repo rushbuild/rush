@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use rush_profiling::profile_scope;
 use rush_starlark::{parse, BuildFileContextGuard, Evaluator, RuleCall, Value as StarlarkValue};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{validate_unique_rule_names, BuildFile, Rule, Value};
@@ -23,6 +23,72 @@ macro_rules! debug_log {
             eprintln!($($arg)*);
         }
     };
+}
+
+/// Loader APIs resolve relative BUILD paths against that loader's workspace.
+/// The loader-free convenience API keeps its historical process-cwd contract.
+/// Preserve logical spelling here: source reads and caller-context resolution
+/// use this exact absolute path; tracked canonicalization supplies witnesses.
+fn absolute_build_path(build_path: &Path, workspace_root: Option<&Path>) -> Result<PathBuf> {
+    if build_path.is_absolute() { return Ok(build_path.to_path_buf()); }
+    let root = match workspace_root {
+        Some(root) if root.is_absolute() => root.to_path_buf(),
+        Some(root) => std::env::current_dir()?.join(root),
+        None => std::env::current_dir()?,
+    };
+    Ok(root.join(build_path))
+}
+
+/// Resolve a BUILD caller using registered logical roots and tracked physical
+/// witnesses. An explicit owner remains authoritative when several names share
+/// one source tree; fallback discovery may select only one most-specific owner.
+fn build_repository_context(
+    build_path: &Path, loader: &rush_starlark::BzlLoader,
+) -> Result<(PathBuf, Option<String>, String)> {
+    let package = build_path.parent().context("BUILD path has no package directory")?;
+    let physical_package = rush_incremental::tracked::canonicalize(package)
+        .with_context(|| format!("resolve BUILD package {}", package.display()))?;
+    let relative_package = |root: &Path| -> Option<String> {
+        if let Ok(relative) = package.strip_prefix(root) {
+            if relative.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir)) {
+                let normalized: PathBuf = relative.components().filter_map(|part| match part {
+                    Component::Normal(name) => Some(name), _ => None,
+                }).collect();
+                return Some(normalized.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        let physical_root = rush_incremental::tracked::canonicalize(root).ok()?;
+        physical_package.strip_prefix(physical_root).ok()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+    };
+    if let Some(owner) = loader.get_current_repo_name() {
+        let root = loader.get_current_repo_root().clone();
+        let package = relative_package(&root).with_context(|| format!(
+            "BUILD package {} is outside selected repository @{}", package.display(), owner))?;
+        return Ok((root, Some(owner.to_owned()), package));
+    }
+    let workspace = loader.get_workspace_root().clone();
+    let mut selected = relative_package(&workspace).map(|package| (workspace.clone(), None, package));
+    // Compare the remaining package suffix, not absolute path length: a
+    // symlinked external root can resolve outside/deeper than the workspace.
+    let mut best_distance = selected.as_ref().map(|(_, _, package)| Path::new(package).components().count()).unwrap_or(usize::MAX);
+    let mut ambiguous = false;
+    for entry in loader.external_repos.iter() {
+        let root = entry.value();
+        let Some(package) = relative_package(root) else { continue; };
+        let distance = Path::new(&package).components().count();
+        if distance < best_distance {
+            best_distance = distance;
+            selected = Some((root.clone(), Some(entry.key().clone()), package));
+            ambiguous = false;
+        } else if distance == best_distance && selected.as_ref().is_some_and(|(_, owner, _)| owner.is_some()) {
+            ambiguous = true;
+        }
+    }
+    if ambiguous {
+        anyhow::bail!("BUILD path has multiple registered repository owners; supply its explicit canonical repository identity: {}", build_path.display());
+    }
+    selected.with_context(|| format!("BUILD package is outside registered repository roots: {}", build_path.display()))
 }
 
 /// Get current process memory usage in MB
@@ -80,6 +146,8 @@ pub fn parse_build_file_with_loader(
     build_path: &Path,
     mut bzl_loader: rush_starlark::BzlLoader,
 ) -> Result<Arc<BuildFile>> {
+    let absolute_path = absolute_build_path(build_path, Some(bzl_loader.get_workspace_root()))?;
+    let build_path = absolute_path.as_path();
     profile_scope!("parse_build_file_with_loader");
     let mem_start = get_memory_mb();
     debug_log!(
@@ -132,96 +200,10 @@ pub fn parse_build_file_with_loader(
         let pkg = parent.to_path_buf();
         bzl_loader.set_current_package(pkg.clone());
 
-        // Detect which repository this BUILD file belongs to
-        let workspace_root = bzl_loader.get_workspace_root().clone();
-        let explicit_repo_root = bzl_loader.get_current_repo_root().clone();
-        let explicit_repo_name = bzl_loader.get_current_repo_name().map(str::to_owned);
-        let (detected_repo_root, repo_name) = if let Some(repo_name) = explicit_repo_name {
-            // The orchestrator has already resolved the label's repository.
-            // Preserve that identity even when an external alias shares the
-            // main repository's path, or several names share one path.
-            (explicit_repo_root, Some(repo_name))
-        } else {
-            let mut detected = workspace_root.clone();
-            let mut best_match_len = workspace_root.as_os_str().len();
-            let mut detected_name = None;
-
-            // Find the longest matching prefix (most specific repo)
-            // Lock-free iteration over DashMap
-            // Canonicalize build_path to handle ".." segments which cause starts_with to fail.
-            // Tracked canonicalize: each symlink hop records a Symlink dep (logic identical
-            // to fs::canonicalize) so a symlinked workspace/repo path invalidates the graph.
-            let check_path = rush_incremental::tracked::canonicalize(build_path)
-                .unwrap_or(build_path.to_path_buf());
-
-            debug_log!(
-                "[DEBUG starlark_bridge] Checking build path: {}",
-                check_path.display()
-            );
-            debug_log!(
-                "[DEBUG starlark_bridge] External repos count: {}",
-                bzl_loader.external_repos.len()
-            );
-
-            for entry in bzl_loader.external_repos.iter() {
-                let path = entry.value();
-                let canonical_repo_path =
-                    rush_incremental::tracked::canonicalize(path).unwrap_or(path.clone());
-                let is_match = check_path.starts_with(&canonical_repo_path);
-                debug_log!("[DEBUG starlark_bridge] Comparing with repo {}: {} (canonical: {}) -> match: {}", entry.key(), path.display(), canonical_repo_path.display(), is_match);
-
-                if is_match {
-                    let path_len = canonical_repo_path.as_os_str().len();
-                    if path_len > best_match_len {
-                        detected = canonical_repo_path;
-                        best_match_len = path_len;
-                        detected_name = Some(entry.key().clone());
-                        debug_log!(
-                            "[DEBUG starlark_bridge] BUILD file {} detected in external repo: {}",
-                            build_path.display(),
-                            path.display()
-                        );
-                    }
-                }
-            }
-            (detected, detected_name)
-        };
-
-        // Set the repo root so subsequent .bzl loads resolve correctly
+        let (detected_repo_root, repo_name, relative_package) = build_repository_context(build_path, &bzl_loader)?;
         bzl_loader.set_current_repo_root(detected_repo_root.clone());
-
-        // Set the current repository name on the evaluator
-        // This ensures that load() statements in the BUILD file are resolved correctly
-        // (e.g. load("//foo:bar.bzl") -> load("@repo//foo:bar.bzl"))
-        debug_log!("[DEBUG starlark_bridge] repo_name: {:?}", repo_name);
-        if let Some(name) = repo_name {
-            debug_log!(
-                "[DEBUG starlark_bridge] Setting current_repository to: {}",
-                name
-            );
-            evaluator.set_current_repository(Some(name));
-        } else {
-            debug_log!("[DEBUG starlark_bridge] repo_name is None, not setting current_repository");
-        }
-
-        // Set the evaluator's current_package (REPO-RELATIVE, e.g.
-        // "third_party/icu/data") so native.package_name() and — critically —
-        // package-relative glob() resolve correctly. Previously only the
-        // bzl_loader got the package; the evaluator's stayed "", which is why
-        // glob() was package-blind and a subpackage glob like
-        // glob(["icu_conversion_data.c.gz.*"]) returned 0 files. Canonicalize
-        // both sides so the strip_prefix is robust to "."/".." segments.
-        let rel_pkg = {
-            let canon_pkg =
-                rush_incremental::tracked::canonicalize(&pkg).unwrap_or_else(|_| pkg.clone());
-            let canon_root = rush_incremental::tracked::canonicalize(&detected_repo_root)
-                .unwrap_or_else(|_| detected_repo_root.clone());
-            canon_pkg
-                .strip_prefix(&canon_root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default()
-        };
-        evaluator.set_current_package(rel_pkg);
+        evaluator.set_current_repository(repo_name);
+        evaluator.set_current_package(relative_package);
 
         // #39 graph-RSS: give the evaluator the package's ABSOLUTE on-disk dir
         // so external-repo glob() scans the real package tree instead of a
@@ -378,6 +360,11 @@ pub fn parse_build_file_with_bzl_loader(
     build_path: &Path,
     bzl_loader: Option<std::sync::Arc<std::sync::Mutex<rush_starlark::BzlLoader>>>,
 ) -> Result<Arc<BuildFile>> {
+    let workspace_root = bzl_loader.as_ref().map(|loader| loader.lock()
+        .map(|loader| loader.get_workspace_root().clone())
+        .map_err(|error| anyhow!("Failed to lock .bzl loader: {error}"))).transpose()?;
+    let absolute_path = absolute_build_path(build_path, workspace_root.as_deref())?;
+    let build_path = absolute_path.as_path();
     let mem_start = get_memory_mb();
     debug_log!(
         "[MEM] 📊 BUILD parsing START: {} (baseline: {} MB)",
@@ -419,6 +406,13 @@ pub fn parse_build_file_with_bzl_loader(
     // Register native namespace for macro support
     evaluator.register_native_namespace();
 
+    // This entrypoint evaluates an actual BUILD even without a module loader.
+    // Establish its caller context after namespace registration; the setter
+    // also installs BUILD-only bare repository_name().
+    if let Some(parent) = build_path.parent() {
+        evaluator.set_current_package_dir(Some(parent.to_path_buf()));
+    }
+
     // Set .bzl loader if provided
     // Also push a per-thread context so that // and : label resolution during
     // BUILD evaluation uses the correct repository/package roots without
@@ -432,35 +426,9 @@ pub fn parse_build_file_with_bzl_loader(
             let pkg = parent.to_path_buf();
             loader_guard.set_current_package(pkg.clone());
 
-            // Detect which repository this BUILD file belongs to
-            // Check if build_path is inside any external repository
-            // Find the MOST SPECIFIC (longest) matching path to handle nested repos
-            let workspace_root = loader_guard.get_workspace_root().clone();
-            let detected_repo_root = {
-                let mut detected = workspace_root.clone();
-                let mut best_match_len = workspace_root.as_os_str().len();
-
-                // Find the longest matching prefix (most specific repo)
-                // Lock-free iteration over DashMap
-                for entry in loader_guard.external_repos.iter() {
-                    let path = entry.value();
-                    if build_path.starts_with(path) {
-                        let path_len = path.as_os_str().len();
-                        if path_len > best_match_len {
-                            detected = path.clone();
-                            best_match_len = path_len;
-                            debug_log!(
-                                "[DEBUG starlark_bridge] BUILD file {} detected in external repo: {}",
-                                build_path.display(),
-                                path.display()
-                            );
-                        }
-                    }
-                }
-                detected
-            };
-
-            // Set the repo root so subsequent .bzl loads resolve correctly
+            let (detected_repo_root, repo_name, relative_package) = build_repository_context(build_path, &loader_guard)?;
+            evaluator.set_current_repository(repo_name);
+            evaluator.set_current_package(relative_package);
             loader_guard.set_current_repo_root(detected_repo_root.clone());
 
             (Some(detected_repo_root), Some(pkg))
