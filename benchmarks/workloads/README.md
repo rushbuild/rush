@@ -21,6 +21,21 @@ Bazel output bases. It changes affinity only for itself and its descendants.
 Run one workload at a time on the measured host; this script does not reserve
 host resources.
 
+Run the controller and all its descendants inside a task-owned process-tree
+containment boundary, such as a service cgroup configured to terminate the
+whole group on stop, with a bounded TERM-to-KILL deadline. On interruption,
+explicitly stop that owned unit and verify its descendants have drained before
+reusing the CPUs. Do not rely on a terminal interrupt alone to stop compilers
+or detached helper servers. The controller's timeout handler signals only its
+still-unreaped direct child's process group; other exceptions propagate without
+signalling a potentially recycled group. An outer stop does not turn an
+interrupted run into a completed result. Preserve the failed root and use a
+fresh root for the next attempt.
+
+Use this controller for the November 10 comparison, SHA256
+`7bdd77317fdb149f88d8c916f570c143312caedde0032592cf818305503eb30c`.
+The November 9 results retain their earlier measured controller hash and data.
+
 Pass the same arguments for each mode below. Replace these example paths:
 
 ```sh

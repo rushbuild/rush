@@ -84,17 +84,25 @@ def invoke(argv, cwd, env, log, timeout):
             if not select.select([descriptor], [], [], timeout)[0]:
                 raise TimeoutError('command timed out; see ' + str(log))
             rc = process.wait()
-        except BaseException:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            if not select.select([descriptor], [], [], 10)[0]:
+        except TimeoutError:
+            # This function is the sole waiter. A None poll leaves the direct
+            # child unreaped, so its PID/PGID cannot be recycled before signalling.
+            # Other exceptions (including KeyboardInterrupt after wait reaps)
+            # propagate without stale group signals; the outer unit contains them.
+            if process.returncode is None and process.poll() is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-            process.wait()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if process.returncode is None and process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=10)
             raise
         finally:
             os.close(descriptor)
@@ -194,7 +202,8 @@ class Engine:
         # Command-specific flags avoid sending build options to mod/shutdown.
         proxy = self.root / 'bazel-cpu'
         proxy.write_text('#!/usr/bin/python3\nimport os,sys,json\nfrom pathlib import Path\na=sys.argv[1:]\n'
-                         'commands={"build","fetch","mod","sync","info","query","cquery","aquery","shutdown","clean"}\n'
+                         'if a==["--version"]: os.execv(' + repr(str(self.args.bazel)) + ',[' + repr(str(self.args.bazel)) + ']+a)\n'
+                         'commands={"build","fetch","mod","sync","info","query","cquery","aquery","shutdown","clean","version"}\n'
                          'i=next((i for i,x in enumerate(a) if x in commands),len(a))\n'
                          'if i==len(a): raise SystemExit("unrecognized helper command")\n'
                          'command=a[i]\nextra=[]\n'
