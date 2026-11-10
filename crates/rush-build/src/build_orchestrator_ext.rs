@@ -2164,7 +2164,12 @@ impl BuildOrchestrator {
             restore: cold_cache_was_disabled,
         };
 
-        // The AnalysisKey we expect both runs to hit (mirrors build_with_dependencies).
+        // ── Run 1: cold build (full analyze, commit snapshot) ──────────────
+        let t1 = Instant::now();
+        self.build_with_dependencies(target_patterns.clone()).await?;
+        let run1_total = t1.elapsed();
+        // Derive the expected key after run 1 initialized its mandatory token.
+        // Preserve that captured domain for every subsequent assertion.
         let expected_key = {
             let semantics = rush_command_core::CommandSemantics::from_process_with_compilation_mode_default(
                 self.output_tree.config().dir_name(),
@@ -2174,10 +2179,6 @@ impl BuildOrchestrator {
             crate::analysis_snapshot::AnalysisKey::new(&semantics, ws_real, target_patterns.clone())
         };
 
-        // ── Run 1: cold build (full analyze, commit snapshot) ──────────────
-        let t1 = Instant::now();
-        self.build_with_dependencies(target_patterns.clone()).await?;
-        let run1_total = t1.elapsed();
         let (b1, p1, t1c) = self.reuse_counters.analysis_work();
         let hits1 = self
             .reuse_counters
@@ -2344,10 +2345,20 @@ impl BuildOrchestrator {
         target_patterns: Vec<String>,
         semantics: rush_command_core::CommandSemantics,
     ) -> Result<()> {
+        if crate::compiler_discovery::requested_compile_mode(&semantics)? == rush_rules::context::NativeCompileMode::Literal {
+            // Legacy blocking jobs must keep the shared lease and command lock
+            // even if their public caller abandons its future.
+            let owner = self.clone();
+            let handle = tokio::runtime::Handle::current();
+            return tokio::task::spawn_blocking(move || handle.block_on(async move {
+                let command_lock = crate::workspace_command_lock(&owner.workspace_root);
+                let _command_guard = command_lock.lock().await;
+                owner.build_with_dependencies_with_semantics_locked(target_patterns,semantics).await
+            })).await.map_err(|e|anyhow!("owned native command failed: {e}"))?;
+        }
         let command_lock = crate::workspace_command_lock(&self.workspace_root);
         let _command_guard = command_lock.lock().await;
-        self.build_with_dependencies_with_semantics_locked(target_patterns, semantics)
-            .await
+        self.build_with_dependencies_with_semantics_locked(target_patterns, semantics).await
     }
 
     pub(crate) async fn build_with_dependencies_with_semantics_locked(
@@ -2355,6 +2366,29 @@ impl BuildOrchestrator {
         target_patterns: Vec<String>,
         semantics: rush_command_core::CommandSemantics,
     ) -> Result<()> {
+        use rush_rules::context::NativeCompileMode;
+        let compile_mode = crate::compiler_discovery::requested_compile_mode(&semantics)?;
+        let diagnostic_mode = compile_mode == NativeCompileMode::UncachedDiagnosticV1;
+        if diagnostic_mode {
+            anyhow::ensure!(cfg!(target_os = "linux"), "uncached compiler discovery diagnostic requires Linux");
+            anyhow::ensure!(self.remote_executor.is_none(), "diagnostic compiler discovery requires local execution");
+            anyhow::ensure!(semantics.getenv(b"RUSH_USE_SCHEDULER") != Some(b"1"),
+                "diagnostic compiler discovery requires legacy execution; disable the scheduler");
+            let arguments = rush_command_core::build_arguments::from_command(&semantics)
+                .map_err(|e|anyhow!("diagnostic compiler discovery requires the immutable expanded request: {e}"))?;
+            anyhow::ensure!(!arguments.iter().any(|arg|matches!(arg.as_str(),
+                "--use-scheduler"|"--use_scheduler"|"--use-scheduler=true"|"--use_scheduler=true")),
+                "diagnostic compiler discovery does not support scheduler execution");
+        }
+        let native_lease = Arc::new(crate::compiler_discovery::WorkspaceLease::acquire(&self.workspace_root,compile_mode)?);
+        let native_admission_token = native_lease.token(diagnostic_mode)?;
+        let (diagnostic_cancel, diagnostic_cancelled) = tokio::sync::watch::channel(false);
+        let _diagnostic_cancel_scope = diagnostic_mode.then(||crate::compiler_discovery::CancelOwnedExecution::new(diagnostic_cancel.clone()));
+        if diagnostic_mode {
+            self.snapshot_cache.invalidate_workspace(&std::fs::canonicalize(&self.workspace_root)?);
+            eprintln!("UNCACHED compiler discovery diagnostic: no retained or action-cache authority");
+        }
+        let mut pending_compile_declarations = rush_rules::context::PendingCompileDeclarations::default();
         let _profile_build_with_dependencies = self
             .profiler
             .scope("build_with_dependencies_with_semantics", "build");
@@ -2517,7 +2551,7 @@ impl BuildOrchestrator {
         // analysis and emit the census. Likewise, reuse is gated on a clean
         // tracked-IO scope being available (the manifest is the admission
         // proof). The candidate is rejected on any `Stale` dep.
-        let reuse_disabled = std::env::var("RUSH_ANALYZE_ONLY").as_deref() == Ok("1")
+        let reuse_disabled = diagnostic_mode || std::env::var("RUSH_ANALYZE_ONLY").as_deref() == Ok("1")
             || std::env::var("RUSH_DISABLE_SNAPSHOT_REUSE").as_deref() == Ok("1");
         // Reuse-path phase timing (RUSH_REUSE_TIMING=1). Profiles where the warm
         // no-op's wall time goes: manifest validate() (over the recorded deps),
@@ -2535,10 +2569,10 @@ impl BuildOrchestrator {
         // connected is, by inotify in-order delivery, already enqueued, so the
         // drain observes it. We capture the epoch before+after the no-op decision
         // to catch a concurrent modification landing during the decision.
-        let watchfs_mode = crate::workspace_watcher::WatchFsMode::parse(
+        let watchfs_mode = if diagnostic_mode { crate::workspace_watcher::WatchFsMode::Off } else { crate::workspace_watcher::WatchFsMode::parse(
             command_semantics.argv(),
             |k| command_semantics.getenv(k).map(|v| v.to_vec()),
-        );
+        ) };
         let watcher = self.watcher();
         let watcher_epoch_before = if watchfs_mode == crate::workspace_watcher::WatchFsMode::Off {
             // `off`: never consult the watcher — today's pure scan behavior.
@@ -2998,7 +3032,7 @@ impl BuildOrchestrator {
                                 if let Some(plan) = pass_b_prune_plan {
                                     self.execute_analyzed_with_prune(&candidate, plan).await?;
                                 } else {
-                                    self.execute_analyzed(&candidate).await?;
+                                    self.execute_analyzed_inner(&candidate, None, None).await?;
                                 }
                             }
                             if profile_phases {
@@ -5346,12 +5380,13 @@ impl BuildOrchestrator {
                         &extra_proto_paths,
                     )
                     .with_labeled_dep_providers(&labeled_dep_providers_vec)
-                    .with_native_execution_root(native_execroot.as_ref().map(|namespace| namespace.root()));
+                    .with_native_execution_root(native_execroot.as_ref().map(|namespace| namespace.root()))
+                    .with_native_compile_discovery(compile_mode,&mut pending_compile_declarations);
                 let mut analyze = || -> Result<_> {
                     node.rule_instance.validate_analysis_dependencies(&analysis_ctx)
                         .with_context(|| format!("validating analysis dependencies for target '{}'", label))?;
                     let providers = node.rule_instance.analyze(&mut analysis_ctx, &dep_providers_vec);
-                    if native_execroot.is_some() {
+                    if native_execroot.is_some() || diagnostic_mode {
                         if let Some(error) = analysis_ctx.native_namespace_analysis_error() {
                             anyhow::bail!("native execution namespace analysis refused for {label}: {error}");
                         }
@@ -6548,6 +6583,28 @@ impl BuildOrchestrator {
         // IO and never touches the manifest, so snapshotting it here — after
         // analysis, before execution — captures exactly the analysis deps.
         let _profile_snapshot_commit = self.profiler.scope("snapshot_commit", "analysis");
+        if diagnostic_mode {
+            let registry = artifact_registry.lock().await;
+            for label in &build_order {
+                let node = graph.get(label).ok_or_else(||anyhow!("diagnostic node missing: {label}"))?;
+                let kind = node.rule_instance.rule_type();
+                let writer = matches!(kind,"cc_library"|"cc_binary"|"genrule");
+                anyhow::ensure!(writer || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
+                    |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
+                    "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
+                let target = *target_id_by_label.get(&label.to_string()).ok_or_else(||anyhow!("diagnostic target identity missing: {label}"))?;
+                for (id,action) in registry.declared_actions().filter(|(_,action)|action.owner_target == target) {
+                    let mnemonic = registry.strings().str(action.mnemonic);
+                    anyhow::ensure!(writer && (if kind == "genrule" { mnemonic == "GenRule" } else {
+                        matches!(mnemonic,"CCompile"|"CppCompile"|"CcArchive"|"CppArchive"|"CcLink"|"CppLink") }),
+                        "uncached compiler diagnostic does not audit action {mnemonic} of {kind} at {label}");
+                    if matches!(mnemonic,"CCompile"|"CppCompile") {
+                        anyhow::ensure!(pending_compile_declarations.get(id).is_some(),
+                            "uncached compiler diagnostic has no pending declaration for {label}");
+                    }
+                }
+            }
+        }
         let snapshot = {
             let manifest = self
                 .tracked_io_shared()
@@ -6575,10 +6632,12 @@ impl BuildOrchestrator {
             }
             let key_hash = analysis_key.stable_hash();
             let manifest_fingerprint = manifest.fingerprint();
-            let (manifest_watch_index, unwatched_manifest) =
-                self.watcher().partition_manifest(&manifest);
+            let (manifest_watch_index, unwatched_manifest) = if diagnostic_mode {
+                (crate::workspace_watcher::ManifestWatchIndex::default(), manifest.clone())
+            } else { self.watcher().partition_manifest(&manifest) };
             let snap = std::sync::Arc::new(crate::analysis_snapshot::AnalysisSnapshot {
                 key: analysis_key.clone(),
+                native_admission_token,
                 key_hash,
                 built_under: command_semantics.clone(),
                 manifest,
@@ -6604,7 +6663,7 @@ impl BuildOrchestrator {
                 // watch was armed before this instant.
                 analyzed_at: Some(std::time::Instant::now()),
             });
-            self.snapshot_cache.put(std::sync::Arc::clone(&snap));
+            if !diagnostic_mode { self.snapshot_cache.put(std::sync::Arc::clone(&snap)); }
             snap
         };
         drop(_profile_snapshot_commit);
@@ -6613,7 +6672,12 @@ impl BuildOrchestrator {
         // into `execute_analyzed`, driven from the committed snapshot. This
         // is the half that runs on BOTH the fresh-analyze and the reuse path.
         let _profile_execute_analyzed = self.profiler.scope("execute_analyzed", "build");
-        self.execute_analyzed(&snapshot).await?;
+        let diagnostic = if diagnostic_mode {
+            Some(crate::compiler_discovery::DiagnosticBuild::new(pending_compile_declarations,
+                snapshot.artifact_registry.clone(), self.action_manager.clone(), native_lease.clone(),
+                &semantics, std::fs::canonicalize(&self.workspace_root)?, diagnostic_cancel, diagnostic_cancelled)?)
+        } else { None };
+        self.execute_analyzed_inner(&snapshot,None,diagnostic).await?;
         drop(_profile_execute_analyzed);
         // (The freshness ledger is captured inside execute_analyzed on a
         // fully-successful wavefront — see the "freshness ledger captured" site.)
@@ -6817,7 +6881,23 @@ impl BuildOrchestrator {
         &self,
         snapshot: &std::sync::Arc<crate::analysis_snapshot::AnalysisSnapshot>,
     ) -> Result<()> {
-        self.execute_analyzed_inner(snapshot, None).await
+        let owner = self.clone();
+        let snapshot = snapshot.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(async move {
+        let command_lock = crate::workspace_command_lock(&owner.workspace_root);
+        let _command_guard = command_lock.lock().await;
+        anyhow::ensure!(crate::compiler_discovery::requested_compile_mode(&snapshot.built_under)?
+            == rush_rules::context::NativeCompileMode::Literal,
+            "diagnostic plans are private and cannot be reused through execute_analyzed");
+        anyhow::ensure!(std::fs::canonicalize(&owner.workspace_root)? == snapshot.key.workspace_realpath,
+            "native snapshot belongs to a different workspace; refusing execution");
+        let _lease = crate::compiler_discovery::WorkspaceLease::acquire(&owner.workspace_root,
+            rush_rules::context::NativeCompileMode::Literal)?;
+        anyhow::ensure!(snapshot.admission_is_current(), "native snapshot admission was revoked; analyze again");
+        owner.execute_analyzed_inner(&snapshot, None, None).await
+        })).await.map_err(|e|anyhow!("owned snapshot execution failed: {e}"))?
+
     }
 
     async fn execute_analyzed_with_prune(
@@ -6825,14 +6905,21 @@ impl BuildOrchestrator {
         snapshot: &std::sync::Arc<crate::analysis_snapshot::AnalysisSnapshot>,
         prune_plan: PassBPrunePlan,
     ) -> Result<()> {
-        self.execute_analyzed_inner(snapshot, Some(prune_plan)).await
+        self.execute_analyzed_inner(snapshot, Some(prune_plan), None).await
     }
 
     async fn execute_analyzed_inner(
         &self,
         snapshot: &std::sync::Arc<crate::analysis_snapshot::AnalysisSnapshot>,
         mut prune_plan: Option<PassBPrunePlan>,
+        diagnostic: Option<Arc<crate::compiler_discovery::DiagnosticBuild>>,
     ) -> Result<()> {
+        let diagnostic_mode = diagnostic.is_some();
+        anyhow::ensure!(snapshot.admission_is_current(), "native snapshot admission was revoked; analyze again");
+        anyhow::ensure!(diagnostic_mode == (crate::compiler_discovery::requested_compile_mode(&snapshot.built_under)?
+            == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1), "diagnostic execution state is missing or mismatched");
+        anyhow::ensure!(!diagnostic_mode || (prune_plan.is_none() && self.remote_executor.is_none()),
+            "diagnostic execution cannot prune or use remote execution");
         if let Some(namespace) = &snapshot.native_execroot {
             namespace.validate()?;
             anyhow::ensure!(!self.remote_executor.as_ref().is_some_and(|executor| executor.is_reapi()),
@@ -6874,7 +6961,7 @@ impl BuildOrchestrator {
         // Providers always start from immutable PASS-A state. Retaining a
         // previous execution's post-build providers would make fill-only
         // provider refresh preserve stale slots after an active rebuild.
-        let mut current_retained_state = snapshot.retained_execution_state();
+        let mut current_retained_state = if diagnostic_mode { None } else { snapshot.retained_execution_state() };
         if let Some(plan) = prune_plan.as_ref() {
             let plan_is_current = current_retained_state.as_ref().is_some_and(|state| {
                 state.generation == plan.retained_generation
@@ -6964,7 +7051,7 @@ impl BuildOrchestrator {
         debug_assert!(prune_plan.is_some() || previous_ledger_for_output_equiv.is_none());
         let pruned_execution = prune_plan.is_some();
 
-        let use_scheduler =
+        let use_scheduler = !diagnostic_mode &&
             std::env::var("RUSH_USE_SCHEDULER").as_deref() == Ok("1");
         // Host tool-probe cache: a content-validated probe of the well-known
         // build tools (gcc/protoc/ar/ld/…). This is only needed when the
@@ -7439,6 +7526,24 @@ impl BuildOrchestrator {
             }
         }
 
+        if let Some(build) = &diagnostic {
+            let registry = artifact_registry.lock().await;
+            rush_action::action_dag::ActionDag::build(&registry)?;
+            let target_indices: HashMap<_,_> = build_order.iter().enumerate().filter_map(|(i,label)|
+                target_id_by_label.get(&label.to_string()).map(|target|(*target,i))).collect();
+            for pending in build.declarations.iter() {
+                let consumer = *target_indices.get(&pending.target()).ok_or_else(||anyhow!("pending target is outside the build closure"))?;
+                for producer in pending.required_producers() {
+                    let owner = registry.declared_action(*producer).owner_target;
+                    let producer_index = *target_indices.get(&owner).ok_or_else(||anyhow!("pending input producer is outside the build closure"))?;
+                    if producer_index != consumer && !original_rev_deps[producer_index].contains(&consumer) {
+                        original_rev_deps[producer_index].push(consumer);
+                        original_in_degree[consumer] += 1;
+                    }
+                }
+            }
+        }
+
         // Experimental action-aware target frontier. Scheduler
         // actions do not consume BuildContext dependency
         // artifacts at execution time; their complete declared
@@ -7839,6 +7944,9 @@ impl BuildOrchestrator {
                 let Some((_, _, std::cmp::Reverse(cur))) = ready.pop() else {
                     break;
                 };
+                // Preparation may fail while earlier blocking targets run.
+                // Keep their lease until the existing drain loop completes.
+                let prepare_result: Result<()> = async {
                 // Active-but-clean under a prune plan already has its exact
                 // prior artifact root in the hydrated full forest. Keep that
                 // root rather than reconstructing a lossy approximation from
@@ -7895,7 +8003,7 @@ impl BuildOrchestrator {
                     break 'skip true;
                 };
                 if skipped {
-                    continue;
+                    return Ok(());
                 }
                 let label = build_order[cur].clone();
                 let node = graph
@@ -7930,7 +8038,7 @@ impl BuildOrchestrator {
                 // (genrule, py_*, uv_lock, ...) read dependency files
                 // directly in build(), outside the action manager's JIT
                 // seam — materialize any virtual dep artifacts first.
-                if rush_action::virtual_artifacts::enabled()
+                if !diagnostic_mode && rush_action::virtual_artifacts::enabled()
                     && !crate::virtual_materializer::rule_consumes_only_via_actions(
                         node.rule_instance.rule_type(),
                     )
@@ -7956,7 +8064,7 @@ impl BuildOrchestrator {
                 let package_path = PathBuf::from(&label.package);
                 let extra_proto_paths = collect_extra_proto_paths(&snapshot.resolver_repo_paths);
                 let materialize_static_libraries =
-                    static_archive_materialization.contains(&label.to_string());
+                    diagnostic_mode || static_archive_materialization.contains(&label.to_string());
                 let dirty_paths = prune_plan
                     .as_ref()
                     .map(|plan| plan.dirty_paths.clone())
@@ -7970,9 +8078,16 @@ impl BuildOrchestrator {
                     .with_dependencies(dep_artifacts, dep_providers)
                     .with_materialize_static_libraries(materialize_static_libraries)
                     .with_dirty_paths(dirty_paths)
-                    .with_action_manager(self.action_manager.clone())
+                    .with_action_manager(if let Some(build) = &diagnostic {
+                        build.manager_for(*target_id_by_label.get(&label.to_string())
+                            .ok_or_else(||anyhow!("diagnostic target has no TargetId"))?)
+                    } else { self.action_manager.clone() })
                     .with_extra_proto_paths(extra_proto_paths)
                     .with_artifact_registry(Arc::clone(&artifact_registry));
+                let context = if let Some(build) = &diagnostic {
+                    context.with_native_compile_discovery(rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
+                        build.declarations.clone())
+                } else { context };
 
                 let target_id_for_dispatch = target_id_by_label.get(&label.to_string()).copied();
                 let archive_elided_for_legacy =
@@ -8145,6 +8260,13 @@ impl BuildOrchestrator {
                     };
                     Ok::<(usize, Vec<Artifact>), anyhow::Error>((cur, artifacts))
                 }));
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = prepare_result {
+                    first_error = Some(error);
+                    break;
+                }
             }
 
             // Await one completed build, then COMMIT it (driver).
@@ -8168,6 +8290,10 @@ impl BuildOrchestrator {
                 }
                 None => break,
             };
+            // A completed target may still fail driver-side validation or
+            // artifact commit while other blocking writers remain in flight.
+            // Route that failure through the same drain as execution errors.
+            let commit_result: Result<()> = async {
             let label = build_order[cur].clone();
             let node = graph
                 .get(&label)
@@ -8330,6 +8456,12 @@ impl BuildOrchestrator {
                     next_ready_sequence += 1;
                 }
             }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = commit_result {
+                first_error = Some(error);
+            }
         }
         // A failure drained the in-flight set above; surface the real first
         // error now (before the stall check, which would otherwise fire a
@@ -8398,7 +8530,7 @@ impl BuildOrchestrator {
         // direct set means a pure forwarder (alias / proto_alias),
         // whose real outputs live one level down. Runs before ledger
         // capture so the ledger records the materialized state.
-        if rush_action::virtual_artifacts::enabled() {
+        if !diagnostic_mode && rush_action::virtual_artifacts::enabled() {
             let mut sweep = || -> Result<()> {
                 for label in &root_labels {
                     let Some(arts) = built_artifacts.get(&label.to_string()) else {
@@ -8441,7 +8573,7 @@ impl BuildOrchestrator {
         // verify the whole graph is unchanged and skip this wavefront. Only
         // reached on a fully-successful build (errors above returned early), so
         // a failed/interrupted build never records a "fresh" ledger.
-        {
+        if !diagnostic_mode {
             let t_ledger = std::time::Instant::now();
             let watcher = self.watcher();
             // Phase 4: JIT/pre-build materialization writes the outputs
@@ -8657,7 +8789,7 @@ impl BuildOrchestrator {
             }
         }
 
-        if !pruned_execution {
+        if !diagnostic_mode && !pruned_execution {
             let t_prune_index = std::time::Instant::now();
             let _ = get_or_build_pass_b_prune_index(snapshot, &self.workspace_root).await;
             if exec_timing {
@@ -20763,8 +20895,8 @@ int main() { printf("%d\n", fixture::float8_value + fixture::intn_value); return
         let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
         let targets = vec!["//:app".to_string()];
         let semantics = semantics_with_define(root, "//:app", "header_fixture", "true")?;
-        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
         orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
         let snapshot = orchestrator.snapshot_cache.get(&key).expect("source-header snapshot");
         let state = snapshot.retained_execution_state().expect("source-header outputs");
         let outputs = state.artifact_forest.get("//:app").expect("app outputs").flatten();
@@ -20821,8 +20953,8 @@ local_repository(name = "flatbuffers", path = "real")
         assert!(orchestrator.register_system_stub(&mut graph, &target).is_err());
         let targets = vec!["//:consumer".to_string()];
         let semantics = semantics_with_define(root, "//:consumer", "source_fixture", "true")?;
-        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
         orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
         let snapshot = orchestrator.snapshot_cache.get(&key).expect("real source graph");
         let node = snapshot.graph.get(&target).expect("declared external target");
         assert_eq!(node.rule_instance.rule_type(), "cc_library");
@@ -21083,9 +21215,9 @@ int main() { printf("%d/%d\n", NATIVE_SCOPE, OPTIMIZED); return 0; }
             let semantics = semantics_with_define_and_environment(root, "//:app", "native_test", "true", &[
                 (rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV, encoded.as_str()),
             ])?;
-            let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
             executed_actions.lock().unwrap().clear();
-            orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics).await?;
+            orchestrator.build_with_dependencies_with_semantics(targets.clone(), semantics.clone()).await?;
+            let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, std::fs::canonicalize(root)?, targets.clone());
             let executed = std::mem::take(&mut *executed_actions.lock().unwrap());
             let compiles: Vec<_> = executed.iter().filter(|action| action.mnemonic == "CppCompile").collect();
             assert_eq!(compiles.len(), 1, "each changed configuration must execute its one real compile action: {executed:?}");
@@ -23869,11 +24001,11 @@ int main() { printf("%d\n", prebuilt() + edited()); return 0; }
         let orchestrator = BuildOrchestrator::with_workspace(workspace_root.to_path_buf());
         let targets = vec!["//:app".to_string()];
         let semantics = command_semantics(workspace_root, "//:app", "off")?;
-        let key = snapshot_key(&semantics, workspace_root, &targets)?;
 
         orchestrator
             .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
             .await?;
+        let key = snapshot_key(&semantics, workspace_root, &targets)?;
         let snapshot = orchestrator
             .snapshot_cache
             .get(&key)
@@ -24115,11 +24247,11 @@ int main() { printf("%d\n", leaf() + middle()); return 0; }
         let orchestrator = BuildOrchestrator::with_workspace(workspace_root.to_path_buf());
         let targets = vec!["//:final".to_string()];
         let semantics = command_semantics(workspace_root, "//:final", "off")?;
-        let key = snapshot_key(&semantics, workspace_root, &targets)?;
 
         orchestrator
             .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
             .await?;
+        let key = snapshot_key(&semantics, workspace_root, &targets)?;
         let snapshot = orchestrator
             .snapshot_cache
             .get(&key)
@@ -24396,11 +24528,11 @@ genrule(
         orchestrator.arm_watcher();
         let targets = vec!["//:generated".to_string()];
         let semantics = command_semantics(workspace_root, "//:generated", "auto")?;
-        let key = snapshot_key(&semantics, workspace_root, &targets)?;
 
         orchestrator
             .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
             .await?;
+        let key = snapshot_key(&semantics, workspace_root, &targets)?;
         let snapshot = orchestrator
             .snapshot_cache
             .get(&key)
@@ -24711,11 +24843,11 @@ genrule(
         orchestrator.arm_watcher();
         let targets = vec!["//:writer".to_string()];
         let semantics = command_semantics(workspace_root, "//:writer", "auto")?;
-        let key = snapshot_key(&semantics, workspace_root, &targets)?;
 
         orchestrator
             .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
             .await?;
+        let key = snapshot_key(&semantics, workspace_root, &targets)?;
         let snapshot = orchestrator
             .snapshot_cache
             .get(&key)

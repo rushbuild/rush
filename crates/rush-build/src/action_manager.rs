@@ -87,6 +87,158 @@ impl ActionCachePolicy {
 }
 
 impl RushActionManager {
+    /// Separate local diagnostic path: no lookup, CAS, virtual restoration,
+    /// thin-archive shortcut, output records or cache publication occurs here.
+    pub(crate) async fn execute_diagnostic_owned(
+        &self,
+        mut action: Action,
+        pending: Option<rush_rules::context::PendingCompileDeclaration>,
+        declared_id: rush_action::ids::DeclaredActionId,
+        target: rush_action::ids::TargetId,
+        declared_inputs: Vec<rush_action::ids::ArtifactId>,
+        declared_outputs: Vec<rush_action::ids::ArtifactId>,
+        mut environment: Vec<(String, String)>,
+        workspace: std::path::PathBuf,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+        scope: Box<dyn Send>,
+    ) -> Result<ActionResult> {
+        anyhow::ensure!(
+            cfg!(target_os = "linux"),
+            "owned diagnostic execution requires Linux"
+        );
+        anyhow::ensure!(
+            !*cancellation.borrow(),
+            "diagnostic execution cancelled before preparation"
+        );
+        crate::generated_cc_sharding::prepare(&mut action)?;
+        let transport = crate::compiler_discovery::prepare_diagnostic_transport(
+            &mut action,
+            pending.as_ref(),
+            &environment,
+            &workspace,
+        )?
+        .map(|(directory, pending)| (Arc::new(directory), pending));
+        for (key, value) in &action.env {
+            environment.retain(|(k, _)| k != key);
+            environment.push((key.clone(), value.clone()));
+        }
+        let paths = Self::output_paths(&action);
+        anyhow::ensure!(
+            !paths.is_empty(),
+            "diagnostic action has no declared outputs"
+        );
+        for input in &action.inputs {
+            let input = match input {
+                rush_action::Artifact::Source(path) => path,
+                rush_action::Artifact::Derived { output_path, .. } => output_path,
+            };
+            anyhow::ensure!(std::fs::metadata(input).is_ok_and(|meta|meta.is_file()),
+                "diagnostic execution requires a real regular input, without virtual/CAS restoration: {}",input.display());
+        }
+        // Output invalidation is not a virtual hit or certificate publication.
+        rush_action::virtual_artifacts::unregister(&paths);
+        for path in &paths {
+            anyhow::ensure!(
+                !action.inputs.iter().any(|input| match input {
+                    rush_action::Artifact::Source(input) => input == path,
+                    rush_action::Artifact::Derived { output_path, .. } => output_path == path,
+                }),
+                "diagnostic output aliases an input"
+            );
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let request = rush_exec::local_action_runner::ExecutionRequest {
+            declared_action_id: declared_id,
+            mnemonic: action.mnemonic.clone(),
+            resource_class: None,
+            owner_target: target,
+            command: rush_action::ids::MaterializedCommand {
+                executable: action.command.executable.clone(),
+                argv0: None,
+                argv: action.command.args.clone(),
+                env: environment,
+                working_dir: Some(
+                    action
+                        .command
+                        .working_dir
+                        .clone()
+                        .unwrap_or_else(|| workspace.clone()),
+                ),
+                env_policy: rush_action::ids::ActionEnvPolicy::ExplicitOnly,
+            },
+            declared_inputs,
+            declared_outputs,
+            timeout: Some(action.command.execution_info.timeout),
+            log_command_index: None,
+            remove_stale_archive_before_execute: false,
+            terminate_process_group_on_drop: true,
+            stdin_null: true,
+            signal_state: None,
+            file_creation_mask: None,
+            credentials: None,
+            isolation: None,
+        };
+        let permit = self
+            .resource_manager
+            .acquire(self.resource_request_for_action(&action))
+            .await?;
+        let (cleaned, cleanup) = tokio::sync::oneshot::channel();
+        let scope: Box<dyn Send> = Box::new(DiagnosticCleanupScope {
+            _owned: Box::new((
+                scope,
+                transport.as_ref().map(|(directory, _)| directory.clone()),
+            )),
+            cleaned: Some(cleaned),
+        });
+        let result = rush_exec::local_action_runner::DefaultLocalActionRunner::execute_owned(
+            request,
+            cancellation,
+            scope,
+        )
+        .await;
+        // This worker is not aborted by caller cancellation. If the runner
+        // cannot confirm cleanup it retains scope, hence this permit and the
+        // workspace lease also remain withheld instead of authorizing writers.
+        let _ = cleanup.await;
+        permit.release_async().await;
+        let result = result?;
+        if result.exit_code == 0 {
+            for path in &paths {
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(path).is_ok(),
+                    "diagnostic action did not create output {}",
+                    path.display()
+                );
+            }
+            if let Some((_, pending)) = &transport {
+                crate::compiler_discovery::read_diagnostic_depfile(pending)?;
+            }
+            #[cfg(test)]
+            crate::compiler_discovery::record_completed_diagnostic_process(
+                &workspace,
+                &action.mnemonic,
+                declared_id,
+            );
+        }
+        Ok(ActionResult {
+            action_id: action.id,
+            exit_code: result.exit_code,
+            stdout: result.stdout_tail,
+            stderr: result.stderr_tail,
+            outputs: action.outputs,
+            output_records: Vec::new(),
+            duration: result.duration,
+            cached: false,
+        })
+    }
+
     /// Create a new RushActionManager.
     pub fn new(
         cache: Arc<ActionCache>,
@@ -333,6 +485,14 @@ impl RushActionManager {
         result.outputs = action.outputs.clone();
         true
     }
+}
+
+struct DiagnosticCleanupScope {
+    _owned: Box<dyn Send>,
+    cleaned: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Drop for DiagnosticCleanupScope {
+    fn drop(&mut self) { if let Some(cleaned) = self.cleaned.take() { let _ = cleaned.send(()); } }
 }
 
 /// #1 roadmap P1 minimality instrumentation: when RUSH_ACTION_TRACE=<file> is

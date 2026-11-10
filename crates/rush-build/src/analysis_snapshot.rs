@@ -42,7 +42,7 @@ use rush_command_core::CommandSemantics;
 use rush_incremental::{DependencyManifest, Staleness};
 use rush_rules::{context::Toolchain, nested_set::NestedSet, providers::ProviderSet, Artifact};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -266,14 +266,18 @@ impl AnalysisKey {
         workspace_realpath: PathBuf,
         ordered_target_patterns: Vec<String>,
     ) -> Self {
-        AnalysisKey {
+        let mut key = AnalysisKey {
             workspace_realpath,
             output_base: semantics.output_base().to_vec(),
             command_kind: semantics.command().map(|s| s.to_string()),
             ordered_target_patterns,
             config_fingerprint: *semantics.config_fingerprint(),
             daemon_compat_fingerprint: daemon_compat_fingerprint(),
+        };
+        if let Ok(token) = crate::compiler_discovery::read_admission_token(&key.workspace_realpath) {
+            crate::compiler_discovery::qualify_analysis_key(&mut key, &token);
         }
+        key
     }
 
     /// A stable, cross-process content hash of this key, used as the on-disk
@@ -403,6 +407,8 @@ fn current_exe_identity() -> std::sync::Arc<[u8; 32]> {
 /// snapshot in `Arc` and share that — no graph deep-copy, the live Rust objects
 /// are retained as-is.
 pub struct AnalysisSnapshot {
+    /// Revocation token sampled before this analysis, never refreshed in place.
+    pub(crate) native_admission_token: [u8; 32],
     /// Reuse-admission identity.
     pub key: AnalysisKey,
     /// Cached stable hash of [`key`](Self::key), used by validation tokens.
@@ -496,6 +502,10 @@ pub struct ValidationToken {
 }
 
 impl AnalysisSnapshot {
+    pub(crate) fn admission_is_current(&self) -> bool {
+        crate::compiler_discovery::read_admission_token(&self.key.workspace_realpath)
+            .is_ok_and(|token| token == self.native_admission_token)
+    }
     /// Clone the current coherent post-build generation, if one exists.
     pub(crate) fn retained_execution_state(&self) -> Option<RetainedExecutionState> {
         let guard = self
@@ -746,7 +756,8 @@ impl SnapshotCache {
     /// Look up a snapshot by key, promoting it to most-recently-used.
     pub fn get(&self, key: &AnalysisKey) -> Option<Arc<AnalysisSnapshot>> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.get(key).cloned()
+        let snapshot = g.get(key).cloned()?;
+        if snapshot.admission_is_current() { Some(snapshot) } else { g.pop(key); None }
     }
 
     /// Insert (or replace) a snapshot under its key.
@@ -760,6 +771,15 @@ impl SnapshotCache {
     pub fn invalidate(&self, key: &AnalysisKey) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.pop(key);
+    }
+
+    /// Remove all local admissions sharing these outputs. Other processes and
+    /// held Arcs are revoked by the separately rotated workspace token.
+    pub(crate) fn invalidate_workspace(&self, canonical_workspace: &Path) {
+        let mut cache = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let keys: Vec<_> = cache.iter().filter(|(key, _)| key.workspace_realpath == canonical_workspace)
+            .map(|(key, _)| key.clone()).collect();
+        for key in keys { cache.pop(&key); }
     }
 }
 

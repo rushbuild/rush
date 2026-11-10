@@ -6777,8 +6777,29 @@ cc_library(
         output_mode: TestOutputMode,
         filter: Option<&str>,
     ) -> Result<TestResults> {
+        let owner = self.clone();
+        let filter = filter.map(str::to_owned);
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(async move {
+            owner.test_owned(request,output_mode,filter.as_deref()).await
+        })).await.map_err(|e|anyhow::anyhow!("owned native test failed: {e}"))?
+    }
+
+    async fn test_owned(
+        &self,
+        request: BuildRequest,
+        output_mode: TestOutputMode,
+        filter: Option<&str>,
+    ) -> Result<TestResults> {
         let command_lock = workspace_command_lock(&self.workspace_root);
         let _command_guard = command_lock.lock().await;
+        let test_semantics = rush_command_core::CommandSemantics::from_process();
+        anyhow::ensure!(crate::compiler_discovery::requested_compile_mode(&test_semantics)?
+            == rush_rules::context::NativeCompileMode::Literal,
+            "diagnostic compiler discovery is a build-only profile");
+        let _native_lease = crate::compiler_discovery::WorkspaceLease::acquire(&self.workspace_root,
+            rush_rules::context::NativeCompileMode::Literal)?;
+        _native_lease.token(false)?;
         use std::time::Instant;
         let test_start = Instant::now();
 
@@ -6954,25 +6975,9 @@ cc_library(
             });
         }
 
-        // Collect results
-        let mut results = TestResults::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(test_result)) => {
-                    // Emit test completed event
-                    events.emit(BuildEvent::TestCompleted {
-                        timestamp: BuildEventStream::timestamp(),
-                        test: test_result.label.clone(),
-                        passed: test_result.passed,
-                        duration_ms: test_result.duration.as_millis() as u64,
-                        exit_code: test_result.exit_code,
-                    });
-                    results.add(test_result);
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => anyhow::bail!("Test task panicked: {}", e),
-            }
-        }
+        // Keep the shared workspace lease until every started test finishes,
+        // including blocking children whose async waiter cannot cancel them.
+        let results = Self::collect_started_test_results(&mut join_set, &events).await?;
 
         // Emit build finished event
         let test_duration_ms = test_start.elapsed().as_millis() as u64;
@@ -7013,6 +7018,43 @@ cc_library(
         Ok(results)
     }
 
+    async fn collect_started_test_results(
+        join_set: &mut JoinSet<Result<TestResult>>,
+        events: &BuildEventStream,
+    ) -> Result<TestResults> {
+        let mut results = TestResults::new();
+        let mut first_error = None;
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(test_result)) => {
+                    // Emit test completed event
+                    events.emit(BuildEvent::TestCompleted {
+                        timestamp: BuildEventStream::timestamp(),
+                        test: test_result.label.clone(),
+                        passed: test_result.passed,
+                        duration_ms: test_result.duration.as_millis() as u64,
+                        exit_code: test_result.exit_code,
+                    });
+                    results.add(test_result);
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!("Test task panicked: {}", error));
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(results)
+    }
     /// Run a single test binary and capture results.
     async fn _run_test(
         &self,

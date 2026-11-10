@@ -1319,6 +1319,31 @@ fn analysis_declare_compile(
     argv: &[String],
 ) -> Option<rush_action::ids::DeclaredActionId> {
     use rush_action::ids::ArtifactKind;
+    if ctx.native_compile_mode() == crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+        let declaration = (|| -> Result<_> {
+            anyhow::ensure!(matches!(mnemonic, "CppCompile" | "CCompile") && outputs.len() == 1,
+                "diagnostic discovery requires a direct single-object C/C++ compile");
+            for provider in dep_providers {
+                if let Some(cc) = &provider.cc_info {
+                    for header in cc.compilation.headers.iter().chain(cc.compilation.textual_headers.iter()) {
+                        if !inputs.contains(&header) { inputs.push(header); }
+                    }
+                }
+            }
+            let source_id = inputs.iter().copied().find(|&id|
+                ctx.registry().artifact_path(id).as_os_str() == source.as_os_str())
+                .ok_or_else(|| anyhow!("diagnostic source has no exact declared input"))?;
+            let object = outputs[0];
+            let id = ctx.declare_incomplete_action(mnemonic, inputs, outputs,
+                "pending compiler input discovery")?;
+            ctx.record_pending_compile(id, source_id, object)?;
+            Ok(id)
+        })();
+        return match declaration {
+            Ok(id) => Some(id),
+            Err(error) => { ctx.fail_native_namespace_analysis(format!("{error:#}")); None }
+        };
+    }
     if let Some(cwd) = ctx.native_execution_root().map(Path::to_path_buf) {
         let mut admitted = inputs.clone();
         for provider in dep_providers {
@@ -1370,6 +1395,11 @@ async fn runtime_namespace_headers(
     argv: &[String],
     existing: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
+    if context.native_compile_mode() == crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+        // No guessed closure and no read-time certificate. The typed manager
+        // must wait for producers and run the actual compiler without reuse.
+        return Ok(Vec::new());
+    }
     let Some(cwd) = context.native_execution_root() else { return Ok(Vec::new()); };
     let layout = collect_sink_compile_header_inputs(context).await;
     if let Some(header) = layout.generated.first() {

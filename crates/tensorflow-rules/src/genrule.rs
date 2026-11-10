@@ -319,18 +319,35 @@ impl RuleInstance for GenruleInstance {
         println!("  Command: {}", expanded_cmd);
 
         // Execute the command
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&expanded_cmd)
-            .current_dir(context.native_execution_root().unwrap_or(&context.workspace_root))
-            .output()
-            .await?;
+        let (success, stderr) = if context.native_compile_mode()
+            == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            let inputs: Vec<_> = src_paths.iter().chain(tool_paths.values())
+                .map(|path| rush_action::Artifact::Source(path.clone())).collect();
+            let command = rush_action::Command { executable: std::path::PathBuf::from("sh"),
+                args: vec!["-c".into(),expanded_cmd.clone()],
+                working_dir: Some(context.native_execution_root().unwrap_or(&context.workspace_root).to_owned()),
+                execution_info: rush_action::ExecutionInfo::default() };
+            let env = std::collections::HashMap::new();
+            let id = rush_action::Action::compute_id(&inputs,&command,&env)?;
+            let result = context.execute_action(rush_action::Action { id,command,env,inputs,
+                outputs: out_paths.iter().cloned().map(rush_action::Artifact::Source).collect(),
+                mnemonic: "GenRule".into() }).await?;
+            (result.exit_code == 0, result.stderr)
+        } else {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&expanded_cmd)
+                .current_dir(context.native_execution_root().unwrap_or(&context.workspace_root))
+                .output()
+                .await?;
+            (output.status.success(),output.stderr)
+        };
 
-        if !output.status.success() {
+        if !success {
             return Err(anyhow!(
                 "Genrule command failed: {}\nstderr: {}",
                 expanded_cmd,
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stderr)
             ));
         }
 

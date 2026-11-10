@@ -12,10 +12,15 @@ use std::sync::Arc;
 pub trait ActionManager: Send + Sync {
     /// Execute an action
     async fn execute(&self, action: Action) -> Result<ActionResult>;
+
+    async fn execute_pending_compile(&self, _action: Action,
+        _pending: PendingCompileDeclaration) -> Result<ActionResult> {
+        anyhow::bail!("pending compiler discovery execution is unsupported by this manager")
+    }
 }
 
 /// Requested native compile policy. This in-memory value is not execution or
-/// cache authority. No current orchestrator selects the diagnostic variant.
+/// cache authority. Diagnostic selection is explicit per immutable request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NativeCompileMode {
     #[default]
@@ -181,6 +186,7 @@ pub struct PendingCompileDeclarations {
 }
 
 impl PendingCompileDeclarations {
+    pub fn iter(&self) -> impl Iterator<Item = &PendingCompileDeclaration> { self.records.values() }
     pub fn record(&mut self, declaration: PendingCompileDeclaration) -> Result<()> {
         if let Some(old) = self.records.get(&declaration.action) {
             anyhow::ensure!(
@@ -467,7 +473,7 @@ impl BuildContext {
         }
     }
 
-    /// Carry an explicit request only; this does not change any execution path.
+    /// Carry this build's explicit compile policy and pending declarations.
     pub fn with_native_compile_discovery(
         mut self,
         mode: NativeCompileMode,
@@ -985,6 +991,19 @@ impl BuildContext {
             );
         }
         if let Some(manager) = &self.action_manager {
+            if self.native_compile_mode == NativeCompileMode::UncachedDiagnosticV1
+                && matches!(action.mnemonic.as_str(), "CppCompile" | "CCompile") {
+                let paths: Vec<_> = action.outputs.iter().map(|out| match out {
+                    rush_action::Artifact::Source(path) => path.as_path(),
+                    rush_action::Artifact::Derived { output_path, .. } => output_path.as_path(),
+                }).collect();
+                let pending: Vec<_> = self.pending_compile_declarations.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("diagnostic compile has no pending declaration table"))?
+                    .iter().filter(|record| paths.iter().any(|path|
+                        path.as_os_str() == record.object_path().as_os_str())).collect();
+                anyhow::ensure!(pending.len() == 1, "diagnostic compile needs exactly one matching pending declaration");
+                return manager.execute_pending_compile(action, pending[0].clone()).await;
+            }
             manager.execute(action).await
         } else {
             anyhow::bail!("No ActionManager configured in BuildContext")

@@ -208,8 +208,8 @@ impl<'a> AnalysisContext<'a> {
         }
     }
 
-    /// Attach explicit, inactive discovery metadata. Existing namespace proof
-    /// and fatal-error handling are unchanged; this builder bypasses nothing.
+    /// Attach explicit per-command discovery metadata. Merely carrying the
+    /// policy does not clear or bypass an existing fatal namespace error.
     pub fn with_native_compile_discovery(
         mut self,
         mode: crate::context::NativeCompileMode,
@@ -225,7 +225,7 @@ impl<'a> AnalysisContext<'a> {
     }
 
     /// Record an already-declared incomplete compile, without making it ready
-    /// or schedulable. No current rule invokes this inactive plumbing.
+    /// or schedulable. The diagnostic manager owns later execution.
     pub fn record_pending_compile(
         &mut self,
         action: rush_action::ids::DeclaredActionId,

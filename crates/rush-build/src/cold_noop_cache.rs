@@ -144,6 +144,7 @@ pub fn persist(
     manifest: &DependencyManifest,
     ledger: &FreshnessLedger,
 ) {
+    if !native_key_is_current(key) { return; }
     // Never persist a useless certificate: an empty ledger always verifies as a
     // MISS (see FreshnessLedger::verify), so it could never serve a cold no-op.
     if ledger.is_empty() {
@@ -239,6 +240,7 @@ pub struct LoadedCertificate {
 /// analysis. The returned manifest/ledger must STILL be validated against the
 /// live filesystem by the caller before a no-op is served.
 pub fn load(workspace_root: &Path, key: &AnalysisKey) -> Option<LoadedCertificate> {
+    if !native_key_is_current(key) { return None; }
     let path = certificate_path(workspace_root, key);
     let bytes = std::fs::read(&path).ok()?;
     // Reject older layouts before decoding the changed dependency payload.
@@ -278,6 +280,16 @@ pub fn load(workspace_root: &Path, key: &AnalysisKey) -> Option<LoadedCertificat
     })
 }
 
+/// No deletion or shared-cache traversal is needed: rotating a workspace's
+/// token makes every older certificate key unreachable. Token loss refuses.
+fn native_key_is_current(key: &AnalysisKey) -> bool {
+    let Ok(token) = crate::compiler_discovery::read_admission_token(&key.workspace_realpath) else { return false; };
+    let mut expected = key.clone();
+    expected.daemon_compat_fingerprint = crate::analysis_snapshot::daemon_compat_fingerprint();
+    crate::compiler_discovery::qualify_analysis_key(&mut expected, &token);
+    expected.daemon_compat_fingerprint == key.daemon_compat_fingerprint
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,14 +300,19 @@ mod tests {
     /// `CommandSemantics`), so the test does not depend on the private
     /// `CommandSemantics::from_parts` constructor.
     fn key_for(ws: &Path, patterns: &[&str]) -> AnalysisKey {
-        AnalysisKey {
+        let lease = crate::compiler_discovery::WorkspaceLease::acquire(ws,
+            rush_rules::context::NativeCompileMode::Literal).unwrap();
+        let token = lease.token(false).unwrap();
+        let mut key = AnalysisKey {
             workspace_realpath: ws.to_path_buf(),
             output_base: ws.as_os_str().as_encoded_bytes().to_vec(),
             command_kind: Some("build".to_string()),
             ordered_target_patterns: patterns.iter().map(|s| s.to_string()).collect(),
             config_fingerprint: [7u8; 32],
             daemon_compat_fingerprint: daemon_compat_fingerprint(),
-        }
+        };
+        crate::compiler_discovery::qualify_analysis_key(&mut key, &token);
+        key
     }
 
     #[test]
