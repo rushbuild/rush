@@ -6598,15 +6598,19 @@ impl BuildOrchestrator {
             for label in &build_order {
                 let node = graph.get(label).ok_or_else(||anyhow!("diagnostic node missing: {label}"))?;
                 let kind = node.rule_instance.rule_type();
-                let writer = matches!(kind,"cc_library"|"cc_binary"|"genrule");
+                let writer = matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
                 anyhow::ensure!(writer || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
                     |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
                     "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
                 let target = *target_id_by_label.get(&label.to_string()).ok_or_else(||anyhow!("diagnostic target identity missing: {label}"))?;
                 for (id,action) in registry.declared_actions().filter(|(_,action)|action.owner_target == target) {
                     let mnemonic = registry.strings().str(action.mnemonic);
-                    anyhow::ensure!(writer && (if kind == "genrule" { mnemonic == "GenRule" } else {
-                        matches!(mnemonic,"CCompile"|"CppCompile"|"CcArchive"|"CppArchive"|"CcLink"|"CppLink") }),
+                    let supported = match kind {
+                        "genrule" => mnemonic == "GenRule",
+                        "tf_proto_library" => matches!(mnemonic,"ProtocCompile"|"CppCompile"|"CcArchive"),
+                        _ => matches!(mnemonic,"CCompile"|"CppCompile"|"CcArchive"|"CppArchive"|"CcLink"|"CppLink"),
+                    };
+                    anyhow::ensure!(writer && supported,
                         "uncached compiler diagnostic does not audit action {mnemonic} of {kind} at {label}");
                     if matches!(mnemonic,"CCompile"|"CppCompile") {
                         anyhow::ensure!(pending_compile_declarations.get(id).is_some(),
