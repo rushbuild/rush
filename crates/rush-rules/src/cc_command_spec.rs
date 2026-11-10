@@ -197,8 +197,8 @@ pub struct CcCompileCommandSpec {
     pub src_path: PathBuf,
     /// Object output path (absolute).
     pub obj_path: PathBuf,
-    /// Rule-side `copts` attribute; filtered for C-vs-C++ at
-    /// argv-build time.
+    /// Ordered rule-side `copts`, after automatic language-specific flags.
+    /// Explicit language and standard choices are passed to the compiler.
     pub copts: Vec<String>,
     /// `toolchain.cxxflags` — applied for non-C sources.
     pub cxxflags: Vec<String>,
@@ -438,7 +438,14 @@ impl CcCompileCommandSpec {
                 argv.push(format!("-I{}", p.display()));
             }
         }
-        // Filter copts by source language (Bazel idiom).
+        // Defaults precede explicit rule options. In particular, a .c input
+        // may deliberately use -x c++ and -std=c++11; its filename must not
+        // erase that standard or let a later default override it.
+        if self.is_c_source {
+            argv.extend(self.cflags.iter().cloned());
+        } else {
+            argv.extend(self.cxxflags.iter().cloned());
+        }
         for opt in &self.copts {
             // rush does not model Bazel make-variables; an unexpanded
             // `$(VAR)` copt (e.g. TF's `$(STACK_FRAME_UNLIMITED)`) would
@@ -448,21 +455,7 @@ impl CcCompileCommandSpec {
             if opt.contains("$(") {
                 continue;
             }
-            if self.is_c_source && opt.starts_with("-std=c++") {
-                continue;
-            }
-            if !self.is_c_source
-                && opt.starts_with("-std=c")
-                && !opt.starts_with("-std=c++")
-            {
-                continue;
-            }
             argv.push(opt.clone());
-        }
-        if self.is_c_source {
-            argv.extend(self.cflags.iter().cloned());
-        } else {
-            argv.extend(self.cxxflags.iter().cloned());
         }
         // Transitive dep defines first (Bazel postorder), then own
         // direct defines minus exact dups — via the shared merge so
@@ -874,30 +867,113 @@ mod tests {
     }
 
     #[test]
-    fn cc_compile_spec_copts_filtered_by_language() {
+    fn cc_compile_spec_preserves_explicit_standard_and_language_options() {
         let mut spec_c = compile_spec_min(true);
         spec_c.copts = vec![
-            "-std=c++17".to_string(), // C++-only → DROP for C
-            "-std=c11".to_string(),   // C-only → KEEP
-            "-Wall".to_string(),      // language-neutral → KEEP
+            "-x".to_string(),
+            "c++".to_string(),
+            "-std=c++11".to_string(),
+            "-Wall".to_string(),
         ];
+        spec_c.cflags = vec!["-std=c11".to_string()];
+        spec_c.cxxflags = vec!["-DWRONG_AUTOMATIC_LANGUAGE".to_string()];
         let n = spec_c.to_normalized_command_spec();
-        assert!(!n.argv.iter().any(|a| a == "-std=c++17"));
-        assert!(n.argv.iter().any(|a| a == "-std=c11"));
-        assert!(n.argv.iter().any(|a| a == "-Wall"));
+        assert!(n
+            .argv
+            .windows(5)
+            .any(|w| w == ["-std=c11", "-x", "c++", "-std=c++11", "-Wall"]));
+        assert!(!n.argv.iter().any(|a| a == "-DWRONG_AUTOMATIC_LANGUAGE"));
 
         let mut spec_cpp = compile_spec_min(false);
         spec_cpp.copts = vec![
-            "-std=c++17".to_string(), // C++-only → KEEP
-            "-std=c11".to_string(),   // C-only → DROP for C++
+            "-xc".to_string(),
+            "-std=c11".to_string(),
+            "-include".to_string(),
+            "-std=c++11".to_string(), // an option operand, not a standard
         ];
+        spec_cpp.cxxflags = vec!["-std=c++17".to_string()];
         let n = spec_cpp.to_normalized_command_spec();
-        // Note: the unconditional -std=c++17 added by the spec
-        // appears once; the copts -std=c++17 also passes through
-        // unchanged (we don't dedup matching flags). Two
-        // -std=c++17 entries is the legacy behavior.
-        assert!(n.argv.iter().filter(|a| a == &&"-std=c++17".to_string()).count() >= 1);
-        assert!(!n.argv.iter().any(|a| a == "-std=c11"));
+        assert!(n
+            .argv
+            .windows(5)
+            .any(|w| w == ["-std=c++17", "-xc", "-std=c11", "-include", "-std=c++11"]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cc_compile_spec_real_compiler_honors_explicit_language_and_standard() {
+        let temp = tempfile::tempdir().unwrap();
+        let toolchain = crate::context::Toolchain::default();
+        for (name, copts, expected_cpp) in [
+            ("joined.c", vec!["-xc++", "-std=c++11"], Some(201103)),
+            ("separated.c", vec!["-x", "c++", "-std=c++11"], Some(201103)),
+            ("explicit.cc", vec!["-std=c++11"], Some(201103)),
+            ("default.c", vec![], None),
+            ("default.cc", vec![], Some(201703)),
+        ] {
+            let is_c = name.ends_with(".c");
+            let src = temp.path().join(name);
+            let obj = temp.path().join(format!("{name}.o"));
+            let language_check = expected_cpp.map(|version| format!(
+                "#if !defined(__cplusplus) || __cplusplus != {version}L\n#error wrong C++ standard\n#endif\n"
+            )).unwrap_or_else(|| "#ifdef __cplusplus\n#error expected C\n#endif\n".into());
+            std::fs::write(&src, format!("{language_check}\n#if defined(RUSH_AUTO_C) != {} || defined(RUSH_AUTO_CPP) != {}\n#error wrong automatic flags\n#endif\nint rush_option_value(void) {{ return 42; }}\n", usize::from(is_c), usize::from(!is_c))).unwrap();
+            let mut spec = compile_spec_min(is_c);
+            spec.executable = if is_c {
+                toolchain.cc.clone()
+            } else {
+                toolchain.cxx.clone()
+            };
+            spec.include_layout = IncludeLayout::Standalone;
+            spec.src_path = src;
+            spec.obj_path = obj.clone();
+            spec.cflags = vec!["-std=c11".into(), "-DRUSH_AUTO_C=1".into()];
+            spec.cxxflags = vec!["-std=c++17".into(), "-DRUSH_AUTO_CPP=1".into()];
+            spec.copts = copts.iter().map(|value| (*value).to_owned()).collect();
+            let command = spec.to_normalized_command_spec();
+            let result = std::process::Command::new(&command.executable)
+                .args(&command.argv)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{name}: {:?}: {}",
+                command.argv,
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(obj.metadata().unwrap().len() > 0);
+        }
+
+        // Do not erase an incompatible explicit standard to make the command
+        // succeed. GCC may warn while Clang rejects it: preserve the selected
+        // compiler's own result rather than inventing language compatibility.
+        let src = temp.path().join("incompatible.c");
+        std::fs::write(&src, "int rush_option_value(void) { return 42; }\n").unwrap();
+        let direct = std::process::Command::new(&toolchain.cc)
+            .args(["-c", "-std=c++11"])
+            .arg(&src)
+            .arg("-o")
+            .arg(temp.path().join("direct.o"))
+            .output()
+            .unwrap();
+        let mut spec = compile_spec_min(true);
+        spec.executable = toolchain.cc;
+        spec.include_layout = IncludeLayout::Standalone;
+        spec.src_path = src;
+        spec.obj_path = temp.path().join("incompatible.o");
+        spec.copts = vec!["-std=c++11".into()];
+        let command = spec.to_normalized_command_spec();
+        assert!(command.argv.contains(&"-std=c++11".into()));
+        let actual = std::process::Command::new(&command.executable)
+            .args(&command.argv)
+            .output()
+            .unwrap();
+        assert_eq!(
+            actual.status.code(),
+            direct.status.code(),
+            "compiler refusal must be preserved: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
     }
 
     // Phase 5.C.4 commit 20: IncludeLayout variants exercise.

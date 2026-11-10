@@ -2266,7 +2266,13 @@ impl RuleInstance for CcLibraryInstance {
                             }
                         }
                     }
-                    // Filter copts for C-vs-C++ language compatibility.
+                    // Automatic language flags precede explicit rule options.
+                    // Preserve -x and -std options regardless of filename.
+                    if !is_c_source {
+                        argv_strs.extend(cxxflags.iter().cloned());
+                    } else {
+                        argv_strs.extend(cflags.iter().cloned());
+                    }
                     for opt in &self.copts {
                         // Drop unexpanded `$(VAR)` make-variable copts (e.g.
                         // TF's `$(STACK_FRAME_UNLIMITED)`) — rush doesn't model
@@ -2274,15 +2280,6 @@ impl RuleInstance for CcLibraryInstance {
                         // missing input file. Empty expansion is the safe
                         // degradation (these are warning/frame-size controls).
                         if opt.contains("$(") {
-                            continue;
-                        }
-                        if is_c_source && opt.starts_with("-std=c++") {
-                            continue;
-                        }
-                        if !is_c_source
-                            && opt.starts_with("-std=c")
-                            && !opt.starts_with("-std=c++")
-                        {
                             continue;
                         }
                         argv_strs.push(opt.clone());
@@ -2340,11 +2337,6 @@ impl RuleInstance for CcLibraryInstance {
                         append_cuda_compile_flags(&mut argv_strs, Path::new(src));
                     if is_cuda_source {
                         normalize_cuda_compile_flags(&mut argv_strs);
-                    }
-                    if !is_c_source {
-                        argv_strs.extend(cxxflags.iter().cloned());
-                    } else {
-                        argv_strs.extend(cflags.iter().cloned());
                     }
                     for d in crate::providers::merged_compile_defines(&dep_defines, &self.defines) {
                         argv_strs.push(format!("-D{}", d));
@@ -3030,26 +3022,9 @@ impl CcLibraryInstance {
             }
         }
 
-        // Add user-specified compiler options. Filter out C++-only flags
-        // when compiling C, and vice-versa, because Bazel-style BUILD
-        // rules often set `copts` for the primary language of the
-        // target but include a single .c helper file alongside.
-        for opt in &self.copts {
-            // Drop unexpanded `$(VAR)` make-variable copts (see other copts
-            // loops) so a literal $(...) never reaches g++.
-            if opt.contains("$(") {
-                continue;
-            }
-            if is_c_source && opt.starts_with("-std=c++") {
-                continue;
-            }
-            if !is_c_source && opt.starts_with("-std=c") && !opt.starts_with("-std=c++") {
-                continue;
-            }
-            args.push(opt.clone());
-        }
-
-        // Add toolchain flags
+        // Defaults precede explicit rule options. A rule can intentionally
+        // select C++ for a .c input; let its ordered -x/-std choices reach
+        // the compiler rather than inferring compatibility from the suffix.
         if !is_c_source {
             for flag in &context.toolchain.cxxflags {
                 args.push(flag.clone());
@@ -3058,6 +3033,14 @@ impl CcLibraryInstance {
             for flag in &context.toolchain.cflags {
                 args.push(flag.clone());
             }
+        }
+        for opt in &self.copts {
+            // Drop unexpanded `$(VAR)` make-variable copts (see other copts
+            // loops) so a literal $(...) never reaches g++.
+            if opt.contains("$(") {
+                continue;
+            }
+            args.push(opt.clone());
         }
 
         // Add defines: transitive dep defines (Bazel `defines` is
@@ -5061,6 +5044,11 @@ impl RuleInstance for CcBinaryInstance {
                             }
                         }
                     }
+                    if !is_c_source {
+                        argv_strs.extend(cxxflags.iter().cloned());
+                    } else {
+                        argv_strs.extend(cflags.iter().cloned());
+                    }
                     for opt in &self.copts {
                         // Drop unexpanded `$(VAR)` make-variable copts (e.g.
                         // TF's `$(STACK_FRAME_UNLIMITED)`) — rush doesn't model
@@ -5068,15 +5056,6 @@ impl RuleInstance for CcBinaryInstance {
                         // missing input file. Empty expansion is the safe
                         // degradation (these are warning/frame-size controls).
                         if opt.contains("$(") {
-                            continue;
-                        }
-                        if is_c_source && opt.starts_with("-std=c++") {
-                            continue;
-                        }
-                        if !is_c_source
-                            && opt.starts_with("-std=c")
-                            && !opt.starts_with("-std=c++")
-                        {
                             continue;
                         }
                         argv_strs.push(opt.clone());
@@ -5134,11 +5113,6 @@ impl RuleInstance for CcBinaryInstance {
                         append_cuda_compile_flags(&mut argv_strs, Path::new(src));
                     if is_cuda_source {
                         normalize_cuda_compile_flags(&mut argv_strs);
-                    }
-                    if !is_c_source {
-                        argv_strs.extend(cxxflags.iter().cloned());
-                    } else {
-                        argv_strs.extend(cflags.iter().cloned());
                     }
                     for d in crate::providers::merged_compile_defines(&dep_defines, &self.defines) {
                         argv_strs.push(format!("-D{}", d));
@@ -5868,14 +5842,12 @@ impl CcBinaryInstance {
             args.push("-fno-rtti".to_string());
         }
 
-        // Add user-specified compiler options
-        for opt in &self.copts {
-            args.push(opt.clone());
-        }
-
-        // Add toolchain flags
+        // Toolchain defaults precede the rule's explicit options.
         for flag in &context.toolchain.cxxflags {
             args.push(flag.clone());
+        }
+        for opt in &self.copts {
+            args.push(opt.clone());
         }
 
         // Add defines: transitive dep defines (Bazel `defines` is
@@ -6344,6 +6316,212 @@ mod cc_binary_response_tests {
     use rush_action::ActionResult;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn library_with_compile_options(source: &str, copts: Vec<String>) -> CcLibraryInstance {
+        CcLibraryInstance {
+            name: "options".into(),
+            srcs: vec![source.into()],
+            hdrs: Vec::new(),
+            deps: Vec::new(),
+            copts,
+            linkopts: Vec::new(),
+            includes: Vec::new(),
+            strip_include_prefix: None,
+            include_prefix: None,
+            defines: Vec::new(),
+            alwayslink: false,
+            data: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_compile_options_preserve_explicit_language_and_standard() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let mut toolchain = Toolchain::default();
+        toolchain.cflags = vec!["-std=c11".into(), "-DRUSH_AUTO_C=1".into()];
+        toolchain.cxxflags = vec!["-std=c++17".into(), "-DRUSH_AUTO_CPP=1".into()];
+        let manager = Arc::new(RecordingExecutingActionManager::default());
+        let context = BuildContext::new(workspace.clone(), output.clone())
+            .with_toolchain(toolchain)
+            .with_action_manager(manager.clone());
+        for (name, copts, expected_cpp) in [
+            ("joined.c", vec!["-xc++", "-std=c++11"], Some(201103)),
+            ("separated.c", vec!["-x", "c++", "-std=c++11"], Some(201103)),
+            ("explicit.cc", vec!["-std=c++11"], Some(201103)),
+            ("default.c", vec![], None),
+            ("default.cc", vec![], Some(201703)),
+        ] {
+            let src = workspace.join(name);
+            let is_c = name.ends_with(".c");
+            let language_check = expected_cpp.map(|version| format!(
+                "#if !defined(__cplusplus) || __cplusplus != {version}L\n#error wrong C++ standard\n#endif\n"
+            )).unwrap_or_else(|| "#ifdef __cplusplus\n#error expected C\n#endif\n".into());
+            std::fs::write(&src, format!("{language_check}\n#if defined(RUSH_AUTO_C) != {} || defined(RUSH_AUTO_CPP) != {}\n#error wrong automatic flags\n#endif\nint rush_option_value(void) {{ return 42; }}\n", usize::from(is_c), usize::from(!is_c))).unwrap();
+            let copts: Vec<String> = copts.iter().map(|value| (*value).to_owned()).collect();
+            let library = library_with_compile_options(name, copts.clone());
+            let object = output.join(format!("library-{name}.o"));
+            library
+                .compile_source(&context, &src, &object, &[])
+                .await
+                .unwrap();
+            assert!(object.metadata().unwrap().len() > 0);
+            let test = CcTestInstance {
+                name: "options_test".into(),
+                srcs: vec![name.into()],
+                deps: Vec::new(),
+                copts: copts.clone(),
+                linkopts: Vec::new(),
+                defines: Vec::new(),
+                data: Vec::new(),
+            };
+            let object = output.join(format!("test-{name}.o"));
+            test.compile_source(&context, &src, &object, &[])
+                .await
+                .unwrap();
+            assert!(object.metadata().unwrap().len() > 0);
+            // The binary fallback already selects its C++ driver; cover its
+            // explicit C++ standard ordering without changing that routing.
+            if !is_c {
+                let binary = CcBinaryInstance {
+                    header_inputs_cache: Default::default(),
+                    name: "options_binary".into(),
+                    srcs: vec![name.into()],
+                    deps: Vec::new(),
+                    copts: copts.clone(),
+                    linkopts: Vec::new(),
+                    linkshared: false,
+                    defines: Vec::new(),
+                    data: Vec::new(),
+                };
+                let object = output.join(format!("binary-{name}.o"));
+                binary
+                    .compile_source(&context, &src, &object, &[], &[])
+                    .await
+                    .unwrap();
+                assert!(object.metadata().unwrap().len() > 0);
+            }
+            if !copts.is_empty() {
+                let actions = manager.actions.lock().unwrap();
+                for action in actions.iter().filter(|action| {
+                    action.inputs.iter().any(|input| {
+                        matches!(input,
+                    ActionArtifact::Source(path) if path == &src)
+                    })
+                }) {
+                    assert!(
+                        action
+                            .command
+                            .args
+                            .windows(copts.len())
+                            .any(|window| window == copts.as_slice()),
+                        "explicit option boundaries/order lost: {:?}",
+                        action.command.args
+                    );
+                    assert_eq!(
+                        action
+                            .command
+                            .args
+                            .iter()
+                            .rev()
+                            .find(|arg| arg.starts_with("-std="))
+                            .map(String::as_str),
+                        Some("-std=c++11")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_and_legacy_specs_agree_on_explicit_language_and_standard() {
+        use rush_action::command_spec::NormalizedCommandSpec;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let output = temp.path().join("output");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for (source, options) in [
+            ("override.c", vec!["-x", "c++", "-std=c++11"]),
+            ("override.cc", vec!["-std=c++11"]),
+        ] {
+            std::fs::write(workspace.join(source), "int value;\n").unwrap();
+            let mut toolchain = Toolchain::default();
+            toolchain.cflags = vec!["-std=c11".into()];
+            toolchain.cxxflags = vec!["-std=c++17".into()];
+            let copts: Vec<_> = options.into_iter().map(str::to_owned).collect();
+            let library = library_with_compile_options(source, copts.clone());
+            let binary = CcBinaryInstance {
+                header_inputs_cache: Default::default(),
+                name: "options".into(),
+                srcs: vec![source.into()],
+                deps: Vec::new(),
+                copts,
+                linkopts: Vec::new(),
+                linkshared: true,
+                defines: Vec::new(),
+                data: Vec::new(),
+            };
+            for rule in [&library as &dyn RuleInstance, &binary as &dyn RuleInstance] {
+                let mut registry = ArtifactRegistry::new();
+                let resolver = StubIncludeResolver::new(workspace.clone());
+                let extra = Vec::new();
+                {
+                    let mut analysis = AnalysisContext::new(
+                        TargetId(1),
+                        ConfigId::DEFAULT,
+                        "",
+                        None,
+                        &output,
+                        &mut registry,
+                        &resolver,
+                        &toolchain,
+                        &workspace,
+                        &extra,
+                    );
+                    let _ = rule.analyze(&mut analysis, &[]);
+                }
+                let scheduler: Vec<_> = registry
+                    .declared_actions()
+                    .filter_map(|(id, _)| {
+                        NormalizedCommandSpec::from_registry_action(&registry, id)
+                    })
+                    .filter(|spec| matches!(spec.mnemonic.as_str(), "CCompile" | "CppCompile"))
+                    .collect();
+                assert_eq!(
+                    scheduler.len(),
+                    1,
+                    "the source must have a real scheduler compile action"
+                );
+                let context = BuildContext::new(workspace.clone(), output.clone())
+                    .with_toolchain(toolchain.clone())
+                    .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)));
+                let legacy: Vec<_> = rule
+                    .build_legacy_command_specs(&context)
+                    .await
+                    .into_iter()
+                    .map(|(_, spec)| spec)
+                    .filter(|spec| matches!(spec.mnemonic.as_str(), "CCompile" | "CppCompile"))
+                    .collect();
+                assert_eq!(
+                    scheduler, legacy,
+                    "scheduler and legacy standard precedence must match for {source}"
+                );
+                assert_eq!(
+                    scheduler[0]
+                        .argv
+                        .iter()
+                        .rev()
+                        .find(|arg| arg.starts_with("-std="))
+                        .map(String::as_str),
+                    Some("-std=c++11")
+                );
+            }
+        }
+    }
 
     #[derive(Default)]
     struct CapturingActionManager {
@@ -9245,20 +9423,6 @@ impl CcTestInstance {
                 }
             }
         }
-        for opt in &self.copts {
-            // Drop unexpanded `$(VAR)` make-variable copts (see other copts
-            // loops) so a literal $(...) never reaches g++.
-            if opt.contains("$(") {
-                continue;
-            }
-            if is_c_source && opt.starts_with("-std=c++") {
-                continue;
-            }
-            if !is_c_source && opt.starts_with("-std=c") && !opt.starts_with("-std=c++") {
-                continue;
-            }
-            args.push(opt.clone());
-        }
         if !is_c_source {
             for flag in &context.toolchain.cxxflags {
                 args.push(flag.clone());
@@ -9267,6 +9431,14 @@ impl CcTestInstance {
             for flag in &context.toolchain.cflags {
                 args.push(flag.clone());
             }
+        }
+        for opt in &self.copts {
+            // Drop unexpanded `$(VAR)` make-variable copts (see other copts
+            // loops) so a literal $(...) never reaches g++.
+            if opt.contains("$(") {
+                continue;
+            }
+            args.push(opt.clone());
         }
         // Transitive dep defines (Bazel `defines` is transitive via CcInfo)
         // before own direct defines — same merge as analyze()/PASS-B.
