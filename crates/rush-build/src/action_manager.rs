@@ -110,7 +110,10 @@ impl RushActionManager {
             !*cancellation.borrow(),
             "diagnostic execution cancelled before preparation"
         );
-        crate::generated_cc_sharding::prepare(&mut action)?;
+        // Diagnostic discovery admits the original direct translation unit,
+        // not synthetic source shards or a shell command. Keep driver selection
+        // before transport; ordinary native preparation still owns sharding.
+        crate::generated_cc_sharding::prepare_compiler_overrides(&mut action)?;
         let transport = crate::compiler_discovery::prepare_diagnostic_transport(
             &mut action,
             pending.as_ref(),
@@ -1409,5 +1412,376 @@ D::D() {}
             .unwrap();
         assert!(result.cached);
         assert_eq!(second_strategy.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod diagnostic_direct_translation_unit_tests {
+    use super::*;
+    use rush_action::ids::{ArtifactKind, ArtifactRegistry, ConfigId, DeclaredActionId, TargetId};
+    use rush_action::{Artifact, Command, ExecutionInfo};
+    use rush_rules::analysis_context::{AnalysisContext, StubIncludeResolver};
+    use rush_rules::context::{PendingCompileDeclaration, Toolchain};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    fn selected_driver(source: &Path) -> PathBuf {
+        rush_rules::rules_cc::execution_native_cxx_overrides()
+            .for_source(source)
+            .unwrap_or_else(|| PathBuf::from("g++"))
+    }
+    fn compile(source: &Path, object: &Path, inputs: Vec<Artifact>, root: &Path) -> Result<Action> {
+        let command = rush_action::Command {
+            executable: selected_driver(source),
+            args: vec![
+                "-c".into(),
+                "-std=c++17".into(),
+                "-O2".into(),
+                source.display().to_string(),
+                "-o".into(),
+                object.display().to_string(),
+            ],
+            working_dir: Some(root.to_owned()),
+            execution_info: rush_action::ExecutionInfo::default(),
+        };
+        let env = HashMap::new();
+        Ok(Action {
+            id: Action::compute_id(&inputs, &command, &env)?,
+            command,
+            env,
+            inputs,
+            outputs: vec![Artifact::Source(object.to_owned())],
+            mnemonic: "CppCompile".into(),
+        })
+    }
+    fn declare_compile(
+        registry: &mut ArtifactRegistry,
+        root: &Path,
+        source: &Path,
+        header: Option<&Path>,
+        object: &Path,
+        target: TargetId,
+    ) -> Result<PendingCompileDeclaration> {
+        let resolver = StubIncludeResolver::new(root.to_owned());
+        let toolchain = Toolchain::default();
+        let mut ctx = AnalysisContext::new(
+            target,
+            ConfigId::DEFAULT,
+            "",
+            None,
+            root,
+            registry,
+            &resolver,
+            &toolchain,
+            root,
+            &[],
+        );
+        let source = ctx.register_source_artifact(source, ArtifactKind::Source);
+        let mut inputs = vec![source];
+        if let Some(header) = header {
+            inputs.push(ctx.register_source_artifact(header, ArtifactKind::Source));
+        }
+        let object = ctx.register_generated_artifact(object, ArtifactKind::Object, None);
+        let id = ctx.declare_incomplete_action(
+            "CppCompile",
+            inputs,
+            vec![object],
+            "actual diagnostic fixture needs compiler discovery",
+        )?;
+        PendingCompileDeclaration::from_registry(
+            ctx.registry(),
+            id,
+            target,
+            ConfigId::DEFAULT,
+            source,
+            object,
+        )
+    }
+    async fn owned(
+        manager: &RushActionManager,
+        registry: &ArtifactRegistry,
+        id: DeclaredActionId,
+        target: TargetId,
+        action: Action,
+        pending: Option<PendingCompileDeclaration>,
+        root: &Path,
+        lease: &Arc<crate::compiler_discovery::WorkspaceLease>,
+    ) -> Result<ActionResult> {
+        let declaration = registry.declared_action(id);
+        let (_cancel, receiver) = tokio::sync::watch::channel(false);
+        manager
+            .execute_diagnostic_owned(
+                action,
+                pending,
+                id,
+                target,
+                declaration.inputs.to_vec(),
+                declaration.outputs.to_vec(),
+                vec![
+                    (
+                        "PATH".into(),
+                        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+                    ),
+                    ("LANG".into(), "C.UTF-8".into()),
+                ],
+                root.to_owned(),
+                receiver,
+                Box::new(lease.clone()),
+            )
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_diagnostic_compiles_original_batch_shape_and_relinks_header_changes(
+    ) -> Result<()> {
+        let temporary = tempfile::TempDir::new()?;
+        let root = temporary.path().canonicalize()?;
+        let source = root.join("tensorflow/core/util/batch_util.cc");
+        let header = source.parent().unwrap().join("value.h");
+        std::fs::create_dir_all(source.parent().unwrap())?;
+        // Valid minimal C++ matching only the legacy sharder recognition/order.
+        // It is not a copy or simulation of TensorFlow batch algorithms.
+        let original = r#"#include "value.h"
+namespace tensorflow {
+namespace batch_util {
+using Status = int;
+int stable() { return VALUE; }
+// The following five functions are copied
+int copied_helper() { return 0; }
+template <typename T, int NDIMS>
+Status rank_helper() { return NDIMS; }
+Status CopyElementToLargerSlice(
+) { return stable(); }
+extern "C" int actual_value() { return CopyElementToLargerSlice(); }
+}  // namespace batch_util
+}  // namespace tensorflow
+"#;
+        std::fs::write(&source, original)?;
+        std::fs::write(&header, "#define VALUE 42\n")?;
+        let direct = root.join("direct");
+        std::fs::create_dir_all(&direct)?;
+        let object = direct.join("batch.o");
+        let main_source = root.join("main.cc");
+        let main_object = direct.join("main.o");
+        let executable = direct.join("program");
+        std::fs::write(
+            &main_source,
+            "extern \"C\" int actual_value(); int main(){return actual_value();}\n",
+        )?;
+        let mut registry = ArtifactRegistry::new();
+        let pending = declare_compile(
+            &mut registry,
+            &root,
+            &source,
+            Some(&header),
+            &object,
+            TargetId(1),
+        )?;
+        let main_pending = declare_compile(
+            &mut registry,
+            &root,
+            &main_source,
+            None,
+            &main_object,
+            TargetId(2),
+        )?;
+        let resolver = StubIncludeResolver::new(root.clone());
+        let toolchain = Toolchain::default();
+        let link_id = {
+            let mut ctx = AnalysisContext::new(
+                TargetId(3),
+                ConfigId::DEFAULT,
+                "",
+                None,
+                &root,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            );
+            let output =
+                ctx.register_generated_artifact(&executable, ArtifactKind::Executable, None);
+            ctx.declare_action(
+                "CppLink",
+                vec![pending.object(), main_pending.object()],
+                vec![output],
+            )?
+        };
+        let first = compile(
+            &source,
+            &object,
+            vec![
+                Artifact::Source(source.clone()),
+                Artifact::Source(header.clone()),
+            ],
+            &root,
+        )?;
+        let mut selected = first.clone();
+        crate::generated_cc_sharding::prepare_compiler_overrides(&mut selected)?;
+        assert_eq!(selected.id, first.id);
+        assert_eq!(selected.command.executable, first.command.executable);
+        assert_eq!(selected.command.args, first.command.args);
+        assert_eq!(selected.inputs, first.inputs);
+        assert_eq!(selected.outputs, first.outputs);
+        // The ordinary path must still recognize and create its legacy shards.
+        let legacy_object = root.join("legacy/batch.o");
+        let mut legacy = compile(&source, &legacy_object, first.inputs.clone(), &root)?;
+        assert!(crate::generated_cc_sharding::prepare(&mut legacy)?);
+        assert_eq!(
+            legacy.command.executable.file_name(),
+            Some(std::ffi::OsStr::new("sh"))
+        );
+        assert!(root.join("legacy/batch.o.rush-shard0.cc").is_file());
+        assert_eq!(std::fs::read(&source)?, original.as_bytes());
+        let cache = Arc::new(ActionCache::new());
+        let manager = RushActionManager::new(
+            cache.clone(),
+            Arc::new(rush_exec::LocalStrategy),
+            ResourceManager::new()?,
+        );
+        let lease = Arc::new(crate::compiler_discovery::WorkspaceLease::acquire(
+            &root,
+            rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
+        )?);
+        lease.token(true)?;
+        let main = compile(
+            &main_source,
+            &main_object,
+            vec![Artifact::Source(main_source.clone())],
+            &root,
+        )?;
+        let result = owned(
+            &manager,
+            &registry,
+            main_pending.action(),
+            TargetId(2),
+            main.clone(),
+            Some(main_pending.clone()),
+            &root,
+            &lease,
+        )
+        .await?;
+        anyhow::ensure!(
+            result.exit_code == 0,
+            "actual main compilation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!result.cached && result.output_records.is_empty());
+        assert!(cache.get(&main.id).is_none());
+        let mut first_object = Vec::new();
+        for value in [42, 43] {
+            std::fs::write(&header, format!("#define VALUE {value}\n"))?;
+            let action = compile(&source, &object, first.inputs.clone(), &root)?;
+            let id = action.id.clone();
+            let result = owned(
+                &manager,
+                &registry,
+                pending.action(),
+                TargetId(1),
+                action,
+                Some(pending.clone()),
+                &root,
+                &lease,
+            )
+            .await?;
+            anyhow::ensure!(
+                result.exit_code == 0,
+                "original direct TU failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(!result.cached && result.output_records.is_empty());
+            assert!(cache.get(&id).is_none());
+            let bytes = std::fs::read(&object)?;
+            if value == 42 {
+                first_object = bytes;
+            } else {
+                assert_ne!(
+                    bytes, first_object,
+                    "real header edit must change the object"
+                );
+            }
+            let inputs = vec![
+                Artifact::Source(object.clone()),
+                Artifact::Source(main_object.clone()),
+            ];
+            let command = Command {
+                executable: selected_driver(&main_source),
+                args: vec![
+                    object.display().to_string(),
+                    main_object.display().to_string(),
+                    "-o".into(),
+                    executable.display().to_string(),
+                ],
+                working_dir: Some(root.clone()),
+                execution_info: ExecutionInfo::default(),
+            };
+            let env = HashMap::new();
+            let link = Action {
+                id: Action::compute_id(&inputs, &command, &env)?,
+                command,
+                env,
+                inputs,
+                outputs: vec![Artifact::Source(executable.clone())],
+                mnemonic: "CppLink".into(),
+            };
+            let result = owned(
+                &manager,
+                &registry,
+                link_id,
+                TargetId(3),
+                link,
+                None,
+                &root,
+                &lease,
+            )
+            .await?;
+            anyhow::ensure!(
+                result.exit_code == 0,
+                "actual link failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(!result.cached && result.output_records.is_empty());
+            assert_eq!(
+                std::process::Command::new(&executable).status()?.code(),
+                Some(value)
+            );
+            assert_eq!(std::fs::read(&source)?, original.as_bytes());
+            assert!(std::fs::read_dir(&direct)?.all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("rush-shard")));
+        }
+        // Unknown compound commands remain refused BEFORE old output removal.
+        let old_object = std::fs::read(&object)?;
+        let forbidden = root.join("shell-must-not-run");
+        let mut shell = first;
+        shell.command.executable = "/bin/sh".into();
+        shell.command.args = vec![
+            "-c".into(),
+            format!("printf forbidden > {}", forbidden.display()),
+        ];
+        shell.id = Action::compute_id(&shell.inputs, &shell.command, &shell.env)?;
+        let error = owned(
+            &manager,
+            &registry,
+            pending.action(),
+            TargetId(1),
+            shell,
+            Some(pending),
+            &root,
+            &lease,
+        )
+        .await
+        .expect_err("unadmitted user shell must not become compiler discovery");
+        assert!(format!("{error:#}").contains("diagnostic"), "{error:#}");
+        assert!(!forbidden.exists());
+        assert_eq!(std::fs::read(&object)?, old_object);
+        assert_eq!(
+            std::process::Command::new(&executable).status()?.code(),
+            Some(43)
+        );
+        Ok(())
     }
 }

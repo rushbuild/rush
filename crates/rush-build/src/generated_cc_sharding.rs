@@ -128,14 +128,24 @@ pub(crate) fn critical_compile_cpu_slots(
     )
 }
 
+/// Apply native compiler selection without rewriting sources or argv.
+/// Diagnostic direct compilation must reach its depfile boundary as one TU;
+/// source sharding remains a separate ordinary-native preparation policy.
+pub(crate) fn prepare_compiler_overrides(action: &mut Action) -> Result<bool> {
+    if !cfg!(target_os = "linux") || action.mnemonic != "CppCompile" {
+        return Ok(false);
+    }
+    let ordinary = override_cpp_compiler(action)?;
+    let critical = override_critical_compiler(action)?;
+    Ok(ordinary || critical)
+}
+
 pub(crate) fn prepare(action: &mut Action) -> Result<bool> {
     if !cfg!(target_os = "linux") || action.mnemonic != "CppCompile" {
         return Ok(false);
     }
 
-    let compiler_overridden = override_cpp_compiler(action)?;
-    let critical_compiler_overridden = override_critical_compiler(action)?;
-    let compiler_overridden = compiler_overridden || critical_compiler_overridden;
+    let compiler_overridden = prepare_compiler_overrides(action)?;
     if prepare_targeted_command(
         &mut action.command.executable,
         &mut action.command.args,
