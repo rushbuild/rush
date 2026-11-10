@@ -9,6 +9,8 @@
 #![allow(missing_docs)]
 
 mod configured_flag_metadata;
+pub(crate) mod configuration_table;
+pub(crate) mod configured_target;
 
 pub mod action_batch;
 pub mod action_manager;
