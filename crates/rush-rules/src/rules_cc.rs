@@ -692,6 +692,55 @@ fn cc_binary_owned_header_quote_dirs(
     package_roots
 }
 
+fn repository_quote_roots(workspace: &Path, output: &Path, enabled: bool) -> Vec<PathBuf> {
+    if enabled {
+        vec![workspace.to_path_buf(), output.join("genfiles")]
+    } else {
+        Vec::new()
+    }
+}
+
+fn append_dependency_quote_roots(
+    registry: &rush_action::ids::ArtifactRegistry,
+    providers: impl IntoIterator<Item = std::sync::Arc<crate::providers::CcInfo>>,
+    paths: &mut Vec<PathBuf>,
+) {
+    for provider in providers {
+        for id in provider.compilation.quote_include_dirs.iter() {
+            let path = registry.paths().path(id).to_path_buf();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+}
+
+async fn runtime_quote_roots(context: &BuildContext, mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    for root in repository_quote_roots(
+        &context.workspace_root,
+        &context.output_dir,
+        context.native_execution_root().is_some()
+            || context.native_compile_mode()
+                == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+    ) {
+        if !paths.contains(&root) {
+            paths.push(root);
+        }
+    }
+    if let Some(registry) = context.artifact_registry.as_ref() {
+        let registry = registry.lock().await;
+        append_dependency_quote_roots(
+            &registry,
+            context
+                .dependency_providers_ordered
+                .iter()
+                .filter_map(|(_, p)| p.cc_info.clone()),
+            &mut paths,
+        );
+    }
+    paths
+}
+
 /// Append label-shaped `data` entries to a dependency list. Bazel builds
 /// `data` targets and stages their outputs into the consumer's runfiles,
 /// so they ARE dependencies for build-graph purposes. Bare-filename data
@@ -745,6 +794,8 @@ async fn collect_sink_compile_header_inputs(context: &BuildContext) -> SinkCompi
         inputs.generated = crate::providers::collect_generated_header_paths(&reg, &cc_infos);
         for cc_info in &cc_infos {
             inputs.include_roots.extend(cc_info.compilation.include_dirs.iter()
+                .map(|path| reg.paths().path(path).to_path_buf()));
+            inputs.include_roots.extend(cc_info.compilation.quote_include_dirs.iter()
                 .map(|path| reg.paths().path(path).to_path_buf()));
             for h_aid in cc_info
                 .compilation
@@ -1396,9 +1447,17 @@ async fn runtime_namespace_headers(
     existing: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
     if context.native_compile_mode() == crate::context::NativeCompileMode::UncachedDiagnosticV1 {
-        // No guessed closure and no read-time certificate. The typed manager
-        // must wait for producers and run the actual compiler without reuse.
-        return Ok(Vec::new());
+        // Match PASS-A's declared upper bound, not a guessed include closure.
+        // The literal scanner cannot decide post-producer/macro-selected reads
+        // here. Preserve every actual CcInfo header until the typed manager
+        // waits for producers and executes the compiler without reuse. These
+        // immutable declarations grant no read-time certificate.
+        let layout = collect_sink_compile_header_inputs(context).await;
+        let mut declared = layout.source;
+        declared.extend(layout.generated);
+        declared.sort();
+        declared.dedup();
+        return Ok(declared);
     }
     let Some(cwd) = context.native_execution_root() else { return Ok(Vec::new()); };
     let layout = collect_sink_compile_header_inputs(context).await;
@@ -1428,7 +1487,10 @@ async fn extend_runtime_namespace_inputs(
     command: &Command,
     inputs: &mut Vec<ActionArtifact>,
 ) -> Result<()> {
-    if context.native_execution_root().is_none() { return Ok(()); }
+    if context.native_execution_root().is_none()
+        && context.native_compile_mode() != crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+        return Ok(());
+    }
     let existing: Vec<_> = inputs.iter().filter_map(|input| match input {
         ActionArtifact::Source(path) => Some(path.clone()),
         _ => None,
@@ -1445,7 +1507,10 @@ async fn namespace_compile_spec(
     source: &Path,
     mut spec: rush_action::command_spec::NormalizedCommandSpec,
 ) -> Result<rush_action::command_spec::NormalizedCommandSpec> {
-    if context.native_execution_root().is_none() { return Ok(spec); }
+    if context.native_execution_root().is_none()
+        && context.native_compile_mode() != crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+        return Ok(spec);
+    }
     let headers = runtime_namespace_headers(context, source, &spec.argv, &spec.declared_inputs).await?;
     for header in headers {
         if !spec.declared_inputs.contains(&header) { spec.declared_inputs.push(header); }
@@ -2203,18 +2268,53 @@ impl RuleInstance for CcLibraryInstance {
         // GENERATED headers are, via `!is_source` in collect_generated_header_*),
         // so the only effect of this resolution is correct per-header freshness.
         let hdr_pkg = ctx.package().to_string();
-        let expanded_hdrs = expand_filegroup_srcs(&self.hdrs, |label| {
+        let expanded_hdrs = expand_cc_binary_srcs(&self.hdrs, |label| {
             ctx.get_dependency_provider(label)
                 .and_then(|p| p.get_files())
                 .map(|fi| fi.files.clone())
         });
-        let direct_headers: Vec<_> = expanded_hdrs
+        let mut direct_headers: Vec<_> = expanded_hdrs
             .iter()
             .map(|h| {
                 let resolved =
                     resolve_cc_src_path(ctx.workspace_root(), &hdr_pkg, h);
                 ctx.register_source_artifact(&resolved, ArtifactKind::Header)
             })
+            .collect();
+        // Header outputs listed in srcs are not translation units. Preserve
+        // their real generated artifact/producer when exporting this CcInfo;
+        // a downstream public header may include them (Snappy is one example).
+        // Do not publish unrelated checked-in private srcs as new headers.
+        let expanded_src_headers = expand_cc_binary_srcs(&self.srcs, |label| {
+            ctx.get_dependency_provider(label)
+                .and_then(|p| p.get_files())
+                .map(|files| files.files.clone())
+        });
+        for header in expanded_src_headers
+            .iter()
+            .filter(|path| is_cc_header_input(path))
+        {
+            let path = resolve_cc_src_path(ctx.workspace_root(), &hdr_pkg, header);
+            if let Some(id) = ctx.registry().find_artifact_by_path(&path, ctx.config_id()) {
+                if !ctx.registry().artifact(id).is_source && !direct_headers.contains(&id) {
+                    direct_headers.push(id);
+                }
+            }
+        }
+        // Bazel propagates repository source and generated quote roots, not
+        // each header's parent. Keep the legacy unguarded None profile intact;
+        // the namespace profile validates selections and diagnostic mode never
+        // admits a reusable compiler-input certificate.
+        let direct_quote_paths = repository_quote_roots(
+            ctx.workspace_root(),
+            ctx.output_dir(),
+            ctx.native_execution_root().is_some()
+                || ctx.native_compile_mode()
+                    == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+        );
+        let direct_quote_dirs: Vec<_> = direct_quote_paths
+            .iter()
+            .map(|path| ctx.intern_path(path))
             .collect();
         let mut direct_include_dirs: Vec<_> = self
             .includes
@@ -2358,6 +2458,12 @@ impl RuleInstance for CcLibraryInstance {
             // docstring for the array_ops.h-class bug this
             // catches.
             let dep_cc_infos = crate::providers::extract_cc_infos(dep_providers);
+            let mut compile_quote_paths = direct_quote_paths.clone();
+            append_dependency_quote_roots(
+                ctx.registry(),
+                dep_cc_infos.iter().cloned(),
+                &mut compile_quote_paths,
+            );
 
             // SOURCE-header compile inputs. A CppCompile must depend on the
             // headers its TU includes, or editing a header never changes the
@@ -2749,6 +2855,9 @@ impl RuleInstance for CcLibraryInstance {
                     for d in crate::providers::merged_compile_defines(&dep_defines, &self.defines) {
                         argv_strs.push(format!("-D{}", d));
                     }
+                    for path in &compile_quote_paths {
+                        argv_strs.push(format!("-iquote{}", path.display()));
+                    }
                     for ip in &direct_include_paths {
                         argv_strs.push(format!("-I{}", ip));
                     }
@@ -2893,6 +3002,7 @@ impl RuleInstance for CcLibraryInstance {
         let direct = DirectCcInfo {
             headers: direct_headers,
             include_dirs: direct_include_dirs,
+            quote_include_dirs: direct_quote_dirs,
             defines: direct_defines,
             link_fragments: direct_link_fragments,
             linker_inputs: direct_linker_inputs,
@@ -3010,19 +3120,11 @@ impl RuleInstance for CcLibraryInstance {
         // This target's OWN headers, resolved per-package — the PASS-B mirror of
         // analyze()'s `direct_headers`. Combined with the dep source headers
         // these complete the source-header declared-input set.
-        let own_pkg = context
-            .package_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let mut source_header_paths: Vec<std::path::PathBuf> = self
-            .hdrs
-            .iter()
-            .map(|h| resolve_cc_src_path(&context.workspace_root, &own_pkg, h))
-            .collect();
+        let mut source_header_paths = self.collect_owned_header_inputs(context).await;
         source_header_paths.extend(dep_source_header_paths);
         source_header_paths.sort();
         source_header_paths.dedup();
+        let compile_quote_paths = runtime_quote_roots(context, Vec::new()).await;
 
         // Direct include paths from self.includes. Use the
         // canonical resolver so legacy and scheduler agree on
@@ -3192,7 +3294,7 @@ impl RuleInstance for CcLibraryInstance {
                 defines: self.defines.clone(),
                 dep_defines: dep_defines.clone(),
                 direct_include_paths: direct_include_paths.clone(),
-                direct_quote_include_paths: Vec::new(),
+                direct_quote_include_paths: compile_quote_paths.clone(),
                 dep_include_paths: dep_include_paths.clone(),
                 include_layout: crate::cc_command_spec::IncludeLayout::BazelPackageRooted {
                     workspace_root: context.workspace_root.clone(),
@@ -3264,12 +3366,10 @@ impl RuleInstance for CcLibraryInstance {
 }
 
 impl CcLibraryInstance {
-    /// SOURCE-header inputs for this target's compiles: own `hdrs` resolved
-    /// per-package, plus every transitively-reachable dep SOURCE header. These
-    /// are added to each CppCompile action's inputs so a header edit changes the
-    /// object's action.id (content-hashed cache key) and forces a recompile —
-    /// the legacy build() analogue of analyze()'s `source_header_inputs`.
-    async fn collect_source_header_inputs(&self, context: &BuildContext) -> Vec<PathBuf> {
+    /// Own declared headers, retaining generated file-label identities. A
+    /// generated header in srcs also participates; unrelated checked-in private
+    /// srcs are left to the include-closure resolver.
+    async fn collect_owned_header_inputs(&self, context: &BuildContext) -> Vec<PathBuf> {
         let own_pkg = context
             .package_path
             .as_ref()
@@ -3289,6 +3389,18 @@ impl CcLibraryInstance {
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut unresolved_labels: Vec<&str> = Vec::new();
         for h in &self.hdrs {
+            let implicit = format!(":{h}");
+            let lookup = if is_label_src(h) {
+                h.as_str()
+            } else {
+                implicit.as_str()
+            };
+            if let Some(files) = context.get_dependency_files(lookup) {
+                if !files.is_empty() && files.iter().all(|path| path.is_absolute()) {
+                    paths.extend(files);
+                    continue;
+                }
+            }
             let label_shaped =
                 h.starts_with(':') || h.starts_with("//") || h.starts_with('@');
             if label_shaped {
@@ -3315,6 +3427,29 @@ impl CcLibraryInstance {
                 unresolved_labels.join(", ")
             );
         }
+        if let Some(reg_arc) = context.artifact_registry.as_ref() {
+            let reg = reg_arc.lock().await;
+            let expanded =
+                expand_cc_binary_srcs(&self.srcs, |label| context.get_dependency_files(label));
+            for header in expanded.iter().filter(|path| is_cc_header_input(path)) {
+                let path = resolve_cc_src_path(&context.workspace_root, &own_pkg, header);
+                if reg
+                    .find_artifact_by_path(&path, rush_action::ids::ConfigId::DEFAULT)
+                    .is_some_and(|id| !reg.artifact(id).is_source)
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Compile inputs include the owned header set and transitive CcInfo
+    /// headers, including generated producer outputs.
+    async fn collect_source_header_inputs(&self, context: &BuildContext) -> Vec<PathBuf> {
+        let mut paths = self.collect_owned_header_inputs(context).await;
         if let Some(reg_arc) = context.artifact_registry.as_ref() {
             let reg = reg_arc.lock().await;
             for providers in context.dependency_providers.values() {
@@ -3483,6 +3618,9 @@ impl CcLibraryInstance {
         };
         for define in crate::providers::merged_compile_defines(&dep_defines, &self.defines) {
             args.push(format!("-D{}", define));
+        }
+        for path in runtime_quote_roots(context, Vec::new()).await {
+            args.push(format!("-iquote{}", path.display()));
         }
 
         // Add include paths from this target
@@ -5171,12 +5309,16 @@ impl RuleInstance for CcBinaryInstance {
             &package,
             &expanded_srcs,
         );
-        let owned_header_quote_dirs = cc_binary_owned_header_quote_dirs(
-            &context.workspace_root,
-            &context.output_dir,
-            &package,
-            &owned_header_paths,
-        );
+        let owned_header_quote_dirs = runtime_quote_roots(
+            context,
+            cc_binary_owned_header_quote_dirs(
+                &context.workspace_root,
+                &context.output_dir,
+                &package,
+                &owned_header_paths,
+            ),
+        )
+        .await;
         let header_inputs = cached_sink_compile_header_inputs(context, &self.header_inputs_cache).await;
         for src in &expanded_srcs {
             // Skip non-compilable srcs (headers in srcs) — see the PCH-clobber
@@ -5311,13 +5453,29 @@ impl RuleInstance for CcBinaryInstance {
                     .cmp(ctx.registry().artifact_path(*right))
             });
             compile_header_inputs.dedup();
-            let owned_header_quote_paths: Vec<String> =
-                cc_binary_owned_header_quote_dirs(
-                    ctx.workspace_root(),
-                    ctx.output_dir(),
-                    &package,
-                    &owned_header_paths,
-                )
+            let mut compile_quote_paths = cc_binary_owned_header_quote_dirs(
+                ctx.workspace_root(),
+                ctx.output_dir(),
+                &package,
+                &owned_header_paths,
+            );
+            for path in repository_quote_roots(
+                ctx.workspace_root(),
+                ctx.output_dir(),
+                ctx.native_execution_root().is_some()
+                    || ctx.native_compile_mode()
+                        == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+            ) {
+                if !compile_quote_paths.contains(&path) {
+                    compile_quote_paths.push(path);
+                }
+            }
+            append_dependency_quote_roots(
+                ctx.registry(),
+                dep_cc_infos.iter().cloned(),
+                &mut compile_quote_paths,
+            );
+            let owned_header_quote_paths: Vec<String> = compile_quote_paths
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect();
@@ -5990,12 +6148,16 @@ impl RuleInstance for CcBinaryInstance {
             &package,
             &expanded_srcs,
         );
-        let owned_header_quote_dirs = cc_binary_owned_header_quote_dirs(
-            &context.workspace_root,
-            &context.output_dir,
-            &package,
-            &owned_header_paths,
-        );
+        let owned_header_quote_dirs = runtime_quote_roots(
+            context,
+            cc_binary_owned_header_quote_dirs(
+                &context.workspace_root,
+                &context.output_dir,
+                &package,
+                &owned_header_paths,
+            ),
+        )
+        .await;
         for src in &expanded_srcs {
             // Headers (.h/.inc) listed in srcs are owned-but-not-compiled
             // (Bazel semantics) — compiling one with `-c` emits a PCH that,
@@ -6312,16 +6474,8 @@ impl CcBinaryInstance {
         // registry) when available, fall back to flat
         // 5.B.3.e: typed-only.
         //
-        // The header-parent-dir loop below pushes one `-I` per transitive
-        // header; for a TF GPU workload that depends on the aggregate
-        // //tensorflow/core:tensorflow target, the transitive header set is
-        // enormous (tens of thousands of headers, most sharing a parent dir),
-        // so without de-duplication the compile command overflows the exec
-        // argument list (`posix_spawn: Argument list too long` from g++ when it
-        // re-execs cc1plus). De-dup every `-I` flag (preserving first-seen
-        // order) — the unique directory count is small. This is a pure
-        // reduction (same set of search dirs, no behavior change) so smaller
-        // CPU compiles are unaffected aside from dropping redundant flags.
+        // Keep explicitly declared include roots in order, without repeating
+        // the same flag through several transitive dependency paths.
         let mut seen_includes: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut push_include = |args: &mut Vec<String>, flag: String| {
@@ -6345,17 +6499,21 @@ impl CcBinaryInstance {
                 }
             }
         }
-        // Headers via transitive artifacts (unchanged by 5.B.3.d —
-        // this reads from the rush-rules Artifact NestedSet, not
-        // CcInfo). Phase 5.E will fold these into the typed
-        // compilation context once the action graph in 5.C
-        // produces ArtifactIds for headers.
-        for dep in &self.deps {
-            if let Some(iter) = context.iter_transitive_artifacts(dep) {
-                for artifact in iter {
-                    if artifact.artifact_type == ArtifactType::Header {
-                        if let Some(parent) = artifact.path.parent() {
-                            push_include(&mut args, format!("-I{}", parent.display()));
+        // Preserve the old unguarded main-only compatibility path. A header
+        // artifact is NOT include-search authority in the namespace/diagnostic
+        // profile: flattening its parent exposes private names to angle
+        // includes (e.g. Abseil's internal/endian.h instead of SDK endian.h).
+        // PASS-A and specs use typed roots, so guarded runtime must do likewise.
+        if context.native_execution_root().is_none()
+            && context.native_compile_mode() == crate::context::NativeCompileMode::Literal
+        {
+            for dep in &self.deps {
+                if let Some(iter) = context.iter_transitive_artifacts(dep) {
+                    for artifact in iter {
+                        if artifact.artifact_type == ArtifactType::Header {
+                            if let Some(parent) = artifact.path.parent() {
+                                push_include(&mut args, format!("-I{}", parent.display()));
+                            }
                         }
                     }
                 }
@@ -8398,6 +8556,641 @@ mod cc_binary_response_tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[derive(Default)]
+    struct QuoteRootExecutingManager {
+        executor: RecordingExecutingActionManager,
+        pending: Mutex<Vec<crate::context::PendingCompileDeclaration>>,
+    }
+
+    #[async_trait]
+    impl ActionManager for QuoteRootExecutingManager {
+        async fn execute(&self, action: Action) -> Result<ActionResult> {
+            self.executor.execute(action).await
+        }
+
+        async fn execute_pending_compile(
+            &self,
+            action: Action,
+            pending: crate::context::PendingCompileDeclaration,
+        ) -> Result<ActionResult> {
+            // This rule-level fixture executes the real compiler. The full
+            // owned manager/depfile/cancellation protocol is covered by the
+            // rush-build diagnostic integration tests, not emulated here.
+            assert!(action.inputs.iter().any(|input| matches!(input,
+                ActionArtifact::Source(path) if path == pending.source_path())));
+            self.pending.lock().unwrap().push(pending);
+            self.executor.execute(action).await
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn repository_quote_roots_reach_generated_headers_across_library_and_binary() {
+        use crate::context::{NativeCompileMode, PendingCompileDeclarations};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let owner = root.join("codec-source");
+        let consumer = root.join("consumer-source");
+        let output = root.join("out");
+        let owner_output = output.join("external/repo-codec");
+        let execution = root.join("execution");
+        let generated = owner_output.join("genfiles/codec/detail/generated.h");
+        for path in [
+            owner.join("codec"),
+            consumer.join("app"),
+            execution.clone(),
+            generated.parent().unwrap().to_path_buf(),
+            output.join("app"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(owner.join("codec/public.h"),
+            "#pragma once\n#include \"codec/detail/generated.h\"\ninline int generated_value() { return GENERATED_VALUE; }\n").unwrap();
+        let template = owner.join("value.in");
+        std::fs::write(&template, "#define GENERATED_VALUE 42\n").unwrap();
+        std::fs::write(
+            consumer.join("app/consumer.cc"),
+            "#include \"codec/public.h\"\nint library_value() { return generated_value(); }\n",
+        )
+        .unwrap();
+        std::fs::write(consumer.join("app/main.cc"),
+            "#include \"codec/public.h\"\nint library_value();\nint main() { return library_value() == generated_value() ? generated_value() : 99; }\n").unwrap();
+        // This same-basename source file is a different logical include path.
+        std::fs::create_dir_all(owner.join("detail")).unwrap();
+        std::fs::write(
+            owner.join("detail/generated.h"),
+            "#error wrong logical include layout\n",
+        )
+        .unwrap();
+        let toolchain = Toolchain::default();
+        let extra = Vec::new();
+        let mut registry = ArtifactRegistry::new();
+        let owner_resolver = StubIncludeResolver::new(owner.clone());
+        let generated_id;
+        let producer_id;
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "codec",
+                Some("codec"),
+                &owner_output,
+                &mut registry,
+                &owner_resolver,
+                &toolchain,
+                &owner,
+                &extra,
+            );
+            let template_id = ctx.register_source_artifact(&template, ArtifactKind::Source);
+            generated_id = ctx.register_generated_artifact(
+                Path::new("genfiles/codec/detail/generated.h"),
+                ArtifactKind::Generated,
+                None,
+            );
+            producer_id = ctx
+                .declare_action("GenRule", vec![template_id], vec![generated_id])
+                .unwrap();
+        }
+        let generator = Arc::new(
+            ProviderSet::empty()
+                .with_files(FilesInfo::new(vec![generated.clone()]))
+                .with_default_info(DefaultInfo {
+                    files: vec![generated_id],
+                }),
+        );
+        let labeled_generator =
+            vec![("@codec//codec:detail/generated.h".into(), generator.clone())];
+        let owner_rule = CcLibraryInstance {
+            name: "codec".into(),
+            srcs: vec!["detail/generated.h".into()],
+            hdrs: vec!["public.h".into()],
+            ..library_with_compile_options("unused.cc", Vec::new())
+        };
+        let owner_provider = Arc::new({
+            let mut ctx = AnalysisContext::new(
+                TargetId(2),
+                ConfigId::DEFAULT,
+                "codec",
+                Some("codec"),
+                &owner_output,
+                &mut registry,
+                &owner_resolver,
+                &toolchain,
+                &owner,
+                &extra,
+            )
+            .with_native_execution_root(Some(&execution))
+            .with_labeled_dep_providers(&labeled_generator);
+            owner_rule.analyze(&mut ctx, &[generator])
+        });
+        let cc = owner_provider.get_cc_info().unwrap();
+        assert!(cc.compilation.headers.iter().any(|id| id == generated_id));
+        assert_eq!(registry.producer(generated_id), Some(producer_id));
+        assert!(!registry.artifact(generated_id).is_source);
+        let owner_quotes: Vec<_> = cc
+            .compilation
+            .quote_include_dirs
+            .iter()
+            .map(|id| registry.paths().path(id).to_path_buf())
+            .collect();
+        assert_eq!(
+            owner_quotes,
+            vec![owner.clone(), owner_output.join("genfiles")]
+        );
+        assert!(!owner_quotes.contains(&generated.parent().unwrap().to_path_buf()));
+        let consumer_rule = CcLibraryInstance {
+            name: "consumer".into(),
+            srcs: vec!["consumer.cc".into()],
+            deps: vec!["@codec//codec:codec".into()],
+            ..library_with_compile_options("unused.cc", Vec::new())
+        };
+        let resolver = StubIncludeResolver::new(consumer.clone());
+        let labeled_owner = vec![("@codec//codec:codec".into(), owner_provider.clone())];
+        let mut declarations = PendingCompileDeclarations::default();
+        let consumer_provider = Arc::new({
+            let mut ctx = AnalysisContext::new(
+                TargetId(3),
+                ConfigId::DEFAULT,
+                "app",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &consumer,
+                &extra,
+            )
+            .with_native_execution_root(Some(&execution))
+            .with_labeled_dep_providers(&labeled_owner)
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                &mut declarations,
+            );
+            let provider = consumer_rule.analyze(&mut ctx, &[owner_provider.clone()]);
+            assert!(ctx.native_namespace_analysis_error().is_none());
+            provider
+        });
+        let binary = CcBinaryInstance {
+            name: "tool".into(),
+            srcs: vec!["main.cc".into()],
+            deps: vec![":consumer".into()],
+            ..binary_with_generated_header()
+        };
+        let labeled_consumer = vec![("//app:consumer".into(), consumer_provider.clone())];
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(4),
+                ConfigId::DEFAULT,
+                "app",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &consumer,
+                &extra,
+            )
+            .with_native_execution_root(Some(&execution))
+            .with_labeled_dep_providers(&labeled_consumer)
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                &mut declarations,
+            );
+            let _ = binary.analyze(&mut ctx, &[consumer_provider.clone()]);
+            assert!(ctx.native_namespace_analysis_error().is_none());
+        }
+        let pass_a: HashMap<_, _> = registry
+            .declared_actions()
+            .filter_map(|(id, action)| {
+                if !matches!(action.owner_target, TargetId(3) | TargetId(4)) {
+                    return None;
+                }
+                rush_action::command_spec::NormalizedCommandSpec::from_registry_action(
+                    &registry, id,
+                )
+                .map(|spec| (spec.declared_outputs.clone(), spec))
+            })
+            .collect();
+        let declarations = Arc::new(declarations);
+        let shared = Arc::new(tokio::sync::Mutex::new(registry));
+        let manager = Arc::new(QuoteRootExecutingManager::default());
+        let consumer_context = BuildContext::new(consumer.clone(), output.clone())
+            .with_package(PathBuf::from("app"))
+            .with_toolchain(toolchain.clone())
+            .with_native_execution_root(Some(execution.clone()))
+            .with_dependencies(
+                HashMap::new(),
+                vec![(
+                    "@codec//codec:codec".into(),
+                    owner_provider.as_ref().clone(),
+                )],
+            )
+            .with_artifact_registry(shared.clone())
+            .with_action_manager(manager.clone())
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                declarations.clone(),
+            );
+        let mut binary_context = BuildContext::new(consumer.clone(), output.clone())
+            .with_package(PathBuf::from("app"))
+            .with_toolchain(toolchain.clone())
+            .with_native_execution_root(Some(execution.clone()))
+            .with_dependencies(
+                HashMap::new(),
+                vec![("//app:consumer".into(), consumer_provider.as_ref().clone())],
+            )
+            .with_artifact_registry(shared.clone())
+            .with_action_manager(manager.clone())
+            .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, declarations);
+        for rule_specs in [
+            consumer_rule
+                .build_legacy_command_specs(&consumer_context)
+                .await,
+            binary.build_legacy_command_specs(&binary_context).await,
+        ] {
+            for (_, spec) in rule_specs {
+                assert_eq!(pass_a.get(&spec.declared_outputs), Some(&spec));
+                if spec.mnemonic == "CppCompile" {
+                    assert!(spec.declared_inputs.contains(&generated));
+                    assert!(spec.argv.contains(&format!(
+                        "-iquote{}",
+                        owner_output.join("genfiles").display()
+                    )));
+                    assert!(!spec.argv.contains(&format!(
+                        "-iquote{}", generated.parent().unwrap().display()
+                    )));
+                }
+            }
+        }
+        let make_producer_action = || {
+            let command = Command {
+                executable: PathBuf::from("/bin/cp"),
+                args: vec![
+                    template.display().to_string(),
+                    generated.display().to_string(),
+                ],
+                working_dir: Some(execution.clone()),
+                execution_info: ExecutionInfo::default(),
+            };
+            let inputs = vec![ActionArtifact::Source(template.clone())];
+            Action {
+                id: Action::compute_id(&inputs, &command, &HashMap::new()).unwrap(),
+                command,
+                env: HashMap::new(),
+                inputs,
+                outputs: vec![ActionArtifact::Source(generated.clone())],
+                mnemonic: "GenRule".into(),
+            }
+        };
+        let mut first_compile_id = None;
+        for (round, value) in [42, 42, 43].into_iter().enumerate() {
+            std::fs::write(&template, format!("#define GENERATED_VALUE {value}\n")).unwrap();
+            assert_eq!(
+                manager
+                    .execute(make_producer_action())
+                    .await
+                    .unwrap()
+                    .exit_code,
+                0
+            );
+            let built = consumer_rule.build(&consumer_context).await.unwrap();
+            binary_context.dependency_artifacts.insert(
+                "//app:consumer".into(),
+                NestedSet::new(
+                    built
+                        .into_iter()
+                        .filter(|artifact| artifact.artifact_type == ArtifactType::StaticLibrary)
+                        .collect(),
+                    Vec::new(),
+                ),
+            );
+            let artifacts = binary.build(&binary_context).await.unwrap();
+            assert_eq!(
+                std::process::Command::new(&artifacts[0].path)
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(value)
+            );
+            let actions = manager.executor.actions.lock().unwrap();
+            assert_eq!(
+                actions.len(),
+                (round + 1) * 5,
+                "every repeat really executes producer/compile/archive/compile/link"
+            );
+            let compile = &actions[round * 5 + 1];
+            assert!(compile.inputs.iter().any(|input| matches!(input,
+                ActionArtifact::Source(path) if path == &generated)));
+            if round == 0 {
+                first_compile_id = Some(compile.id.clone());
+            } else if round == 1 {
+                assert_eq!(Some(&compile.id), first_compile_id.as_ref());
+            } else {
+                assert_ne!(Some(&compile.id), first_compile_id.as_ref());
+            }
+        }
+        assert_eq!(manager.pending.lock().unwrap().len(), 6);
+        let old_binary = std::fs::read(output.join("tool")).unwrap();
+        std::fs::remove_file(&generated).unwrap();
+        let executed = manager.executor.actions.lock().unwrap().len();
+        assert!(consumer_rule.build(&consumer_context).await.is_err());
+        assert_eq!(manager.executor.actions.lock().unwrap().len(), executed);
+        assert_eq!(std::fs::read(output.join("tool")).unwrap(), old_binary);
+        assert_eq!(
+            manager
+                .execute(make_producer_action())
+                .await
+                .unwrap()
+                .exit_code,
+            0
+        );
+        assert!(generated.is_file());
+        // The default source-only namespace profile still refuses produced
+        // headers before snapshot adoption, even with prior output bytes.
+        {
+            let mut registry = shared.lock().await;
+            let blocked = CcLibraryInstance {
+                name: "blocked".into(),
+                ..consumer_rule
+            };
+            let mut ctx = AnalysisContext::new(
+                TargetId(5),
+                ConfigId::DEFAULT,
+                "app",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &consumer,
+                &extra,
+            )
+            .with_native_execution_root(Some(&execution))
+            .with_labeled_dep_providers(&labeled_owner);
+            let _ = blocked.analyze(&mut ctx, &[owner_provider]);
+            assert!(ctx
+                .native_namespace_analysis_error()
+                .is_some_and(|error| error.contains("produced translation-unit/header input")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn namespace_transitive_header_parents_do_not_shadow_sdk_search() {
+        for explicit_internal_include in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let workspace = root.join("workspace");
+            let dependency = root.join("vendor-source");
+            let output = root.join("out");
+            let vendor_output = output.join("external/repo-vendor");
+            let execution = root.join("execution");
+            let public = dependency.join("vendor/api/public.h");
+            let private = dependency.join("vendor/internal/endian.h");
+            for directory in [
+                workspace.as_path(),
+                output.as_path(),
+                execution.as_path(),
+                public.parent().unwrap(),
+                private.parent().unwrap(),
+            ] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            std::fs::write(&public, "#define PUBLIC_VALUE 42\n").unwrap();
+            std::fs::write(&private, "#error PRIVATE_ENDIAN_HEADER_WAS_SELECTED\n").unwrap();
+            std::fs::write(workspace.join("main.cc"),
+                "#define _DEFAULT_SOURCE 1\n#include <sys/types.h>\n#include <cstdlib>\n#include \"vendor/api/public.h\"\nint main() { char* end = nullptr; return std::strtol(\"42\", &end, 10) == PUBLIC_VALUE ? PUBLIC_VALUE : 1; }\n").unwrap();
+            with_namespace_header_tracking(&workspace, async {
+                let toolchain = Toolchain::default();
+                let mut registry = ArtifactRegistry::new();
+                let resolver = StubIncludeResolver::new(dependency.clone());
+                let extra = Vec::new();
+                let vendor = CcLibraryInstance {
+                    name: "api".into(), srcs: Vec::new(),
+                    hdrs: vec!["vendor/api/public.h".into(), "vendor/internal/endian.h".into()],
+                    includes: if explicit_internal_include { vec!["vendor/internal".into()] } else { Vec::new() },
+                    ..library_with_compile_options("unused.cc", Vec::new())
+                };
+                let vendor_provider = Arc::new({
+                    let mut analysis = AnalysisContext::new(TargetId(1), ConfigId::DEFAULT,
+                        "", Some("vendor"), &vendor_output, &mut registry, &resolver,
+                        &toolchain, &dependency, &extra)
+                        .with_native_execution_root(Some(&execution));
+                    vendor.analyze(&mut analysis, &[])
+                });
+                let labeled = vec![("@vendor//:api".into(), vendor_provider.clone())];
+                let binary = CcBinaryInstance {
+                    name: "sdk-shadow".into(), srcs: vec!["main.cc".into()], deps: vec!["@vendor//:api".into()],
+                    ..binary_with_generated_header()
+                };
+                let resolver = StubIncludeResolver::new(workspace.clone());
+                {
+                    let mut analysis = AnalysisContext::new(TargetId(2), ConfigId::DEFAULT,
+                        "", None, &output, &mut registry, &resolver, &toolchain,
+                        &workspace, &extra).with_native_execution_root(Some(&execution))
+                        .with_labeled_dep_providers(&labeled);
+                    let _ = binary.analyze(&mut analysis, &[vendor_provider.clone()]);
+                    assert!(analysis.native_namespace_analysis_error().is_none());
+                }
+                let pass_a = registry.declared_actions().find_map(|(id, action)| {
+                    (action.owner_target == TargetId(2)
+                        && registry.strings().str(action.mnemonic) == "CppCompile")
+                        .then(|| rush_action::command_spec::NormalizedCommandSpec::from_registry_action(&registry, id).unwrap())
+                }).unwrap();
+                let artifacts = vec![Artifact { path: public.clone(), artifact_type: ArtifactType::Header },
+                    Artifact { path: private.clone(), artifact_type: ArtifactType::Header }];
+                let manager = Arc::new(RecordingExecutingActionManager::default());
+                let context = BuildContext::new(workspace.clone(), output.clone())
+                    .with_toolchain(toolchain)
+                    .with_native_execution_root(Some(execution.clone()))
+                    .with_dependencies(HashMap::from([("@vendor//:api".into(), NestedSet::new(artifacts, Vec::new()))]),
+                        vec![("@vendor//:api".into(), vendor_provider.as_ref().clone())])
+                    .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+                    .with_action_manager(manager.clone());
+                let legacy = binary.build_legacy_command_specs(&context).await.into_iter()
+                    .find(|(key, _)| key.mnemonic == "CppCompile").unwrap().1;
+                assert_eq!(pass_a, legacy);
+                let internal_flag = format!("-I{}", private.parent().unwrap().display());
+                let public_parent_flag = format!("-I{}", public.parent().unwrap().display());
+                assert_eq!(legacy.argv.contains(&internal_flag), explicit_internal_include);
+                assert!(!legacy.argv.contains(&public_parent_flag));
+                assert!(legacy.declared_inputs.contains(&public));
+                let result = binary.build(&context).await;
+                if explicit_internal_include {
+                    let error = result.expect_err("an explicit typed include root must not be silently sanitized");
+                    assert!(format!("{error:#}").contains("PRIVATE_ENDIAN_HEADER_WAS_SELECTED"));
+                } else {
+                    let built = result.unwrap();
+                    assert_eq!(std::process::Command::new(&built[0].path).status().unwrap().code(), Some(42));
+                }
+                let actions = manager.actions.lock().unwrap();
+                let compile = actions.iter().find(|action| action.mnemonic == "CppCompile").unwrap();
+                assert_eq!(compile.command.args.contains(&internal_flag), explicit_internal_include);
+                assert!(!compile.command.args.contains(&public_parent_flag));
+                assert!(compile.command.args.contains(&format!("-iquote{}", dependency.display())));
+                assert!(compile.inputs.iter().any(|input| matches!(input,
+                    ActionArtifact::Source(path) if path == &public)));
+            }).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn namespace_dependency_quote_roots_track_shadowing_and_header_values() {
+        use rush_incremental::{tracked, Dependency, RealTrackedIo, Staleness, TrackedIo};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let workspace = root.join("source");
+        let execution = root.join("execution");
+        let output = root.join("out");
+        let early = execution.join("early");
+        let late = execution.join("late");
+        for path in [&workspace, &output, &early.join("api"), &late.join("api")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let first = workspace.join("first.h");
+        let second = workspace.join("second.h");
+        std::fs::write(&first, "#define VALUE 42\n").unwrap();
+        std::fs::write(&second, "#define VALUE 43\n").unwrap();
+        std::fs::write(
+            workspace.join("main.cc"),
+            "#include \"api/value.h\"\nint main() { return VALUE; }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&first, late.join("api/value.h")).unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let headers: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|path| {
+                let exec_path = registry.paths_mut().intern(path);
+                registry.intern_artifact(
+                    ArtifactKey {
+                        config: ConfigId::DEFAULT,
+                        exec_path,
+                    },
+                    ArtifactKind::Header,
+                    true,
+                    TargetId(1),
+                    None,
+                )
+            })
+            .collect();
+        let quotes = [&early, &late]
+            .into_iter()
+            .map(|path| registry.intern_path(path))
+            .collect();
+        let provider = ProviderSet::empty().with_cc_info(CcInfo::from_direct_and_deps(
+            DirectCcInfo {
+                headers,
+                quote_include_dirs: quotes,
+                ..Default::default()
+            },
+            std::iter::empty(),
+        ));
+        let manager = Arc::new(CachingExecutingActionManager::default());
+        let context = BuildContext::new(workspace.clone(), output.clone())
+            .with_native_execution_root(Some(execution.clone()))
+            .with_dependencies(HashMap::new(), vec![("//:headers".into(), provider)])
+            .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+            .with_action_manager(manager.clone());
+        let binary = CcBinaryInstance {
+            name: "quoted".into(),
+            srcs: vec!["main.cc".into()],
+            deps: vec!["//:headers".into()],
+            ..binary_with_generated_header()
+        };
+        let semantics = rush_command_core::CommandSemantics::from_process();
+        let io = Arc::new(RealTrackedIo::new(semantics.clone(), &workspace));
+        let mut future = std::pin::pin!(binary.build(&context));
+        let artifacts = std::future::poll_fn(|cx| {
+            tracked::scope(io.clone(), || {
+                std::future::Future::poll(future.as_mut(), cx)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::process::Command::new(&artifacts[0].path)
+                .status()
+                .unwrap()
+                .code(),
+            Some(42)
+        );
+        let first_action = manager
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(action, _)| action.mnemonic == "CppCompile")
+            .unwrap()
+            .0
+            .clone();
+        assert!(first_action
+            .command
+            .args
+            .contains(&format!("-iquote{}", early.display())));
+        assert!(first_action
+            .command
+            .args
+            .contains(&format!("-iquote{}", late.display())));
+        // Read the same production admission path after output materialization,
+        // so unrelated new output-directory metadata cannot explain staleness.
+        let proof_io = Arc::new(RealTrackedIo::new(semantics.clone(), &workspace));
+        let admitted = tracked::scope(proof_io.clone(), || {
+            namespace_compile_headers(
+                &workspace.join("main.cc"),
+                &first_action.command.args,
+                &execution,
+                &[workspace.join("main.cc"), first.clone(), second.clone()],
+            )
+        })
+        .unwrap();
+        assert!(admitted.contains(&first) && !admitted.contains(&second));
+        let manifest = proof_io.manifest();
+        assert!(manifest.deps().iter().any(|dep| matches!(dep,
+            Dependency::FileExistence { path, exists: false, .. } if path == &early.join("api/value.h"))));
+        assert!(matches!(
+            manifest.validate(&semantics).staleness,
+            Staleness::Fresh
+        ));
+        std::os::unix::fs::symlink(&second, early.join("api/value.h")).unwrap();
+        assert!(matches!(
+            manifest.validate(&semantics).staleness,
+            Staleness::Stale { .. }
+        ));
+        for expected in [43, 44] {
+            if expected == 44 {
+                std::fs::write(&second, "#define VALUE 44\n").unwrap();
+            }
+            let io = Arc::new(RealTrackedIo::new(semantics.clone(), &workspace));
+            let mut future = std::pin::pin!(binary.build(&context));
+            let artifacts = std::future::poll_fn(|cx| {
+                tracked::scope(io.clone(), || {
+                    std::future::Future::poll(future.as_mut(), cx)
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::process::Command::new(&artifacts[0].path)
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(expected)
+            );
+            let actions = manager.requests.lock().unwrap();
+            let (compile, cached) = actions
+                .iter()
+                .rev()
+                .find(|(a, _)| a.mnemonic == "CppCompile")
+                .unwrap();
+            assert!(!cached);
+            assert_ne!(compile.id, first_action.id);
+            assert!(compile.inputs.iter().any(|input| matches!(input,
+                ActionArtifact::Source(path) if path == &second)));
+        }
     }
 
     #[tokio::test]
