@@ -5413,7 +5413,9 @@ impl RuleInstance for CcBinaryInstance {
         let native_working_dir = analysis_native_working_dir(ctx);
         use rush_action::ids::ArtifactKind;
         use std::path::Path;
-        if !self.srcs.is_empty() {
+        // Runtime always links, including deps-only binaries. An empty source
+        // list must still declare the real link producer and public output.
+        {
             // Phase 5.C0 P0: include generated headers from dep
             // CcCompilationContexts in CppCompile inputs.
             let dep_cc_infos = crate::providers::extract_cc_infos(dep_providers);
@@ -5983,7 +5985,6 @@ impl RuleInstance for CcBinaryInstance {
                     files: vec![bin_aid],
                 });
         }
-        ProviderSet::empty()
     }
 
     fn rule_type(&self) -> &str {
@@ -6001,9 +6002,6 @@ impl RuleInstance for CcBinaryInstance {
         use crate::providers::LinkFragment;
         use crate::SchedulerActionKey;
         let mut specs = Vec::new();
-        if self.srcs.is_empty() {
-            return specs;
-        }
         let (expanded_linkopts, linkopt_input_paths) =
             match expand_cc_binary_linkopts(&self.linkopts, |label| {
                 cc_binary_runtime_linkopt_files(context, label)
@@ -6938,6 +6936,301 @@ mod cc_binary_response_tests {
             alwayslink: false,
             data: Vec::new(),
         }
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn deps_only_binary_declares_real_link_and_matches_specs() {
+        use rush_action::command_spec::NormalizedCommandSpec;
+        for shared in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("source");
+            let output = temp.path().join("out");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("entry.cc"),
+                "extern \"C\" int printf(const char*, ...);\nint main(){printf(\"42\\n\");return 0;}\n").unwrap();
+            let library = CcLibraryRule
+                .parse_attributes(&HashMap::from([
+                    ("name".into(), Value::String("entry".into())),
+                    ("alwayslink".into(), Value::Bool(shared)),
+                    (
+                        "srcs".into(),
+                        Value::List(vec![Value::String("entry.cc".into())]),
+                    ),
+                ]))
+                .unwrap();
+            let name = if shared { "binding.so" } else { "app" };
+            let binary = CcBinaryRule
+                .parse_attributes(&HashMap::from([
+                    ("name".into(), Value::String(name.into())),
+                    (
+                        "deps".into(),
+                        Value::List(vec![Value::String(":entry".into())]),
+                    ),
+                    ("linkshared".into(), Value::Bool(shared)),
+                ]))
+                .unwrap();
+            let mut registry = ArtifactRegistry::new();
+            let resolver = StubIncludeResolver::new(workspace.clone());
+            let toolchain = Toolchain::default();
+            let library_provider = Arc::new({
+                let mut ctx = AnalysisContext::new(
+                    TargetId(1),
+                    ConfigId::DEFAULT,
+                    "",
+                    None,
+                    &output,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    &workspace,
+                    &[],
+                );
+                library.analyze(&mut ctx, &[])
+            });
+            let linker = library_provider
+                .get_cc_info()
+                .unwrap()
+                .linking
+                .linker_inputs
+                .iter()
+                .next()
+                .unwrap();
+            let archive = registry.linker_input(linker).artifact;
+            let archive_producer = registry.producer(archive).unwrap();
+            assert_eq!(
+                registry
+                    .strings()
+                    .str(registry.declared_action(archive_producer).mnemonic),
+                "CcArchive"
+            );
+            let labels = vec![("//:entry".into(), library_provider.clone())];
+            let provider = {
+                let mut ctx = AnalysisContext::new(
+                    TargetId(2),
+                    ConfigId::DEFAULT,
+                    "",
+                    None,
+                    &output,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    &workspace,
+                    &[],
+                )
+                .with_labeled_dep_providers(&labels);
+                binary.validate_analysis_dependencies(&ctx).unwrap();
+                binary.analyze(&mut ctx, &[library_provider.clone()])
+            };
+            assert!(
+                provider.get_cc_info().is_none(),
+                "a binary must not become a linkable CcInfo dependency"
+            );
+            let outputs = &provider.get_default_info().unwrap().files;
+            assert_eq!(outputs.len(), 1);
+            let binary_artifact = outputs[0];
+            assert_eq!(registry.artifact_path(binary_artifact), output.join(name));
+            assert_eq!(
+                registry.artifact(binary_artifact).kind,
+                if shared {
+                    ArtifactKind::SharedLibrary
+                } else {
+                    ArtifactKind::Executable
+                }
+            );
+            let links: Vec<_> = registry
+                .declared_actions()
+                .filter(|(_, action)| action.owner_target == TargetId(2))
+                .collect();
+            assert_eq!(
+                links.len(),
+                1,
+                "deps-only app declares one link and no compile"
+            );
+            let (link_id, declaration) = links[0];
+            assert_eq!(registry.strings().str(declaration.mnemonic), "CcLink");
+            assert_eq!(declaration.inputs.as_ref(), &[archive]);
+            assert_eq!(declaration.outputs.as_ref(), &[binary_artifact]);
+            assert_eq!(registry.producer(binary_artifact), Some(link_id));
+            let pass_a = NormalizedCommandSpec::from_registry_action(&registry, link_id).unwrap();
+            assert_eq!(pass_a.argv.contains(&"-shared".to_owned()), shared);
+            let registry = Arc::new(tokio::sync::Mutex::new(registry));
+            let manager = Arc::new(RecordingExecutingActionManager::default());
+            let library_context = BuildContext::new(workspace.clone(), output.clone())
+                .with_toolchain(toolchain.clone())
+                .with_artifact_registry(registry.clone())
+                .with_materialize_static_libraries(true)
+                .with_action_manager(manager.clone());
+            let library_artifacts = library.build(&library_context).await.unwrap();
+            let binary_context = BuildContext::new(workspace, output.clone())
+                .with_toolchain(toolchain)
+                .with_artifact_registry(registry)
+                .with_dependencies(
+                    HashMap::from([(
+                        "//:entry".into(),
+                        NestedSet::new(library_artifacts, Vec::new()),
+                    )]),
+                    vec![("//:entry".into(), library_provider.as_ref().clone())],
+                )
+                .with_action_manager(manager.clone());
+            let specs = binary.build_legacy_command_specs(&binary_context).await;
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].0.mnemonic, "CcLink");
+            assert_eq!(specs[0].1, pass_a);
+            let artifacts = binary.build(&binary_context).await.unwrap();
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(artifacts[0].path, output.join(name));
+            assert_eq!(
+                artifacts[0].artifact_type,
+                if shared {
+                    ArtifactType::SharedLibrary
+                } else {
+                    ArtifactType::Executable
+                }
+            );
+            assert!(artifacts[0].path.is_file());
+            if !shared {
+                let result = std::process::Command::new(&artifacts[0].path)
+                    .output()
+                    .unwrap();
+                assert!(result.status.success());
+                assert_eq!(result.stdout, b"42\n");
+            }
+            let actions = manager.actions.lock().unwrap();
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| a.mnemonic == "CppCompile")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                // The legacy runtime mnemonic differs from the declaration/spec
+                // family (CcArchive); require its one real archive invocation.
+                actions.iter().filter(|a| a.mnemonic == "CppArchive").count(),
+                1
+            );
+            // Runtime uses CppLink; analysis/spec use CcLink. Match the actual
+            // runtime event while preserving full command/input parity below.
+            let runtime_links: Vec<_> = actions.iter().filter(|a| a.mnemonic == "CppLink").collect();
+            assert_eq!(runtime_links.len(), 1);
+            let runtime = runtime_links[0];
+            assert_eq!(runtime.command.executable, pass_a.executable);
+            assert_eq!(runtime.command.args, pass_a.argv);
+            assert_eq!(runtime.command.working_dir, pass_a.cwd);
+            let mut inputs: Vec<_> = runtime
+                .inputs
+                .iter()
+                .map(|a| match a {
+                    ActionArtifact::Source(p) => p.clone(),
+                    _ => panic!("fixture uses physical artifacts"),
+                })
+                .collect();
+            inputs.sort();
+            inputs.dedup();
+            assert_eq!(inputs, pass_a.declared_inputs);
+        }
+    }
+
+    #[tokio::test]
+    async fn deps_only_binary_invalid_link_location_refuses_before_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(&output).unwrap();
+        let prior = output.join("app");
+        std::fs::write(&prior, b"prior output must not be returned").unwrap();
+        let binary = CcBinaryRule
+            .parse_attributes(&HashMap::from([
+                ("name".into(), Value::String("app".into())),
+                (
+                    "linkopts".into(),
+                    Value::List(vec![Value::String("$(location :missing)".into())]),
+                ),
+            ]))
+            .unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let resolver = StubIncludeResolver::new(temp.path().into());
+        let toolchain = Toolchain::default();
+        let provider = {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                temp.path(),
+                &[],
+            );
+            assert!(binary.validate_analysis_dependencies(&ctx).is_err());
+            binary.analyze(&mut ctx, &[])
+        };
+        let output_id = provider.get_default_info().unwrap().files[0];
+        let producer = registry.producer(output_id).unwrap();
+        assert!(matches!(
+            registry.declared_action(producer).status,
+            rush_action::ids::ActionDeclarationStatus::Incomplete { .. }
+        ));
+        assert!(
+            rush_action::command_spec::NormalizedCommandSpec::from_registry_action(
+                &registry, producer
+            )
+            .is_none()
+        );
+        assert!(provider.get_cc_info().is_none());
+        let manager = Arc::new(RecordingExecutingActionManager::default());
+        let context = BuildContext::new(temp.path().into(), output)
+            .with_artifact_registry(Arc::new(tokio::sync::Mutex::new(registry)))
+            .with_action_manager(manager.clone());
+        assert!(binary.build_legacy_command_specs(&context).await.is_empty());
+        assert!(binary.build(&context).await.is_err());
+        assert!(manager.actions.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(prior).unwrap(),
+            b"prior output must not be returned"
+        );
+    }
+
+    #[test]
+    fn deps_only_binary_without_link_inputs_is_not_empty_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("out");
+        let binary = CcBinaryRule
+            .parse_attributes(&HashMap::from([(
+                "name".into(),
+                Value::String("app".into()),
+            )]))
+            .unwrap();
+        let mut registry = ArtifactRegistry::new();
+        let resolver = StubIncludeResolver::new(temp.path().into());
+        let toolchain = Toolchain::default();
+        let provider = {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                None,
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                temp.path(),
+                &[],
+            );
+            binary.analyze(&mut ctx, &[])
+        };
+        let files = &provider.get_default_info().unwrap().files;
+        assert_eq!(files.len(), 1);
+        let action = registry.declared_action(registry.producer(files[0]).unwrap());
+        assert_eq!(registry.strings().str(action.mnemonic), "CcLink");
+        assert!(action.inputs.is_empty());
+        assert_eq!(action.outputs.as_ref(), files.as_slice());
+        assert!(provider.get_cc_info().is_none());
+        // No output is fabricated: the real linker must decide this request.
+        assert!(!output.join("app").exists());
     }
 
     #[cfg(target_os = "linux")]

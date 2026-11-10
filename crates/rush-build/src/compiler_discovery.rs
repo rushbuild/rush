@@ -1146,7 +1146,7 @@ pub(crate) fn record_completed_diagnostic_process(
         .push((workspace.to_owned(), mnemonic.to_owned(), id));
 }
 #[cfg(test)]
-fn take_completed_diagnostic_processes(
+pub(crate) fn take_completed_diagnostic_processes(
     workspace: &std::path::Path,
 ) -> Vec<(String, DeclaredActionId)> {
     let mut trace = DIAGNOSTIC_PROCESS_TRACE
@@ -1636,6 +1636,105 @@ mod tests {
         }
         rush_command_core::populate_workspace_config(&mut request, root);
         Ok(CommandSemantics::from_run_request(&request)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compiler_discovery_deps_only_binary_owns_real_link_and_rejects_missing_main(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        std::fs::write(root.join("WORKSPACE"), "workspace(name='deps_only_link')\n")?;
+        std::fs::write(
+            root.join("BUILD"),
+            "cc_library(name='entry',srcs=['entry.cc'])\ncc_binary(name='app',deps=[':entry'])\n",
+        )?;
+        let source = |value| {
+            format!("#include <stdio.h>\nint main(){{printf(\"%d\\n\",{value});return 0;}}\n")
+        };
+        std::fs::write(root.join("entry.cc"), source(42))?;
+        let orchestrator = crate::BuildOrchestrator::with_workspace(root.clone());
+        let semantics = build_request(&root, "//:app", Some(b"uncached-diagnostic-v1"))?;
+        let targets = vec!["//:app".to_string()];
+        let binary = crate::cache_paths::workspace_output_root(&root).join("app");
+        for expected in [42, 42, 43] {
+            if expected == 43 {
+                std::fs::write(root.join("entry.cc"), source(43))?;
+            }
+            orchestrator
+                .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
+                .await?;
+            let result = std::process::Command::new(&binary)
+                .current_dir(&root)
+                .output()?;
+            assert!(result.status.success());
+            assert_eq!(result.stdout, format!("{expected}\n").as_bytes());
+            let events = take_completed_diagnostic_processes(&root);
+            let mut counts = std::collections::BTreeMap::new();
+            for (mnemonic, _) in &events {
+                let kind = match mnemonic.as_str() {
+                    "CCompile" | "CppCompile" => "compile",
+                    "CcArchive" | "CppArchive" => "archive",
+                    "CcLink" | "CppLink" => "link",
+                    other => anyhow::bail!("unexpected diagnostic process: {other}"),
+                };
+                *counts.entry(kind).or_insert(0usize) += 1;
+            }
+            assert_eq!(
+                counts,
+                std::collections::BTreeMap::from([("compile", 1), ("archive", 1), ("link", 1),]),
+                "all real processes must repeat without cache: {events:?}"
+            );
+            // Inspect the current admission token, which rotates per command.
+            let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, root.clone(), targets.clone());
+            assert!(orchestrator.snapshot_cache.get(&key).is_none());
+            assert!(crate::cold_noop_cache::load(&root, &key).is_none());
+        }
+        // Keep a real previous executable in place. A newly compiled archive
+        // without main must reach the linker and fail, never reuse that file or
+        // fail at the diagnostic manager's missing-declaration guard.
+        assert!(binary.is_file());
+        std::fs::write(
+            root.join("entry.cc"),
+            "int unrelated_library_function(){return 43;}\n",
+        )?;
+        let error = orchestrator
+            .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
+            .await
+            .expect_err("a main-less deps-only binary must fail the real link");
+        let message = format!("{error:#}");
+        assert!(message.contains("main"), "{message}");
+        assert!(
+            !message.contains("requires one exact declared producer/output shape"),
+            "{message}"
+        );
+        let events = take_completed_diagnostic_processes(&root);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(kind, _)| matches!(kind.as_str(), "CCompile" | "CppCompile"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(kind, _)| matches!(kind.as_str(), "CcArchive" | "CppArchive"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(kind, _)| matches!(kind.as_str(), "CcLink" | "CppLink"))
+                .count(),
+            0,
+            "failed link must never report successful completion"
+        );
+        let key = crate::analysis_snapshot::AnalysisKey::new(&semantics, root.clone(), targets.clone());
+        assert!(orchestrator.snapshot_cache.get(&key).is_none());
+        assert!(crate::cold_noop_cache::load(&root, &key).is_none());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
