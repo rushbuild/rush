@@ -14,6 +14,193 @@ pub trait ActionManager: Send + Sync {
     async fn execute(&self, action: Action) -> Result<ActionResult>;
 }
 
+/// Requested native compile policy. This in-memory value is not execution or
+/// cache authority. No current orchestrator selects the diagnostic variant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeCompileMode {
+    #[default]
+    Literal,
+    UncachedDiagnosticV1,
+}
+
+/// Pre-producer compile shape, tied to one build's artifact registry. It is
+/// deliberately separate from a ready `PendingCompileDiscovery` request and
+/// from serialized declared actions. No file has been read or certified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCompileDeclaration {
+    action: rush_action::ids::DeclaredActionId,
+    target: rush_action::ids::TargetId,
+    config: rush_action::ids::ConfigId,
+    source: rush_action::ids::ArtifactId,
+    object: rush_action::ids::ArtifactId,
+    source_path: PathBuf,
+    object_path: PathBuf,
+    inputs: Vec<rush_action::ids::ArtifactId>,
+    outputs: Vec<rush_action::ids::ArtifactId>,
+    // Raw spellings retain distinctions Path equality would normalize. This
+    // binds every declared input/output name, not only source and object.
+    artifact_paths: Vec<std::ffi::OsString>,
+    producers: Vec<rush_action::ids::DeclaredActionId>,
+}
+
+impl PendingCompileDeclaration {
+    /// Validate declaration identity only. Registry handles must belong to the
+    /// supplied registry; unknown action handles are refused before lookup.
+    pub fn from_registry(
+        registry: &rush_action::ids::ArtifactRegistry,
+        action: rush_action::ids::DeclaredActionId,
+        target: rush_action::ids::TargetId,
+        config: rush_action::ids::ConfigId,
+        source: rush_action::ids::ArtifactId,
+        object: rush_action::ids::ArtifactId,
+    ) -> Result<Self> {
+        use rush_action::ids::ActionDeclarationStatus;
+        anyhow::ensure!(
+            (action.0 as usize) < registry.declared_action_count(),
+            "pending compile action is not in this registry"
+        );
+        let declaration = registry.declared_action(action);
+        anyhow::ensure!(
+            declaration.owner_target == target,
+            "pending compile target does not own its declaration"
+        );
+        anyhow::ensure!(
+            matches!(
+                registry.strings().str(declaration.mnemonic),
+                "CCompile" | "CppCompile"
+            ),
+            "pending compile requires a C/C++ compile declaration"
+        );
+        anyhow::ensure!(
+            matches!(
+                declaration.status,
+                ActionDeclarationStatus::Incomplete { .. }
+            ),
+            "pending compile must remain an incomplete declaration"
+        );
+        anyhow::ensure!(
+            source != object
+                && declaration.inputs.contains(&source)
+                && declaration.outputs.contains(&object),
+            "pending compile source/object must be distinct declared input/output artifacts"
+        );
+        let mut producers = Vec::new();
+        for &id in declaration.inputs.iter().chain(declaration.outputs.iter()) {
+            anyhow::ensure!(
+                (id.0 as usize) < registry.artifact_count(),
+                "pending compile artifact is not in this registry"
+            );
+            let path = registry.artifact_path(id);
+            anyhow::ensure!(
+                registry.find_artifact_by_path(path, config) == Some(id),
+                "pending compile artifact belongs to another configuration"
+            );
+        }
+        for &id in declaration.inputs.iter() {
+            let data = registry.artifact(id);
+            if data.is_source {
+                anyhow::ensure!(
+                    data.owner_action.is_none() && data.owner_action_declared.is_none(),
+                    "pending compile source artifact has a producer"
+                );
+            } else {
+                let producer = data.owner_action_declared.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pending compile generated input has no declared producer: {}",
+                        registry.artifact_path(id).display()
+                    )
+                })?;
+                anyhow::ensure!(
+                    producer != action,
+                    "pending compile consumes its own output"
+                );
+                if !producers.contains(&producer) {
+                    producers.push(producer);
+                }
+            }
+        }
+        let output = registry.artifact(object);
+        anyhow::ensure!(
+            !output.is_source
+                && output.kind == rush_action::ids::ArtifactKind::Object
+                && output.owner_target == target
+                && output.owner_action_declared == Some(action),
+            "pending compile object is not owned by its declaration"
+        );
+        Ok(Self {
+            action,
+            target,
+            config,
+            source,
+            object,
+            source_path: registry.artifact_path(source).to_owned(),
+            object_path: registry.artifact_path(object).to_owned(),
+            inputs: declaration.inputs.to_vec(),
+            outputs: declaration.outputs.to_vec(),
+            artifact_paths: declaration
+                .inputs
+                .iter()
+                .chain(declaration.outputs.iter())
+                .map(|&id| registry.artifact_path(id).as_os_str().to_os_string())
+                .collect(),
+            producers,
+        })
+    }
+
+    pub fn action(&self) -> rush_action::ids::DeclaredActionId {
+        self.action
+    }
+    pub fn target(&self) -> rush_action::ids::TargetId {
+        self.target
+    }
+    pub fn config(&self) -> rush_action::ids::ConfigId {
+        self.config
+    }
+    pub fn source(&self) -> rush_action::ids::ArtifactId {
+        self.source
+    }
+    pub fn object(&self) -> rush_action::ids::ArtifactId {
+        self.object
+    }
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+    pub fn object_path(&self) -> &Path {
+        &self.object_path
+    }
+    pub fn required_producers(&self) -> &[rush_action::ids::DeclaredActionId] {
+        &self.producers
+    }
+}
+
+/// Per-build, nonserialized pending declarations. A record is a request to wait
+/// for producers and discover inputs later, never a certificate or cache key.
+#[derive(Clone, Debug, Default)]
+pub struct PendingCompileDeclarations {
+    records: HashMap<rush_action::ids::DeclaredActionId, PendingCompileDeclaration>,
+}
+
+impl PendingCompileDeclarations {
+    pub fn record(&mut self, declaration: PendingCompileDeclaration) -> Result<()> {
+        if let Some(old) = self.records.get(&declaration.action) {
+            anyhow::ensure!(
+                old == &declaration,
+                "conflicting pending compile declaration"
+            );
+            return Ok(());
+        }
+        self.records.insert(declaration.action, declaration);
+        Ok(())
+    }
+
+    pub fn get(
+        &self,
+        action: rush_action::ids::DeclaredActionId,
+    ) -> Option<&PendingCompileDeclaration> {
+        self.records.get(&action)
+    }
+}
+
 /// Toolchain information for compilation
 #[derive(Debug, Clone)]
 pub struct Toolchain {
@@ -70,6 +257,8 @@ impl Toolchain {
 
 /// Build context passed to rule execution
 pub struct BuildContext {
+    native_compile_mode: NativeCompileMode,
+    pending_compile_declarations: Option<Arc<PendingCompileDeclarations>>,
     /// Source root for the rule's owning repository.
     pub workspace_root: PathBuf,
     /// Main workspace root that owns shared caches and fetched toolchains.
@@ -257,6 +446,8 @@ pub mod label_fallback_counters {
 impl BuildContext {
     pub fn new(workspace_root: PathBuf, output_dir: PathBuf) -> Self {
         Self {
+            native_compile_mode: NativeCompileMode::Literal,
+            pending_compile_declarations: None,
             main_workspace_root: workspace_root.clone(),
             native_execution_root: None,
             workspace_root,
@@ -274,6 +465,25 @@ impl BuildContext {
             materialize_static_libraries: true,
             dirty_paths: Vec::new(),
         }
+    }
+
+    /// Carry an explicit request only; this does not change any execution path.
+    pub fn with_native_compile_discovery(
+        mut self,
+        mode: NativeCompileMode,
+        declarations: Arc<PendingCompileDeclarations>,
+    ) -> Self {
+        self.native_compile_mode = mode;
+        self.pending_compile_declarations = Some(declarations);
+        self
+    }
+
+    pub fn native_compile_mode(&self) -> NativeCompileMode {
+        self.native_compile_mode
+    }
+
+    pub fn pending_compile_declarations(&self) -> Option<&PendingCompileDeclarations> {
+        self.pending_compile_declarations.as_deref()
     }
 
     /// Package-qualified output directory for a target.

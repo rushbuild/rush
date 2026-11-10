@@ -114,6 +114,8 @@ impl IncludeResolver for StubIncludeResolver {
 /// helper methods so borrow checking enforces "only one rule at
 /// a time can register artifacts during its analysis."
 pub struct AnalysisContext<'a> {
+    native_compile_mode: crate::context::NativeCompileMode,
+    pending_compile_declarations: Option<&'a mut crate::context::PendingCompileDeclarations>,
     target: TargetId,
     config_id: ConfigId,
     /// Rule's package (e.g. `tensorflow/core`).
@@ -188,6 +190,8 @@ impl<'a> AnalysisContext<'a> {
         extra_proto_paths: &'a [PathBuf],
     ) -> Self {
         Self {
+            native_compile_mode: crate::context::NativeCompileMode::Literal,
+            pending_compile_declarations: None,
             target,
             config_id,
             package,
@@ -202,6 +206,48 @@ impl<'a> AnalysisContext<'a> {
             extra_proto_paths,
             labeled_dep_providers: &[],
         }
+    }
+
+    /// Attach explicit, inactive discovery metadata. Existing namespace proof
+    /// and fatal-error handling are unchanged; this builder bypasses nothing.
+    pub fn with_native_compile_discovery(
+        mut self,
+        mode: crate::context::NativeCompileMode,
+        declarations: &'a mut crate::context::PendingCompileDeclarations,
+    ) -> Self {
+        self.native_compile_mode = mode;
+        self.pending_compile_declarations = Some(declarations);
+        self
+    }
+
+    pub fn native_compile_mode(&self) -> crate::context::NativeCompileMode {
+        self.native_compile_mode
+    }
+
+    /// Record an already-declared incomplete compile, without making it ready
+    /// or schedulable. No current rule invokes this inactive plumbing.
+    pub fn record_pending_compile(
+        &mut self,
+        action: rush_action::ids::DeclaredActionId,
+        source: ArtifactId,
+        object: ArtifactId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.native_compile_mode == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+            "literal compile mode cannot record a pending discovery request"
+        );
+        let record = crate::context::PendingCompileDeclaration::from_registry(
+            self.registry,
+            action,
+            self.target,
+            self.config_id,
+            source,
+            object,
+        )?;
+        self.pending_compile_declarations
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::anyhow!("pending compile declaration table is not attached"))?
+            .record(record)
     }
 
     pub fn with_native_execution_root(mut self, root: Option<&'a Path>) -> Self {

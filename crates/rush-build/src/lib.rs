@@ -9,6 +9,7 @@
 #![allow(missing_docs)]
 
 mod configured_flag_metadata;
+pub(crate) mod compiler_discovery;
 pub(crate) mod configuration_table;
 pub(crate) mod configured_target;
 
