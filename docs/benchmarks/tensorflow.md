@@ -1,71 +1,168 @@
-# Check TensorFlow builds before comparing latency
+# Check TensorFlow builds and program behavior
 
-Build pristine TensorFlow 2.17.0 commit
-`ad6d8cc177d0c868982e39e0823d0efbfb95f04c` with
-`//tensorflow/core:framework`, `framework_shared_object=false`, optimization
-mode `opt`, eight jobs and the same eight CPUs per host. Compare Rush before
-the incremental optimizations (`b003cc3`) with the integrated engine
-`b059a25` published in `f9d97fe`. Use Bazel 6.5.0 as the reference.
+Build the framework and run a native Tensor consumer using the normal Auto
+policy. Keep each selected target and its validation scope attached to its
+result before comparing build times.
 
-## Read the November 9 build checks
+## Read the accepted 2026-11-10 checks
 
-| Host | Rush before | Rush after | Bazel reference |
-| --- | --- | --- | --- |
-| Host C | Rule loading fails; zero compiler calls | Same failure | Build completes |
-| Host D | Rule loading fails; zero compiler calls | Same failure | Build completes |
+Use **Rush 2026-11-10 (`ad87da5`)**, commit
+`ad87da5188201534d443c40481aba6b57ecc30d6`, tree
+`87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd`. The original TensorFlow 2.17.0
+source is commit `ad6d8cc177d0c868982e39e0823d0efbfb95f04c`; its archive
+SHA256 is `7f188a68313206ebb8284912125066b55af710bbf4c18c6bc00adcaa5ab03960`.
 
-Both Rush versions stop while loading
-`@rules_java//java/private:native.bzl`: `JavaInfo` is undefined. The failure
-precedes compilation. Bazel completes 2,119 actions on each host, including
-1,277 local processes and 990 instrumented compile invocations. Inspect the
-framework object outputs as well as the successful exit; the top-level
-framework target aggregates dependencies rather than producing a standalone
-archive in this profile.
+| Case | Selected work | Build interval | Samples | Accepted outcome |
+| --- | --- | ---: | ---: | --- |
+| C | Native `tensor_roundtrip` consumer and its framework dependency | 652.786 s | 1 | Build and one Tensor runtime pass; source/SDK/output before/after file checks pass, including 234 archives and 645 unique thin members |
+| D | `//tensorflow/core:framework` | 674.906 s | 1 | Build and original-source audit pass; framework-subtree inventory contains 57 objects and 46 archives |
 
-Use [the complete build-check data](data/tensorflow-build-retest-20261109.json)
-for exact binary digests, source archive, defines, configuration and object
-checks. Expand `CASE` to each isolated run directory, `REPOSITORY_CACHE` to
-its dependency-download cache, and engine variables to the pinned executables.
-Run from that case's pristine TensorFlow workspace. The compiler wrappers log
-invocations and pass arguments unchanged to Clang. Retain failed attempts as
-compatibility evidence. Assign no speed ratio to their durations and claim no current TensorFlow speed improvement
-from the synthetic C++ results.
+Use these single shared-host intervals as correctness diagnostics for
+**different selected targets**. Unrelated GPU work was permitted on both
+validation systems. The intervals measure the build command; source/profile setup,
+C's pre-build SDK snapshot and C's runtime verification are outside them. Collect paired Bazel samples and complete distributions before computing
+medians or speed ratios. D has no runtime or
+SDK/runtime-bookend result. Use the [sanitized data](data/tensorflow-native-20261110.json)
+for full-precision intervals, exact Rush and tool executable hashes,
+source/probe digests and
+separate integrity scopes.
 
-Preserve the initialized predeclared environment in `Evaluator::new` and
-export the required native Java providers correctly. The current constructor
-populates an environment and then returns a different empty one; the module
-also needs `JavaPluginInfo`. Add a real module-load regression and complete
-fresh framework builds before measuring clean, unchanged and edit latency.
-Keep TensorFlow sources and dependency checksums unchanged; substitute no
-placeholder providers or generated files to pass this gate.
+Both cases use eight CPUs, eight jobs, optimization mode `opt`, the
+`repair_cpu` and `monolithic` configurations, Clang 21, and these defines:
 
-## Keep the recorded no-op scope separate
+```text
+framework_shared_object=false
+tflite_with_xnnpack=false
+tensorflow_mkldnn_contraction_kernel=0
+no_gcp_support=true
+__TENSORFLOW_NO_LGPL_DEPS__=1
+no_aws_support=true
+no_hdfs_support=true
+no_nccl_support=true
+```
 
-The imported unchanged-command record reports `//tensorflow/core:framework`,
-18,522 retained dependencies and these 30-sample medians:
+Bazel 6.5.0 supplies configuration queries in this native profile. The host
+build Python is 3.13; TensorFlow's default hermetic Python selection remains
+in place. Keep these tools and configurations explicit in a new record.
 
-| Engine | Median | Samples |
+Leave `RUSH_CPP_DISCOVERY` unset and run the normal build command.
+C records `ConditionalIncludes` at `@fft2d//:fft2d`.
+D records `ConditionalIncludes` at `@fft2d//:fft2d`.
+That path executes the whole selected invocation locally with reuse disabled.
+Run the normal command again; if either supported compiler-execution reason
+recurs, expect all selected actions to execute again, including unchanged
+repeats. Treat compiler dependency records as observations and validate the
+required input closure separately before admitting reusable results. Qualify
+reusable full-framework execution before reporting no-op or edit latency.
+
+## Reproduce the target and probe
+
+Start from a fresh copy of the pinned TensorFlow source. Use separate owned
+Rush cache, output and runtime directories, a verified dependency-download
+cache, local Linux execution and the scheduler disabled. Select Clang 21,
+Bazel 6.5.0 and the host build Python explicitly. Keep the original upstream
+files and dependency checksums unchanged.
+
+Set `TF_SOURCE` to that TensorFlow workspace and `RUSH_REPO` to this Rush
+checkout. Set `DOWNLOAD_CACHE`, `PYTHON_BIN_PATH` and `PYTHON_LIB_PATH` to the
+selected download cache and host Python locations. In a fresh workspace,
+write this case-local profile after expanding those variables:
+
+```sh
+umask 077
+test ! -e "$TF_SOURCE/.bazelrc.user"
+cat > "$TF_SOURCE/.bazelrc.user" <<EOF_PROFILE
+common --repo_env=CC
+common --repo_env=CXX
+common --repository_cache=$DOWNLOAD_CACHE
+build:repair_cpu --action_env=CC
+build:repair_cpu --action_env=CXX
+build:repair_cpu --action_env=PYTHON_BIN_PATH
+build:repair_cpu --action_env=PYTHON_LIB_PATH
+build:repair_cpu --python_path=$PYTHON_BIN_PATH
+EOF_PROFILE
+```
+
+Export `CC`, `CXX` and `RUSH_CXX` for the selected Clang drivers, with
+`RUSH_CXX` using the C++ driver. Export the selected `PYTHON_BIN_PATH` and
+`PYTHON_LIB_PATH`. Make the selected Bazel available to Rush's configuration
+resolver. Set `RUSH_WORKSPACE_CACHE_ROOT`, `RUSH_CACHE_ROOT`,
+`RUSH_WORKSPACE_OUTPUT_ROOT`, `RUSH_WORKSPACE_BIN_LINK` and `XDG_RUNTIME_DIR`
+to fresh owned locations outside the source tree; keep `RUSH_WORKSPACE_OUTPUT_ROOT` as `TF_OUTPUT` for the runtime command below.
+Select an eight-CPU affinity as `EIGHT_CPU_SET` and use eight jobs. Use a
+fresh HOME for the record, CPU-only TensorFlow selections
+(`TF_NEED_CUDA=0`, `TF_NEED_ROCM=0`, `TF_NEED_TENSORRT=0`) and empty
+`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`.
+
+Set `TARGET=//tensorflow/core:framework` for the framework check. Install the
+probe below and choose `TARGET=//rush_runtime_probe:tensor_roundtrip` for
+the program check. Build either selected target with the recorded flags and defines:
+
+```sh
+unset RUSH_CPP_DISCOVERY RUSH_USE_SCHEDULER
+cd "$TF_SOURCE"
+taskset -c "$EIGHT_CPU_SET" rush build "$TARGET" -j 8 -c opt \
+  --config=repair_cpu --config=monolithic --daemon=auto \
+  --define framework_shared_object=false \
+  --define tflite_with_xnnpack=false \
+  --define tensorflow_mkldnn_contraction_kernel=0 \
+  --define no_gcp_support=true \
+  --define __TENSORFLOW_NO_LGPL_DEPS__=1 \
+  --define no_aws_support=true --define no_hdfs_support=true \
+  --define no_nccl_support=true
+```
+
+For the program check, add these two published files before running the
+build command:
+
+```sh
+mkdir -m 700 "$TF_SOURCE/rush_runtime_probe"
+install -m 600 "$RUSH_REPO/benchmarks/workloads/tensorflow-probe/probe.cc" \
+  "$TF_SOURCE/rush_runtime_probe/probe.cc"
+install -m 600 "$RUSH_REPO/benchmarks/workloads/tensorflow-probe/BUILD.bazel.in" \
+  "$TF_SOURCE/rush_runtime_probe/BUILD.bazel"
+```
+
+Set `TARGET=//rush_runtime_probe:tensor_roundtrip`, run the build command,
+then run `"$TF_OUTPUT/tensor_roundtrip"`. Require exit zero and exactly
+`TF_TENSOR_ROUNDTRIP_SLICE_OK` followed by a newline. The program checks a
+float Tensor of shape `[2, 3]`, TensorProto content serialization/restoration,
+and a `[1, 3]` row slice with nondefault values.
+
+The fixture is copied verbatim from the accepted runtime input: `probe.cc`
+is 1,213 bytes, SHA256
+`f31bd4d31988ae31bca4d642a402bdca8540ea4a9e34000c93ce5a16385e558c`;
+`BUILD.bazel.in` is 113 bytes, SHA256
+`2577c1ce7d5f2acd584f72c1772db27dca63ff2bad3d2722013109a08b811355`.
+Its installed name is `BUILD.bazel`.
+
+Record the actual command, tool/profile digests, compiler work and outputs
+for a new run. Compare the selected compiler/toolchain files before and
+after the build. Check original source bytes/modes/links, expected additions,
+and selected source/toolchain files and linked native outputs before and after runtime,
+including every referenced thin-archive member. The commands reproduce the
+target/profile and program-check shape; they do not replace those integrity
+checks or reproduce the original shared-host durations by themselves.
+
+## Keep the imported timing record historical
+
+The separate imported unchanged-command record reports 30-sample medians:
+
+| Variant | Recorded median | Recorded samples |
 | --- | ---: | ---: |
 | Rush | 9.3 ms | 30 |
 | Bazel | 64.2 ms | 30 |
 | Bazel with `--watchfs` | 54.5 ms | 30 |
 
-![Recorded TensorFlow warm no-op latency](graphs/bench-tensorflow-noop.svg)
+Its exact timing candidate, full sample series and complete toolchain/host
+record remain unrecovered. It does not qualify the current engine or the
+fresh compiler-execution path above. The imported TF 2.15 **463/463** CPU
+runtime corpus is also historical and was not rerun here; C's current runtime
+count is one program.
 
-Keep this record attached to its original scope. Its complete sample series,
-exact timing candidate and host/toolchain record remain unrecovered. It does
-not validate the current release or override the fresh-build failures above.
-The separate TF 2.15 runtime corpus is also outside this new build check.
-
-## Reproduce the comparison
-
-Freeze both engines, the TensorFlow tree and configuration. Match the target,
-environment and cache conditions, collect all 30 samples, and verify that
-unchanged commands execute no unexpected actions. Report the distribution
-and output checks. Do not derive p99 from a median.
-
-Recover the complete sample series, exact timing-candidate identity and
-toolchain/host record before claiming an independently reproduced result.
-The [source record](PROVENANCE.md) identifies what is retained and what is
-missing. Read [TensorFlow compatibility](../status/tensorflow.md) for build
-and runtime acceptance scopes.
+Recover those timing inputs before claiming an independently reproduced
+comparison. For a new comparison, match selected targets, configuration,
+compiler work, environment and cache conditions; verify program/output
+behavior and collect the complete distributions. Read the
+[provenance record](PROVENANCE.md) and [current TensorFlow status](../status/tensorflow.md)
+for the distinct acceptance scopes.

@@ -1,0 +1,5 @@
+cc_binary(
+    name = "tensor_roundtrip",
+    srcs = ["probe.cc"],
+    deps = ["//tensorflow/core:framework"],
+)

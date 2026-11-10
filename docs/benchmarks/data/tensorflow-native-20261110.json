@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-10",
+  "rush": {
+    "commit": "ad87da5188201534d443c40481aba6b57ecc30d6",
+    "tree": "87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd",
+    "label": "Rush 2026-11-10 (ad87da5)",
+    "source_component_release_checks": {
+      "passed_per_system": 21,
+      "systems": [
+        "C",
+        "D"
+      ]
+    },
+    "source_identity_binding": {
+      "measured_commit": "c63206f79f7b1ce04a634b4e063f9e8bfbadcd15",
+      "measured_tree": "87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd",
+      "published_commit": "ad87da5188201534d443c40481aba6b57ecc30d6",
+      "tree": "87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd",
+      "tracked_source_files": 2090,
+      "exact_tree_equal": true,
+      "proof_sha256": "fe692861863ac842ca1e226f0f5457e9af4dbd026c13c68600e58fecf7a22760",
+      "executable_and_evidence_digests": "unchanged after source history assembly"
+    }
+  },
+  "tensorflow": {
+    "version": "2.17.0",
+    "source_commit": "ad6d8cc177d0c868982e39e0823d0efbfb95f04c",
+    "archive_sha256": "7f188a68313206ebb8284912125066b55af710bbf4c18c6bc00adcaa5ab03960",
+    "original_source": {
+      "regular_files": 31981,
+      "symlinks": 2,
+      "bytes_modes_links_unchanged_on": [
+        "C",
+        "D"
+      ]
+    },
+    "runtime_probe_source_additions": {
+      "rush_runtime_probe/probe.cc": {
+        "public_path": "benchmarks/workloads/tensorflow-probe/probe.cc",
+        "sha256": "f31bd4d31988ae31bca4d642a402bdca8540ea4a9e34000c93ce5a16385e558c",
+        "bytes": 1213,
+        "tested_mode": "0600"
+      },
+      "rush_runtime_probe/BUILD.bazel": {
+        "public_path": "benchmarks/workloads/tensorflow-probe/BUILD.bazel.in",
+        "sha256": "2577c1ce7d5f2acd584f72c1772db27dca63ff2bad3d2722013109a08b811355",
+        "bytes": 113,
+        "tested_mode": "0600"
+      }
+    }
+  },
+  "request": {
+    "policy": "Auto",
+    "discovery_environment": "unset",
+    "jobs": 8,
+    "cpu_count": 8,
+    "common_flags": [
+      "-j",
+      "8",
+      "-c",
+      "opt",
+      "--config=repair_cpu",
+      "--config=monolithic",
+      "--daemon=auto"
+    ],
+    "defines": {
+      "framework_shared_object": "false",
+      "tflite_with_xnnpack": "false",
+      "tensorflow_mkldnn_contraction_kernel": "0",
+      "no_gcp_support": "true",
+      "__TENSORFLOW_NO_LGPL_DEPS__": "1",
+      "no_aws_support": "true",
+      "no_hdfs_support": "true",
+      "no_nccl_support": "true"
+    },
+    "tool_profile": "Clang 21 native compiler; Bazel 6.5.0 configuration queries; host build Python 3.13; default TensorFlow hermetic Python retained",
+    "explicit_execution_mode_override": false,
+    "cpu_environment": {
+      "TF_NEED_CUDA": "0",
+      "TF_NEED_ROCM": "0",
+      "TF_NEED_TENSORRT": "0",
+      "CUDA_VISIBLE_DEVICES": "",
+      "HIP_VISIBLE_DEVICES": "",
+      "ROCR_VISIBLE_DEVICES": ""
+    },
+    "memory_limit_gib": 48
+  },
+  "measurement_scope": {
+    "samples_per_case": 1,
+    "interval": "native build command only; source/profile setup, C pre-build SDK snapshot and C runtime verification excluded",
+    "shared_host": true,
+    "same_selected_target": false,
+    "matched_bazel_comparison": false,
+    "speed_ratio": null,
+    "cached_full_framework_qualified": false,
+    "unchanged_full_framework_latency_measured": false,
+    "background_gpu_work_permitted": true
+  },
+  "cases": [
+    {
+      "system": "C",
+      "selected_target": "//rush_runtime_probe:tensor_roundtrip",
+      "framework_dependency": "//tensorflow/core:framework",
+      "binary_sha256": "57803822ea8d036e38b2830f18cb5d37dd8fff77cd496760050256e4f9ff2b11",
+      "build_returncode": 0,
+      "build_seconds": 652.786165373,
+      "runtime": {
+        "status": "pass",
+        "program_count": 1,
+        "returncode": 0,
+        "checks": [
+          "float Tensor shape [2,3] with values 1 through 6",
+          "TensorProto content serialization and restoration",
+          "row slice shape [1,3] with values 4 through 6"
+        ],
+        "expected_stdout": "TF_TENSOR_ROUNDTRIP_SLICE_OK\n",
+        "elf_sha256": "06873a1383748d588c3b17f5b6dba5fff13f4d5b3d3f4a4de7fb456bdc3dd1b3",
+        "verification_interval_seconds": 6.47335956,
+        "verification_interval_scope": "runtime and verification together; not isolated program execution time"
+      },
+      "integrity": {
+        "original_source": "pass",
+        "selected_source_sdk_output_bookends": "pass",
+        "native_archive_containers": 234,
+        "unique_thin_member_objects": 645,
+        "source_addition_counts": {
+          "profile": 1,
+          "execution_control": 3,
+          "declared_probe": 2
+        },
+        "check_intervals": {
+          "compiler_sdk_before_after_build": "pass",
+          "selected_source_sdk_outputs_before_after_runtime": "pass",
+          "evidence_scope": "Passed controller checks SDK/toolchain across build, then selected source/SDK/native outputs/thin members across runtime; two separate intervals."
+        }
+      },
+      "evidence_sha256": {
+        "build_result": "b4adb174272e7b19b600853d5a8b082f275898190a332fba549991e17b2c5c39",
+        "qualification_result": "49990e043d7e917560bf829f0323118ea0f2904ba54709cf2c73b9f16a824fd9",
+        "runtime_stdout": "0d1a6a037166ddb10bf0e2ccd72a31d1721e88412eb1b556bd0ccbaa7c9a1fc0",
+        "runtime_stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "SDK_before_build": "899b1700eac6cfa71b88338d045d91d0748d67114ad6a7a857275a906ccf8fd3",
+        "SDK_after_build": "899b1700eac6cfa71b88338d045d91d0748d67114ad6a7a857275a906ccf8fd3",
+        "runtime_before": "2118214d0363d5b15c04d9deb6537ed41056399a21198be1947f0a72ca77bfc2",
+        "runtime_after": "2118214d0363d5b15c04d9deb6537ed41056399a21198be1947f0a72ca77bfc2",
+        "archive_members": "6c36b7268a4cf4a05565d32c2f4503f82b871433e62350ada3359026625c939a",
+        "source_manifest": "b560be0a33c0842d56f71efec49f82eb381c93b630b73c248b6b47fd8f240e79",
+        "independent_scoped_audit": "61bb97df0ef21a529a1890256346faa6c3d6d12dfcc0f8f561153b894be07f24",
+        "daemon_log": "5c569405640f14456d31dfd1252c43937f5a3c1ea6d33ad21d691106d874b616"
+      },
+      "tools_sha256": {
+        "bazel": "a40ac69263440761199fcb8da47ad4e3f328cbe79ffbf4ecc14e5ba252857307",
+        "cc": "bed5e21439b93ad0ec1d2121805ef4228ed36b86e33b31419d9b249058da052a",
+        "cxx": "bed5e21439b93ad0ec1d2121805ef4228ed36b86e33b31419d9b249058da052a",
+        "ar": "ac2b6d5f269e2105f9192b701c3f221829905dd69eac1d539190f92e2b83520d",
+        "build_python": "b28c07dbea2f11257ffe17508d32ad07b725b43bbeb7914217e78228cc599f52",
+        "controller_python": "f49602ce76d4a3fe779b35d09d04ef4f156dfb9231f2cb4805052fe4be15699e"
+      },
+      "source_qualification_sha256": "8daad969b17247cd93ec58f90499de8962da70e39c71ccdb16c825c178c22c74",
+      "controller_sha256": "9a2798434853c13a9d377b87e9806f67a965f480275b6eb213049141ee7b7081",
+      "observed_fallbacks": 1,
+      "fallback_target": "@fft2d//:fft2d",
+      "fallback_reason": "ConditionalIncludes",
+      "effective_execution": "whole-invocation always-run local"
+    },
+    {
+      "system": "D",
+      "selected_target": "//tensorflow/core:framework",
+      "binary_sha256": "41c5b53e3558c5c3ae71e1d8ffe21232022cd50700e881bf156998d92b5bf9af",
+      "build_returncode": 0,
+      "build_seconds": 674.905560432,
+      "observed_fallbacks": 1,
+      "fallback_target": "@fft2d//:fft2d",
+      "fallback_reason": "ConditionalIncludes",
+      "effective_execution": "whole-invocation always-run local",
+      "runtime": {
+        "status": "not_run"
+      },
+      "integrity": {
+        "original_source": "pass",
+        "expected_source_additions": 4,
+        "framework_subtree": {
+          "scope": "tensorflow/core/framework outputs only",
+          "object_files": 57,
+          "archive_files": 46
+        },
+        "sdk_runtime_bookends": "not_measured"
+      },
+      "evidence_sha256": {
+        "accepted_summary": "eda783d8c2ee19be31c2217c055aefd7b0151488a1af80324418a1e025ffbe65",
+        "build_result": "c30605efb2022ed2843c508efdaa2a875c54d002ca6b02cefb33bdfbc992db60",
+        "source_audit": "f13da37f1cea4ea3bd8c1ad833841a3b990aa598291cf89f7a5161117e510f0e",
+        "framework_output_inventory": "acd9c4ed72f6ef8b26ab4785c6680027fed564c5f9fddeb77e9f2ffbe1ae9edd"
+      },
+      "tools_sha256": {
+        "bazel": "a40ac69263440761199fcb8da47ad4e3f328cbe79ffbf4ecc14e5ba252857307",
+        "cc": "bcc14c05505b873adb12af5d84fc3b4b92054f2713d0141e8257b051d6e88e37",
+        "cxx": "bcc14c05505b873adb12af5d84fc3b4b92054f2713d0141e8257b051d6e88e37",
+        "ar": "9362baf27fa8d031982fbadfad93763341ab353e0a331615c065159a7100168f",
+        "build_python": "aa7caff7dcabb09abdb8610f820186e71064351711eeb4882328705c33878f8f",
+        "controller_python": "36103f0154f128cf946c4fdc4ea2dc21eb30a48d42dd83541a6b751f005fa60d"
+      },
+      "source_qualification_sha256": "a478baea202e5648c571ec6342e3a42c33c01619fdb06981bc09747b9cf5ec60",
+      "controller_sha256": "17c8af6a05ab17b8f29dc8ec46f40c065e58fbe9d341227fc9e8c1ac3d45cd58"
+    }
+  ],
+  "historical_records": {
+    "tf_2_15_cpu_runtime": {
+      "status": "imported historical record; not rerun for this engine",
+      "recorded_passed": 463,
+      "recorded_total": 463
+    },
+    "unchanged_command_timing": {
+      "status": "historical imported record; exact candidate and full sample series unrecovered",
+      "selected_target": "//tensorflow/core:framework",
+      "reported_samples_per_variant": 30,
+      "reported_medians_ms": {
+        "Rush": 9.3,
+        "Bazel": 64.2,
+        "Bazel_watchfs": 54.5
+      },
+      "exact_candidate": null,
+      "complete_sample_series_recovered": false,
+      "current_engine_qualification": false
+    }
+  }
+}
