@@ -270,6 +270,7 @@ fn validate_scoped_configuration(
             .get(label)
             .ok_or_else(|| anyhow!("Node not found in graph: {}", label))?;
         if let Some(error) = node.rule_instance.configuration_error() {
+            if graph.feature_flag_error_is_verified(label, node.rule_instance.as_ref()) { continue; }
             return Err(anyhow!(
                 "target '{}' cannot be configured: {}",
                 label,
@@ -2446,6 +2447,14 @@ impl BuildOrchestrator {
             });
         }
 
+        {
+            let mut command = self.feature_flag_command.lock()
+                .map_err(|_| anyhow!("feature-flag command lock poisoned"))?;
+            *command = Some(crate::configured_flag_metadata::FeatureFlagCommandState {
+                semantics: semantics.clone(), analysis: None,
+            });
+        }
+
         // Record the whole-configuration dependency ONCE, up front. The config
         // fingerprint now folds in the root `.bazelrc` + `WORKSPACE`/
         // `WORKSPACE.bazel` + `MODULE.bazel` content (rush-command-core
@@ -3502,6 +3511,9 @@ impl BuildOrchestrator {
                 target_patterns
             ));
         }
+
+        rush_starlark::config_defines::set_configuration_request_roots(
+            &self.config_registry_scope(), &expanded_targets);
 
         eprintln!("📋 Resolved {} targets", expanded_targets.len());
         for target in &expanded_targets {
@@ -21100,6 +21112,62 @@ filegroup(name = "root", srcs = select({
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn configurable_alias_discovers_flag_proofs_before_no_default_actual_selection() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?; let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"deferred_alias_proof\")\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+        for (predicate, needs_proof) in [
+            ("flag_values = {\":ordinary\": \"x\"}", true),
+            ("define_values = {\"NOT_ENABLED\": \"yes\"}", false),
+        ] {
+            write_file(&root.join("BUILD.bazel"), &format!(r#"
+config_setting(name = "flag", {predicate})
+filegroup(name = "ordinary")
+alias(name = "condition_alias", actual = select({{":flag": ":flag"}}))
+filegroup(name = "consumer", srcs = select({{":condition_alias": [], "//conditions:default": []}}))
+"#))?;
+            let error = orchestrator.build_with_dependencies_with_semantics(
+                vec!["//:consumer".into()], semantics_with_environment(root, "//:consumer", &[])?,
+            ).await.expect_err("proof requirements and real no-match errors must both remain fallible");
+            let message = format!("{error:#}");
+            if needs_proof {
+                assert!(message.contains("//:flag") && message.contains("config_setting.flag_values"), "{message}");
+                assert!(!message.to_lowercase().contains("matching condition"), "unproved predicates were selected before proof: {message}");
+            } else {
+                assert!(message.to_lowercase().contains("matching condition"), "real non-flag select error was suppressed: {message}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unscoped_package_inspection_defers_unconsumed_flag_metadata_proofs() -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?; let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"unscoped_flag_metadata\")\n")?;
+        write_file(&root.join("BUILD.bazel"), r#"
+config_setting(name = "flag", flag_values = {":ordinary": "x"})
+filegroup(name = "ordinary")
+filegroup(name = "unrelated", srcs = select({":flag": [], "//conditions:default": []}))
+"#)?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+        let _io = orchestrator.install_fresh_tracked_io_for_test();
+        let instances = orchestrator.instantiate_build_file(&root.join("BUILD.bazel"), None)?;
+        assert!(instances.iter().any(|instance| instance.target_name() == "ordinary"));
+        let flag = instances.iter().find(|instance| instance.target_name() == "flag").unwrap();
+        assert!(flag.configuration_error_needs_feature_flag_proof());
+        assert!(orchestrator.feature_flag_command.lock().unwrap().is_none(),
+            "inspection must not invent or require a command/analyzer context");
+        let error = orchestrator.build_with_dependencies_with_semantics(
+            vec!["//:unrelated".into()], semantics_with_environment(root, "//:unrelated", &[])?,
+        ).await.expect_err("consuming the inspected flag must still require real configured proof");
+        let message = format!("{error:#}");
+        assert!(message.contains("//:flag") && message.contains("config_setting.flag_values"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn semantic_config_setting_errors_are_deferred_to_the_configured_closure() -> Result<()> {
         once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
         let temp = TempDir::new()?;
@@ -22119,6 +22187,23 @@ filegroup(
     }}),
 )
 filegroup(
+    name = "nonmatching_root",
+    srcs = select({{
+        "//pycross:{alternate_environment_name}": [":selected"],
+        "//conditions:default": [":fallback"],
+    }}),
+)
+filegroup(
+    name = "mixed_root",
+    srcs = select({{
+        "//pycross:{environment_name}": [":selected"],
+        "//conditions:default": [":fallback"],
+    }}) + select({{
+        "@@{environments_repository}//:inner_python_config": [],
+        "//conditions:default": [],
+    }}),
+)
+filegroup(
     name = "bad_root",
     srcs = select({{
         "//bad_pycross:{environment_name}": [":selected"],
@@ -22170,6 +22255,22 @@ filegroup(
                 )?,
             )
             .await?;
+        orchestrator.build_with_dependencies_with_semantics(
+            vec!["//app:nonmatching_root".into()],
+            semantics_with_environment(workspace_root, "//app:nonmatching_root", &[])?,
+        ).await?;
+        assert!(!rush_starlark::config_defines::is_pycross_environment_compatibility_match_in_scope(
+            &orchestrator.config_registry_scope(), &format!("//pycross:{alternate_environment_name}")));
+        let mixed = orchestrator.build_with_dependencies_with_semantics(
+            vec!["//app:mixed_root".into()],
+            semantics_with_environment(workspace_root, "//app:mixed_root", &[])?,
+        ).await.expect_err("an unrelated direct flag key cannot borrow a sibling alias's compatibility provenance");
+        assert!(format!("{mixed:#}").contains("config_setting.flag_values"), "{mixed:#}");
+        let mixed_roots = orchestrator.build_with_dependencies_with_semantics(
+            vec!["//app:root".into(),format!("@{environments_repository}//:inner_python_config")],
+            semantics_with_environment(workspace_root, "//app:root", &[])?,
+        ).await.expect_err("an explicit inner root cannot borrow compatibility from another requested root");
+        assert!(format!("{mixed_roots:#}").contains("config_setting.flag_values"), "{mixed_roots:#}");
         let bad_alias = orchestrator
             .build_with_dependencies_with_semantics(
                 vec!["//app:bad_root".to_string()],
@@ -23086,6 +23187,231 @@ cc_binary(
         assert!(note.contains("@rules_cc//cc:defs.bzl"), "{}", note);
         assert!(note.contains("PROBABLE CAUSE"), "{}", note);
     }
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires genuine pinned Bazel 6.5; set RUSH_TEST_BAZEL6_5"]
+    async fn configured_feature_flags_drive_real_orchestrator_requests_and_artifacts() -> Result<()> {
+        use bytes::Bytes;
+        use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+        use sha2::Digest;
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        struct OwnBazelServer {
+            binary: PathBuf,
+            workspace: PathBuf,
+            output_base: PathBuf,
+            environment: BTreeMap<Vec<u8>, Vec<u8>>,
+            stopped: bool,
+        }
+        impl OwnBazelServer {
+            fn command(&self) -> std::process::Command {
+                let mut command = std::process::Command::new(&self.binary);
+                command.arg("--windows_enable_symlinks")
+                    .arg("--ignore_all_rc_files")
+                    .arg(format!("--output_base={}", self.output_base.display()))
+                    .arg("--max_idle_secs=30").current_dir(&self.workspace).env_clear();
+                for (name, value) in &self.environment {
+                    command.env(OsString::from_vec(name.clone()), OsString::from_vec(value.clone()));
+                }
+                command
+            }
+            fn stop(&mut self) -> Result<()> {
+                if self.stopped { return Ok(()); }
+                let output = self.command().arg("shutdown").output()?;
+                anyhow::ensure!(output.status.success(), "own Bazel server shutdown failed: {}",
+                    String::from_utf8_lossy(&output.stderr));
+                self.stopped = true;
+                Ok(())
+            }
+        }
+        impl Drop for OwnBazelServer {
+            fn drop(&mut self) {
+                if let Err(error) = self.stop() {
+                    eprintln!("own configured-feature test server cleanup failed: {error:#}");
+                }
+            }
+        }
+
+        // Avoid redirecting this task-owned fixture into a caller's shared
+        // output/cache tree. No process-global driver/environment changes.
+        for name in ["RUSH_WORKSPACE_CACHE_ROOT", "RUSH_WORKSPACE_OUTPUT_ROOT",
+            "RUSH_WORKSPACE_BIN_LINK", "RUSH_CACHE_ROOT"] {
+            anyhow::ensure!(std::env::var_os(name).is_none(), "isolated test requires {name} unset");
+        }
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let binary = PathBuf::from(std::env::var_os("RUSH_TEST_BAZEL6_5")
+            .context("set RUSH_TEST_BAZEL6_5 to genuine pinned Bazel")?).canonicalize()?;
+        anyhow::ensure!(format!("{:x}", sha2::Sha256::digest(std::fs::read(&binary)?))
+            == "a40ac69263440761199fcb8da47ad4e3f328cbe79ffbf4ecc14e5ba252857307",
+            "the oracle binary must be the pinned Bazel 6.5 Linux binary");
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"configured_feature_orchestrator\")\n")?;
+        write_file(&root.join(".bazelversion"), "6.5.0\n")?;
+        write_file(&root.join(".bazelrc"), "startup --windows_enable_symlinks\n")?;
+        for name in ["gcc.txt", "clang.txt", "other.txt", "alias.txt"] {
+            write_file(&root.join(name), &format!("{name}\n"))?;
+        }
+        let build = |mode: &str| format!(r#"
+config_setting(name = "gcc", define_values = {{"MODE": "{mode}"}},
+    flag_values = {{"@bazel_tools//tools/cpp:compiler": "gcc"}})
+config_setting(name = "clang", define_values = {{"MODE": "{mode}"}},
+    flag_values = {{"@bazel_tools//tools/cpp:compiler": "clang"}})
+filegroup(name = "selected", srcs = select({{
+    ":gcc": ["gcc.txt"], ":clang": ["clang.txt"],
+    "//conditions:default": ["other.txt"],
+}}))
+filegroup(name = "gcc_files", srcs = ["gcc.txt"])
+filegroup(name = "clang_files", srcs = ["clang.txt"])
+alias(name = "no_default_source", actual = select({{":gcc": ":gcc_files", ":clang": ":clang_files"}}))
+alias(name = "no_default_condition", actual = select({{":gcc": ":gcc", ":clang": ":clang"}}))
+filegroup(name = "through_no_default", srcs = select({{":no_default_condition": ["alias.txt"], "//conditions:default": ["other.txt"]}}))
+filegroup(name = "ordinary")
+config_setting(name = "wrong", flag_values = {{":ordinary": "gcc"}})
+alias(name = "wrong_no_default_condition", actual = select({{":wrong": ":wrong"}}))
+filegroup(name = "bad_no_default", srcs = select({{":wrong_no_default_condition": ["gcc.txt"], "//conditions:default": []}}))
+config_setting(name = "missing", flag_values = {{":absent": "gcc"}})
+alias(name = "missing_no_default_condition", actual = select({{":missing": ":missing"}}))
+filegroup(name = "missing_no_default", srcs = select({{":missing_no_default_condition": ["gcc.txt"], "//conditions:default": []}}))
+filegroup(name = "bad", srcs = select({{":wrong": ["gcc.txt"], "//conditions:default": ["other.txt"]}}))
+"#);
+        write_file(&root.join("BUILD"), &build("a"))?;
+        let mut environment: BTreeMap<Vec<u8>, Vec<u8>> = std::env::vars_os()
+            .map(|(name, value)| (name.as_os_str().as_bytes().to_vec(), value.as_os_str().as_bytes().to_vec()))
+            .collect();
+        environment.remove(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes());
+        environment.remove(rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes());
+        environment.insert(b"RUSH_BAZEL_PATH".to_vec(), binary.as_os_str().as_bytes().to_vec());
+        // Repository rules and all analysis subprocesses inherit this exact
+        // client snapshot; the execution PATH remains the real process PATH.
+        environment.insert(b"CUDA_VISIBLE_DEVICES".to_vec(), Vec::new());
+        environment.insert(b"HIP_VISIBLE_DEVICES".to_vec(), Vec::new());
+        environment.insert(b"ROCR_VISIBLE_DEVICES".to_vec(), Vec::new());
+        let output_base = root.join(".cache/rush/bazel_output_base");
+        let mut server = OwnBazelServer { binary, workspace: root.to_path_buf(), output_base,
+            environment: environment.clone(), stopped: false };
+        let semantics = |target: &str, mode: &str| -> Result<rush_command_core::CommandSemantics> {
+            let mut captured = environment.clone();
+            let tokens = vec!["--jobs=8".to_string(), format!("--define=MODE={mode}")];
+            captured.insert(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes().to_vec(),
+                rush_command_core::build_arguments::encode_with_startup(&tokens,
+                    &["--windows_enable_symlinks".into()]).into_bytes());
+            captured.insert(rush_command_core::native_options::EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes().to_vec(),
+                serde_json::to_vec(&vec![format!("--define=MODE={mode}")])?);
+            let mut request = RunRequest {
+                argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build"), Bytes::copy_from_slice(target.as_bytes())],
+                working_directory: Bytes::copy_from_slice(root.as_os_str().as_bytes()),
+                environment: captured.into_iter().map(|(name, value)| EnvironmentVariable {
+                    name: Bytes::from(name), value: Bytes::from(value),
+                }).collect(),
+                protocol_major: rush_protocol::PROTOCOL_MAJOR, protocol_minor: rush_protocol::PROTOCOL_MINOR,
+                ..Default::default()
+            };
+            rush_command_core::populate_workspace_config(&mut request, root);
+            Ok(rush_command_core::CommandSemantics::from_run_request(&request)?)
+        };
+        let oracle_artifact = |request: &rush_command_core::CommandSemantics, target: &str| -> Result<PathBuf> {
+            let mut command = server.command();
+            command.arg("cquery").arg(target).arg("--output=files")
+                .arg("--noshow_progress").arg("--color=no").arg("--curses=no");
+            command.env_clear();
+            for (name, value) in request.env() {
+                command.env(OsString::from_vec(name.to_vec()), OsString::from_vec(value.to_vec()));
+            }
+            let native = rush_command_core::native_options::NativeConfiguration::from_command_semantics(request)
+                .map_err(anyhow::Error::msg)?;
+            for (key, value) in native.defines { command.arg(format!("--define={key}={value}")); }
+            command.args(rush_command_core::build_arguments::from_command(request).map_err(anyhow::Error::msg)?);
+            let output = command.output()?;
+            anyhow::ensure!(output.status.success(), "genuine filegroup oracle failed: {}",
+                String::from_utf8_lossy(&output.stderr));
+            let stdout = String::from_utf8(output.stdout)?;
+            let files: Vec<_> = stdout.lines().filter(|line| !line.trim().is_empty()).collect();
+            anyhow::ensure!(files.len() == 1, "oracle must expose exactly one selected source: {stdout}");
+            let selected = Path::new(files[0]);
+            anyhow::ensure!(!selected.is_absolute() && selected.components().count() == 1,
+                "oracle selected a source outside this tiny fixture: {}", selected.display());
+            Ok(root.join(selected))
+        };
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_path_buf());
+        let scope = orchestrator.config_registry_scope();
+        // Every call uses the normal retained-snapshot decision path. Stderr
+        // dependencies may conservatively reanalyze; no cache hit is forced.
+        let mut current_condition_mode = "a";
+        for (condition_mode, request_mode, compiler_branch) in [
+            ("a", "a", true), ("a", "a", true), ("a", "b", false),
+            ("b", "b", true), ("b", "a", false), ("a", "a", true),
+        ] {
+            if condition_mode != current_condition_mode {
+                write_file(&root.join("BUILD"), &build(condition_mode))?;
+                current_condition_mode = condition_mode;
+            }
+            let request = semantics("//:selected", request_mode)?;
+            let expected = oracle_artifact(&request, "//:selected")?;
+            if compiler_branch {
+                anyhow::ensure!(matches!(expected.file_name().and_then(|name| name.to_str()),
+                    Some("gcc.txt" | "clang.txt")), "expected a real GCC/Clang branch, got {}", expected.display());
+            } else { anyhow::ensure!(expected == root.join("other.txt"), "native define conjunction did not select default"); }
+            let key = crate::analysis_snapshot::AnalysisKey::new(&request, root.canonicalize()?, vec!["//:selected".into()]);
+            let generation = rush_starlark::config_defines::feature_flag_generation(&scope);
+            orchestrator.build_with_dependencies_with_semantics(vec!["//:selected".into()], request).await?;
+            anyhow::ensure!(rush_starlark::config_defines::feature_flag_generation(&scope) > generation,
+                "the normal command entry must reset feature-flag proof generation");
+            let snapshot = orchestrator.snapshot_cache.get(&key).context("successful command must retain its analyzed snapshot")?;
+            let state = snapshot.retained_execution_state().context("successful command must retain its artifact forest")?;
+            let artifacts = state.artifact_forest.get("//:selected").context("selected filegroup artifacts missing")?.flatten();
+            anyhow::ensure!(artifacts.len() == 1 && artifacts[0].path == expected,
+                "orchestrator artifacts differ from genuine configured Bazel: {artifacts:?}, expected {}", expected.display());
+            anyhow::ensure!(std::fs::read(&artifacts[0].path)? == std::fs::read(&expected)?, "selected source bytes differ");
+        }
+        // A configurable condition alias with no default must discover/prove
+        // its real flag keys before evaluating actual. Also cover a direct
+        // ordinary source alias; both are compared with genuine Bazel artifacts.
+        for target in ["//:through_no_default", "//:no_default_source"] {
+            let request = semantics(target, "a")?;
+            let expected = oracle_artifact(&request, target)?;
+            let key = crate::analysis_snapshot::AnalysisKey::new(&request, root.canonicalize()?, vec![target.into()]);
+            orchestrator.build_with_dependencies_with_semantics(vec![target.into()], request).await?;
+            let snapshot = orchestrator.snapshot_cache.get(&key).context("no-default alias snapshot missing")?;
+            let state = snapshot.retained_execution_state().context("no-default alias artifacts missing")?;
+            let outputs = state.artifact_forest.get(target).context("no-default target missing")?.flatten();
+            anyhow::ensure!(outputs.len() == 1 && outputs[0].path == expected,
+                "no-default alias differs from genuine Bazel: {outputs:?}, expected {}", expected.display());
+        }
+        let no_match = orchestrator.build_with_dependencies_with_semantics(
+            vec!["//:through_no_default".into()], semantics("//:through_no_default", "b")?,
+        ).await.expect_err("an actual no-match error must survive after genuine flag proof");
+        anyhow::ensure!(format!("{no_match:#}").to_lowercase().contains("matching condition"), "{no_match:#}");
+
+        // Request the condition itself: successful no-op metadata still needs
+        // genuine proof before validate_scoped_configuration accepts its root.
+        orchestrator.build_with_dependencies_with_semantics(vec!["//:gcc".into()], semantics("//:gcc", "a")?).await?;
+        anyhow::ensure!(rush_starlark::config_defines::feature_flag_condition_is_verified(&scope, "//:gcc"),
+            "direct condition root bypassed genuine configured metadata");
+        for target in ["//:wrong", "//:bad", "//:bad_no_default"] {
+            let request = semantics(target, "a")?;
+            let key = crate::analysis_snapshot::AnalysisKey::new(&request, root.canonicalize()?, vec![target.into()]);
+            let error = orchestrator.build_with_dependencies_with_semantics(vec![target.into()], request).await
+                .expect_err("missing FeatureFlagInfo must fail for direct and selected conditions");
+            anyhow::ensure!(format!("{error:#}").contains("must be build settings or feature flags"),
+                "wrong-producer refusal must come from genuine configured analysis: {error:#}");
+            anyhow::ensure!(orchestrator.snapshot_cache.get(&key).is_none(), "failed request published a configured snapshot");
+        }
+        let target = "//:missing_no_default";
+        let request = semantics(target, "a")?;
+        let key = crate::analysis_snapshot::AnalysisKey::new(&request, root.canonicalize()?, vec![target.into()]);
+        let missing = orchestrator.build_with_dependencies_with_semantics(vec![target.into()], request).await
+            .expect_err("a missing flag producer cannot become a no-match fallback");
+        let message = format!("{missing:#}");
+        anyhow::ensure!(message.contains("absent") && message.contains("configured metadata probe failed"), "{message}");
+        anyhow::ensure!(orchestrator.snapshot_cache.get(&key).is_none(), "missing producer published a snapshot");
+        drop(oracle_artifact);
+        server.stop()?;
+        Ok(())
+    }
+
 }
 
 #[cfg(all(test, unix))]

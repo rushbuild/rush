@@ -79,6 +79,7 @@ impl BuildRule for ConfigSettingRule {
             }
             _ => None,
         };
+        let mut needs_feature_flag_proof = false;
         let configuration_error = if !has_predicate {
             Some(
                 "Either values, define_values, flag_values or constraint_values must be specified and non-empty"
@@ -97,6 +98,7 @@ impl BuildRule for ConfigSettingRule {
             // configured-rule boundary. Preserve the error as metadata so an
             // unrelated sibling stays lazy; selecting/requesting this condition
             // must not silently turn an unresolved flag into a false predicate.
+            needs_feature_flag_proof = true;
             Some("Rush does not yet support non-empty config_setting.flag_values".to_string())
         } else {
             None
@@ -105,6 +107,7 @@ impl BuildRule for ConfigSettingRule {
         Ok(Box::new(ConfigSettingInstance {
             name,
             constraint_values,
+            needs_feature_flag_proof,
             configuration_error,
         }))
     }
@@ -114,6 +117,7 @@ pub struct ConfigSettingInstance {
     name: String,
     constraint_values: Vec<String>,
     configuration_error: Option<String>,
+    needs_feature_flag_proof: bool,
 }
 
 #[async_trait]
@@ -141,6 +145,10 @@ impl RuleInstance for ConfigSettingInstance {
 
     fn configuration_error(&self) -> Option<&str> {
         self.configuration_error.as_deref()
+    }
+
+    fn configuration_error_needs_feature_flag_proof(&self) -> bool {
+        self.needs_feature_flag_proof
     }
 
     async fn build(&self, _context: &BuildContext) -> Result<Vec<Artifact>> {

@@ -45,12 +45,32 @@ pub struct BazelRcNamedConfig {
     pub run_flags: Vec<String>,
 }
 
+/// Bounded UTF-8 form of Bazel 6.5 util/strings.cc Tokenize: quoting and
+/// backslash escapes preserve argument boundaries, # comments apply outside
+/// quotes. Unterminated quotes/escapes are explicitly unsupported.
+fn tokenize_rc_line(line: &str) -> Result<Vec<String>> {
+    let mut output = Vec::new(); let mut token = String::new();
+    let mut quote = None; let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            token.push(chars.next().context("unterminated rc escape")?); continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter { quote = None; } else { token.push(character); }
+        } else if character == '#' { break; }
+        else if character == '\'' || character == '"' { quote = Some(character); }
+        else if matches!(character, ' ' | '\t' | '\r' | '\n') {
+            if !token.is_empty() { output.push(std::mem::take(&mut token)); }
+        } else { token.push(character); }
+    }
+    if quote.is_some() { anyhow::bail!("unterminated rc quote"); }
+    if !token.is_empty() { output.push(token); }
+    Ok(output)
+}
+
 impl BazelRc {
     /// Parse a .bazelrc file
     pub fn parse(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read .bazelrc: {}", path.display()))?;
-
         let mut rc = BazelRc {
             common_flags: Vec::new(),
             build_flags: Vec::new(),
@@ -60,29 +80,48 @@ impl BazelRc {
             startup_flags: Vec::new(),
         };
 
-        for line in content.lines() {
-            // Skip comments and empty lines
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            // Parse the line
-            rc.parse_line(trimmed)?;
-        }
+        let workspace = path.parent().unwrap_or_else(|| Path::new("."));
+        rc.parse_file(path, workspace, &mut Vec::new())?;
 
         Ok(rc)
     }
 
+    fn parse_file(&mut self, path: &Path, workspace: &Path, stack: &mut Vec<std::path::PathBuf>) -> Result<()> {
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("resolve rc import {}", path.display()))?;
+        if stack.contains(&canonical) { anyhow::bail!("rc import cycle at {}", path.display()); }
+        if stack.len() >= 64 { anyhow::bail!("rc import depth exceeds supported bound"); }
+        let content = std::fs::read_to_string(&canonical)
+            .with_context(|| format!("read rc import {}", canonical.display()))?;
+        stack.push(canonical);
+        let content = content.replace("\\\r\n", "").replace("\\\n", "");
+        for line in content.lines() {
+            let tokens = tokenize_rc_line(line)?;
+            if tokens.is_empty() { continue; }
+            if matches!(tokens[0].as_str(), "import" | "try-import") {
+                if tokens.len() != 2 { anyhow::bail!("rc import requires exactly one path"); }
+                let raw = tokens[1].replace("%workspace%", workspace.to_str()
+                    .context("rc workspace path is not UTF-8")?);
+                if raw.contains('%') { anyhow::bail!("unsupported rc import substitution {raw}"); }
+                let imported = std::path::PathBuf::from(raw);
+                let imported = if imported.is_absolute() { imported } else { workspace.join(imported) };
+                if tokens[0] == "try-import" && !imported.try_exists()? { continue; }
+                self.parse_file(&imported, workspace, stack)?;
+            } else { self.parse_tokens(tokens)?; }
+        }
+        stack.pop();
+        Ok(())
+    }
+
     /// Parse a single .bazelrc line
     fn parse_line(&mut self, line: &str) -> Result<()> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            return Ok(());
-        }
+        self.parse_tokens(tokenize_rc_line(line)?)
+    }
 
-        let command = parts[0];
-        let flags: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    fn parse_tokens(&mut self, parts: Vec<String>) -> Result<()> {
+        if parts.is_empty() { return Ok(()); }
+        let command = parts[0].as_str();
+        let flags: Vec<String> = parts[1..].to_vec();
 
         match command {
             "startup" => {
@@ -296,6 +335,36 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn rc_quotes_comments_escapes_and_continuations_match_bazel_65() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".bazelrc");
+        std::fs::write(&path, concat!(
+            r#"build --define SPACE='a b' --define ESC=a\ b --define HASH='a#b' # comment"#,
+            "\n", "build --define CONT=ab", "\\", "\n", "cd\n",
+        )).unwrap();
+        let parsed = BazelRc::parse(&path).unwrap();
+        assert_eq!(parsed.build_flags, ["--define","SPACE=a b","--define","ESC=a b","--define","HASH=a#b","--define","CONT=abcd"]);
+        assert!(tokenize_rc_line("build --define='unterminated").is_err());
+    }
+
+    #[test]
+    fn rc_imports_use_workspace_relative_paths_and_refuse_cycles_or_required_missing() {
+        let temp=tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("rc")).unwrap();
+        let path=temp.path().join(".bazelrc");
+        std::fs::write(&path,"import %workspace%/rc/first.rc\ntry-import absent.rc\n").unwrap();
+        std::fs::write(temp.path().join("rc/first.rc"),"build --define KEY=first\nimport choice.rc\n").unwrap();
+        std::fs::write(temp.path().join("choice.rc"),"build --define KEY=workspace\n").unwrap();
+        std::fs::write(temp.path().join("rc/choice.rc"),"build --define KEY=relative\n").unwrap();
+        assert_eq!(BazelRc::parse(&path).unwrap().build_flags,
+            ["--define","KEY=first","--define","KEY=workspace"]);
+        std::fs::write(temp.path().join("choice.rc"),"import %workspace%/.bazelrc\n").unwrap();
+        assert!(BazelRc::parse(&path).unwrap_err().to_string().contains("cycle"));
+        std::fs::write(&path,"import missing.rc\n").unwrap();
+        assert!(BazelRc::parse(&path).is_err());
+    }
 
     #[test]
     fn test_parse_bazelrc() {

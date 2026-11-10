@@ -7923,6 +7923,12 @@ impl BzlLoader {
         Ok(res)
     }
 
+    /// Select the same tracked analyzer executable used for genuine repository
+    /// admission. Configured metadata queries must share that tool authority.
+    pub fn resolve_configured_analysis_binary(workspace_root: &Path) -> Result<PathBuf> {
+        resolve_bazel_binary_for_fetch(workspace_root)
+    }
+
     /// Materialize a declared legacy WORKSPACE repository with its genuine
     /// repository rule, including patches, overlays and formatted attributes.
     /// Callers register the resulting Bazel-owned source root. This does not

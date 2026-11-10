@@ -94,6 +94,7 @@ struct BazelRcBuildExpansion {
     rc_flags: Vec<String>,
     effective_visibility_flags: Vec<String>,
     effective_native_flags: Vec<String>,
+    effective_build_arguments: Vec<String>,
 }
 
 fn native_flag_at(tokens: &[String], index: usize) -> Result<Option<(String, bool)>> {
@@ -148,9 +149,13 @@ fn expand_bazelrc_tokens(
     tokens: &[String],
     stack: &mut Vec<String>,
 ) -> Result<BazelRcBuildExpansion> {
+    let normalized=rush_command_core::build_arguments::normalize_tokens(tokens)
+        .map_err(anyhow::Error::msg)?;
+    let tokens=&normalized;
     let mut rc_flags = Vec::new();
     let mut effective_visibility_flags = Vec::new();
     let mut effective_native_flags = Vec::new();
+    let mut effective_build_arguments = Vec::new();
     let mut index = 0usize;
     while index < tokens.len() {
         let token = &tokens[index];
@@ -172,12 +177,14 @@ fn expand_bazelrc_tokens(
                 name,
                 stack,
             )?;
+            effective_build_arguments.extend(expansion.effective_build_arguments);
             rc_flags.extend(expansion.rc_flags);
             effective_visibility_flags.extend(
                 expansion.effective_visibility_flags,
             );
             effective_native_flags.extend(expansion.effective_native_flags);
         } else {
+            effective_build_arguments.push(token.clone());
             rc_flags.push(token.clone());
             if is_visibility_compatibility_flag(token) {
                 effective_visibility_flags.push(token.clone());
@@ -186,6 +193,7 @@ fn expand_bazelrc_tokens(
                 effective_native_flags.push(native);
                 if consumes_value {
                     index += 1;
+                    effective_build_arguments.push(tokens[index].clone());
                     rc_flags.push(tokens[index].clone());
                 }
             }
@@ -196,6 +204,7 @@ fn expand_bazelrc_tokens(
         rc_flags,
         effective_visibility_flags,
         effective_native_flags,
+        effective_build_arguments,
     })
 }
 
@@ -203,6 +212,9 @@ fn expand_bazelrc_build(
     bazelrc: &BazelRc,
     cli_tokens: &[String],
 ) -> Result<BazelRcBuildExpansion> {
+    let normalized=rush_command_core::build_arguments::normalize_tokens(cli_tokens)
+        .map_err(anyhow::Error::msg)?;
+    let cli_tokens=&normalized;
     let mut stack = Vec::new();
     let common = expand_bazelrc_tokens(
         bazelrc,
@@ -214,6 +226,11 @@ fn expand_bazelrc_build(
         &bazelrc.build_flags,
         &mut stack,
     )?;
+    let mut effective_build_arguments = common.effective_build_arguments;
+    effective_build_arguments.extend(build.effective_build_arguments);
+    effective_build_arguments.extend(
+        expand_bazelrc_tokens(bazelrc, cli_tokens, &mut Vec::new())?.effective_build_arguments,
+    );
     let mut rc_flags = common.rc_flags;
     rc_flags.extend(build.rc_flags);
     let mut effective_visibility_flags =
@@ -221,6 +238,7 @@ fn expand_bazelrc_build(
     effective_visibility_flags.extend(build.effective_visibility_flags);
     let mut effective_native_flags = common.effective_native_flags;
     effective_native_flags.extend(build.effective_native_flags);
+
     let mut index = 0usize;
     while index < cli_tokens.len() {
         let token = &cli_tokens[index];
@@ -254,11 +272,71 @@ fn expand_bazelrc_build(
         }
         index += 1;
     }
+    effective_build_arguments = expand_platform_build_arguments(bazelrc, effective_build_arguments)?;
+    // Use the same final ordered stream for native options and metadata. A
+    // platform config can introduce either dimension at its selected trigger.
+    effective_native_flags.clear();
+    effective_visibility_flags.clear();
+    let mut index = 0;
+    while index < effective_build_arguments.len() {
+        let token = &effective_build_arguments[index];
+        if token == "--" { break; }
+        if is_visibility_compatibility_flag(token) {
+            effective_visibility_flags.push(token.clone());
+        }
+        if let Some((flag, consumes_value)) = native_flag_at(&effective_build_arguments, index)? {
+            effective_native_flags.push(flag);
+            if consumes_value { index += 1; }
+        }
+        index += 1;
+    }
     Ok(BazelRcBuildExpansion {
         rc_flags,
         effective_visibility_flags,
         effective_native_flags,
+        effective_build_arguments,
     })
+}
+
+/// Bazel 6.5 ConfigExpander applies the native platform expansion at the
+/// canonical (last) enable flag, after explicit config expansion. Replace that
+/// trigger in the client stream so metadata can disable every rc file.
+fn expand_platform_build_arguments(bazelrc: &BazelRc, tokens: Vec<String>) -> Result<Vec<String>> {
+    let mut selected = None;
+    for (index, token) in tokens.iter().enumerate() {
+        if token == "--" { break; }
+        let enabled = match token.as_str() {
+            "--enable_platform_specific_config" => Some(true),
+            "--noenable_platform_specific_config" => Some(false),
+            _ => token.strip_prefix("--enable_platform_specific_config=")
+                .map(|value| match value {
+                    "true" | "1" => Ok(true), "false" | "0" => Ok(false),
+                    _ => Err(anyhow!("unsupported platform-specific-config boolean {value:?}")),
+                }).transpose()?,
+        };
+        if let Some(enabled) = enabled { selected = Some((index, enabled)); }
+    }
+    let platform = match std::env::consts::OS {
+        "macos" => "macos", "linux" => "linux", "windows" => "windows",
+        "freebsd" => "freebsd", "openbsd" => "openbsd", other => other,
+    };
+    let expansion = if selected.is_some_and(|(_, enabled)| enabled)
+        && bazelrc.named_config_flags("build", platform).is_some() {
+        expand_named_bazelrc_config(bazelrc, platform, &mut Vec::new())?.effective_build_arguments
+    } else { Vec::new() };
+    // A recursively introduced platform trigger cannot create another expansion
+    // phase. Refuse that unsupported ambiguity rather than carrying it to Bazel.
+    if expansion.iter().any(|token| token == "--enable_platform_specific_config"
+        || token == "--noenable_platform_specific_config"
+        || token.starts_with("--enable_platform_specific_config=")) {
+        return Err(anyhow!("platform config recursively changes its enable flag"));
+    }
+    let mut result = Vec::new();
+    for (index, token) in tokens.into_iter().enumerate() {
+        result.push(token);
+        if selected == Some((index, true)) { result.extend(expansion.iter().cloned()); }
+    }
+    Ok(result)
 }
 
 fn process_command_tokens() -> Vec<String> {
@@ -300,7 +378,20 @@ fn load_bazelrc_build_expansion(
         }
     };
 
+    // The existing CLI accepts UTF-8 strings. Refuse a lossy metadata request
+    // instead of transporting replacement characters as original argument bytes.
+    if std::env::args_os().any(|argument| argument.into_string().is_err()) {
+        return Err(anyhow!("configured metadata does not support non-UTF-8 CLI arguments"));
+    }
     let expansion = expand_bazelrc_build(&bazelrc, cli_tokens)?;
+    publish_effective_native_flags(&expansion.effective_native_flags)?;
+    std::env::set_var(
+        rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV,
+        rush_command_core::build_arguments::encode_with_startup(
+            &expansion.effective_build_arguments,
+            &bazelrc.startup_flags,
+        ),
+    );
     if verbose && !expansion.rc_flags.is_empty() {
         eprintln!("   Flags from .bazelrc: {:?}", expansion.rc_flags);
     }
@@ -5868,4 +5959,116 @@ mod reapi_cli_tests {
         assert!(Cli::try_parse_from(["rush", "remote-execute", "action.json",
             "--endpoint", "http://127.0.0.1:9000", "--deadline-seconds", "0"]).is_err());
     }
+}
+
+#[cfg(test)]
+mod configured_metadata_argument_tests {
+    use super::*;
+    use rush_build::BazelRcNamedConfig;
+
+    #[test]
+    fn configured_metadata_rc_startup_is_immutable_transport_not_global_admission() {
+        const CHILD: &str = "RUSH_TEST_RC_STARTUP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Publication mutates process environment; isolate it from all
+            // parallel CLI tests, just as a real client is a separate process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "configured_metadata_argument_tests::configured_metadata_rc_startup_is_immutable_transport_not_global_admission", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("rush-rc-startup-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("imported.rc"), "startup --host_jvm_args='-Dmessage=two words'\n").unwrap();
+        std::fs::write(root.join(".bazelrc"), "startup --windows_enable_symlinks\nimport %workspace%/imported.rc\nstartup --host_jvm_args=-Xmx1g\nbuild --define=KEY=value\n").unwrap();
+        let capture = || {
+            use bytes::Bytes;
+            use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+            let snapshot = std::env::var(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV).unwrap();
+            rush_command_core::CommandSemantics::from_run_request(&RunRequest {
+                argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build")],
+                environment: vec![EnvironmentVariable {
+                    name: Bytes::from(rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV),
+                    value: Bytes::from(snapshot),
+                }],
+                protocol_major: rush_protocol::PROTOCOL_MAJOR,
+                protocol_minor: rush_protocol::PROTOCOL_MINOR,
+                ..Default::default()
+            }).unwrap()
+        };
+        load_bazelrc_build_expansion(&root, &[], false).unwrap();
+        let first = capture();
+        assert_eq!(rush_command_core::build_arguments::startup_from_command(&first).unwrap(),
+            ["--windows_enable_symlinks", "--host_jvm_args=-Dmessage=two words", "--host_jvm_args=-Xmx1g"]);
+        assert_eq!(rush_command_core::build_arguments::from_command(&first).unwrap(), ["--define=KEY=value"]);
+        // Unknown startup options remain exact transport. Only the metadata
+        // consumer may reject compatibility; ordinary builds must reach Rush.
+        std::fs::write(root.join(".bazelrc"), "startup --unsupported_startup=value\nbuild --define=KEY=value\n").unwrap();
+        load_bazelrc_build_expansion(&root, &[], false).unwrap();
+        let second = capture();
+        assert_eq!(rush_command_core::build_arguments::startup_from_command(&second).unwrap(), ["--unsupported_startup=value"]);
+        assert_ne!(first.config_fingerprint(), second.config_fingerprint());
+        std::fs::write(root.join(".bazelrc"), "build --define=KEY=value\n").unwrap();
+        load_bazelrc_build_expansion(&root, &[], false).unwrap();
+        assert!(rush_command_core::build_arguments::startup_from_command(&capture()).unwrap().is_empty());
+        assert_eq!(rush_command_core::build_arguments::startup_from_command(&first).unwrap().len(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    fn rc() -> BazelRc {
+        BazelRc { common_flags:vec!["--define=KEY=common".into()],
+            build_flags:vec!["--define=KEY=base".into(),"--enable_platform_specific_config".into()],
+            test_flags:vec![],run_flags:vec![],startup_flags:vec![],
+            configs:HashMap::from([
+                (std::env::consts::OS.into(),BazelRcNamedConfig {
+                    build_flags:vec!["--define=KEY=platform".into(),"--config=nested".into()],..Default::default() }),
+                ("nested".into(),BazelRcNamedConfig { build_flags:vec!["--define=KEY=nested".into(),
+                    "--action_env=VALUE=a b".into()],..Default::default() }),
+            ]) }
+    }
+    #[test]
+    fn configured_metadata_arguments_keep_platform_position_and_all_option_boundaries() {
+        let rc=rc();
+        let cli=["//:app","--define=KEY=cli","--enable_platform_specific_config=true","--daemon=auto"]
+            .map(str::to_owned);
+        let expanded=expand_bazelrc_build(&rc,&cli).unwrap();
+        assert_eq!(expanded.effective_build_arguments,["--define=KEY=common","--define=KEY=base","--enable_platform_specific_config",
+            "//:app","--define=KEY=cli","--enable_platform_specific_config=true","--define=KEY=platform","--define=KEY=nested",
+            "--action_env=VALUE=a b","--daemon=auto"]);
+        assert!(!expanded.effective_build_arguments.iter().any(|v| v.starts_with("--config")));
+    }
+    #[test]
+    fn configured_metadata_arguments_last_false_disables_platform_and_preserves_cli_override() {
+        let rc=rc();
+        let disabled=expand_bazelrc_build(&rc,&["--noenable_platform_specific_config".into()]).unwrap();
+        assert_eq!(disabled.effective_build_arguments,["--define=KEY=common","--define=KEY=base","--enable_platform_specific_config","--noenable_platform_specific_config"]);
+        let after=expand_bazelrc_build(&rc,&["--enable_platform_specific_config=true".into(),
+            "--define=KEY=cli".into()]).unwrap();
+        assert_eq!(after.effective_build_arguments.last().unwrap(),"--define=KEY=cli");
+    }
+    #[test]
+    fn configured_metadata_platform_flag_is_observable_and_data_substrings_are_preserved() {
+        let mut rc=rc();
+        rc.configs.get_mut(std::env::consts::OS).unwrap().build_flags.extend([
+            "--define=NOTE=enable_platform_specific_config".into(),
+            "--copt=-Denable_platform_specific_config".into()]);
+        let expanded=expand_bazelrc_build(&rc,&[]).unwrap();
+        assert!(expanded.effective_build_arguments.iter().any(|v|v == "--enable_platform_specific_config"));
+        assert!(expanded.effective_build_arguments.iter().any(|v|v == "--define=NOTE=enable_platform_specific_config"));
+        assert!(expanded.effective_build_arguments.iter().any(|v|v == "--copt=-Denable_platform_specific_config"));
+    }
+
+    #[test]
+    fn configured_metadata_arguments_preserve_option_shaped_operands_and_config_boundaries() {
+        let mut rc=rc();
+        rc.build_flags.extend(["--action_env".into(),"--daemon=off".into(),
+            "--action_env".into(),"--copt=-O3".into(),"--action_env".into(),"--config=missing-data".into()]);
+        let expanded=expand_bazelrc_build(&rc,&[]).unwrap();
+        assert!(expanded.effective_build_arguments.iter().any(|v|v=="--action_env=--daemon=off"));
+        assert!(expanded.effective_build_arguments.iter().any(|v|v=="--action_env=--copt=-O3"));
+        assert!(expanded.effective_build_arguments.iter().any(|v|v=="--action_env=--config=missing-data"));
+        assert!(!expanded.effective_native_flags.iter().any(|v|v=="--copt=-O3"));
+    }
+
 }

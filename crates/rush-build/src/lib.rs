@@ -8,6 +8,8 @@
 
 #![allow(missing_docs)]
 
+mod configured_flag_metadata;
+
 pub mod action_batch;
 pub mod action_manager;
 pub mod action_manifest;
@@ -718,6 +720,7 @@ pub struct BuildOrchestrator {
     /// records into the same manifest. `None` until the entry installs it; held
     /// behind a `Mutex` so the `&self`/`Clone` orchestrator can set it once.
     tracked_io: Arc<std::sync::Mutex<Option<Arc<rush_incremental::RealTrackedIo>>>>,
+    feature_flag_command: Arc<std::sync::Mutex<Option<configured_flag_metadata::FeatureFlagCommandState>>>,
 
     /// Retained analysis snapshots (persistent-daemon Run-wiring brick).
     ///
@@ -745,6 +748,43 @@ pub struct BuildOrchestrator {
     /// back to the full Phase-1 manifest validate. Shared via `Arc` so a cloned
     /// orchestrator sees the same armed watcher.
     watcher: Arc<crate::workspace_watcher::WorkspaceWatcher>,
+}
+
+#[derive(Default)]
+struct ConfigurationMetadataPreload {
+    visited: std::collections::HashSet<String>,
+    alias_nodes: std::collections::BTreeSet<String>,
+    edges: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    flag_conditions: std::collections::BTreeSet<String>,
+    deferred_alias_errors: Vec<anyhow::Error>,
+}
+
+impl ConfigurationMetadataPreload {
+    fn classify_flag_proofs(
+        &self, scope: &str, roots: &[String], inherited: &std::collections::BTreeSet<String>,
+    ) -> (std::collections::BTreeSet<String>, std::collections::BTreeMap<String, std::collections::BTreeSet<String>>) {
+        let mut queue = std::collections::VecDeque::new();
+        for label in roots {
+            if inherited.is_empty() { queue.push_back((label.clone(),None)); }
+            else { queue.extend(inherited.iter().cloned().map(|origin| (label.clone(),Some(origin)))); }
+        }
+        let mut visited = std::collections::HashSet::new();
+        let mut required = std::collections::BTreeSet::new();
+        let mut provenance: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+        while let Some((label, mut origin)) = queue.pop_front() {
+            if origin.is_none() && self.alias_nodes.contains(&label)
+                && rush_starlark::config_defines::pycross_environment_alias_profile_in_scope(scope, &label).is_some() {
+                origin = Some(label.clone());
+            }
+            if !visited.insert((label.clone(), origin.clone())) { continue; }
+            if let Some(origin) = &origin { provenance.entry(label.clone()).or_default().insert(origin.clone()); }
+            if self.flag_conditions.contains(&label) && origin.is_none() { required.insert(label.clone()); }
+            if let Some(edges) = self.edges.get(&label) {
+                queue.extend(edges.iter().cloned().map(|label| (label, origin.clone())));
+            }
+        }
+        (required, provenance)
+    }
 }
 
 /// Configuration state is keyed by canonical workspace path, so every public
@@ -901,6 +941,7 @@ impl Clone for BuildOrchestrator {
             memory_guard: Arc::clone(&self.memory_guard),
             action_manager: Arc::clone(&self.action_manager),
             tracked_io: Arc::clone(&self.tracked_io),
+            feature_flag_command: Arc::clone(&self.feature_flag_command),
             snapshot_cache: Arc::clone(&self.snapshot_cache),
             reuse_counters: Arc::clone(&self.reuse_counters),
             watcher: Arc::clone(&self.watcher),
@@ -1216,6 +1257,7 @@ impl BuildOrchestrator {
                 action_manager_resource_manager,
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
+            feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1431,6 +1473,7 @@ impl BuildOrchestrator {
                 action_manager_resource_manager,
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
+            feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1604,6 +1647,7 @@ impl BuildOrchestrator {
                 action_manager_resource_manager,
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
+            feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1777,6 +1821,7 @@ impl BuildOrchestrator {
                 action_manager_resource_manager,
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
+            feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1941,6 +1986,7 @@ impl BuildOrchestrator {
                 action_manager_resource_manager,
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
+            feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -4828,7 +4874,7 @@ cc_library(
             repository_mapping: self.repository_mapping_for(repository, actual_repo_root),
             ..rule_execution::InstantiationContext::default()
         };
-        let mut visited = std::collections::HashSet::new();
+
         let declarations =
             Self::package_declaration_catalog(build_file, repository, package)?;
         let all_rule_names = build_file
@@ -4864,25 +4910,27 @@ cc_library(
                     .cloned()
                     .collect(),
             };
-            for condition in rule_execution::build_file_raw_configuration_conditions(
-                &selected_build_file,
-                &context,
-            )
-            {
-                let condition = if condition.starts_with(':') {
-                    format!("//{package}{condition}")
-                } else if condition.starts_with("//") || condition.starts_with('@') {
-                    condition
-                } else {
-                    format!("//{package}:{condition}")
-                };
-                self.preload_configuration_metadata_target(
-                    &condition,
-                    actual_repo_root,
-                    repository,
-                    &mut visited,
-                )?;
+            let mut roots = Vec::new();
+            if target_names.is_some() && selected_build_file.rules.iter().any(|rule|
+                rule.rule_type == "config_setting"
+                    && matches!(rule.attributes.get("flag_values"), Some(Value::Dict(values)) if !values.is_empty())) {
+                roots.push(format!("//{package}:{name}"));
             }
+            for condition in rule_execution::build_file_raw_configuration_conditions(&selected_build_file, &context) {
+                roots.push(if condition.starts_with(':') { format!("//{package}{condition}") }
+                    else if condition.starts_with("//") || condition.starts_with('@') { condition }
+                    else { format!("//{package}:{condition}") });
+            }
+            let inherited = if target_names.is_some() && selected_build_file.rules.iter()
+                .all(|rule| matches!(rule.rule_type.as_str(), "alias" | "config_setting")) {
+                let current = crate::dependency_graph::Label {
+                    workspace: repository.map(str::to_owned), package: package.to_owned(), target: name.clone(),
+                };
+                rush_starlark::config_defines::inherited_pycross_metadata_origins(&context.configuration_scope, &current.to_string())
+            } else { std::collections::BTreeSet::new() };
+            if !inherited.is_empty() && roots.is_empty() { roots.push(format!("//{package}:{name}")); }
+            self.preload_configuration_metadata_roots(&roots, actual_repo_root, repository,
+                target_names.is_some(), &inherited)?;
             rush_starlark::config_defines::recompute_active_config_settings_public();
             context.repository_mapping =
                 self.repository_mapping_for(repository, actual_repo_root);
@@ -4932,13 +4980,88 @@ cc_library(
     /// depend on which package happened to be parsed first.  Chase only these
     /// metadata references (never unrelated sibling rules), with a target-level
     /// cycle guard, before resolving the consumer's select.
+    fn validate_feature_flag_condition(&self, canonical_label: &str) -> Result<()> {
+        self.validate_feature_flag_condition_inner(canonical_label).with_context(|| format!(
+            "condition {canonical_label}: Rush does not yet support non-empty config_setting.flag_values without verified configured metadata"))
+    }
+
+    fn validate_feature_flag_condition_inner(&self, canonical_label: &str) -> Result<()> {
+        let scope = self.config_registry_scope();
+        if rush_starlark::config_defines::feature_flag_condition_is_verified(&scope, canonical_label) {
+            return Ok(());
+        }
+        let command = self.feature_flag_command.lock()
+            .map_err(|_| anyhow::anyhow!("feature-flag command lock poisoned"))?
+            .clone().context("configured flag analysis has no immutable command request")?;
+        let analysis = if let Some(analysis) = command.analysis { analysis } else {
+            let binary = rush_starlark::BzlLoader::resolve_configured_analysis_binary(&self.workspace_root)?;
+            let cache_root = command.semantics.getenv(b"RUSH_WORKSPACE_CACHE_ROOT")
+                .map(|value| {
+                    #[cfg(unix)] { use std::os::unix::ffi::OsStrExt;
+                        PathBuf::from(std::ffi::OsStr::from_bytes(value)) }
+                    #[cfg(not(unix))] { PathBuf::from(String::from_utf8_lossy(value).into_owned()) }
+                }).unwrap_or_else(|| self.workspace_root.join(".cache/rush"));
+            let native = configured_flag_metadata::NativeCompilerSelection::from_toolchain(
+                &rush_rules::context::Toolchain::default(), &command.semantics)?;
+            let analysis = configured_flag_metadata::ConfiguredFeatureFlagAnalysis::new(
+                &self.workspace_root, &binary, &cache_root.join("bazel_output_base"),
+                &command.semantics, native)?;
+            let mut slot = self.feature_flag_command.lock()
+                .map_err(|_| anyhow::anyhow!("feature-flag command lock poisoned"))?;
+            if let Some(current) = slot.as_mut() {
+                if current.semantics.config_fingerprint() != command.semantics.config_fingerprint() {
+                    anyhow::bail!("feature-flag command changed while constructing analysis context");
+                }
+                current.analysis = Some(analysis.clone());
+            }
+            analysis
+        };
+        analysis.validate_registered_condition(&scope, canonical_label)
+    }
+
+    fn preload_configuration_metadata_roots(
+        &self, raw_roots: &[String], repo_root: &Path, repository: Option<&str>, demand_proof: bool,
+        inherited: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let scope = self.config_registry_scope();
+        for _ in 0..64 {
+            let mut metadata = ConfigurationMetadataPreload::default();
+            let mut roots = Vec::new();
+            for root in raw_roots {
+                if let Some(label) = self.preload_configuration_metadata_target(root, repo_root, repository, &mut metadata)? {
+                    roots.push(label);
+                }
+            }
+            if !demand_proof {
+                return metadata.deferred_alias_errors.into_iter().next().map_or(Ok(()), Err);
+            }
+            let mut changed = false;
+            let (required, provenance) = metadata.classify_flag_proofs(&scope, &roots, inherited);
+            for condition in required {
+                if !rush_starlark::config_defines::feature_flag_condition_is_verified(&scope, &condition) {
+                    self.validate_feature_flag_condition(&condition)?;
+                    changed = true;
+                }
+            }
+            if !changed {
+                if let Some(error) = metadata.deferred_alias_errors.into_iter().next() { return Err(error); }
+                rush_starlark::config_defines::record_pycross_metadata_origins(&scope, &provenance);
+                return Ok(());
+            }
+            // A newly proved predicate can change a configurable alias actual.
+            // Reload only these roots so its newly selected metadata is loaded
+            // before any consumer's select or pending RuleInstance is resolved.
+        }
+        anyhow::bail!("configured metadata proof closure did not converge")
+    }
+
     fn preload_configuration_metadata_target(
         &self,
         raw_label: &str,
         current_repo_root: &Path,
         current_repository: Option<&str>,
-        visited: &mut std::collections::HashSet<String>,
-    ) -> Result<()> {
+        metadata: &mut ConfigurationMetadataPreload,
+    ) -> Result<Option<String>> {
         let Some((repo_root, repository, rest)) = self.resolve_condition_package(
             raw_label,
             current_repo_root,
@@ -4946,11 +5069,14 @@ cc_library(
         )? else {
             // `//conditions:default` and intrinsic @platforms constraints have
             // no BUILD package that Rush needs to materialize here.
-            return Ok(());
+            return Ok(None);
         };
         let Some((package, target)) = rest.split_once(':') else {
-            return Ok(());
+            return Ok(None);
         };
+        let canonical_label = crate::dependency_graph::Label {
+            workspace: repository.clone(), package: package.to_owned(), target: target.to_owned(),
+        }.to_string();
         let visit_key = format!(
             "{}::{}::{}:{}",
             repo_root.display(),
@@ -4958,8 +5084,8 @@ cc_library(
             package,
             target,
         );
-        if !visited.insert(visit_key) {
-            return Ok(());
+        if !metadata.visited.insert(visit_key) {
+            return Ok(Some(canonical_label));
         }
 
         let Some(build_path) = self.preferred_build_file(&repo_root.join(package)) else {
@@ -4970,7 +5096,7 @@ cc_library(
                     package,
                 );
             });
-            return Ok(());
+            return Ok(Some(canonical_label));
         };
         self.pre_register_config_settings(
             &build_path,
@@ -4990,8 +5116,15 @@ cc_library(
             repository.as_deref(),
         )?;
         let Some(rule) = build_file.rules.iter().find(|rule| rule.name == target) else {
-            return Ok(());
+            return Ok(Some(canonical_label));
         };
+
+        if rule.rule_type == "config_setting"
+            && matches!(rule.attributes.get("flag_values"), Some(Value::Dict(values)) if !values.is_empty()) {
+            metadata.flag_conditions.insert(canonical_label.clone());
+        }
+        if rule.rule_type == "alias" { metadata.alias_nodes.insert(canonical_label.clone()); }
+        let mut alias_edges = std::collections::BTreeSet::new();
 
         let relative = |label: &str| {
             if label.starts_with(':') {
@@ -5041,23 +5174,31 @@ cc_library(
                         conditions.sort();
                         conditions.dedup();
                         for condition in conditions {
-                            self.preload_configuration_metadata_target(
-                                &relative(&condition),
-                                &repo_root,
-                                repository.as_deref(),
-                                visited,
-                            )?;
+                            if let Some(label) = self.preload_configuration_metadata_target(
+                                &relative(&condition), &repo_root, repository.as_deref(), metadata,
+                            )? { alias_edges.insert(label); }
                         }
                         context.repository_mapping = self.repository_mapping_for(
                             repository.as_deref(),
                             &repo_root,
                         );
-                        let actual = rule_execution::resolve_parse_value_as_label(
-                            rule.attributes.get("actual").expect("matched actual"),
-                            &context,
-                        )?;
-                        resolved_configurable_alias_actual = Some(actual.clone());
-                        references.push(relative(&actual));
+                        match rule_execution::resolve_parse_value_as_label(
+                            rule.attributes.get("actual").expect("matched actual"), &context,
+                        ) {
+                            Ok(actual) => {
+                                resolved_configurable_alias_actual = Some(actual.clone());
+                                references.push(relative(&actual));
+                            }
+                            Err(error) => {
+                                // Discovery still records every condition edge.
+                                // Required flag proofs run before selecting an
+                                // actual; on the next pass a matching no-default
+                                // select can resolve. If no proof changes, return
+                                // this original error rather than suppressing it.
+                                metadata.deferred_alias_errors.push(error.context(
+                                    format!("resolve configurable metadata alias {canonical_label}")));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -5069,13 +5210,10 @@ cc_library(
                         _ => None,
                     }));
                 }
-                // flag_values is a deferred unsupported boundary in this TODO,
-                // but its exact referenced labels are still metadata closure;
-                // loading them keeps the eventual analysis diagnostic
-                // deterministic instead of parse-order dependent.
-                if let Some(Value::Dict(values)) = rule.attributes.get("flag_values") {
-                    references.extend(values.keys().map(|label| relative(label)));
-                }
+                // Genuine configured Bazel analysis validates flag producers,
+                // aliases, type and allowed domain. Do not execute those rule
+                // implementations through Rush's ordinary dependency loader.
+
             }
             "constraint_value" => {
                 if let Some(Value::String(setting)) = rule.attributes.get("constraint_setting") {
@@ -5087,12 +5225,11 @@ cc_library(
         references.sort();
         references.dedup();
         for reference in references {
-            self.preload_configuration_metadata_target(
-                &reference,
-                &repo_root,
-                repository.as_deref(),
-                visited,
-            )?;
+            if let Some(label) = self.preload_configuration_metadata_target(
+                &reference, &repo_root, repository.as_deref(), metadata,
+            )? {
+                if rule.rule_type == "alias" { alias_edges.insert(label); }
+            }
         }
         if let Some(actual) = resolved_configurable_alias_actual {
             let context = rule_execution::InstantiationContext {
@@ -5130,8 +5267,9 @@ cc_library(
             repository.as_deref(),
             package,
         )?;
+        metadata.edges.entry(canonical_label.clone()).or_default().extend(alias_edges);
         rush_starlark::config_defines::recompute_active_config_settings_public();
-        Ok(())
+        Ok(Some(canonical_label))
     }
 
     /// Start a fresh pre-registration pass for the next command.

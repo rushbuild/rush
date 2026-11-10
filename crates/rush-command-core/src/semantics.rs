@@ -115,6 +115,9 @@ impl CommandSemantics {
             env.insert(var.name.clone(), var.value.clone());
         }
 
+        if let Some(snapshot) = env.get(crate::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes()) {
+            crate::build_arguments::decode(snapshot).map_err(CommandError::InvalidRequest)?;
+        }
         let argv: Vec<Bytes> = request.argv.clone();
         let working_directory = request.working_directory.clone();
 
@@ -291,6 +294,25 @@ impl CommandSemantics {
                 }
             }
             idx += 1;
+        }
+        if let Some(snapshot) = env.get(crate::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes()) {
+            if let Ok(tokens) = crate::build_arguments::decode(snapshot) {
+                let mut effective = BTreeMap::new();
+                let mut index = 0;
+                while index < tokens.len() {
+                    let token = &tokens[index];
+                    if token == "--" { break; }
+                    let body = if token == "--define" {
+                        index += 1;
+                        tokens.get(index).map(String::as_str)
+                    } else { token.strip_prefix("--define=") };
+                    if let Some(define) = body.and_then(parse_define) {
+                        effective.insert(define.key, define.value);
+                    }
+                    index += 1;
+                }
+                defines = effective.into_iter().map(|(key, value)| BuildDefine { key, value }).collect();
+            }
         }
         defines.sort();
         defines.dedup();

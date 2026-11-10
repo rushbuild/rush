@@ -34,30 +34,23 @@ pub struct Toolchain {
 /// one compiler, tf_cc_binary objects and the final link from another —
 /// the same two-resolutions-of-one-tool defect that made rush generate
 /// protos with one protoc and compile them against another's headers.
-fn env_compiler(var: &str, fallback: &str) -> PathBuf {
-    std::env::var(var)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(fallback))
-}
-
 impl Default for Toolchain {
-    fn default() -> Self {
-        Self {
-            cc: env_compiler("RUSH_CC", "gcc"),
-            cxx: env_compiler("RUSH_CXX", "g++"),
-            ar: PathBuf::from("ar"),
-            ld: PathBuf::from("ld"),
-            cflags: Vec::new(),
-            cxxflags: Vec::new(),
-            ldflags: Vec::new(),
-        }
-    }
+    fn default() -> Self { Self::from_environment_lookup(|name| std::env::var_os(name)) }
 }
 
 impl Toolchain {
+    /// Shared exact base driver selection for execution and immutable-client
+    /// admission checks. Preserve the existing UTF-8 trim/fallback policy.
+    pub fn from_environment_lookup(mut lookup: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Self {
+        let mut driver = |name, fallback: &str| lookup(name)
+            .and_then(|value| value.into_string().ok()).map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(fallback));
+        Self { cc:driver("RUSH_CC","gcc"),cxx:driver("RUSH_CXX","g++"),
+            ar:PathBuf::from("ar"),ld:PathBuf::from("ld"),
+            cflags:Vec::new(),cxxflags:Vec::new(),ldflags:Vec::new() }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

@@ -348,12 +348,17 @@ impl DependencyGraph {
         self.configuration_registry_scope = Some(scope);
     }
 
-    fn is_pycross_environment_compatibility_match(&self, label: &Label) -> bool {
+    pub(crate) fn feature_flag_error_is_verified(&self, label: &Label, rule: &dyn RuleInstance) -> bool {
+        rule.configuration_error_needs_feature_flag_proof()
+            && self.configuration_registry_scope.as_deref().is_some_and(|scope|
+                rush_starlark::config_defines::feature_flag_condition_is_verified(scope, &label.to_string()))
+    }
+
+    fn has_pycross_environment_alias_profile(&self, label: &Label) -> bool {
         self.configuration_registry_scope.as_deref().is_some_and(|scope| {
-            rush_starlark::config_defines::is_pycross_environment_compatibility_match_in_scope(
-                scope,
-                &label.to_string(),
-            )
+            rush_starlark::config_defines::pycross_environment_alias_profile_in_scope(
+                scope, &label.to_string(),
+            ).is_some()
         })
     }
 
@@ -754,7 +759,7 @@ impl DependencyGraph {
             let mut first = true;
             let mut path = Vec::new();
             let pycross_environment_name =
-                self.is_pycross_environment_compatibility_match(condition_label);
+                self.has_pycross_environment_alias_profile(condition_label);
             let mut pycross_environment_alias = inherited_pycross_environment_alias;
             loop {
                 if path.contains(current_label) {
@@ -786,10 +791,10 @@ impl DependencyGraph {
                 {
                     let preserved_pycross_flag_boundary = pycross_environment_alias
                         && (inherited_pycross_environment_alias || !first)
-                        && configuration_error.starts_with(
-                            "Rush does not yet support non-empty config_setting.flag_values",
-                        );
-                    if !preserved_pycross_flag_boundary {
+                        && condition.rule_instance.configuration_error_needs_feature_flag_proof();
+                    let verified_feature_flag_boundary = self.feature_flag_error_is_verified(
+                        current_label, condition.rule_instance.as_ref());
+                    if !preserved_pycross_flag_boundary && !verified_feature_flag_boundary {
                         return Err(anyhow!(
                             "Target {} select() references unconfigurable \
                              condition {}: {}",
@@ -868,7 +873,7 @@ impl DependencyGraph {
     ) -> HashSet<Label> {
         let mut queue = VecDeque::new();
         for label in self.configuration_metadata_scope(roots) {
-            if self.is_pycross_environment_compatibility_match(&label)
+            if self.has_pycross_environment_alias_profile(&label)
                 && self.nodes.get(&label).is_some_and(|node| {
                 node.rule_instance.is_configuration_alias()
             }) {

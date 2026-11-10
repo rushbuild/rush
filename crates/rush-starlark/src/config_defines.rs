@@ -81,6 +81,120 @@ struct SeenConfigSetting {
     flag_values: Vec<(Vec<String>, String)>,
 }
 
+/// Exact native declaration compared with authoritative configured metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeatureFlagPredicate {
+    pub label: String,
+    pub define_values: std::collections::BTreeMap<String, String>,
+    pub native_values: std::collections::BTreeMap<String, String>,
+    pub constraint_values: std::collections::BTreeSet<String>,
+    pub flag_values: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone)]
+struct VerifiedFeatureFlags {
+    generation: u64,
+    predicate: FeatureFlagPredicate,
+    // Declared canonical flag -> (actual alias-resolved producer, value).
+    values: std::collections::BTreeMap<String, (String, String)>,
+}
+
+static FEATURE_FLAG_GENERATIONS: Lazy<RwLock<HashMap<String, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+static VERIFIED_FEATURE_FLAGS: Lazy<RwLock<HashMap<(String, String), VerifiedFeatureFlags>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+static CONFIGURATION_REQUEST_ROOTS: Lazy<RwLock<HashMap<String, std::collections::BTreeSet<String>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+static PYCROSS_METADATA_ORIGINS: Lazy<RwLock<HashMap<(String, String), std::collections::BTreeSet<String>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+pub fn set_configuration_request_roots(scope: &str, roots: &[String]) {
+    CONFIGURATION_REQUEST_ROOTS.write().unwrap().insert(scope.to_owned(),
+        roots.iter().map(|label| canonical_configuration_label(label)).collect());
+}
+
+/// Carry only already traversed, loaded native-alias provenance into later
+/// graph metadata loads. This is not FeatureFlagInfo proof or flag activation.
+pub fn record_pycross_metadata_origins(
+    scope: &str, nodes: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    let validated: Vec<_> = nodes.iter().map(|(label, origins)| (label.clone(), origins.iter()
+        .filter(|origin| pycross_environment_alias_profile_in_scope(scope, origin).is_some())
+        .cloned().collect::<std::collections::BTreeSet<_>>())).collect();
+    let mut recorded = PYCROSS_METADATA_ORIGINS.write().unwrap();
+    for (label, origins) in validated {
+        recorded.entry((scope.to_owned(), label)).or_default().extend(origins);
+    }
+}
+
+pub fn inherited_pycross_metadata_origins(scope: &str, label: &str) -> std::collections::BTreeSet<String> {
+    let label = canonical_configuration_label(label);
+    if CONFIGURATION_REQUEST_ROOTS.read().unwrap().get(scope).is_some_and(|roots| roots.contains(&label)) {
+        return std::collections::BTreeSet::new();
+    }
+    let origins = PYCROSS_METADATA_ORIGINS.read().unwrap().get(&(scope.to_owned(),label)).cloned().unwrap_or_default();
+    origins.into_iter().filter(|origin| pycross_environment_alias_profile_in_scope(scope, origin).is_some()).collect()
+}
+
+pub fn feature_flag_generation(scope: &str) -> u64 {
+    FEATURE_FLAG_GENERATIONS.read().unwrap().get(scope).copied().unwrap_or(0)
+}
+
+fn feature_flag_predicate_for_setting(setting: &SeenConfigSetting) -> FeatureFlagPredicate {
+    FeatureFlagPredicate {
+        label: setting.labels.iter().map(|label| canonical_configuration_label(label)).min().unwrap_or_default(),
+        define_values: setting.define_values.iter().map(|(k,v)| (k.clone(),v.clone())).collect(),
+        native_values: setting.native_values.iter().map(|(k,v)| (k.clone(),v.clone())).collect(),
+        constraint_values: setting.constraint_values.iter().map(|v| canonical_configuration_label(v)).collect(),
+        flag_values: setting.flag_values.iter().map(|(forms,value)| (
+            forms.iter().map(|label| canonical_configuration_label(label)).min().unwrap_or_default(), value.clone()
+        )).collect(),
+    }
+}
+
+pub fn feature_flag_predicate(scope: &str, label: &str) -> Option<FeatureFlagPredicate> {
+    let label = canonical_configuration_label(label);
+    SEEN_CONFIG_SETTINGS.read().unwrap().iter().filter(|(key,_)| key.0 == scope)
+        .map(|(_, setting)| feature_flag_predicate_for_setting(setting))
+        .find(|predicate| predicate.label == label)
+}
+
+/// Publish only after the caller's tracked Bazel analysis has validated the
+/// exact declaration, actual configured edges, string provider and value domain.
+/// The generation and native declaration are checked again after subprocesses.
+pub fn install_verified_feature_flag_condition(
+    scope: &str, generation: u64, predicate: FeatureFlagPredicate,
+    values: std::collections::BTreeMap<String, (String, String)>,
+) -> Result<(), String> {
+    if generation == 0 || feature_flag_generation(scope) != generation
+        || feature_flag_predicate(scope, &predicate.label).as_ref() != Some(&predicate)
+        || values.keys().collect::<Vec<_>>() != predicate.flag_values.keys().collect::<Vec<_>>() {
+        return Err("configured feature-flag command/declaration changed during analysis".into());
+    }
+    let mut producers = HashSet::new();
+    if values.values().any(|(producer,_)| !producers.insert(producer.clone())) {
+        return Err("configured condition references one producer through duplicate aliases".into());
+    }
+    VERIFIED_FEATURE_FLAGS.write().unwrap().insert(
+        (scope.to_owned(), predicate.label.clone()),
+        VerifiedFeatureFlags { generation, predicate, values },
+    );
+    with_configuration_scope(scope, recompute_active_config_settings_public);
+    Ok(())
+}
+
+fn verified_feature_flags(scope: &str, predicate: &FeatureFlagPredicate) -> Option<VerifiedFeatureFlags> {
+    let proof = VERIFIED_FEATURE_FLAGS.read().unwrap()
+        .get(&(scope.to_owned(), predicate.label.clone())).cloned()?;
+    (proof.generation == feature_flag_generation(scope) && proof.predicate == *predicate).then_some(proof)
+}
+
+pub fn feature_flag_condition_is_verified(scope: &str, label: &str) -> bool {
+    feature_flag_predicate(scope, label).is_some_and(|predicate|
+        verified_feature_flags(scope, &predicate).is_some())
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ConfigPredicate {
     Define(String, String),
@@ -300,7 +414,14 @@ fn config_setting_predicates(
                 .unwrap_or_else(|| canonical_configuration_label(label)),
         )
     }));
+    let verified_flags = verified_feature_flags(scope, &feature_flag_predicate_for_setting(setting));
     predicates.extend(setting.flag_values.iter().map(|(labels, value)| {
+        if let Some(proof) = &verified_flags {
+            if let Some((producer, _)) = labels.iter().find_map(|label|
+                proof.values.get(&canonical_configuration_label(label))) {
+                return ConfigPredicate::Flag(producer.clone(), value.clone());
+            }
+        }
         let label = labels
             .iter()
             .map(|label| {
@@ -842,6 +963,14 @@ pub fn begin_command_with_native_options(
     mut native_configuration: NativeConfiguration,
 ) {
     let scope = configuration_scope();
+    {
+        let mut generations = FEATURE_FLAG_GENERATIONS.write().unwrap();
+        let generation = generations.entry(scope.clone()).or_default();
+        *generation = generation.checked_add(1).expect("feature-flag generation exhausted");
+    }
+    VERIFIED_FEATURE_FLAGS.write().unwrap().retain(|(owner,_),_| owner != &scope);
+    CONFIGURATION_REQUEST_ROOTS.write().unwrap().remove(&scope);
+    PYCROSS_METADATA_ORIGINS.write().unwrap().retain(|(owner,_),_| owner != &scope);
     for (key, value) in defines {
         native_configuration.defines.entry(key.clone()).or_insert_with(|| value.clone());
     }
@@ -973,7 +1102,13 @@ fn recompute_active_config_settings() {
                 .and_then(|label| intrinsic_platform_constraint_matches(&label))
                 == Some(true)
         });
+        let verified_flags = verified_feature_flags(&scope, &feature_flag_predicate_for_setting(setting));
         let flag_values_match = setting.flag_values.iter().all(|(labels, expected)| {
+            if let Some(proof) = &verified_flags {
+                return labels.iter().any(|label| proof.values
+                    .get(&canonical_configuration_label(label))
+                    .is_some_and(|(_, actual)| actual == expected));
+            }
             labels.iter().any(|label| {
                 build_settings
                     .get(&(scope.clone(), label.clone()))
@@ -1242,10 +1377,18 @@ pub fn is_pycross_environment_compatibility_match(condition: &str) -> bool {
 /// Explicit-scope form used after async boundaries. It consults only the
 /// environment snapshot captured by [`begin_command`]; it never performs a
 /// fresh tracked environment read.
-pub fn is_pycross_environment_compatibility_match_in_scope(
+pub fn is_pycross_environment_compatibility_match_in_scope(scope: &str, condition: &str) -> bool {
+    pycross_environment_alias_profile_in_scope(scope, condition) == Some(true)
+}
+
+/// A loaded native alias with the existing canonical base-environment shape.
+/// Presence records compatibility provenance; the bool separately records
+/// activation. Nonmatching host/version aliases remain false without requiring
+/// unsupported inner predicates to become native feature-flag implementations.
+pub fn pycross_environment_alias_profile_in_scope(
     scope: &str,
     condition: &str,
-) -> bool {
+) -> Option<bool> {
     let expected_actual = SEEN_CONFIG_ALIASES
         .read()
         .unwrap()
@@ -1263,21 +1406,21 @@ pub fn is_pycross_environment_compatibility_match_in_scope(
                 .iter()
                 .any(|actual| is_rules_pycross_environment_config_label(actual))
         });
-    if !expected_actual {
-        return false;
+    if !expected_actual || !is_pycross_environment_alias_label(condition) {
+        return None;
     }
     let name = condition
         .rsplit_once(':')
         .map(|(_, name)| name)
         .unwrap_or(condition);
     let Some(rest) = name.strip_prefix("_env_python_") else {
-        return false;
+        return None;
     };
     let Some((version, triple)) = rest.split_once('_') else {
-        return false;
+        return None;
     };
     if triple.ends_with("_gpu") || triple.ends_with("-freethreaded") {
-        return false;
+        return None;
     }
     let host_triple = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         "x86_64-unknown-linux-gnu"
@@ -1286,7 +1429,7 @@ pub fn is_pycross_environment_compatibility_match_in_scope(
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "aarch64-apple-darwin"
     } else {
-        return false;
+        return None;
     };
     let active_version = COMMAND_CONFIGURATION_ENVIRONMENTS
         .read()
@@ -1294,7 +1437,7 @@ pub fn is_pycross_environment_compatibility_match_in_scope(
         .get(scope)
         .map(|environment| environment.pycross_python_version.clone())
         .unwrap_or_else(|| "3.13".to_string());
-    triple == host_triple && version == active_version
+    Some(triple == host_triple && version == active_version)
 }
 
 /// Return whether a label has the generated rules_pycross environment-alias
@@ -1730,6 +1873,60 @@ mod tests {
         CONFIG_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn verified_feature_flag_metadata_is_command_scoped_and_declared_predicate_exact() {
+        let _guard = isolate_config_state();
+        let temp = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(temp.path(), || {
+            with_configuration_scope("verified-flag-command", || {
+                begin_command(&[]);
+                let flags = HashMap::from([("//cfg:alias".into(), "a".into())]);
+                consider_config_setting_predicates(None,"cfg","condition", &HashMap::new(),
+                    &HashMap::new(), &[], &flags);
+                let predicate = feature_flag_predicate("verified-flag-command", "//cfg:condition").unwrap();
+                let generation = feature_flag_generation("verified-flag-command");
+                let observed = std::collections::BTreeMap::from([
+                    ("//cfg:alias".into(), ("//cfg:actual".into(), "a".into()))]);
+                assert!(!feature_flag_condition_is_verified("verified-flag-command", "//cfg:condition"));
+                install_verified_feature_flag_condition("verified-flag-command", generation,
+                    predicate.clone(), observed.clone()).unwrap();
+                assert!(feature_flag_condition_is_verified("verified-flag-command", "//cfg:condition"));
+                assert!(is_active_config_setting("//cfg:condition"));
+                assert!(!feature_flag_condition_is_verified("other-workspace", "//cfg:condition"));
+                // An edited native predicate cannot borrow the old proof.
+                consider_config_setting_predicates(None,"cfg","condition", &HashMap::new(),
+                    &HashMap::new(), &[], &HashMap::from([("//cfg:alias".into(), "b".into())]));
+                assert!(!feature_flag_condition_is_verified("verified-flag-command", "//cfg:condition"));
+                assert!(!is_active_config_setting("//cfg:condition"));
+                begin_command(&[]);
+                assert!(install_verified_feature_flag_condition("verified-flag-command", generation,
+                    predicate, observed).is_err());
+            });
+        });
+    }
+
+    #[test]
+    fn verified_feature_flag_metadata_refuses_incomplete_and_duplicate_alias_evidence() {
+        let _guard = isolate_config_state();
+        let temp = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(temp.path(), || {
+            with_configuration_scope("verified-flag-aliases", || {
+                begin_command(&[]);
+                consider_config_setting_predicates(None,"cfg","condition", &HashMap::new(),
+                    &HashMap::new(), &[], &HashMap::from([
+                        ("//cfg:first".into(),"a".into()),("//cfg:second".into(),"a".into())]));
+                let predicate = feature_flag_predicate("verified-flag-aliases", "//cfg:condition").unwrap();
+                let generation = feature_flag_generation("verified-flag-aliases");
+                assert!(install_verified_feature_flag_condition("verified-flag-aliases", generation,
+                    predicate.clone(), std::collections::BTreeMap::new()).is_err());
+                assert!(install_verified_feature_flag_condition("verified-flag-aliases", generation,
+                    predicate, std::collections::BTreeMap::from([
+                        ("//cfg:first".into(),("//cfg:same".into(),"a".into())),
+                        ("//cfg:second".into(),("//cfg:same".into(),"a".into()))])).is_err());
+            });
+        });
     }
 
     #[test]
@@ -2194,6 +2391,36 @@ config_setting(
         assert!(!is_active_config_setting("//cfg:linux_x86_64"));
         assert!(!is_active_config_setting("@ext//cfg:linux_x86_64"));
         assert!(!is_active_config_setting("@@ext//cfg:linux_x86_64"));
+    }
+
+    #[test]
+    fn pycross_metadata_provenance_is_request_scoped_and_resets_per_command() {
+        let _guard = isolate_config_state();
+        let host = if cfg!(all(target_os="linux",target_arch="x86_64")) { "x86_64-unknown-linux-gnu" }
+            else if cfg!(all(target_os="linux",target_arch="aarch64")) { "aarch64-unknown-linux-gnu" }
+            else if cfg!(all(target_os="macos",target_arch="aarch64")) { "aarch64-apple-darwin" }
+            else { return; };
+        let temp = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(temp.path(), || with_configuration_scope("pycross-proof-provenance", || {
+            begin_command(&[]);
+            let alias_name = format!("_env_python_9.9_{host}");
+            let alias = format!("//pycross:{alias_name}");
+            consider_config_alias(None,"pycross",&alias_name,
+                "@@rules_pycross++environments+rules_pycross_all_environments//:python_3_13_host_config");
+            assert_eq!(pycross_environment_alias_profile_in_scope("pycross-proof-provenance", &alias), Some(false));
+            let inner = "@rules_pycross++environments+rules_pycross_all_environments//:inner_python_config";
+            record_pycross_metadata_origins("pycross-proof-provenance", &std::collections::BTreeMap::from([
+                (inner.into(), std::collections::BTreeSet::from([alias.clone()]))]));
+            assert_eq!(inherited_pycross_metadata_origins("pycross-proof-provenance", inner),
+                std::collections::BTreeSet::from([alias.clone()]));
+            set_configuration_request_roots("pycross-proof-provenance", &[inner.into()]);
+            assert!(inherited_pycross_metadata_origins("pycross-proof-provenance", inner).is_empty());
+            set_configuration_request_roots("pycross-proof-provenance", &[]);
+            assert!(!inherited_pycross_metadata_origins("pycross-proof-provenance", inner).is_empty());
+            assert!(!feature_flag_condition_is_verified("pycross-proof-provenance", inner));
+            begin_command(&[]);
+            assert!(inherited_pycross_metadata_origins("pycross-proof-provenance", inner).is_empty());
+        }));
     }
 
     #[test]

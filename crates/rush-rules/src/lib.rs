@@ -289,6 +289,10 @@ pub trait RuleInstance: Send + Sync {
         None
     }
 
+    /// True only when the retained error is the deferred flag_values boundary.
+    /// Graph validation may discharge it using exact per-command Bazel proof.
+    fn configuration_error_needs_feature_flag_proof(&self) -> bool { false }
+
     /// Validate dependency-sensitive attributes immediately before analysis.
     ///
     /// Most rule attributes are fully checked while the BUILD file is parsed.
@@ -571,6 +575,10 @@ impl RuleInstance for RuleMetadataInstance {
 
     fn configuration_error(&self) -> Option<&str> {
         self.inner.configuration_error()
+    }
+
+    fn configuration_error_needs_feature_flag_proof(&self) -> bool {
+        self.inner.configuration_error_needs_feature_flag_proof()
     }
 
     fn validate_analysis_dependencies(

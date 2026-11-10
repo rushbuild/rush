@@ -24,21 +24,41 @@ const TF_CRITICAL_CXX_ENV: &str = "RUSH_TF_CRITICAL_CXX";
 const TF_BATCH_UTIL_SOURCE_SUFFIX: &str = "/tensorflow/core/util/batch_util.cc";
 const TF_GENERATED_CC_OPS_DIR: &str = "/rush-out/genfiles/tensorflow/cc/ops/";
 
-fn selected_cxx_for_source(src_path: &Path) -> Option<PathBuf> {
-    let source = src_path.to_string_lossy();
-    let generated_cc_op = source.contains(TF_GENERATED_CC_OPS_DIR)
-        && src_path.extension().and_then(|extension| extension.to_str()) == Some("cc");
-    if source.ends_with(TF_BATCH_UTIL_SOURCE_SUFFIX) || generated_cc_op {
-        if let Some(critical_cxx) =
-            std::env::var_os(TF_CRITICAL_CXX_ENV).filter(|value| !value.is_empty())
-        {
-            return Some(PathBuf::from(critical_cxx));
-        }
+/// C++ driver overrides shared by execution and configured metadata analysis.
+/// The caller supplies its captured environment; this type never reads globals.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NativeCxxOverrides {
+    pub ordinary: Option<PathBuf>,
+    pub critical: Option<PathBuf>,
+}
+
+impl NativeCxxOverrides {
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Self {
+        let mut path = |name| lookup(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+        Self { ordinary: path(CXX_ENV), critical: path(TF_CRITICAL_CXX_ENV) }
     }
 
-    std::env::var_os(CXX_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    pub fn for_source(&self, src_path: &Path) -> Option<PathBuf> {
+        let source = src_path.to_string_lossy();
+        let generated = source.contains(TF_GENERATED_CC_OPS_DIR)
+            && src_path.extension().and_then(|extension| extension.to_str()) == Some("cc");
+        if source.ends_with(TF_BATCH_UTIL_SOURCE_SUFFIX) || generated {
+            if let Some(driver) = &self.critical { return Some(driver.clone()); }
+        }
+        self.ordinary.clone()
+    }
+
+    pub fn configured_drivers(&self) -> impl Iterator<Item = &PathBuf> {
+        self.ordinary.iter().chain(self.critical.iter())
+    }
+}
+
+pub fn execution_native_cxx_overrides() -> NativeCxxOverrides {
+    NativeCxxOverrides::from_lookup(|name| std::env::var_os(name))
+}
+
+fn selected_cxx_for_source(src_path: &Path) -> Option<PathBuf> {
+    execution_native_cxx_overrides().for_source(src_path)
 }
 
 /// Resolve a `srcs`/`hdrs` entry that may be a plain filename or a Bazel label.

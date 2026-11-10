@@ -242,6 +242,9 @@ impl NativeConfiguration {
     /// Read only the immutable client snapshot. A daemon's own environment is
     /// never a source of native option values.
     pub fn from_command_semantics(semantics: &CommandSemantics) -> Result<Self, String> {
+        let full = if semantics.getenv(crate::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV.as_bytes()).is_some() {
+            Some(crate::build_arguments::from_command(semantics)?)
+        } else { None };
         let tokens: Vec<String> =
             if let Some(raw) = semantics.getenv(EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes()) {
                 serde_json::from_slice(raw)
@@ -253,7 +256,14 @@ impl NativeConfiguration {
                     .map(|token| String::from_utf8_lossy(token).into_owned())
                     .collect()
             };
-        let mut configuration = Self::from_tokens(&tokens)?;
+        let mut configuration = if let Some(full) = full {
+            let complete = Self::from_tokens(&full)?;
+            if semantics.getenv(EFFECTIVE_NATIVE_FLAGS_ENV.as_bytes()).is_some()
+                && complete != Self::from_tokens(&tokens)? {
+                return Err("expanded build and native-option snapshots disagree".into());
+            }
+            complete
+        } else { Self::from_tokens(&tokens)? };
         let mut defines = BTreeMap::new();
         if let Some(inherited) = semantics.getenv(b"RUSH_DEFINES") {
             let inherited = std::str::from_utf8(inherited)
@@ -278,6 +288,8 @@ impl NativeConfiguration {
     /// Parse ordered flags. Scalar options use the last value; repeatable
     /// compiler options retain every occurrence and its order.
     pub fn from_tokens(tokens: &[String]) -> Result<Self, String> {
+        let normalized=crate::build_arguments::normalize_tokens(tokens)?;
+        let tokens=&normalized;
         let mut configuration = Self::default();
         let mut index = 0;
         while index < tokens.len() {

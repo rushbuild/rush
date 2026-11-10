@@ -23,6 +23,7 @@
 mod core;
 mod error;
 pub mod native_options;
+pub mod build_arguments;
 mod semantics;
 mod service;
 
