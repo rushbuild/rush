@@ -32,6 +32,17 @@ pub struct WorkspaceRepositoryFetchContext {
 }
 
 impl WorkspaceRepositoryFetchContext {
+    /// Invocation-local mapping memo identity only; never source admission.
+    /// Include exact stat consistency as well as the semantic context digest so
+    /// an equal-byte replacement cannot retain a memoized analyzer context.
+    pub(crate) fn mapping_context_identity(&self) -> Result<[u8; 32]> {
+        Ok(Sha256::digest(serde_json::to_vec(&(
+            &self.fingerprint,
+            &self.consistency_inputs,
+        ))?)
+        .into())
+    }
+
     /// Apply before command-specific startup arguments such as --output_base.
     pub fn apply(&self, command: &mut Command) -> Result<()> {
         command.args(&self.startup_arguments).env_clear();
@@ -65,7 +76,7 @@ impl WorkspaceRepositoryFetchContext {
         let environment = self.environment.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
         // info may unpack the executable's embedded tools. Earlier absent-path
         // observations remain dependencies but must not mask that mutation.
-        tracked::refresh_filesystem_observations();
+        // The tracked probe itself owns the paired producer boundary.
         let output = tracked::probe_process(&self.executable, &arguments, &environment, workspace)
             .context("query selected analyzer's genuine bazel_tools installation")?;
         if output.status != 0 {
@@ -719,7 +730,7 @@ fn query_definition_output(
 ) -> Result<String> {
     // Even a definition query can materialize external repositories. Earlier
     // path probes must remain evidence without hiding the resulting paths.
-    tracked::refresh_filesystem_observations();
+    let _producer = tracked::begin_analysis_producer();
     let mut command = Command::new(&context.executable);
     context.apply(&mut command)?;
     command

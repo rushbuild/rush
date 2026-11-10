@@ -721,36 +721,134 @@ fn command_environment_default_is_unsupported() {
     use crate::{DependencyManifest, FileKind, ProcessProbeResult, Validated};
 
     // Leave command_environment unimplemented, as existing IO test doubles do.
-    // No other accessor may be called to invent a fallback environment.
-    struct NoCommandEnvironment;
-    impl TrackedIo for NoCommandEnvironment {
-        fn read_file(&self, _: &Path) -> std::io::Result<Bytes> { unreachable!() }
-        fn read_to_string(&self, _: &Path) -> std::io::Result<String> { unreachable!() }
-        fn exists(&self, _: &Path) -> bool { unreachable!() }
-        fn metadata_kind(&self, _: &Path) -> Option<FileKind> { unreachable!() }
-        fn metadata_full(&self, _: &Path) -> bool { unreachable!() }
-        fn read_link(&self, _: &Path) -> Option<PathBuf> { unreachable!() }
-        fn read_dir_names(&self, _: &Path) -> std::io::Result<Vec<OsString>> { unreachable!() }
-        fn getenv(&self, _: &[u8]) -> Option<Bytes> { unreachable!() }
-        fn get_option(&self, _: &str) -> Option<String> { unreachable!() }
-        fn config_fingerprint(&self) -> [u8; 32] { unreachable!() }
-        fn probe_process(&self, _: &Path, _: &[Vec<u8>], _: &[Vec<u8>], _: &Path)
-            -> std::io::Result<ProcessProbeResult> { unreachable!() }
-        fn probe_process_stdout(&self, _: &Path, _: &[Vec<u8>], _: &[Vec<u8>], _: &Path)
-            -> std::io::Result<ProcessProbeResult> { unreachable!() }
-        fn manifest(&self) -> DependencyManifest { unreachable!() }
-        fn mark(&self) -> usize { unreachable!() }
-        fn captured_since(&self, _: usize) -> Vec<Dependency> { unreachable!() }
-        fn record_deps(&self, _: &[Dependency]) { unreachable!() }
-        fn validate_manifest(&self, _: &DependencyManifest) -> Validated { unreachable!() }
+    // No accessor may invent a fallback command environment. This custom
+    // backend also models a negative path memo around a materializing probe.
+    #[derive(Default)]
+    struct NoCommandEnvironment {
+        materialized: std::sync::atomic::AtomicBool,
+        memo: std::sync::Mutex<Option<bool>>,
+        refreshes: std::sync::atomic::AtomicUsize,
     }
-    let io: crate::tracked::SharedTrackedIo = std::sync::Arc::new(NoCommandEnvironment);
+    impl TrackedIo for NoCommandEnvironment {
+        fn read_file(&self, _: &Path) -> std::io::Result<Bytes> {
+            unreachable!()
+        }
+        fn read_to_string(&self, _: &Path) -> std::io::Result<String> {
+            unreachable!()
+        }
+        fn exists(&self, _: &Path) -> bool {
+            let mut memo = self.memo.lock().unwrap();
+            *memo.get_or_insert_with(|| self.materialized.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn metadata_kind(&self, _: &Path) -> Option<FileKind> {
+            unreachable!()
+        }
+        fn metadata_full(&self, _: &Path) -> bool {
+            unreachable!()
+        }
+        fn read_link(&self, _: &Path) -> Option<PathBuf> {
+            unreachable!()
+        }
+        fn read_dir_names(&self, _: &Path) -> std::io::Result<Vec<OsString>> {
+            unreachable!()
+        }
+        fn getenv(&self, _: &[u8]) -> Option<Bytes> {
+            unreachable!()
+        }
+        fn get_option(&self, _: &str) -> Option<String> {
+            unreachable!()
+        }
+        fn config_fingerprint(&self) -> [u8; 32] {
+            unreachable!()
+        }
+        fn probe_process(
+            &self,
+            _: &Path,
+            _: &[Vec<u8>],
+            _: &[Vec<u8>],
+            _: &Path,
+        ) -> std::io::Result<ProcessProbeResult> {
+            self.materialized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ProcessProbeResult {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_digest: crate::content_digest(b""),
+                stderr_digest: crate::content_digest(b""),
+            })
+        }
+        fn probe_process_stdout(
+            &self,
+            _: &Path,
+            _: &[Vec<u8>],
+            _: &[Vec<u8>],
+            _: &Path,
+        ) -> std::io::Result<ProcessProbeResult> {
+            self.probe_process(Path::new("/probe"), &[], &[], Path::new("/"))
+        }
+        fn refresh_filesystem_observations(&self) {
+            *self.memo.lock().unwrap() = None;
+            self.refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn manifest(&self) -> DependencyManifest {
+            unreachable!()
+        }
+        fn mark(&self) -> usize {
+            unreachable!()
+        }
+        fn captured_since(&self, _: usize) -> Vec<Dependency> {
+            unreachable!()
+        }
+        fn record_deps(&self, _: &[Dependency]) {
+            unreachable!()
+        }
+        fn validate_manifest(&self, _: &DependencyManifest) -> Validated {
+            unreachable!()
+        }
+    }
+    let backend = std::sync::Arc::new(NoCommandEnvironment::default());
+    let io: crate::tracked::SharedTrackedIo = backend.clone();
+    assert_eq!(io.quiescent_analysis_epoch(), None);
+    assert_eq!(io.captured_since_bounded(0, 10, 1024), None);
+    assert!(!io.begin_analysis_producer());
+    assert_eq!(io.quiescent_analysis_epoch(), None);
     let error = crate::tracked::scope(io.clone(), crate::tracked::command_environment).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     let error = crate::tracked::scope(io.clone(), || crate::tracked::fresh_canonical_regular_file_metadata(Path::new("/unused"))).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    let error = crate::tracked::scope(io, || crate::tracked::read_canonical_regular_file(Path::new("/unused"))).unwrap_err();
+    let error = crate::tracked::scope(io.clone(), || {
+        crate::tracked::read_canonical_regular_file(Path::new("/unused"))
+    })
+    .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(!io.process_probes_are_paired());
+    for stdout_only in [false, true] {
+        backend
+            .materialized
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *backend.memo.lock().unwrap() = None;
+        crate::tracked::scope(io.clone(), || {
+            assert!(!crate::tracked::exists(Path::new("/materialized")));
+            let before = backend.refreshes.load(std::sync::atomic::Ordering::SeqCst);
+            if stdout_only {
+                crate::tracked::probe_process_stdout(Path::new("/probe"), &[], &[], Path::new("/"))
+                    .unwrap();
+            } else {
+                crate::tracked::probe_process(Path::new("/probe"), &[], &[], Path::new("/"))
+                    .unwrap();
+            }
+            assert_eq!(
+                backend.refreshes.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+            assert!(
+                crate::tracked::exists(Path::new("/materialized")),
+                "custom backend's negative memo must be cleared"
+            );
+        });
+    }
 }
 
 /// Fix 4a: chmod on a recorded file changes its metadata → Stale (FileMetadata),
@@ -1203,4 +1301,205 @@ fn canonical_regular_file_open_races_refuse_fifo_and_symlink_without_blocking() 
             "a swapped nonregular file must be refused before any byte read"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn analysis_producer_scopes_close_errors_and_never_restore_filesystem_memos() {
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("created");
+    let io: crate::tracked::SharedTrackedIo =
+        Arc::new(RealTrackedIo::new(empty_semantics(), directory.path()));
+    crate::tracked::scope(io.clone(), || {
+        assert!(!io.exists(&path));
+        assert_eq!(io.quiescent_analysis_epoch(), Some(0));
+        let outer = crate::tracked::begin_analysis_producer();
+        assert_eq!(io.quiescent_analysis_epoch(), None);
+        let result = (|| -> Result<(), ()> {
+            let _inner = crate::tracked::begin_analysis_producer();
+            // An actual failing producer still materializes its output and must
+            // close its own boundary before the outer guard can close.
+            let output = io
+                .probe_process_stdout(
+                    Path::new("/bin/sh"),
+                    &[b"-c".to_vec(), b"printf actual > created; exit 7".to_vec()],
+                    &[],
+                    directory.path(),
+                )
+                .unwrap();
+            assert_eq!(output.status, 7);
+            Err(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(io.quiescent_analysis_epoch(), None);
+        drop(outer);
+        assert!(io.quiescent_analysis_epoch().is_some_and(|epoch| epoch > 0));
+        let before_failure = io.quiescent_analysis_epoch().unwrap();
+        assert!(io
+            .probe_process_stdout(
+                &directory.path().join("no-such-program"),
+                &[],
+                &[],
+                directory.path()
+            )
+            .is_err());
+        assert!(io.quiescent_analysis_epoch().unwrap() > before_failure);
+        assert!(io.exists(&path));
+        fs::remove_file(&path).unwrap();
+        assert!(
+            !io.exists(&path),
+            "paired completion must not resurrect path memos"
+        );
+        io.refresh_filesystem_observations();
+        assert_eq!(io.quiescent_analysis_epoch(), None);
+        drop(crate::tracked::begin_analysis_producer());
+        assert_eq!(
+            io.quiescent_analysis_epoch(),
+            None,
+            "an unpaired fence is permanent for this IO"
+        );
+    });
+}
+
+#[test]
+#[cfg(unix)]
+fn analysis_probe_receipt_excludes_overlapping_completed_producer_and_validation() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let directory = tempfile::tempdir().unwrap();
+    let io: crate::tracked::SharedTrackedIo =
+        Arc::new(RealTrackedIo::new(empty_semantics(), directory.path()));
+    let marker = directory.path().join("started");
+    let worker_io = io.clone();
+    let root = directory.path().to_path_buf();
+    let worker = std::thread::spawn(move || {
+        worker_io
+            .probe_process_stdout_with_epoch(
+                Path::new("/bin/sh"),
+                &[
+                    b"-c".to_vec(),
+                    br#"printf start > started; i=0; while [ ! -e release ] && [ "$i" -lt 500 ]; do /bin/sleep 0.01; i=$((i+1)); done; [ -e release ] || exit 9; printf stable"#.to_vec(),
+                ],
+                &[],
+                &root,
+            )
+            .unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "actual probe did not start");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // This producer starts AND ends while the real probe is executing.
+    assert!(io.begin_analysis_producer());
+    io.end_analysis_producer();
+    fs::write(directory.path().join("release"), b"completed").unwrap();
+    let (output, receipt) = worker.join().unwrap();
+    assert_eq!(output.stdout, b"stable");
+    assert_eq!(receipt, None);
+    let (output, receipt) = io
+        .probe_process_stdout_with_epoch(
+            Path::new("/bin/sh"),
+            &[b"-c".to_vec(), b"printf stable".to_vec()],
+            &[],
+            directory.path(),
+        )
+        .unwrap();
+    assert_eq!(output.status, 0);
+    assert_eq!(receipt, io.quiescent_analysis_epoch());
+    assert!(receipt.is_some());
+    let manifest = io.manifest();
+    let before = io.quiescent_analysis_epoch().unwrap();
+    assert!(matches!(
+        io.validate_manifest(&manifest).staleness,
+        Staleness::Fresh
+    ));
+    assert!(
+        io.quiescent_analysis_epoch().unwrap() > before,
+        "validation running recorded ProcessProbe must retire mapping snapshots"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn bounded_replay_capture_declines_count_bytes_and_non_utf8_without_losing_evidence() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = tempfile::tempdir().unwrap();
+    let io = RealTrackedIo::new(empty_semantics(), directory.path());
+    let source = directory.path().join("source");
+    fs::write(&source, b"actual bytes").unwrap();
+    io.read_file(&source).unwrap();
+    let before = io.manifest();
+    assert!(io.captured_since_bounded(0, 0, 1024 * 1024).is_none());
+    assert!(io.captured_since_bounded(0, usize::MAX, 1).is_none());
+    assert!(io
+        .captured_since_bounded(usize::MAX, usize::MAX, usize::MAX)
+        .is_none());
+    let captured = io.captured_since_bounded(0, 64, 65536).unwrap();
+    assert_eq!(captured, io.captured_since(0));
+    assert_eq!(io.manifest(), before);
+    let non_utf8 = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"input-\xff".to_vec()));
+    fs::write(&non_utf8, b"real non-UTF8 source filename").unwrap();
+    let mark = io.mark();
+    io.read_file(&non_utf8).unwrap();
+    assert!(io.captured_since_bounded(mark, 64, 65536).is_none());
+    assert!(io
+        .captured_since(mark)
+        .iter()
+        .any(|dep| matches!(dep, Dependency::FileContent { path, .. } if path == &non_utf8)));
+    assert_eq!(io.read_file(&source).unwrap().as_ref(), b"actual bytes");
+}
+
+#[test]
+#[cfg(unix)]
+fn canonical_suffix_capture_keeps_actual_fd_proofs_and_all_raw_observations() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("header.h");
+    fs::write(&source, b"first source value").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let io = RealTrackedIo::new(empty_semantics(), directory.path());
+    let mark = io.mark();
+    for index in 0..8 {
+        io.read_canonical_regular_file(&source).unwrap().unwrap();
+        if index == 3 {
+            io.probe_process_stdout(
+                Path::new("/bin/sh"),
+                &[b"-c".to_vec(), b"printf actual".to_vec()],
+                &[],
+                directory.path(),
+            )
+            .unwrap();
+        }
+    }
+    let raw = io.captured_since(mark);
+    let count = io.mark();
+    let captured = io.captured_manifest_since(mark);
+    let expected = crate::DependencyManifest::from_deps(raw.clone());
+    assert_eq!(
+        serde_json::to_vec(&captured).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert!(captured.deps().iter().any(|dep| matches!(dep,
+        Dependency::FileContent { binding: Some(binding), .. } if binding.historically_qualified())));
+    assert_eq!(io.mark(), count);
+    assert_eq!(
+        io.captured_since(mark),
+        raw,
+        "canonical capture never replaces raw evidence"
+    );
+    assert!(matches!(
+        captured.validate_staleness(&empty_semantics()),
+        Staleness::Fresh
+    ));
+    fs::write(&source, b"changed source value").unwrap();
+    io.read_file(&source).unwrap();
+    let contradictory = io.captured_manifest_since(mark);
+    assert!(matches!(
+        contradictory.validate_staleness(&empty_semantics()),
+        Staleness::Stale { .. }
+    ));
+    assert_eq!(io.captured_since(mark)[..raw.len()], raw);
 }

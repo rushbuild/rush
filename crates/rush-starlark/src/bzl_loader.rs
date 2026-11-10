@@ -1379,6 +1379,101 @@ pub fn is_skip_require_manifest() -> bool {
         .unwrap_or(false)
 }
 
+// Ephemeral optimization only. Logical module keys and producing manifests
+// remain authoritative. Weak IO identity prevents allocator-address reuse from
+// making a later invocation look like this one.
+#[derive(Default)]
+struct OwnerMappingMemo {
+    io: Option<std::sync::Weak<dyn rush_incremental::TrackedIo + Send + Sync>>,
+    context: Option<OwnerMappingContext>,
+    epoch: Option<u64>,
+    demanded: std::collections::BTreeMap<String, PathBuf>,
+    disabled: bool,
+    maps: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    deps: Vec<Dependency>,
+    owner_inputs: std::collections::BTreeMap<String, [u8; 32]>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OwnerMappingContext {
+    workspace: PathBuf,
+    executable: PathBuf,
+    output_base: PathBuf,
+    environment: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    configuration: [u8; 32],
+    analyzer_context: [u8; 32],
+}
+
+const MAX_MAPPING_OWNERS: usize = 128;
+const MAX_MAPPING_MEMO_BYTES: usize = 1024 * 1024;
+const MAX_MAPPING_REPLAY_DEPS: usize = 16384;
+
+fn parse_owner_mapping_batch(
+    owners: &[String],
+    stdout: &[u8],
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>> {
+    // A mapping object per owner, in argv order (Bazel's documented NDJSON).
+    // Deserialize maps manually to reject duplicate keys rather than silently
+    // letting serde_json's map implementation overwrite a conflicting value.
+    struct Mapping(std::collections::BTreeMap<String, String>);
+    impl<'de> serde::Deserialize<'de> for Mapping {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Mapping;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    formatter.write_str("one owner repository mapping")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut access: A,
+                ) -> std::result::Result<Mapping, A::Error> {
+                    let mut result = std::collections::BTreeMap::new();
+                    while let Some((name, value)) = access.next_entry::<String, String>()? {
+                        if result.insert(name, value).is_some() {
+                            return Err(serde::de::Error::custom(
+                                "duplicate repository mapping key",
+                            ));
+                        }
+                    }
+                    Ok(Mapping(result))
+                }
+            }
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+    if owners.len() == 1 {
+        // Preserve the original single-object JSON grammar, including pretty
+        // whitespace/newlines. from_slice still rejects another/trailing object
+        // and the visitor rejects duplicate keys.
+        let Mapping(mapping) = serde_json::from_slice::<Mapping>(stdout)?;
+        return Ok(std::collections::BTreeMap::from([(
+            owners[0].clone(),
+            mapping,
+        )]));
+    }
+    if owners.is_empty() {
+        anyhow::bail!("no requested repository mapping owner");
+    }
+    let mut lines: Vec<_> = stdout.split(|byte| *byte == b'\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if lines.len() != owners.len() {
+        anyhow::bail!("owner repository mapping output cardinality mismatch");
+    }
+    let mut result = std::collections::BTreeMap::new();
+    for (owner, line) in owners.iter().zip(lines) {
+        let Mapping(mapping) = serde_json::from_slice::<Mapping>(line)?;
+        if result.insert(owner.clone(), mapping).is_some() {
+            anyhow::bail!("duplicate requested repository mapping owner");
+        }
+    }
+    Ok(result)
+}
+
 /// Evaluated module identity is distinct from its filesystem dependencies.
 /// `None` is reserved for legacy/test cache entries and is never admitted by a
 /// real module load. This also makes pre-context entries a guaranteed miss.
@@ -2299,6 +2394,15 @@ impl GlobalBzlCache {
     }
 
     fn set_dep_set_key(&self, key: &ModuleCacheKey, generation: u64, dep_set: Vec<Dependency>) {
+        self.set_dep_manifest_key(key, generation, DependencyManifest::from_deps(dep_set));
+    }
+
+    fn set_dep_manifest_key(
+        &self,
+        key: &ModuleCacheKey,
+        generation: u64,
+        manifest: DependencyManifest,
+    ) {
         let admission = {
             let entry = match self.symbol_cache.get(key) {
                 Some(entry) if entry.generation == generation => entry,
@@ -2315,9 +2419,9 @@ impl GlobalBzlCache {
             Some(entry) if entry.generation == generation => entry,
             _ => return,
         };
-        admission_guard.manifest = DependencyManifest::from_deps(dep_set);
-        admission_guard.admitted_io = rush_incremental::tracked::current()
-            .map(|io| Arc::downgrade(&io));
+        admission_guard.manifest = manifest;
+        admission_guard.admitted_io =
+            rush_incremental::tracked::current().map(|io| Arc::downgrade(&io));
         drop(entry);
     }
 
@@ -4453,6 +4557,7 @@ pub struct BzlLoader {
     /// next command cannot classify a select key using a stale module name or
     /// repo_name mapping before its tracked mapping probe has run.
     command_repo_mapping_owners: Arc<DashSet<String>>,
+    owner_mapping_memo: Arc<Mutex<OwnerMappingMemo>>,
 
     /// Main workspace name (from workspace(name = "...")). Used to identify
     /// the mapping context when evaluating files in the main workspace.
@@ -4699,6 +4804,7 @@ impl BzlLoader {
             repo_aliases: Arc::new(DashMap::new()),
             repo_mappings: Arc::new(DashMap::new()),
             command_repo_mapping_owners: Arc::new(DashSet::new()),
+            owner_mapping_memo: Arc::new(Mutex::new(OwnerMappingMemo::default())),
             main_workspace_name: None,
         }
     }
@@ -4816,12 +4922,11 @@ impl BzlLoader {
             implicit_system_adapters: Arc::clone(&self.implicit_system_adapters),
             managed_workspace_sources: Arc::clone(&self.managed_workspace_sources),
             resource_manager: self.resource_manager.clone(), // Shared resource manager
-            memory_budget: self.memory_budget.clone(), // Shared memory budget
-            repo_aliases: Arc::clone(&self.repo_aliases), // Shared repo aliases
-            repo_mappings: Arc::clone(&self.repo_mappings), // Shared repo mappings
-            command_repo_mapping_owners: Arc::clone(
-                &self.command_repo_mapping_owners,
-            ),
+            memory_budget: self.memory_budget.clone(),       // Shared memory budget
+            repo_aliases: Arc::clone(&self.repo_aliases),    // Shared repo aliases
+            repo_mappings: Arc::clone(&self.repo_mappings),  // Shared repo mappings
+            command_repo_mapping_owners: Arc::clone(&self.command_repo_mapping_owners),
+            owner_mapping_memo: Arc::clone(&self.owner_mapping_memo),
             main_workspace_name: self.main_workspace_name.clone(),
         }
     }
@@ -4980,12 +5085,17 @@ impl BzlLoader {
         }
     }
 
-    fn set_dep_set_cache(&self, key: &ModuleCacheKey, generation: u64, dep_set: Vec<Dependency>) {
+    fn set_dep_set_cache(
+        &self,
+        key: &ModuleCacheKey,
+        generation: u64,
+        manifest: DependencyManifest,
+    ) {
         if let Some(ref global) = self.global_cache {
-            global.set_dep_set_key(key, generation, dep_set);
+            global.set_dep_manifest_key(key, generation, manifest);
         } else if self.symbol_cache.peek(key).is_some() {
             if let Ok(mut manifests) = self.local_symbol_manifests.lock() {
-                manifests.insert(key.clone(), DependencyManifest::from_deps(dep_set));
+                manifests.insert(key.clone(), manifest);
             }
         }
     }
@@ -5956,7 +6066,7 @@ impl BzlLoader {
             // entry, so a cross-command HIT can replay it. No-op outside a command
             // scope (`dep_mark` is None) or when nothing was recorded.
             if let (Some(mark), Some(generation)) = (dep_mark, inserted_generation) {
-                let captured = rush_incremental::tracked::captured_since(mark);
+                let captured = rush_incremental::tracked::captured_manifest_since(mark);
                 loader.set_dep_set_cache(&module_key, generation, captured);
             }
         } // Lock released here
@@ -6456,40 +6566,10 @@ impl BzlLoader {
         }
 
         let dump_mapping = |owner: &str| -> Result<HashMap<String, String>> {
-            let args = vec![
-                b"--output_base".to_vec(),
-                path_command_argument(&output_base),
-                b"mod".to_vec(),
-                b"dump_repo_mapping".to_vec(),
-                owner.as_bytes().to_vec(),
-            ];
-            rush_incremental::tracked::refresh_filesystem_observations();
-            let output = rush_incremental::tracked::probe_process_stdout(
-                &bazel_binary,
-                &args,
-                &bazel_repository_mapping_probe_environment(),
-                &self.workspace_root,
-            )
-                .with_context(|| {
-                    format!(
-                        "Failed to run `{} mod dump_repo_mapping {}`",
-                        bazel_binary.display(),
-                        owner
-                    )
-                })?;
-            if output.status != 0 {
-                return Err(anyhow!(
-                    "`{} --output_base={} mod dump_repo_mapping {}` failed with status {:?}: {}",
-                    bazel_binary.display(),
-                    output_base.display(),
-                    owner,
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-            serde_json::from_slice(&output.stdout).with_context(|| {
-                format!("Failed to parse repository mapping for canonical repo `{owner}`")
-            })
+            Ok(self
+                .module_repository_mapping(owner, owner_repo_root)?
+                .into_iter()
+                .collect())
         };
 
         let root_mapping = dump_mapping("")?;
@@ -6572,7 +6652,7 @@ impl BzlLoader {
         }
         let path = output_base.join("external").join(&repository);
         if !path.exists() {
-            rush_incremental::tracked::refresh_filesystem_observations();
+            let _analysis_producer = rush_incremental::tracked::begin_analysis_producer();
             let status = StdCommand::new(&bazel_binary)
                 .arg("--output_base")
                 .arg(&output_base)
@@ -6728,20 +6808,313 @@ impl BzlLoader {
     fn module_repository_mapping(
         &self, owner: &str, root: &Path,
     ) -> Result<std::collections::BTreeMap<String, String>> {
+        let root = if owner.is_empty() {
+            self.workspace_root.as_path()
+        } else {
+            root
+        };
+        let io = rush_incremental::tracked::current_required();
+        let context_epoch = io.quiescent_analysis_epoch();
+        let mark = io.mark();
         let cache_root = tracked_command_environment("RUSH_WORKSPACE_CACHE_ROOT")?
             .map(PathBuf::from).unwrap_or_else(|| self.workspace_root.join(".cache/rush"));
         let binary = resolve_bazel_binary_for_fetch(&self.workspace_root)?;
-        for input in [self.workspace_root.join("MODULE.bazel"), self.workspace_root.join("MODULE.bazel.lock"), root.join("MODULE.bazel"), root.join("MODULE.bazel.lock")] {
-            track_optional_repository_mapping_input(&input)?;
+        let single_owner = || -> Result<std::collections::BTreeMap<String, String>> {
+            for input in [
+                self.workspace_root.join("MODULE.bazel"),
+                self.workspace_root.join("MODULE.bazel.lock"),
+                root.join("MODULE.bazel"),
+                root.join("MODULE.bazel.lock"),
+            ] {
+                track_optional_repository_mapping_input(&input)?;
+            }
+            let args = vec![
+                b"--output_base".to_vec(),
+                path_command_argument(&cache_root.join("bazel_output_base")),
+                b"mod".to_vec(),
+                b"dump_repo_mapping".to_vec(),
+                owner.as_bytes().to_vec(),
+            ];
+            if !io.process_probes_are_paired() {
+                io.refresh_filesystem_observations();
+            }
+            let output = io.probe_process_stdout(
+                &binary,
+                &args,
+                &bazel_repository_mapping_probe_environment(),
+                &self.workspace_root,
+            )?;
+            if output.status != 0 {
+                anyhow::bail!(
+                    "Failed to read repository mapping for .bzl owner {:?}: {}",
+                    owner,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            parse_owner_mapping_batch(&[owner.to_owned()], &output.stdout)?
+                .remove(owner)
+                .ok_or_else(|| anyhow!("requested owner mapping omitted"))
+        };
+        if context_epoch.is_none() {
+            // Unsupported/open/unpaired IO retains genuine single-owner
+            // behavior without adding context capability requirements.
+            return single_owner();
         }
-        let args = vec![b"--output_base".to_vec(), path_command_argument(&cache_root.join("bazel_output_base")),
-            b"mod".to_vec(), b"dump_repo_mapping".to_vec(), owner.as_bytes().to_vec()];
-        let output = rush_incremental::tracked::probe_process_stdout(&binary, &args,
-            &bazel_repository_mapping_probe_environment(), &self.workspace_root)?;
-        if output.status != 0 {
-            return Err(anyhow!("Failed to read repository mapping for .bzl owner {:?}: {}", owner, String::from_utf8_lossy(&output.stderr)));
+        let context = match crate::fetch_strategy::prepare_workspace_repository_fetch(
+            &self.workspace_root,
+            &binary,
+        ) {
+            Ok(context) => context,
+            // Context formats/platforms unsupported by this optimization keep
+            // the original authoritative operation, not a cached old mapping.
+            Err(_) => return single_owner(),
+        };
+        let environment_keys = bazel_repository_mapping_probe_environment();
+        let identity = OwnerMappingContext {
+            workspace: self.workspace_root.clone(),
+            executable: binary.clone(),
+            output_base: cache_root.join("bazel_output_base"),
+            environment: environment_keys
+                .iter()
+                .map(|key| (key.clone(), io.getenv(key).map(|value| value.to_vec())))
+                .collect(),
+            configuration: io.config_fingerprint(),
+            analyzer_context: context.mapping_context_identity()?,
+        };
+        let observe_owner = |root: &Path| -> Result<Option<[u8; 32]>> {
+            // Build value identity from this operation's returned observations,
+            // not captured_since(mark): another clone may append unrelated raw
+            // dependencies concurrently. Those raw facts remain replay evidence.
+            let physical = rush_incremental::tracked::canonicalize(root)?;
+            let mut hash = blake3::Hasher::new();
+            let field = |hash: &mut blake3::Hasher, bytes: &[u8]| {
+                hash.update(&(bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            };
+            field(&mut hash, &path_command_argument(root));
+            field(&mut hash, &path_command_argument(&physical));
+            for input in [
+                physical.join("MODULE.bazel"),
+                physical.join("MODULE.bazel.lock"),
+            ] {
+                let kind = io.metadata_kind(&input);
+                io.metadata_full(&input);
+                if kind.is_none() {
+                    hash.update(b"absent\0");
+                    continue;
+                }
+                let source = rush_incremental::tracked::canonicalize(&input)?;
+                let read = match io.read_canonical_regular_file(&source) {
+                    Ok(Some(read)) => read,
+                    Ok(None) => return Ok(None),
+                    Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                        return Ok(None)
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let metadata = read.metadata;
+                hash.update(b"present\0");
+                field(&mut hash, &path_command_argument(&source));
+                for value in [
+                    metadata.len,
+                    metadata.mode as u64,
+                    metadata.dev,
+                    metadata.ino,
+                ] {
+                    hash.update(&value.to_le_bytes());
+                }
+                hash.update(&metadata.mtime_ns.to_le_bytes());
+                hash.update(&metadata.ctime_ns.to_le_bytes());
+                hash.update(blake3::hash(&read.contents).as_bytes());
+            }
+            Ok(Some(*hash.finalize().as_bytes()))
+        };
+        let mut memo = self
+            .owner_mapping_memo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let same_io = memo
+            .io
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|previous| Arc::ptr_eq(&previous, &io));
+        if !same_io || memo.context.as_ref() != Some(&identity) {
+            *memo = OwnerMappingMemo::default();
+            memo.io = Some(Arc::downgrade(&io));
+            let context_bytes = identity
+                .environment
+                .iter()
+                .fold(0usize, |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(name.len())
+                        .saturating_add(value.as_ref().map_or(0, Vec::len))
+                })
+                .saturating_add(path_command_argument(&identity.workspace).len())
+                .saturating_add(path_command_argument(&identity.executable).len())
+                .saturating_add(path_command_argument(&identity.output_base).len());
+            if context_bytes > MAX_MAPPING_MEMO_BYTES {
+                memo.disabled = true;
+            } else {
+                memo.context = Some(identity.clone());
+            }
         }
-        serde_json::from_slice(&output.stdout).context("Invalid .bzl owner repository mapping")
+        // The retained roots are batching hints only and are bounded even if
+        // callers demand arbitrary owner strings after optimization is disabled.
+        if !memo.demanded.contains_key(owner) && memo.demanded.len() == MAX_MAPPING_OWNERS {
+            memo.disabled = true;
+        }
+        if !memo.disabled {
+            let hint_bytes = memo.demanded.iter().fold(
+                owner
+                    .len()
+                    .saturating_add(path_command_argument(root).len()),
+                |bytes, (name, root)| {
+                    bytes
+                        .saturating_add(name.len())
+                        .saturating_add(path_command_argument(root).len())
+                },
+            );
+            if hint_bytes > MAX_MAPPING_MEMO_BYTES {
+                memo.disabled = true;
+                memo.demanded.clear();
+            } else {
+                memo.demanded.insert(owner.to_owned(), root.to_path_buf());
+            }
+        }
+        let epoch = io.quiescent_analysis_epoch();
+        let mut owner_inputs = std::collections::BTreeMap::new();
+        let mut can_observe = !memo.disabled && epoch.is_some();
+        if can_observe {
+            for (name, root) in &memo.demanded {
+                match observe_owner(root) {
+                    Ok(Some(stamp)) => {
+                        owner_inputs.insert(name.clone(), stamp);
+                    }
+                    // Root paths/capabilities are optimization hints. A missing
+                    // speculative root or unsupported current-root read must
+                    // not add requirements to the genuine requested operation.
+                    Ok(None) | Err(_) => {
+                        can_observe = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !can_observe {
+            memo.epoch = None;
+            memo.maps.clear();
+            memo.owner_inputs.clear();
+            memo.deps.clear();
+            memo.demanded.clear();
+            drop(memo);
+            return single_owner();
+        }
+        if epoch.is_some()
+            && epoch == context_epoch
+            && memo.epoch == epoch
+            && owner_inputs.len() == memo.demanded.len()
+            && memo.owner_inputs == owner_inputs
+        {
+            if let Some(mapping) = memo.maps.get(owner) {
+                let mapping = mapping.clone();
+                io.record_deps(&memo.deps);
+                if io.quiescent_analysis_epoch() == epoch {
+                    return Ok(mapping);
+                }
+            }
+        }
+        let optimized = epoch.is_some()
+            && epoch == context_epoch
+            && !memo.disabled
+            && owner_inputs.len() == memo.demanded.len();
+        let mut owners: Vec<String> = if optimized {
+            memo.demanded.keys().cloned().collect()
+        } else {
+            vec![owner.to_owned()]
+        };
+        let run = |owners: &[String]| -> Result<_> {
+            let mut args = vec![
+                b"--output_base".to_vec(),
+                path_command_argument(&identity.output_base),
+                b"mod".to_vec(),
+                b"dump_repo_mapping".to_vec(),
+            ];
+            args.extend(owners.iter().map(|owner| owner.as_bytes().to_vec()));
+            let (output, completed) = io.probe_process_stdout_with_epoch(
+                &binary,
+                &args,
+                &environment_keys,
+                &self.workspace_root,
+            )?;
+            if output.status != 0 {
+                return Err(anyhow!(
+                    "Failed to read repository mapping for .bzl owner {:?}: {}",
+                    owner,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let maps = parse_owner_mapping_batch(owners, &output.stdout)?;
+            Ok((maps, completed, output.stdout.len()))
+        };
+        let queried = run(&owners);
+        let (mut maps, completed, bytes) = match queried {
+            Ok(result) => result,
+            Err(_) if owners.len() > 1 => {
+                // Old demanded names are only batching hints. A removed owner
+                // must not mask a valid actually requested owner, or its error.
+                owners = vec![owner.to_owned()];
+                memo.demanded.clear();
+                memo.demanded.insert(owner.to_owned(), root.to_path_buf());
+                run(&owners)?
+            }
+            Err(error) => return Err(error),
+        };
+        let result = maps
+            .get(owner)
+            .cloned()
+            .ok_or_else(|| anyhow!("requested owner mapping omitted"))?;
+        // Never return old authority on a declined fill. Unsupported/capped IO
+        // still ran the exact genuine single-owner operation above.
+        memo.epoch = None;
+        memo.maps.clear();
+        memo.owner_inputs.clear();
+        memo.deps.clear();
+        let hint_bytes: usize = memo
+            .demanded
+            .iter()
+            .map(|(name, root)| name.len().saturating_add(path_command_argument(root).len()))
+            .sum();
+        let fixed_bytes = bytes.saturating_add(hint_bytes);
+        if fixed_bytes > MAX_MAPPING_MEMO_BYTES {
+            memo.disabled = true;
+            memo.demanded.clear();
+        }
+        if !optimized
+            || memo.disabled
+            || fixed_bytes > MAX_MAPPING_MEMO_BYTES
+            || completed.is_none()
+            || completed != context_epoch.and_then(|epoch| epoch.checked_add(2))
+            || io.quiescent_analysis_epoch() != completed
+        {
+            return Ok(result);
+        }
+        // Count and streaming byte checks happen under the recorded lock before
+        // any raw suffix clone. Declined/capped/non-UTF8 capture is not a failure
+        // of the genuine mapping operation, and cannot grant an old value.
+        let Some(deps) = io.captured_since_bounded(
+            mark,
+            MAX_MAPPING_REPLAY_DEPS,
+            MAX_MAPPING_MEMO_BYTES - fixed_bytes,
+        ) else {
+            return Ok(result);
+        };
+        if io.quiescent_analysis_epoch() == completed {
+            memo.owner_inputs = owner_inputs;
+            memo.maps.append(&mut maps);
+            memo.deps = deps;
+            memo.epoch = completed;
+        }
+        Ok(result)
     }
 
     /// Resolve the logical module owner before consulting any symbol cache.
@@ -7112,7 +7485,7 @@ impl BzlLoader {
         // store it on the just-inserted cache entry so a cross-command HIT replays
         // it. No-op outside a command scope or when nothing was recorded.
         if let (Some(mark), Some(generation)) = (dep_mark, inserted_generation) {
-            let captured = rush_incremental::tracked::captured_since(mark);
+            let captured = rush_incremental::tracked::captured_manifest_since(mark);
             self.set_dep_set_cache(&module_key, generation, captured);
         }
         let subphase_put_symbols_cache_dur =
@@ -8472,7 +8845,7 @@ impl BzlLoader {
                 String::new()
             };
 
-            rush_incremental::tracked::refresh_filesystem_observations();
+            let _analysis_producer = rush_incremental::tracked::begin_analysis_producer();
             let mapping_output = StdCommand::new(&bazel_binary)
                 .arg("--output_base")
                 .arg(&output_base)
@@ -8554,7 +8927,7 @@ impl BzlLoader {
         }
         // The analyzer may materialize paths previously observed absent.
         // Retain their dependencies but stop reusing pre-mutation observations.
-        rush_incremental::tracked::refresh_filesystem_observations();
+        let _analysis_producer = rush_incremental::tracked::begin_analysis_producer();
         let status = fetch_command.status().map_err(|error| {
             anyhow!(
                 "failed to start `{} {}`: {}",
@@ -11281,6 +11654,475 @@ mod tests {
                     other
                 ),
             }
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owner_mapping_batch_tests {
+    use super::*;
+    use bytes::Bytes;
+    use rush_command_core::CommandSemantics;
+    use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn io(root: &Path, tool: &Path, variant: &str) -> rush_incremental::tracked::SharedTrackedIo {
+        io_with_runtime(root, root, tool, variant)
+    }
+
+    fn io_with_runtime(
+        root: &Path,
+        runtime: &Path,
+        tool: &Path,
+        variant: &str,
+    ) -> rush_incremental::tracked::SharedTrackedIo {
+        let request = RunRequest {
+            auth_cookie: Bytes::new(),
+            argv: vec![
+                Bytes::from_static(b"rush"),
+                Bytes::from_static(b"build"),
+                Bytes::from_static(b"//:test"),
+                Bytes::from(format!("--define=VARIANT={variant}")),
+            ],
+            working_directory: Bytes::from(root.display().to_string()),
+            environment: [
+                ("RUSH_BAZEL_PATH", tool.to_path_buf()),
+                ("RUSH_WORKSPACE_CACHE_ROOT", runtime.join("cache")),
+                ("HOME", runtime.join("home")),
+                ("PATH", PathBuf::from("/usr/bin:/bin")),
+            ]
+            .into_iter()
+            .map(|(name, value)| EnvironmentVariable {
+                name: Bytes::from(name.to_owned()),
+                value: Bytes::from(value.display().to_string()),
+            })
+            .collect(),
+            block_for_lock: true,
+            client_build_id: "mapping-batch-test".to_owned(),
+            protocol_major: rush_protocol::PROTOCOL_MAJOR,
+            protocol_minor: rush_protocol::PROTOCOL_MINOR,
+            workspace_config: Vec::new(),
+        };
+        Arc::new(rush_incremental::RealTrackedIo::new(
+            CommandSemantics::from_run_request(&request).unwrap(),
+            root,
+        ))
+    }
+
+    fn calls(path: &Path) -> Vec<Vec<String>> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn owner_mapping_batch_parser_binds_exact_ndjson_and_refuses_ambiguity() {
+        let owners = vec![String::new(), "dep+".to_owned()];
+        let maps =
+            parse_owner_mapping_batch(&owners, b"{\"root\":\"\"}\n{\"dep\":\"dep+\"}\n").unwrap();
+        assert_eq!(maps[""]["root"], "");
+        assert_eq!(maps["dep+"]["dep"], "dep+");
+        assert_eq!(
+            parse_owner_mapping_batch(&[String::new()], b"{\n  \"root\": \"\"\n}\n").unwrap()[""]
+                ["root"],
+            ""
+        );
+        assert!(parse_owner_mapping_batch(&[String::new()], b"{}\n{}\n").is_err());
+        assert!(
+            parse_owner_mapping_batch(&[String::new()], b"{\"a\":\"one\",\"a\":\"two\"}").is_err()
+        );
+        for bytes in [
+            b"{}\n".as_slice(),
+            b"{}\n{}\n{}\n",
+            b"{} {}\n",
+            b"{}\n\n{}\n",
+            b"{\"a\":\"one\",\"a\":\"two\"}\n{}\n",
+            b"{}\n{\"a\":1}\n",
+        ] {
+            assert!(
+                parse_owner_mapping_batch(&owners, bytes).is_err(),
+                "{bytes:?}"
+            );
+        }
+        assert!(parse_owner_mapping_batch(&["same".into(), "same".into()], b"{}\n{}\n").is_err());
+    }
+
+    #[test]
+    fn owner_mapping_protocol_fixture_reuses_clones_and_retires_every_mutation() {
+        // This is a controlled subprocess protocol fixture, not a substitute
+        // Bazel/source-admission proof. The ignored test below uses real Bazel.
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("home")).unwrap();
+        fs::create_dir_all(root.join("dep")).unwrap();
+        fs::write(root.join("MODULE.bazel"), "module(name='root')\n").unwrap();
+        fs::write(root.join("dep/MODULE.bazel"), "module(name='dep')\n").unwrap();
+        let state = root.join("protocol-state.json");
+        let log = root.join("all-helper-argv.jsonl");
+        fs::write(&state, r#"{"":{"self":""},"dep+":{"self":"dep+"}}"#).unwrap();
+        let tool = root.join("bazel-protocol-fixture");
+        fs::write(
+            &tool,
+            format!(
+                r#"#!/usr/bin/python3
+import json,sys
+from pathlib import Path
+args=sys.argv[1:]
+with Path({log}).open('a') as stream: stream.write(json.dumps(args)+'\n')
+if args[2:4]!=['mod','dump_repo_mapping']: raise SystemExit(19)
+data=json.loads(Path({state}).read_text())
+for owner in args[4:]:
+ if owner not in data: raise SystemExit(17)
+ print(json.dumps(data[owner]))
+"#,
+                log = serde_json::to_string(&log.display().to_string()).unwrap(),
+                state = serde_json::to_string(&state.display().to_string()).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let loader = BzlLoader::new(root.to_path_buf());
+        let first = io(root, &tool, "one");
+        rush_incremental::tracked::scope(first.clone(), || {
+            assert_eq!(
+                loader.module_repository_mapping("", root).unwrap()["self"],
+                ""
+            );
+            assert_eq!(
+                loader
+                    .module_repository_mapping("dep+", &root.join("dep"))
+                    .unwrap()["self"],
+                "dep+"
+            );
+            let before = calls(&log).len();
+            let clone = loader.clone_for_parallel_parsing();
+            let fingerprint = first.manifest().fingerprint();
+            for _ in 0..8 {
+                loader.module_repository_mapping("", root).unwrap();
+                clone
+                    .module_repository_mapping("dep+", &root.join("dep"))
+                    .unwrap();
+            }
+            assert_eq!(
+                calls(&log).len(),
+                before,
+                "ALL helper processes, not only dump calls"
+            );
+            assert_eq!(
+                first.manifest().fingerprint(),
+                fingerprint,
+                "raw replay does not change semantic identity"
+            );
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let clone = loader.clone_for_parallel_parsing();
+                let root = root.to_path_buf();
+                workers.push(std::thread::spawn(rush_incremental::tracked::bind(
+                    move || {
+                        for _ in 0..4 {
+                            clone.module_repository_mapping("", &root).unwrap();
+                        }
+                    },
+                )));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(
+                calls(&log).len(),
+                before,
+                "concurrent clone hits must share the same IO session"
+            );
+            fs::write(root.join("MODULE.bazel.lock"), "created lock\n").unwrap();
+            loader.module_repository_mapping("", root).unwrap();
+            assert!(
+                calls(&log).len() > before,
+                "fresh negative MODULE.lock must retire a memo"
+            );
+            let before = calls(&log).len();
+            fs::write(
+                root.join("dep/MODULE.bazel"),
+                "module(name='changed_dep')\n",
+            )
+            .unwrap();
+            loader.module_repository_mapping("", root).unwrap();
+            assert!(
+                calls(&log).len() > before,
+                "all demanded owner inputs participate"
+            );
+            let before = calls(&log).len();
+            let guard = rush_incremental::tracked::begin_analysis_producer();
+            loader.module_repository_mapping("", root).unwrap();
+            loader.module_repository_mapping("", root).unwrap();
+            assert_eq!(
+                calls(&log).len(),
+                before + 2,
+                "never fill while a producer is open"
+            );
+            drop(guard);
+            loader.module_repository_mapping("", root).unwrap();
+            let before = calls(&log).len();
+            loader.module_repository_mapping("", root).unwrap();
+            assert_eq!(calls(&log).len(), before);
+            // A real previously demanded root is renamed after a producer.
+            // The helper still knows both owners: root-path hints must not
+            // prevent a genuine current-owner operation from succeeding.
+            let guard = rush_incremental::tracked::begin_analysis_producer();
+            fs::rename(root.join("dep"), root.join("retired-dep")).unwrap();
+            drop(guard);
+            let before = calls(&log).len();
+            assert_eq!(
+                loader.module_repository_mapping("", root).unwrap()["self"],
+                ""
+            );
+            assert_eq!(calls(&log).len(), before + 1);
+            assert_eq!(calls(&log).last().unwrap()[4..], [String::new()]);
+            // Even the requested root is only an observation hint here. The
+            // original query can resolve an owner with a missing caller hint.
+            assert_eq!(
+                loader
+                    .module_repository_mapping("dep+", &root.join("missing-context-root"))
+                    .unwrap()["self"],
+                "dep+"
+            );
+            assert!(loader
+                .module_repository_mapping("missing+", &root.join("missing-context-root"))
+                .is_err());
+            // Restore the root, then test the separate disappeared-owner
+            // response path against a previously valid batching hint.
+            let guard = rush_incremental::tracked::begin_analysis_producer();
+            fs::rename(root.join("retired-dep"), root.join("dep")).unwrap();
+            drop(guard);
+            loader
+                .module_repository_mapping("dep+", &root.join("dep"))
+                .unwrap();
+            loader.module_repository_mapping("", root).unwrap();
+            // A previously demanded owner disappears. Its speculative batch
+            // error cannot hide success (or failure) of the requested owner.
+            let guard = rush_incremental::tracked::begin_analysis_producer();
+            fs::write(&state, r#"{"":{"self":"new-root"}}"#).unwrap();
+            drop(guard);
+            assert_eq!(
+                loader.module_repository_mapping("", root).unwrap()["self"],
+                "new-root"
+            );
+            assert!(loader.module_repository_mapping("missing+", root).is_err());
+            first.refresh_filesystem_observations();
+            let before = calls(&log).len();
+            loader.module_repository_mapping("", root).unwrap();
+            loader.module_repository_mapping("", root).unwrap();
+            assert_eq!(
+                calls(&log).len(),
+                before + 2,
+                "unpaired refresh permanently disables memoization"
+            );
+        });
+        let before = calls(&log).len();
+        let next = io(root, &tool, "two");
+        rush_incremental::tracked::scope(next, || {
+            assert_eq!(
+                loader.module_repository_mapping("", root).unwrap()["self"],
+                "new-root"
+            );
+        });
+        assert!(
+            calls(&log).len() > before,
+            "new actual IO/config cannot reuse a live old IO's snapshot"
+        );
+        assert!(calls(&log)
+            .iter()
+            .all(|args| args[2..4] == ["mod", "dump_repo_mapping"]));
+    }
+
+    #[test]
+    #[ignore = "requires independently pinned real Bazel: RUSH_MAPPING_BAZEL_BIN and RUSH_MAPPING_BAZEL_SHA256"]
+    fn owner_mapping_real_bazel_batches_repeated_loads_and_reprobes_next_request() {
+        use sha2::{Digest, Sha256};
+        let actual =
+            fs::canonicalize(std::env::var_os("RUSH_MAPPING_BAZEL_BIN").expect("real Bazel path"))
+                .unwrap();
+        let expected = std::env::var("RUSH_MAPPING_BAZEL_SHA256")
+            .expect("independently qualified tool SHA256");
+        assert_eq!(
+            hex::encode(Sha256::digest(fs::read(&actual).unwrap())),
+            expected
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path();
+        let workspace = runtime.join("ws");
+        fs::create_dir(&workspace).unwrap();
+        let root = workspace.as_path();
+        fs::create_dir(runtime.join("home")).unwrap();
+        fs::create_dir(root.join("dep")).unwrap();
+        fs::write(
+            root.join("dep/MODULE.bazel"),
+            "module(name='local_dep', version='1.0')\n",
+        )
+        .unwrap();
+        fs::write(root.join("MODULE.bazel"), "module(name='root_a')\nbazel_dep(name='local_dep',version='1.0')\nlocal_path_override(module_name='local_dep',path='dep')\n").unwrap();
+        let log = runtime.join("all-helper-argv.jsonl");
+        let tool = runtime.join("bazel-real-delegating-wrapper");
+        fs::write(
+            &tool,
+            format!(
+                r#"#!/usr/bin/python3
+import os,json,sys
+from pathlib import Path
+with Path({log}).open('a') as stream: stream.write(json.dumps(sys.argv[1:])+'\n')
+os.execv({actual},[{actual}]+sys.argv[1:])
+"#,
+                log = serde_json::to_string(&log.display().to_string()).unwrap(),
+                actual = serde_json::to_string(&actual.display().to_string()).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        struct Shutdown {
+            tool: PathBuf,
+            root: PathBuf,
+            runtime: PathBuf,
+        }
+        impl Drop for Shutdown {
+            fn drop(&mut self) {
+                let _ = StdCommand::new(&self.tool)
+                    .arg("--nohome_rc")
+                    .arg("--nosystem_rc")
+                    .arg("--output_base")
+                    .arg(self.runtime.join("cache/bazel_output_base"))
+                    .arg("shutdown")
+                    .env_clear()
+                    .env("HOME", self.runtime.join("home"))
+                    .env("PATH", "/usr/bin:/bin")
+                    .current_dir(&self.root)
+                    .status();
+            }
+        }
+        let _shutdown = Shutdown {
+            tool: actual,
+            root: root.to_path_buf(),
+            runtime: runtime.to_path_buf(),
+        };
+        let loader = BzlLoader::new(root.to_path_buf());
+        let first = io_with_runtime(root, runtime, &tool, "first");
+        rush_incremental::tracked::scope(first.clone(), || {
+            let root_map = loader.module_repository_mapping("", root).unwrap();
+            assert_eq!(root_map["root_a"], "");
+            let dep = root_map["local_dep"].clone();
+            assert!(!dep.is_empty());
+            loader
+                .module_repository_mapping(&dep, &root.join("dep"))
+                .unwrap();
+            // Genuine lockfile creation may decline the first fill. Establish
+            // the quiescent two-owner state without assuming query purity.
+            for _ in 0..3 {
+                loader.module_repository_mapping("", root).unwrap();
+                loader
+                    .module_repository_mapping(&dep, &root.join("dep"))
+                    .unwrap();
+            }
+            let before = calls(&log).len();
+            let clone = loader.clone_for_parallel_parsing();
+            for _ in 0..12 {
+                assert_eq!(
+                    clone.module_repository_mapping("", root).unwrap()["root_a"],
+                    ""
+                );
+                assert_eq!(
+                    loader
+                        .module_repository_mapping(&dep, &root.join("dep"))
+                        .unwrap()["local_dep"],
+                    dep
+                );
+            }
+            assert_eq!(
+                calls(&log).len(),
+                before,
+                "zero additional helper commands after genuine batch admission"
+            );
+            assert!(
+                calls(&log).iter().any(|args| args.len() > 5),
+                "actual multi-owner call occurred"
+            );
+            assert_eq!(
+                loader
+                    .module_repository_mapping(&dep, &root.join("missing-context-root"))
+                    .unwrap()["local_dep"],
+                dep
+            );
+            assert!(loader
+                .module_repository_mapping("not_a_real_repo+", &root.join("missing-context-root"))
+                .is_err());
+            let guard = rush_incremental::tracked::begin_analysis_producer();
+            fs::write(root.join("MODULE.bazel"), "module(name='root_b')\nbazel_dep(name='local_dep',version='1.0')\nlocal_path_override(module_name='local_dep',path='dep')\n").unwrap();
+            drop(guard);
+            let changed = loader.module_repository_mapping("", root).unwrap();
+            assert_eq!(changed["root_b"], "");
+            assert!(!changed.contains_key("root_a"));
+        });
+        let before = calls(&log).len();
+        let next = io_with_runtime(root, runtime, &tool, "next-config");
+        rush_incremental::tracked::scope(next, || {
+            assert_eq!(
+                loader.module_repository_mapping("", root).unwrap()["root_b"],
+                ""
+            );
+        });
+        assert!(calls(&log).len() > before);
+        assert!(
+            calls(&log)
+                .iter()
+                .all(|args| args[2..4] == ["mod", "dump_repo_mapping"]),
+            "count all helper commands; context stamping must not run info/version probes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod canonical_module_capture_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_module_capture_revalidates_real_nested_sources_in_next_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("leaf.bzl"), "value = 'old'\n").unwrap();
+        fs::write(root.join("parent.bzl"), "load(':leaf.bzl', 'value')\n").unwrap();
+        let loader = Arc::new(Mutex::new(BzlLoader::new_with_global_cache(
+            root.to_path_buf(),
+            GlobalBzlCache::new(),
+        )));
+        let load = || {
+            BzlLoader::load_bzl_from_evaluator(
+                loader.clone(),
+                "//:parent.bzl",
+                &[("value".to_owned(), "value".to_owned())],
+            )
+            .unwrap()
+        };
+        rush_incremental::tracked::test_scope(root, || {
+            for _ in 0..2 {
+                assert!(
+                    matches!(load().get("value"), Some(Value::String(value)) if value == "old")
+                );
+            }
+            let io = rush_incremental::tracked::current_required();
+            let raw = io.captured_since(0);
+            let canonical = io.captured_manifest_since(0);
+            assert_eq!(
+                serde_json::to_vec(&canonical).unwrap(),
+                serde_json::to_vec(&DependencyManifest::from_deps(raw.clone())).unwrap()
+            );
+            assert_eq!(io.captured_since(0), raw);
+            assert!(canonical.deps().iter().any(|dep| matches!(dep,
+                Dependency::FileContent { path, .. } if path == &root.join("leaf.bzl"))));
+        });
+        fs::write(root.join("leaf.bzl"), "value = 'changed'\n").unwrap();
+        rush_incremental::tracked::test_scope(root, || {
+            assert!(
+                matches!(load().get("value"), Some(Value::String(value)) if value == "changed")
+            );
         });
     }
 }

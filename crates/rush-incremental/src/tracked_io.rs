@@ -168,6 +168,32 @@ pub trait TrackedIo {
         cwd: &Path,
     ) -> std::io::Result<ProcessProbeResult>;
 
+    /// Whether the required probe methods themselves own a paired producer
+    /// fence. Older/custom backends default false, so tracked wrappers retain
+    /// the historical pre-probe live-filesystem refresh for them.
+    #[doc(hidden)]
+    fn process_probes_are_paired(&self) -> bool {
+        false
+    }
+
+    /// A stdout probe with a same-invocation, quiescent completion stamp.
+    /// None is required unless the backend can exclude overlapping producers.
+    /// The stamp is not serialized and is never dependency freshness authority.
+    #[doc(hidden)]
+    fn probe_process_stdout_with_epoch(
+        &self,
+        program: &Path,
+        args: &[Vec<u8>],
+        env_keys: &[Vec<u8>],
+        cwd: &Path,
+    ) -> std::io::Result<(ProcessProbeResult, Option<u64>)> {
+        if !self.process_probes_are_paired() {
+            self.refresh_filesystem_observations();
+        }
+        self.probe_process_stdout(program, args, env_keys, cwd)
+            .map(|result| (result, None))
+    }
+
     /// Snapshot the dependencies recorded so far into a manifest.
     fn manifest(&self) -> DependencyManifest;
 
@@ -188,6 +214,27 @@ pub trait TrackedIo {
     /// returned. The returned deps are NOT canonicalized — they are the raw
     /// recorded observations, suitable to store and later [`Self::record_deps`].
     fn captured_since(&self, mark: usize) -> Vec<Dependency>;
+
+    /// Canonical authority for a cache that already stores a manifest rather
+    /// than a raw record. The original ledger and raw capture API are unchanged.
+    /// RealTrackedIo reduces borrowed observations before cloning any payloads.
+    fn captured_manifest_since(&self, mark: usize) -> DependencyManifest {
+        DependencyManifest::from_deps(self.captured_since(mark))
+    }
+
+    /// Optional bounded raw replay capture for invocation-local optimizations.
+    /// Check count and encoded byte budget atomically before cloning the suffix.
+    /// Unsupported encoding/capability or any exceeded cap returns None and
+    /// leaves every original observation recorded in this IO.
+    #[doc(hidden)]
+    fn captured_since_bounded(
+        &self,
+        _mark: usize,
+        _max_deps: usize,
+        _max_bytes: usize,
+    ) -> Option<Vec<Dependency>> {
+        None
+    }
 
     /// Append a set of pre-existing dependencies to the recorded list (the REPLAY
     /// primitive). Used on a cache HIT to re-inject the dependencies that were
@@ -210,6 +257,25 @@ pub trait TrackedIo {
     /// them after this boundary; a producer may have created or replaced paths.
     /// Implementations that always read the filesystem need no extra work.
     fn refresh_filesystem_observations(&self) {}
+
+    /// Start an analysis-owned producer. The caller MUST pair a true result
+    /// with `end_analysis_producer`, including on failure/unwind. Unsupported
+    /// backends retain the old live-filesystem fence and cannot grant reuse.
+    #[doc(hidden)]
+    fn begin_analysis_producer(&self) -> bool {
+        self.refresh_filesystem_observations();
+        false
+    }
+
+    #[doc(hidden)]
+    fn end_analysis_producer(&self) {}
+
+    /// An invocation-local optimization stamp, never freshness authority.
+    /// None means unsupported, an open producer, or an unpaired mutation fence.
+    #[doc(hidden)]
+    fn quiescent_analysis_epoch(&self) -> Option<u64> {
+        None
+    }
 
     /// Return a successful canonicalization cached for this analysis command.
     ///
@@ -241,6 +307,26 @@ pub struct ProcessProbeResult {
     pub stderr_digest: [u8; 32],
 }
 
+#[derive(Default)]
+struct AnalysisProducerState {
+    epoch: u64,
+    in_flight: u64,
+    unpaired: bool,
+}
+
+struct RealAnalysisProducer<'a> {
+    io: &'a RealTrackedIo,
+    paired: bool,
+}
+
+impl Drop for RealAnalysisProducer<'_> {
+    fn drop(&mut self) {
+        if self.paired {
+            self.io.end_analysis_producer();
+        }
+    }
+}
+
 /// Production [`TrackedIo`]: real filesystem for file ops, [`CommandSemantics`]
 /// for env / options.
 ///
@@ -261,6 +347,7 @@ pub struct RealTrackedIo {
     /// Once analysis materializes inputs, filesystem values can evolve within
     /// this command. Disable memos until the next immutable command snapshot.
     live_filesystem: std::sync::atomic::AtomicBool,
+    analysis_producers: Mutex<AnalysisProducerState>,
 }
 
 impl RealTrackedIo {
@@ -496,6 +583,7 @@ impl RealTrackedIo {
             canonicalized: Mutex::new(HashMap::new()),
             existence_observations: Mutex::new(HashMap::new()),
             live_filesystem: std::sync::atomic::AtomicBool::new(false),
+            analysis_producers: Mutex::new(AnalysisProducerState::default()),
         }
     }
 
@@ -506,7 +594,35 @@ impl RealTrackedIo {
     /// analysis cannot obtain the raw [`CommandSemantics`], while still checking
     /// environment and option dependencies against the daemon client's command.
     pub fn validate_manifest(&self, manifest: &DependencyManifest) -> Validated {
+        // Replayed probes may run Bazel/extensions and mutate analysis inputs,
+        // just like fresh probes. Do not let a mapping memo survive that work.
+        let _producer = manifest
+            .deps()
+            .iter()
+            .any(|dep| matches!(dep, Dependency::ProcessProbe { .. }))
+            .then(|| self.analysis_producer());
         manifest.validate(&self.semantics)
+    }
+
+    fn analysis_producer(&self) -> RealAnalysisProducer<'_> {
+        RealAnalysisProducer {
+            io: self,
+            paired: self.begin_analysis_producer(),
+        }
+    }
+
+    fn resume_live_filesystem(&self) {
+        // Permanent for this IO: paired producers never resurrect path memos.
+        self.live_filesystem
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.existence_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.canonicalized
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Normalize a caller-supplied path to an absolute, lexically-canonical path
@@ -628,14 +744,65 @@ pub(crate) fn classify(meta: &fs::Metadata) -> Option<FileKind> {
 }
 
 impl TrackedIo for RealTrackedIo {
+    fn process_probes_are_paired(&self) -> bool {
+        true
+    }
+
     fn refresh_filesystem_observations(&self) {
-        // Publish live mode first so in-flight memo writers cannot repopulate
-        // a cache that later reads might use. Never discard recorded evidence.
-        self.live_filesystem.store(true, std::sync::atomic::Ordering::Release);
-        self.existence_observations.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
-        self.canonicalized.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        // An old unpaired fence says nothing about when its producer ends.
+        // Keep all invocation-local mapping reuse disabled from this point.
+        let mut state = self
+            .analysis_producers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.unpaired = true;
+        state.epoch = state.epoch.saturating_add(1);
+        self.resume_live_filesystem();
+    }
+
+    fn begin_analysis_producer(&self) -> bool {
+        let mut state = self
+            .analysis_producers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(next) = state.in_flight.checked_add(1) else {
+            state.unpaired = true;
+            self.resume_live_filesystem();
+            return false;
+        };
+        state.in_flight = next;
+        if let Some(next) = state.epoch.checked_add(1) {
+            state.epoch = next;
+        } else {
+            state.unpaired = true;
+        }
+        self.resume_live_filesystem();
+        true
+    }
+
+    fn end_analysis_producer(&self) {
+        let mut state = self
+            .analysis_producers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.in_flight == 0 {
+            state.unpaired = true;
+        } else {
+            state.in_flight -= 1;
+        }
+        if let Some(next) = state.epoch.checked_add(1) {
+            state.epoch = next;
+        } else {
+            state.unpaired = true;
+        }
+    }
+
+    fn quiescent_analysis_epoch(&self) -> Option<u64> {
+        let state = self
+            .analysis_producers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!state.unpaired && state.in_flight == 0).then_some(state.epoch)
     }
 
     fn canonicalize_cache_get(&self, path: &Path) -> Option<PathBuf> {
@@ -845,6 +1012,7 @@ impl TrackedIo for RealTrackedIo {
         cwd: &Path,
     ) -> std::io::Result<ProcessProbeResult> {
         let cwd = self.norm(cwd);
+        let _producer = self.analysis_producer();
         let outcome = run_probe(program, args, env_keys, &cwd, &self.semantics)?;
         self.record(Dependency::ProcessProbe {
             program: program.to_path_buf(),
@@ -874,6 +1042,7 @@ impl TrackedIo for RealTrackedIo {
         cwd: &Path,
     ) -> std::io::Result<ProcessProbeResult> {
         let cwd = self.norm(cwd);
+        let _producer = self.analysis_producer();
         let outcome = run_probe(program, args, env_keys, &cwd, &self.semantics)?;
         self.record(Dependency::ProcessProbe {
             program: program.to_path_buf(),
@@ -892,6 +1061,23 @@ impl TrackedIo for RealTrackedIo {
             stdout_digest: outcome.stdout_digest,
             stderr_digest: outcome.stderr_digest,
         })
+    }
+
+    fn probe_process_stdout_with_epoch(
+        &self,
+        program: &Path,
+        args: &[Vec<u8>],
+        env_keys: &[Vec<u8>],
+        cwd: &Path,
+    ) -> std::io::Result<(ProcessProbeResult, Option<u64>)> {
+        let before = self.quiescent_analysis_epoch();
+        let output = self.probe_process_stdout(program, args, env_keys, cwd)?;
+        // That exact probe has one begin and one end. Another producer, even
+        // one which already finished, makes this equality fail conservatively.
+        let completed = before
+            .and_then(|epoch| epoch.checked_add(2))
+            .filter(|epoch| self.quiescent_analysis_epoch() == Some(*epoch));
+        Ok((output, completed))
     }
 
     fn manifest(&self) -> DependencyManifest {
@@ -920,6 +1106,62 @@ impl TrackedIo for RealTrackedIo {
         } else {
             guard[mark..].to_vec()
         }
+    }
+
+    fn captured_manifest_since(&self, mark: usize) -> DependencyManifest {
+        let guard = self
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        DependencyManifest::from_recorded_refs(guard.get(mark..).unwrap_or(&[]).iter())
+    }
+
+    fn captured_since_bounded(
+        &self,
+        mark: usize,
+        max_deps: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<Dependency>> {
+        struct Counter {
+            bytes: usize,
+            maximum: usize,
+        }
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let total = self
+                    .bytes
+                    .checked_add(bytes.len())
+                    .filter(|total| *total <= self.maximum)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "bounded replay capture exceeded byte budget",
+                        )
+                    })?;
+                self.bytes = total;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let guard = self
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let suffix = guard.get(mark..)?;
+        if suffix.len() > max_deps {
+            return None;
+        }
+        // Stream into a capped counter, never a full temporary JSON Vec. Invalid
+        // PathBuf encodings also decline optimization rather than changing the
+        // genuine producer's successful result into an error.
+        let mut counter = Counter {
+            bytes: 0,
+            maximum: max_bytes,
+        };
+        serde_json::to_writer(&mut counter, suffix).ok()?;
+        Some(suffix.to_vec())
     }
 
     fn record_deps(&self, deps: &[Dependency]) {

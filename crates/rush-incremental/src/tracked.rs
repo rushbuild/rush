@@ -190,6 +190,29 @@ pub fn refresh_filesystem_observations() {
     current_required().refresh_filesystem_observations();
 }
 
+/// Paired analysis-owned materialization. Holds the exact IO alive until its
+/// end fence; dropping on an error/unwind still closes the producer boundary.
+/// This does not restore filesystem memos or grant dependency freshness.
+#[must_use]
+pub struct AnalysisProducerGuard {
+    io: SharedTrackedIo,
+    paired: bool,
+}
+
+impl Drop for AnalysisProducerGuard {
+    fn drop(&mut self) {
+        if self.paired {
+            self.io.end_analysis_producer();
+        }
+    }
+}
+
+pub fn begin_analysis_producer() -> AnalysisProducerGuard {
+    let io = current_required();
+    let paired = io.begin_analysis_producer();
+    AnalysisProducerGuard { io, paired }
+}
+
 /// Probe a path's full stat metadata through the current analysis IO. See
 /// [`TrackedIo::metadata_full`].
 pub fn metadata_full(path: &Path) -> bool {
@@ -397,7 +420,11 @@ pub fn probe_process(
     env_keys: &[Vec<u8>],
     cwd: &Path,
 ) -> std::io::Result<ProcessProbeResult> {
-    current_required().probe_process(program, args, env_keys, cwd)
+    let io = current_required();
+    if !io.process_probes_are_paired() {
+        io.refresh_filesystem_observations();
+    }
+    io.probe_process(program, args, env_keys, cwd)
 }
 
 /// Run a tracked subprocess probe whose semantic result is status + stdout.
@@ -409,7 +436,11 @@ pub fn probe_process_stdout(
     env_keys: &[Vec<u8>],
     cwd: &Path,
 ) -> std::io::Result<ProcessProbeResult> {
-    current_required().probe_process_stdout(program, args, env_keys, cwd)
+    let io = current_required();
+    if !io.process_probes_are_paired() {
+        io.refresh_filesystem_observations();
+    }
+    io.probe_process_stdout(program, args, env_keys, cwd)
 }
 
 /// Consume the per-command configuration fingerprint through the current analysis
@@ -446,6 +477,24 @@ pub fn captured_since(mark: usize) -> Vec<crate::Dependency> {
         Some(io) => io.captured_since(mark),
         None => Vec::new(),
     }
+}
+
+/// Capture a canonical suffix for a cache which stores manifest authority.
+/// Raw observations stay in the IO; outside a scope this matches empty capture.
+pub fn captured_manifest_since(mark: usize) -> crate::DependencyManifest {
+    current()
+        .map(|io| io.captured_manifest_since(mark))
+        .unwrap_or_else(|| crate::DependencyManifest::from_deps(Vec::new()))
+}
+
+/// Bounded raw capture, or None outside a capable current analysis IO. A decline
+/// never removes the original command observations or grants reuse authority.
+pub fn captured_since_bounded(
+    mark: usize,
+    max_deps: usize,
+    max_bytes: usize,
+) -> Option<Vec<crate::Dependency>> {
+    current()?.captured_since_bounded(mark, max_deps, max_bytes)
 }
 
 /// Replay a pre-recorded dependency set into the currently installed analysis IO

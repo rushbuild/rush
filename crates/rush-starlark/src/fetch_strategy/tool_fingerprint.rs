@@ -186,9 +186,19 @@ impl ToolFingerprintMemo {
                     .with_context(|| format!("read analyzer executable {}", tool.display()))
             }
         };
-        let deps = io.captured_since(mark);
         let bytes = contents.as_ref();
         let sha256 = hex::encode(Sha256::digest(bytes));
+        // Capture only an otherwise eligible descriptor-bound fill, before the
+        // independent postguard adds its second metadata observation. Count and
+        // byte checks happen under the IO lock before any raw suffix clone.
+        let deps = before
+            .as_ref()
+            .filter(|signature| {
+                fill_started_old
+                    && bound.as_ref() == Some(*signature)
+                    && signature.old_enough(clock())
+            })
+            .and_then(|_| io.captured_since_bounded(mark, MAX_CAPTURED_DEPS, MAX_ENTRY_BYTES));
         let after = Signature::read(tool);
         if before.is_some()
             && (after != before
@@ -201,9 +211,12 @@ impl ToolFingerprintMemo {
                 tool.display()
             );
         }
-        if let Some(signature) = after.filter(|after| {
-            fill_started_old && before.as_ref() == Some(after) && after.old_enough(clock())
-        }) {
+        if let (Some(signature), Some(deps)) = (
+            after.filter(|after| {
+                fill_started_old && before.as_ref() == Some(after) && after.old_enough(clock())
+            }),
+            deps,
+        ) {
             if bound.as_ref() == Some(&signature)
                 && admissible_capture(tool, &signature, bytes, &deps, clock())
             {
@@ -753,6 +766,43 @@ mod tests {
         ));
         assert!(first.1.manifest().deps().iter().any(|dep| matches!(dep,
             Dependency::FileExistence { path, exists: false, .. } if path == &optional)));
+    }
+
+    #[test]
+    fn tool_fingerprint_memo_declines_oversized_raw_fill_without_losing_observations() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = directory.path().join("analyzer");
+        std::fs::write(&tool, b"actual executable contents").unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        let memo = ToolFingerprintMemo::new(MAX_ENTRIES);
+        tracked::test_scope(directory.path(), || {
+            let io = tracked::current_required();
+            let fingerprint = memo
+                .fingerprint_with(&tool, SystemTime::now, |path| {
+                    let read = tracked::read_canonical_regular_file(path)?;
+                    for _ in 0..MAX_CAPTURED_DEPS + 1 {
+                        io.getenv(b"RUSH_TEST_TOOL_OBSERVATION");
+                    }
+                    Ok(read)
+                })
+                .unwrap();
+            assert_eq!(
+                fingerprint,
+                hex::encode(Sha256::digest(b"actual executable contents"))
+            );
+            assert!(memo.entries.lock().unwrap().peek(&tool).is_none());
+            let raw = io.captured_since(0);
+            assert!(
+                raw.iter()
+                    .filter(|dep| matches!(dep, Dependency::Env { name, .. }
+                if name == b"RUSH_TEST_TOOL_OBSERVATION"))
+                    .count()
+                    > MAX_CAPTURED_DEPS
+            );
+            assert!(raw
+                .iter()
+                .any(|dep| matches!(dep, Dependency::FileContent { path, .. } if path == &tool)));
+        });
     }
 
     #[test]

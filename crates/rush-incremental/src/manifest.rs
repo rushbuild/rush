@@ -149,21 +149,72 @@ fn canonicalize_content_observations(deps: Vec<Dependency>) -> Vec<Dependency> {
 }
 
 impl DependencyManifest {
-    /// Canonicalize borrowed observations without cloning repeated payloads.
-    ///
-    /// Keep distinct proof payloads until the existing conservative content
-    /// reducer has seen them. Removing only exact duplicates is idempotent for
-    /// that reducer and for the final dedup, including process probes. Keep the
-    /// first Ord-equal representation, matching the stable owned sort. Scratch
-    /// storage grows with distinct observations, not the raw recording length.
+    /// Canonicalize native borrowed observations without retaining every
+    /// read-time proof variant in scratch storage. The raw ledger is untouched.
+    /// Native construction sorts globally, placing every FileContent before
+    /// ProcessProbe; wire deserialization still uses its separate span reducer.
     pub(crate) fn from_recorded_refs<'a>(
         recorded: impl IntoIterator<Item = &'a Dependency>,
     ) -> Self {
-        let mut distinct = BTreeSet::new();
+        // Keep the minimum full-Ord representative, including first-seen ties:
+        // equivalent Path spellings can serialize differently even though Ord
+        // treats them as equal. This matches the original stable owned sort.
+        let mut content = BTreeMap::<
+            (&'a Path, [u8; 32]),
+            (&'a Dependency, Option<&'a crate::FileContentBinding>),
+        >::new();
+        let mut other = BTreeSet::new();
         for dep in recorded {
-            distinct.insert(dep);
+            if let Dependency::FileContent {
+                path,
+                digest,
+                binding,
+            } = dep
+            {
+                let binding = binding.as_ref().filter(|binding| {
+                    binding.matches_content(path, digest) && binding.historically_qualified()
+                });
+                content
+                    .entry((path.as_path(), *digest))
+                    .and_modify(|(representative, existing)| {
+                        if dep < *representative {
+                            *representative = dep;
+                        }
+                        *existing = match (*existing, binding) {
+                            (Some(a), Some(b)) if a.same_bound_value(b) => Some(
+                                if (a.read_start_ns, a.read_end_ns)
+                                    <= (b.read_start_ns, b.read_end_ns)
+                                {
+                                    a
+                                } else {
+                                    b
+                                },
+                            ),
+                            _ => None,
+                        };
+                    })
+                    .or_insert((dep, binding));
+            } else {
+                other.insert(dep);
+            }
         }
-        Self::from_recorded(distinct.into_iter().cloned().collect())
+        let mut reduced: Vec<_> = content
+            .into_values()
+            .map(|(representative, binding)| {
+                let Dependency::FileContent { path, digest, .. } = representative else {
+                    unreachable!()
+                };
+                Dependency::FileContent {
+                    path: path.clone(),
+                    digest: *digest,
+                    binding: binding.cloned(),
+                }
+            })
+            .collect();
+        reduced.extend(other.into_iter().cloned());
+        // The existing owned normalizer remains the final authority. Its input
+        // is now bounded by distinct values/facts, not distinct proof clocks.
+        Self::from_recorded(reduced)
     }
 
     /// Build a canonical manifest from a raw recorded list: dedup identical
@@ -1229,6 +1280,95 @@ mod metadata_preflight_tests {
     }
 
     #[test]
+    fn borrowed_native_proof_reduction_preserves_full_wire_path_representatives() {
+        let digest = content_digest(b"same");
+        let proof = crate::FileContentBinding {
+            version: 1,
+            path: PathBuf::from("/snapshot/header.h"),
+            digest,
+            len: 4,
+            mode: 0o100644,
+            dev: 1,
+            ino: 2,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            read_start_ns: 3_000_000_001,
+            read_end_ns: 3_000_000_002,
+        };
+        let mut late = proof.clone();
+        late.read_start_ns += 10;
+        late.read_end_ns += 10;
+        let mut other_inode = proof.clone();
+        other_inode.ino += 1;
+        let mut invalid = proof.clone();
+        invalid.version = 99;
+        let mut fresh = proof.clone();
+        fresh.read_start_ns = 1;
+        let mut wrong_value = proof.clone();
+        wrong_value.digest = [7; 32];
+        let variants = [
+            None,
+            Some(proof.clone()),
+            Some(late),
+            Some(other_inode),
+            Some(invalid),
+            Some(fresh),
+            Some(wrong_value),
+        ];
+        for a in &variants {
+            for b in &variants {
+                let mut same_repr = proof.clone();
+                same_repr.path = PathBuf::from("/snapshot//header.h");
+                let mut raw = vec![
+                    Dependency::FileContent {
+                        path: PathBuf::from("/snapshot/header.h"),
+                        digest,
+                        binding: a.clone(),
+                    },
+                    Dependency::ProcessProbe {
+                        program: PathBuf::from("/tool"),
+                        args: vec![],
+                        env_keys: vec![],
+                        cwd: PathBuf::from("/snapshot"),
+                        status: 0,
+                        stdout_digest: [1; 32],
+                        stderr_digest: [0; 32],
+                        compare_stderr: false,
+                    },
+                    Dependency::FileContent {
+                        path: PathBuf::from("/snapshot//header.h"),
+                        digest,
+                        binding: b.clone(),
+                    },
+                    Dependency::FileContent {
+                        path: PathBuf::from("/snapshot/./header.h"),
+                        digest,
+                        binding: Some(same_repr),
+                    },
+                    Dependency::FileContent {
+                        path: PathBuf::from("/snapshot/header.h"),
+                        digest: [8; 32],
+                        binding: None,
+                    },
+                ];
+                for _ in 0..raw.len() {
+                    raw.rotate_left(1);
+                    for values in [raw.clone(), raw.iter().rev().cloned().collect()] {
+                        let expected = DependencyManifest::from_recorded(values.clone());
+                        let actual = DependencyManifest::from_recorded_refs(values.iter());
+                        assert_eq!(
+                            serde_json::to_vec(&actual).unwrap(),
+                            serde_json::to_vec(&expected).unwrap(),
+                            "raw path spelling and complete binding, not just semantic Eq"
+                        );
+                        assert_eq!(actual.fingerprint(), expected.fingerprint());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn borrowed_manifest_keeps_raw_marks_and_conflicting_reads() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("header.h");
@@ -1241,6 +1381,12 @@ mod metadata_preflight_tests {
             io.record_deps(&prefix);
         }
         let raw = io.captured_since(mark);
+        let captured_manifest = io.captured_manifest_since(mark);
+        assert_eq!(
+            serde_json::to_vec(&captured_manifest).unwrap(),
+            serde_json::to_vec(&DependencyManifest::from_deps(raw.clone())).unwrap()
+        );
+        assert_eq!(io.captured_since(mark), raw);
         let first = io.manifest();
         assert_eq!(first.len(), prefix.len());
         assert_eq!(io.mark(), mark + raw.len());

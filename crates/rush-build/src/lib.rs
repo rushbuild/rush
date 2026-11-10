@@ -5729,14 +5729,14 @@ cc_library(
         // full dependency set (everything recorded since `dep_mark`) and store it
         // in the cache entry so a cross-command HIT can replay it. Empty when no
         // command scope is active. `with_tracked_scope` installs the IO so
-        // `captured_since` resolves the same shared manifest the parse recorded into.
-        let dep_set = match dep_mark {
+        // Canonicalize borrowed observations in that same IO rather than first
+        // cloning a potentially huge raw BUILD suffix. Raw evidence stays live.
+        let manifest = match dep_mark {
             Some(mark) => {
-                self.with_tracked_scope(|| rush_incremental::tracked::captured_since(mark))
+                self.with_tracked_scope(|| rush_incremental::tracked::captured_manifest_since(mark))
             }
-            None => Vec::new(),
+            None => rush_incremental::DependencyManifest::from_deps(Vec::new()),
         };
-        let manifest = rush_incremental::DependencyManifest::from_deps(dep_set);
         let admitted_io = self
             .real_tracked_io_shared()
             .map(|io| Arc::downgrade(&io))
