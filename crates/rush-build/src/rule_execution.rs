@@ -873,19 +873,6 @@ pub fn instantiate_rule(
         })
         .unwrap_or_default();
 
-    // Get the rule from registry
-    let rule = registry.get(&rule_call.rule_type).ok_or_else(|| {
-        anyhow!(
-            "Unknown rule type: {} (target: {}, BUILD file context needed)",
-            rule_call.rule_type,
-            if name.is_empty() {
-                "unknown"
-            } else {
-                name.as_str()
-            }
-        )
-    })?;
-
     // Convert RuleCall to attribute map
     let starlark_attrs = rule_call_to_attrs(rule_call)?;
     let platform = PlatformConfig::new();
@@ -985,6 +972,40 @@ pub fn instantiate_rule(
     // the target enters the scoped configured-target closure (Bazel resolves
     // attributes at configuration time, so an unrequested sibling must not
     // fail package loading).
+    if let Some(declaration) = &rule_call.cc_projection {
+        if let Some(reason) = declaration.refusal_reason() {
+            return Ok(unconfigurable_target(
+                name,
+                anyhow!(reason.to_owned()),
+                &rush_attrs,
+                visibility_was_explicit,
+                configuration_conditions,
+            ));
+        }
+    }
+    let projection_factory = rule_call
+        .cc_projection
+        .as_ref()
+        .and_then(|declaration| declaration.kind())
+        .map(|kind| match kind {
+            rush_starlark::CcProjectionKind::CompilationParametersV1 => {
+                rush_rules::rules_cc_projection::CcProjectionRule::parameters()
+            }
+            rush_starlark::CcProjectionKind::HeadersV1 => {
+                rush_rules::rules_cc_projection::CcProjectionRule::headers()
+            }
+        });
+    let rule: &dyn rush_rules::BuildRule = if let Some(factory) = &projection_factory {
+        factory
+    } else {
+        registry.get(&rule_call.rule_type).ok_or_else(|| {
+            anyhow!(
+                "Unknown rule type: {} (target: {})",
+                rule_call.rule_type,
+                name
+            )
+        })?
+    };
     let instance = match rule.parse_attributes(&rush_attrs) {
         Ok(instance) => instance,
         Err(err) => Box::new(
@@ -1458,7 +1479,7 @@ pub fn parse_rule_to_instance_with_context(
     // real C++. Repo-agnostic: keyed on the _cc_proto / _proto (with .proto srcs) name
     // pattern, which is proto-specific by convention. Gated by RUSH_ENABLE_BZLMOD, so
     // the certified TF/463 path is unaffected.
-    let effective_rule_type: &str = if inst_ctx.bzlmod && rule.rule_type == "CustomRule" {
+    let effective_rule_type: &str = if inst_ctx.bzlmod && rule.rule_type == "CustomRule" && rule.cc_projection.is_none() {
         if rule.name.ends_with("_cc_proto") {
             "cc_proto_library"
         } else if rule.name.ends_with("_proto") && has_proto_srcs(&rush_attrs) {
@@ -1477,13 +1498,38 @@ pub fn parse_rule_to_instance_with_context(
         }
     }
 
-    // Get the rule definition from registry
-    let rule_def = registry
-        .get(effective_rule_type)
-        .ok_or_else(|| anyhow!("Unknown rule type: {}", effective_rule_type))?;
-
     // Parse attributes and create rule instance; failures defer until the
     // instance enters the requested configured-target closure.
+    if let Some(declaration) = &rule.cc_projection {
+        if let Some(reason) = declaration.refusal_reason() {
+            return Ok(unconfigurable_target(
+                rule.name.clone(),
+                anyhow!(reason.to_owned()),
+                &rush_attrs,
+                visibility_was_explicit,
+                configuration_conditions,
+            ));
+        }
+    }
+    let projection_factory = rule
+        .cc_projection
+        .as_ref()
+        .and_then(|declaration| declaration.kind())
+        .map(|kind| match kind {
+            rush_starlark::CcProjectionKind::CompilationParametersV1 => {
+                rush_rules::rules_cc_projection::CcProjectionRule::parameters()
+            }
+            rush_starlark::CcProjectionKind::HeadersV1 => {
+                rush_rules::rules_cc_projection::CcProjectionRule::headers()
+            }
+        });
+    let rule_def: &dyn rush_rules::BuildRule = if let Some(factory) = &projection_factory {
+        factory
+    } else {
+        registry
+            .get(effective_rule_type)
+            .ok_or_else(|| anyhow!("Unknown rule type: {}", effective_rule_type))?
+    };
     let instance = match rule_def.parse_attributes(&rush_attrs) {
         Ok(instance) => instance,
         Err(err) => Box::new(
@@ -1534,7 +1580,7 @@ mod tests {
     fn selected_analyzer_proto_consumers_cannot_fall_back_to_global_protoc() {
         let mut registry=RuleRegistry::new();
         registry.register(Box::new(rush_rules::rules_cc::CcProtoLibraryRule));
-        let rule=Rule { name:"generated".into(),rule_type:"cc_proto_library".into(),attributes:HashMap::from([
+        let rule=Rule { cc_projection: None, name:"generated".into(),rule_type:"cc_proto_library".into(),attributes:HashMap::from([
             ("name".into(),ParseValue::String("generated".into())),
             ("deps".into(),ParseValue::List(vec![ParseValue::String(":messages".into())])),
         ]) };
@@ -1586,6 +1632,7 @@ mod tests {
 
     fn cc_rule(name: &str, srcs: ParseValue) -> Rule {
         Rule {
+            cc_projection: None,
             name: name.to_string(),
             rule_type: "cc_library".to_string(),
             attributes: HashMap::from([
@@ -1626,6 +1673,7 @@ mod tests {
         );
 
         let rule_call = RuleCall {
+            cc_projection: None,
             rule_type: "cc_library".to_string(),
             args: vec![],
             kwargs,
@@ -1641,6 +1689,7 @@ mod tests {
     #[test]
     fn rule_bridge_retains_select_and_visibility_origin_metadata() {
         let configurable = RuleCall {
+            cc_projection: None,
             rule_type: "cc_library".to_string(),
             args: vec![],
             kwargs: HashMap::from([
@@ -1671,6 +1720,7 @@ mod tests {
         let mut registry = RuleRegistry::new();
         registry.register(Box::new(rush_rules::ConfigSettingRule));
         let config_setting = RuleCall {
+            cc_projection: None,
             rule_type: "config_setting".to_string(),
             args: vec![],
             kwargs: HashMap::from([
@@ -1702,6 +1752,7 @@ mod tests {
     fn package_group_rejects_configurable_attributes_before_rule_call_resolution() {
         let registry = package_group_registry();
         let packages_select = RuleCall {
+            cc_projection: None,
             rule_type: "package_group".to_string(),
             args: vec![],
             kwargs: HashMap::from([
@@ -1722,6 +1773,7 @@ mod tests {
         assert_nonconfigurable_package_group(instance.as_ref(), "packages");
 
         let includes_configurable = RuleCall {
+            cc_projection: None,
             rule_type: "package_group".to_string(),
             args: vec![],
             kwargs: HashMap::from([
@@ -1754,6 +1806,7 @@ mod tests {
     fn package_group_rejects_configurable_attributes_before_parse_bridge_resolution() {
         let registry = package_group_registry();
         let packages_configurable = Rule {
+            cc_projection: None,
             name: "packages".to_string(),
             rule_type: "package_group".to_string(),
             attributes: HashMap::from([
@@ -1782,6 +1835,7 @@ mod tests {
         assert_nonconfigurable_package_group(instance.as_ref(), "packages");
 
         let includes_select = Rule {
+            cc_projection: None,
             name: "includes".to_string(),
             rule_type: "package_group".to_string(),
             attributes: HashMap::from([
@@ -1810,6 +1864,7 @@ mod tests {
     fn package_group_accepts_constant_lists_through_both_bridges() {
         let registry = package_group_registry();
         let rule_call = RuleCall {
+            cc_projection: None,
             rule_type: "package_group".to_string(),
             args: vec![],
             kwargs: HashMap::from([
@@ -1826,6 +1881,7 @@ mod tests {
         assert!(raw_instance.configuration_error().is_none());
 
         let rule = Rule {
+            cc_projection: None,
             name: "parsed".to_string(),
             rule_type: "package_group".to_string(),
             attributes: HashMap::from([
@@ -1846,6 +1902,7 @@ mod tests {
     fn visibility_rejects_selects_before_both_bridge_resolvers() {
         let registry = cc_registry();
         let rule_call = RuleCall {
+            cc_projection: None,
             rule_type: "cc_library".to_string(),
             args: vec![],
             kwargs: HashMap::from([
@@ -1868,6 +1925,7 @@ mod tests {
         assert_nonconfigurable_visibility(raw_instance.as_ref());
 
         let rule = Rule {
+            cc_projection: None,
             name: "parsed".to_string(),
             rule_type: "cc_library".to_string(),
             attributes: HashMap::from([
@@ -1942,6 +2000,7 @@ mod tests {
         registry.register(Box::new(tensorflow_rules::AliasRule));
 
         let config_setting = Rule {
+            cc_projection: None,
             name: "host".to_string(),
             rule_type: "config_setting".to_string(),
             attributes: HashMap::from([
@@ -1962,6 +2021,7 @@ mod tests {
         );
 
         let constraint_value = Rule {
+            cc_projection: None,
             name: "linux".to_string(),
             rule_type: "constraint_value".to_string(),
             attributes: HashMap::from([
@@ -1980,6 +2040,7 @@ mod tests {
         );
 
         let alias = Rule {
+            cc_projection: None,
             name: "linux_alias".to_string(),
             rule_type: "alias".to_string(),
             attributes: HashMap::from([
@@ -3058,6 +3119,7 @@ cc_library(
             path: std::path::PathBuf::from("/tmp/rush-java-sibling/BUILD"),
             rules: vec![
                 Rule {
+                    cc_projection: None,
                     name: "unused_java".to_string(),
                     rule_type: "java_plugin".to_string(),
                     attributes: HashMap::from([
@@ -3110,5 +3172,99 @@ cc_library(
         );
 
         assert!(instance.build(&context).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cc_projection_carrier_tests {
+    use super::*;
+
+    #[test]
+    fn refused_projection_is_deferred_in_both_instantiation_apis_without_registry_names() {
+        let root = tempfile::tempdir().unwrap();
+        rush_incremental::tracked::test_scope(root.path(), || {
+            let text = "def implementation(ctx):\n    return []\nr=rule(implementation=implementation,attrs={'original_deps':attr.label_list(allow_files=True,allow_empty=True,providers=[CcInfo])})\nr(name='refused',original_deps=[':real'])\n";
+            let mut evaluator = rush_starlark::Evaluator::new();
+            evaluator.register_native_namespace();
+            evaluator.set_current_package_dir(Some(root.path().to_owned()));
+            evaluator
+                .eval_program(&rush_starlark::parse(text).unwrap())
+                .unwrap();
+            let call = &evaluator.get_rule_calls()[0];
+            assert!(call
+                .cc_projection
+                .as_ref()
+                .unwrap()
+                .refusal_reason()
+                .is_some());
+            let registry = rush_rules::registry::RuleRegistry::new();
+            let instance = instantiate_rule(call, &registry).unwrap();
+            assert_eq!(instance.target_name(), "refused");
+            assert!(instance
+                .configuration_error()
+                .unwrap()
+                .contains("source-qualified"));
+            std::fs::write(root.path().join("BUILD"), text).unwrap();
+            let parsed =
+                rush_parse::parse_build_file_with_starlark(&root.path().join("BUILD")).unwrap();
+            let cloned = parsed.clone();
+            let rule = &cloned.rules[0];
+            assert!(std::sync::Arc::ptr_eq(
+                parsed.rules[0].cc_projection.as_ref().unwrap(),
+                rule.cc_projection.as_ref().unwrap(),
+            ));
+            // Compatibility translation cannot erase an opaque declaration,
+            // even if a caller presents it with an Envoy-looking type string.
+            for rule_type in [
+                "envoy_cc_library",
+                "envoy_cc_linux_library",
+                "envoy_cc_posix_library",
+                "envoy_cc_win32_library",
+                "envoy_cc_extension",
+                "envoy_cc_contrib_extension",
+                "envoy_cc_test",
+                "envoy_cc_fuzz_test",
+                "envoy_benchmark_test",
+                "envoy_cc_binary",
+                "envoy_proto_library",
+            ] {
+                let mut carried = rule.clone();
+                carried.rule_type = rule_type.into();
+                let translated = rush_parse::translate_envoy_macro(&carried);
+                assert_eq!(translated.rule_type, rule_type);
+                assert!(std::sync::Arc::ptr_eq(
+                    carried.cc_projection.as_ref().unwrap(),
+                    translated.cc_projection.as_ref().unwrap(),
+                ));
+                let refused = parse_rule_to_instance(&translated, &registry).unwrap();
+                assert!(refused
+                    .configuration_error()
+                    .unwrap()
+                    .contains("source-qualified"));
+                carried.cc_projection = None;
+                let ordinary = rush_parse::translate_envoy_macro(&carried);
+                assert!(ordinary.cc_projection.is_none());
+                assert_ne!(
+                    ordinary.rule_type, rule_type,
+                    "ordinary Envoy translation is unchanged"
+                );
+            }
+            assert!(rule
+                .cc_projection
+                .as_ref()
+                .unwrap()
+                .refusal_reason()
+                .is_some());
+            let instance = parse_rule_to_instance(rule, &registry).unwrap();
+            assert_eq!(instance.target_name(), "refused");
+            assert!(instance
+                .configuration_error()
+                .unwrap()
+                .contains("source-qualified"));
+            assert!(
+                registry.list_rules().is_empty(),
+                "no public registry kind grants admission"
+            );
+        });
     }
 }

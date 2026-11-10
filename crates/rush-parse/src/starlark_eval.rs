@@ -146,6 +146,7 @@ impl StarlarkEvaluator {
                 } else {
                     // Regular rule
                     let mut rule = Rule {
+                        cc_projection: None,
                         name: name_str.to_string(),
                         rule_type: rule_type_str.to_string(),
                         attributes,
@@ -425,6 +426,7 @@ impl StarlarkEvaluator {
         };
 
         Ok(Rule {
+            cc_projection: None,
             name,
             rule_type: rule_type.to_string(),
             attributes,
@@ -508,6 +510,7 @@ impl StarlarkEvaluator {
                 };
 
                 let rule = Rule {
+                    cc_projection: None,
                     name: rule_name,
                     rule_type: rule_type_str.to_string(),
                     attributes: macro_attributes,
@@ -520,6 +523,7 @@ impl StarlarkEvaluator {
         // If no rules found in macro body, create a placeholder rule
         if rules.is_empty() {
             rules.push(Rule {
+                cc_projection: None,
                 name: name.to_string(),
                 rule_type: "macro_expanded".to_string(),
                 attributes: attributes.clone(),
@@ -1109,6 +1113,7 @@ impl Clone for BuildFile {
                 .rules
                 .iter()
                 .map(|r| Rule {
+                    cc_projection: r.cc_projection.clone(),
                     name: r.name.clone(),
                     rule_type: r.rule_type.clone(),
                     attributes: r.attributes.clone(),

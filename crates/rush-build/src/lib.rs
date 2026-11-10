@@ -85,6 +85,7 @@ pub mod mmap_io;
 pub mod optimization;
 pub mod output_tree;
 pub(crate) mod native_execroot;
+mod native_execution_demand;
 pub mod persistent_workers;
 pub mod profile;
 pub mod profiling;
@@ -5565,32 +5566,40 @@ cc_library(
             // entry once when a new command's tracker first reaches it; replay is
             // safe only after that admission succeeds.
             let current_io = self.real_tracked_io_shared();
-            let stale_reason = match current_io {
-                Some(_) if cached.manifest.is_empty() => {
-                    Some("cached BUILD has no tracked dependency manifest".to_string())
-                }
-                Some(ref io)
-                    if cached
-                        .admitted_io
-                        .upgrade()
-                        .is_some_and(|admitted| Arc::ptr_eq(&admitted, io)) =>
-                {
-                    None
-                }
-                Some(ref io) => {
-                    let validated = io.validate_manifest(&cached.manifest);
-                    match validated.staleness {
-                        rush_incremental::Staleness::Fresh => {
-                            cached.manifest = validated.refreshed;
-                            cached.admitted_io = Arc::downgrade(io);
-                            None
-                        }
-                        rush_incremental::Staleness::Stale { reason, .. } => Some(reason),
+            // Opaque declaration bindings are deliberately not cache authority.
+            // Re-evaluate the BUILD so ordinary module admission and the live
+            // definition closure run for every actual instantiation. Unrequested
+            // refused declarations remain lazy after this conservative miss.
+            let stale_reason = if cached.build_file.rules.iter().any(|rule| rule.cc_projection.is_some()) {
+                Some("source-qualified CcInfo projection requires fresh instantiation".to_string())
+            } else {
+                match current_io {
+                    Some(_) if cached.manifest.is_empty() => {
+                        Some("cached BUILD has no tracked dependency manifest".to_string())
                     }
+                    Some(ref io)
+                        if cached
+                            .admitted_io
+                            .upgrade()
+                            .is_some_and(|admitted| Arc::ptr_eq(&admitted, io)) =>
+                    {
+                        None
+                    }
+                    Some(ref io) => {
+                        let validated = io.validate_manifest(&cached.manifest);
+                        match validated.staleness {
+                            rush_incremental::Staleness::Fresh => {
+                                cached.manifest = validated.refreshed;
+                                cached.admitted_io = Arc::downgrade(io);
+                                None
+                            }
+                            rush_incremental::Staleness::Stale { reason, .. } => Some(reason),
+                        }
+                    }
+                    // Calls outside a command scope have no client semantics to
+                    // validate against. Daemon and normal builds install `tracked_io`.
+                    None => None,
                 }
-                // Calls outside a command scope have no client semantics to
-                // validate against. Daemon and normal builds install `tracked_io`.
-                None => None,
             };
 
             if let Some(reason) = stale_reason {
@@ -10273,6 +10282,7 @@ mod cc_binary_linkshared_compat_tests {
         let output = temp.path().join("binding_without_suffix");
         std::fs::write(&object, b"object fixture").unwrap();
         let rule = rush_parse::Rule {
+            cc_projection: None,
             name: "binding_without_suffix".to_string(),
             rule_type: "cc_binary".to_string(),
             attributes: HashMap::from([("linkshared".to_string(), Value::Int(1))]),
@@ -10296,6 +10306,7 @@ mod cc_binary_linkshared_compat_tests {
         );
 
         let mut compatibility_rule = rush_parse::Rule {
+            cc_projection: None,
             name: "legacy.so".to_string(),
             rule_type: "cc_binary".to_string(),
             attributes: HashMap::new(),
@@ -10329,6 +10340,7 @@ mod cc_binary_linkshared_compat_tests {
         std::fs::write(&object, b"object fixture").unwrap();
         std::fs::write(&version, b"{ global: rush_extension_value; local: *; };\n").unwrap();
         let rule = rush_parse::Rule {
+            cc_projection: None,
             name: "binding.so".to_string(),
             rule_type: "cc_binary".to_string(),
             attributes: HashMap::from([
@@ -10487,6 +10499,7 @@ cc_library(
 
     fn rule(name: &str, rule_type: &str, attributes: HashMap<String, Value>) -> rush_parse::Rule {
         rush_parse::Rule {
+            cc_projection: None,
             name: name.to_string(),
             rule_type: rule_type.to_string(),
             attributes,

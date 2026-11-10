@@ -286,6 +286,7 @@ mod tests {
         );
 
         let rule = Rule {
+            cc_projection: None,
             name: "test_genrule".to_string(),
             rule_type: "genrule".to_string(),
             attributes: attrs,

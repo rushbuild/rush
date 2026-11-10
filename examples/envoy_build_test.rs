@@ -95,6 +95,7 @@ envoy_cc_test(
             // Demonstrate macro translation
             println!("Macro Translation Example:");
             let mut envoy_rule = Rule {
+                cc_projection: None,
                 name: "example_lib".to_string(),
                 rule_type: "envoy_cc_library".to_string(),
                 attributes: HashMap::new(),

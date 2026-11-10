@@ -220,6 +220,82 @@ mod execution_artifacts_tests {
         assert!(Arc::ptr_eq(&updates["//pkg:active"], &replacement));
         assert!(Arc::ptr_eq(&base["@repo//pkg:dep"], &untouched));
     }
+
+    #[test]
+    fn projection_artifact_roots_exclude_prerequisites_built_for_other_roots() -> Result<()> {
+        use rush_rules::nested_set::NestedSet;
+        use rush_rules::rules_cc_projection::CcProjectionRule;
+        use rush_rules::{BuildRule, Value as Attr};
+        let artifact = |path: &str, artifact_type| Artifact {
+            path: PathBuf::from(path),
+            artifact_type,
+        };
+        let original = NestedSet::new(
+            vec![
+                artifact("/out/liboriginal.a", ArtifactType::StaticLibrary),
+                artifact("/out/original.o", ArtifactType::Object),
+            ],
+            Vec::new(),
+        );
+        let built = HashMap::from([("//pkg:original".to_owned(), original)]);
+        let mut graph = DependencyGraph::new();
+        for (name, factory, attribute, own) in [
+            (
+                "headers",
+                CcProjectionRule::headers(),
+                "deps",
+                vec![artifact("/source/public.h", ArtifactType::Header)],
+            ),
+            (
+                "parameters",
+                CcProjectionRule::parameters(),
+                "original_deps",
+                Vec::new(),
+            ),
+        ] {
+            let label = Label::parse(&format!("//pkg:{name}"), None, None)?;
+            graph.add_node(
+                label.clone(),
+                factory.parse_attributes(&HashMap::from([
+                    ("name".into(), Attr::String(name.into())),
+                    (
+                        attribute.into(),
+                        Attr::List(vec![Attr::String(":original".into())]),
+                    ),
+                ]))?,
+            )?;
+            let node = graph.get(&label).unwrap();
+            assert_eq!(node.dependencies.len(), 1);
+            let expected: Vec<_> = own.iter().map(|artifact| artifact.path.clone()).collect();
+            let projected = build_committed_target_artifacts(&label, &node, own, &built)?;
+            assert_eq!(projected.flatten().iter().map(|artifact| artifact.path.clone()).collect::<Vec<_>>(), expected,
+                "a metadata prerequisite's archive/object must not enter public files even if another root builds it");
+        }
+        let label = Label::parse("//pkg:ordinary", None, None)?;
+        graph.add_node(
+            label.clone(),
+            rush_rules::rules_cc::CcLibraryRule.parse_attributes(&HashMap::from([
+                ("name".into(), Attr::String("ordinary".into())),
+                (
+                    "deps".into(),
+                    Attr::List(vec![Attr::String(":original".into())]),
+                ),
+            ]))?,
+        )?;
+        let ordinary = build_committed_target_artifacts(
+            &label,
+            &graph.get(&label).unwrap(),
+            Vec::new(),
+            &built,
+        )?;
+        assert_eq!(
+            ordinary.flatten().len(),
+            2,
+            "ordinary runtime propagation must remain intact"
+        );
+        Ok(())
+    }
+
 }
 
 /// #39 link-reachability: resolve a dep's built artifact NestedSet, mirroring
@@ -2653,7 +2729,8 @@ impl BuildOrchestrator {
         }
         if !reuse_disabled {
             let t_lookup = std::time::Instant::now();
-            let candidate_opt = self.snapshot_cache.get(&analysis_key);
+            let candidate_opt = self.snapshot_cache.get(&analysis_key)
+                .filter(|candidate| !crate::native_execution_demand::has_projections(candidate));
             if profile_phases {
                 crate::phase_profile::record("analysis_key_lookup", t_lookup.elapsed());
             }
@@ -6673,36 +6750,8 @@ impl BuildOrchestrator {
         // IO and never touches the manifest, so snapshotting it here — after
         // analysis, before execution — captures exactly the analysis deps.
         let _profile_snapshot_commit = self.profiler.scope("snapshot_commit", "analysis");
-        if diagnostic_mode {
-            let registry = artifact_registry.lock().await;
-            for label in &build_order {
-                let node = graph.get(label).ok_or_else(||anyhow!("diagnostic node missing: {label}"))?;
-                let kind = node.rule_instance.rule_type();
-                let inline_options = kind == "tf_gen_options_header"
-                    && options_header_inputs.contains_key(&label.to_string());
-                let writer = inline_options || matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
-                anyhow::ensure!(writer || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
-                    |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
-                    "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
-                let target = *target_id_by_label.get(&label.to_string()).ok_or_else(||anyhow!("diagnostic target identity missing: {label}"))?;
-                for (id,action) in registry.declared_actions().filter(|(_,action)|action.owner_target == target) {
-                    let mnemonic = registry.strings().str(action.mnemonic);
-                    let supported = match kind {
-                        "genrule" => mnemonic == "GenRule",
-                        "tf_proto_library" => matches!(mnemonic,"ProtocCompile"|"CppCompile"|"CcArchive"),
-                        "tf_gen_options_header" => inline_options && mnemonic == "GenOptionsHeader"
-                            && matches!(&action.status, rush_action::ids::ActionDeclarationStatus::Complete),
-                        _ => matches!(mnemonic,"CCompile"|"CppCompile"|"CcArchive"|"CppArchive"|"CcLink"|"CppLink"),
-                    };
-                    anyhow::ensure!(writer && supported,
-                        "uncached compiler diagnostic does not audit action {mnemonic} of {kind} at {label}");
-                    if matches!(mnemonic,"CCompile"|"CppCompile") {
-                        anyhow::ensure!(pending_compile_declarations.get(id).is_some(),
-                            "uncached compiler diagnostic has no pending declaration for {label}");
-                    }
-                }
-            }
-        }
+        census_phase("before snapshot manifest", &format!("recorded_observations={}",
+            self.tracked_io_shared().map_or(0, |io| io.mark())));
         let snapshot = {
             let manifest = self
                 .tracked_io_shared()
@@ -6710,6 +6759,7 @@ impl BuildOrchestrator {
                 .unwrap_or_else(|| {
                     rush_incremental::DependencyManifest::from_deps(Vec::new())
                 });
+            census_phase("after snapshot manifest", &format!("manifest_dependencies={}", manifest.len()));
             // Record .bzl evaluation work for the invariant: the number of
             // distinct `.bzl` files whose CONTENT the analysis read (recorded as
             // FileContent deps). On the reuse path no manifest is built here, so
@@ -6762,10 +6812,11 @@ impl BuildOrchestrator {
                 // watch was armed before this instant.
                 analyzed_at: Some(std::time::Instant::now()),
             });
-            if !diagnostic_mode { self.snapshot_cache.put(std::sync::Arc::clone(&snap)); }
+            if !diagnostic_mode && !crate::native_execution_demand::has_projections(&snap) { self.snapshot_cache.put(std::sync::Arc::clone(&snap)); }
             snap
         };
         drop(_profile_snapshot_commit);
+        census_phase("after snapshot commit", &format!("manifest_dependencies={}", snapshot.manifest.len()));
 
         // Persistent-daemon Run-wiring: PASS-A.5 + PASS-B execution moved
         // into `execute_analyzed`, driven from the committed snapshot. This
@@ -6776,6 +6827,7 @@ impl BuildOrchestrator {
                 snapshot.artifact_registry.clone(), self.action_manager.clone(), native_lease.clone(),
                 &semantics, std::fs::canonicalize(&self.workspace_root)?, diagnostic_cancel, diagnostic_cancelled)?)
         } else { None };
+        census_phase("after diagnostic manager", "before execution demand");
         self.execute_analyzed_inner(&snapshot,None,diagnostic).await?;
         drop(_profile_execute_analyzed);
         // (The freshness ledger is captured inside execute_analyzed on a
@@ -7038,6 +7090,53 @@ impl BuildOrchestrator {
             .map(|s| Label::parse(s, None, None))
             .map(|label| label.map(|label| graph.canonicalize_label(label)))
             .collect::<Result<Vec<_>>>()?;
+        let execution_demand = {
+            let registry = snapshot.artifact_registry.lock().await;
+            let mut pending_producers: HashMap<rush_action::ids::TargetId, Vec<rush_action::ids::DeclaredActionId>> = HashMap::new();
+            if let Some(build) = &diagnostic {
+                for pending in build.declarations.iter() {
+                    pending_producers.entry(pending.target()).or_default()
+                        .extend(pending.required_producers().iter().copied());
+                }
+            }
+            crate::native_execution_demand::NativeExecutionDemand::build(snapshot, &root_labels, &registry, &pending_producers)?
+        };
+        anyhow::ensure!(execution_demand.is_none() || (prune_plan.is_none() && self.remote_executor.is_none()),
+            "C++ metadata projection execution requires a fresh local runtime plan");
+        // Audit every target that this command can actually execute. Pure
+        // projection prerequisites remain analysis-only; demanded generators
+        // and complete ordinary roots still require their real writer lifecycle.
+        if let Some(build) = &diagnostic {
+            let registry = snapshot.artifact_registry.lock().await;
+            for (index, label) in build_order.iter().enumerate() {
+                if execution_demand.as_ref().is_some_and(|plan| !plan.active[index]) { continue; }
+                let node = graph.get(label).ok_or_else(||anyhow!("diagnostic node missing: {label}"))?;
+                let kind = node.rule_instance.rule_type();
+                let inline_options = kind == "tf_gen_options_header"
+                    && snapshot.options_header_inputs.contains_key(&label.to_string());
+                let writer = inline_options || matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
+                anyhow::ensure!(writer || node.rule_instance.cc_projection_kind().is_some() || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
+                    |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
+                    "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
+                let target = *snapshot.target_id_by_label.get(&label.to_string()).ok_or_else(||anyhow!("diagnostic target identity missing: {label}"))?;
+                for (id,action) in registry.declared_actions().filter(|(_,action)|action.owner_target == target) {
+                    let mnemonic = registry.strings().str(action.mnemonic);
+                    let supported = match kind {
+                        "genrule" => mnemonic == "GenRule",
+                        "tf_proto_library" => matches!(mnemonic,"ProtocCompile"|"CppCompile"|"CcArchive"),
+                        "tf_gen_options_header" => inline_options && mnemonic == "GenOptionsHeader"
+                            && matches!(&action.status, rush_action::ids::ActionDeclarationStatus::Complete),
+                        _ => matches!(mnemonic,"CCompile"|"CppCompile"|"CcArchive"|"CppArchive"|"CcLink"|"CppLink"),
+                    };
+                    anyhow::ensure!(writer && supported,
+                        "uncached compiler diagnostic does not audit action {mnemonic} of {kind} at {label}");
+                    if matches!(mnemonic,"CCompile"|"CppCompile") {
+                        anyhow::ensure!(build.declarations.get(id).is_some(),
+                            "uncached compiler diagnostic has no pending declaration for {label}");
+                    }
+                }
+            }
+        }
         let static_archive_materialization = &snapshot.static_archive_materialization;
         if std::env::var("RUSH_DEBUG_ARCHIVE_MATERIALIZATION").as_deref() == Ok("1") {
             let producer_count = build_order
@@ -7600,12 +7699,14 @@ impl BuildOrchestrator {
         let idx_by_label: HashMap<String, usize> = build_order
             .iter()
             .enumerate()
-            .filter(|(index, _)| prune_plan.as_ref().map_or(true, |plan| plan.active[*index]))
+            .filter(|(index, _)| prune_plan.as_ref().map_or(true, |plan| plan.active[*index])
+                && execution_demand.as_ref().map_or(true, |plan| plan.active[*index]))
             .map(|(i, l)| (l.to_string(), i))
             .collect();
         let nt = build_order.len();
-        let prune_active = prune_plan.as_ref().map(|p| p.active.as_slice());
-        let wavefront_target_count = prune_plan.as_ref().map_or(nt, |p| p.active_count);
+        let prune_active = execution_demand.as_ref().map(|plan| plan.active.as_slice())
+            .or_else(|| prune_plan.as_ref().map(|p| p.active.as_slice()));
+        let wavefront_target_count = prune_active.map_or(nt, |active| active.iter().filter(|active| **active).count());
         let mut original_in_degree = vec![0usize; nt];
         let mut original_rev_deps: Vec<Vec<usize>> = vec![Vec::new(); nt];
         for (i, lbl) in build_order.iter().enumerate() {
@@ -7625,7 +7726,17 @@ impl BuildOrchestrator {
             }
         }
 
-        if let Some(build) = &diagnostic {
+        if let Some(plan) = &execution_demand {
+            original_in_degree.fill(0);
+            original_rev_deps.iter_mut().for_each(Vec::clear);
+            for (consumer, dependencies) in plan.dependencies.iter().enumerate() {
+                for &producer in dependencies {
+                    original_in_degree[consumer] += 1;
+                    original_rev_deps[producer].push(consumer);
+                }
+            }
+        }
+        if let Some(build) = diagnostic.as_ref().filter(|_| execution_demand.is_none()) {
             let registry = artifact_registry.lock().await;
             rush_action::action_dag::ActionDag::build(&registry)?;
             let target_indices: HashMap<_,_> = build_order.iter().enumerate().filter_map(|(i,label)|
@@ -7658,6 +7769,7 @@ impl BuildOrchestrator {
             std::env::var("RUSH_ACTION_AWARE_TARGET_WAVEFRONT").as_deref()
                 == Ok("1")
                 && use_scheduler
+                && execution_demand.is_none()
                 && prune_plan.is_none()
                 && std::env::var("RUSH_VERIFY_SCHEDULER_COMMANDS").as_deref()
                     != Ok("1");
@@ -8183,6 +8295,8 @@ impl BuildOrchestrator {
                     } else { self.action_manager.clone() })
                     .with_extra_proto_paths(extra_proto_paths)
                     .with_artifact_registry(Arc::clone(&artifact_registry));
+                let context = context.with_native_action_selection(execution_demand.as_ref()
+                    .and_then(|plan| plan.selected_actions.get(&cur).cloned()));
                 let context = if let Some(build) = &diagnostic {
                     context.with_native_compile_discovery(rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
                         build.declarations.clone())
@@ -8197,7 +8311,9 @@ impl BuildOrchestrator {
                 let archive_elided_for_legacy =
                     !materialize_static_libraries
                         && static_archive_producer_rule_kind(node.rule_instance.rule_type());
-                let use_scheduler = !archive_elided_for_legacy && target_id_for_dispatch
+                let use_scheduler = node.rule_instance.cc_projection_kind().is_none()
+                    && !execution_demand.as_ref().is_some_and(|plan| plan.selected_actions.contains_key(&cur))
+                    && !archive_elided_for_legacy && target_id_for_dispatch
                     .map(|t| scheduler_eligible_after_allowlist.contains(&t))
                     .unwrap_or(false);
                 if self.remote_executor.as_ref().is_some_and(|executor| executor.is_reapi()) {
@@ -8418,8 +8534,13 @@ impl BuildOrchestrator {
                 let to_validate: Vec<(String, PathBuf)> = {
                     let reg = artifact_registry.lock().await;
                     let mut out = Vec::new();
-                    for (_, action) in reg.declared_actions() {
+                    for (id, action) in reg.declared_actions() {
                         if action.owner_target != target_id {
+                            continue;
+                        }
+                        if execution_demand.as_ref()
+                            .and_then(|plan| plan.selected_actions.get(&cur))
+                            .is_some_and(|selected| !selected.contains(&id)) {
                             continue;
                         }
                         if !matches!(
@@ -8677,7 +8798,7 @@ impl BuildOrchestrator {
         // verify the whole graph is unchanged and skip this wavefront. Only
         // reached on a fully-successful build (errors above returned early), so
         // a failed/interrupted build never records a "fresh" ledger.
-        if !diagnostic_mode {
+        if !diagnostic_mode && execution_demand.is_none() {
             let t_ledger = std::time::Instant::now();
             let watcher = self.watcher();
             // Phase 4: JIT/pre-build materialization writes the outputs
@@ -8893,7 +9014,7 @@ impl BuildOrchestrator {
             }
         }
 
-        if !diagnostic_mode && !pruned_execution {
+        if !diagnostic_mode && execution_demand.is_none() && !pruned_execution {
             let t_prune_index = std::time::Instant::now();
             let _ = get_or_build_pass_b_prune_index(snapshot, &self.workspace_root).await;
             if exec_timing {
@@ -14533,7 +14654,10 @@ fn build_committed_target_artifacts(
         return Ok(Arc::clone(forward));
     }
 
-    if rule_type == "genrule" {
+    // Analysis prerequisites of a projection carry provider metadata only.
+    // Even if another requested root builds them, their archives and objects
+    // must not enter this projection's public artifact forest.
+    if rule_type == "genrule" || node.rule_instance.cc_projection_kind().is_some() {
         return Ok(rush_rules::nested_set::NestedSet::new(artifacts, vec![]));
     }
 
@@ -18976,6 +19100,7 @@ filegroup(
         let build_file = rush_parse::BuildFile {
             path: PathBuf::from("/workspace/p/BUILD"),
             rules: vec![rush_parse::Rule {
+                cc_projection: None,
                 name: "selected_sources".to_string(),
                 rule_type: "cc_library".to_string(),
                 attributes: HashMap::from([
@@ -19047,6 +19172,7 @@ filegroup(
         let build_file = rush_parse::BuildFile {
             path: PathBuf::from("/workspace/p/BUILD"),
             rules: vec![rush_parse::Rule {
+                cc_projection: None,
                 name: "exported.txt".to_string(),
                 rule_type: "source_file".to_string(),
                 attributes: HashMap::from([(
@@ -21477,6 +21603,187 @@ filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//co
         );
         Ok(())
     }
+    /// Whole-driver runtime control. The test registry injects the already
+    /// qualified backend factories; genuine frontend qualification has separate
+    /// source-backed controls. No production registry name admits projections.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projection_demand_builds_real_headers_without_unused_library_actions() -> Result<()> {
+        use rush_rules::{BuildRule, Value};
+        struct FixtureLibrary;
+        impl BuildRule for FixtureLibrary {
+            fn name(&self) -> &str {
+                "cc_library"
+            }
+            fn parse_attributes(
+                &self,
+                attributes: &HashMap<String, Value>,
+            ) -> Result<Box<dyn RuleInstance>> {
+                let name = attributes.get("name").and_then(|value| match value {
+                    Value::String(name) => Some(name.as_str()),
+                    _ => None,
+                });
+                match name {
+                    Some("project_headers") => {
+                        rush_rules::rules_cc_projection::CcProjectionRule::headers()
+                            .parse_attributes(attributes)
+                    }
+                    Some("project_parameters") => {
+                        let mut attributes = attributes.clone();
+                        attributes.insert(
+                            "original_deps".into(),
+                            attributes.get("deps").cloned().unwrap(),
+                        );
+                        rush_rules::rules_cc_projection::CcProjectionRule::parameters()
+                            .parse_attributes(&attributes)
+                    }
+                    _ => rush_rules::rules_cc::CcLibraryRule.parse_attributes(attributes),
+                }
+            }
+        }
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(
+            &root.join("WORKSPACE"),
+            "workspace(name = \"projection_driver\")\n",
+        )?;
+        write_file(
+            &root.join("BUILD"),
+            r#"
+genrule(name = "generated", srcs = ["value.h.in"], outs = ["generated.h"], cmd = "cp $(SRCS) $@")
+cc_library(name = "leaf_parameters", defines = ["OVERRIDE=1"])
+cc_library(name = "original", srcs = ["unused.cc"], hdrs = ["public.h"], deps = [":leaf_parameters"],
+    textual_hdrs = [":generated.h"], defines = ["PUBLIC_DEFINE=1", "OVERRIDE=2"], local_defines = ["PRIVATE_DEFINE=1"])
+cc_library(name = "project_headers", deps = [":original"])
+cc_library(name = "project_parameters", deps = [":original"])
+cc_library(name = "wrapper", hdrs = [":project_headers"], deps = [":project_parameters"])
+cc_library(name = "consumer", srcs = ["consumer.cc"], deps = [":wrapper"])
+cc_binary(name = "app", srcs = ["main.cc"], deps = [":consumer"])
+"#,
+        )?;
+        write_file(
+            &root.join("unused.cc"),
+            "#error unused original compilation must never execute\n",
+        )?;
+        write_file(
+            &root.join("public.h"),
+            "#pragma once\n#define PUBLIC_HEADER_VALUE 40\n",
+        )?;
+        write_file(&root.join("value.h.in"), "#define GENERATED_VALUE 2\n")?;
+        write_file(
+            &root.join("consumer.cc"),
+            r#"
+#include "public.h"
+#include "generated.h"
+#ifndef PUBLIC_DEFINE
+#error compilation parameters did not propagate
+#endif
+#ifdef PRIVATE_DEFINE
+#error private defines leaked through the projection
+#endif
+#if OVERRIDE != 2
+#error projected dependency defines must precede the original target define
+#endif
+int result() { return PUBLIC_HEADER_VALUE + GENERATED_VALUE; }
+"#,
+        )?;
+        write_file(&root.join("main.cc"), "#include <stdio.h>\nint result();\nint main(){printf(\"%d\\n\",result());return 0;}\n")?;
+        let mut orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+        Arc::get_mut(&mut orchestrator.rule_registry)
+            .context("fixture registry is shared")?
+            .register(Box::new(FixtureLibrary));
+        let expanded = rush_command_core::build_arguments::encode(&["--define=fixture=projection".into()]);
+        let command = |target: &str| {
+            semantics_with_define_and_environment(
+                root,
+                target,
+                "fixture",
+                "projection",
+                &[("RUSH_CPP_DISCOVERY", "uncached-diagnostic-v1"),
+                    ("PATH", "/usr/bin:/bin"),
+                    (rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV, expanded.as_str())],
+            )
+        };
+        let targets = vec!["//:app".to_string()];
+        let semantics = command("//:app")?;
+        let output = cache_paths::workspace_output_root(root);
+        let executable = output.join("app");
+        let run = || -> Result<String> {
+            let result = std::process::Command::new(&executable)
+                .current_dir(root)
+                .output()?;
+            anyhow::ensure!(
+                result.status.success(),
+                "fixture executable failed: {:?}",
+                result.status
+            );
+            Ok(String::from_utf8(result.stdout)?)
+        };
+        for expected in [42, 42, 43] {
+            if expected == 43 {
+                write_file(&root.join("value.h.in"), "#define GENERATED_VALUE 3\n")?;
+            }
+            orchestrator
+                .build_with_dependencies_with_semantics(targets.clone(), semantics.clone())
+                .await?;
+            assert_eq!(run()?, format!("{expected}\n"));
+            let events = crate::compiler_discovery::take_completed_diagnostic_processes(root);
+            let mut counts = std::collections::BTreeMap::new();
+            for (mnemonic, _) in events {
+                let kind = match mnemonic.as_str() {
+                    "GenRule" => "generator",
+                    "CCompile" | "CppCompile" => "compile",
+                    "CcArchive" | "CppArchive" => "archive",
+                    "CcLink" | "CppLink" => "link",
+                    other => anyhow::bail!("unexpected real process: {other}"),
+                };
+                *counts.entry(kind).or_insert(0usize) += 1;
+            }
+            assert_eq!(
+                counts,
+                std::collections::BTreeMap::from([
+                    ("generator", 1),
+                    ("compile", 2),
+                    ("archive", 1),
+                    ("link", 1),
+                ])
+            );
+            assert!(!output.join("original/liboriginal.a").exists());
+            assert!(!output.join("original/unused.o").exists());
+            let key = crate::analysis_snapshot::AnalysisKey::new(
+                &semantics,
+                root.canonicalize()?,
+                targets.clone(),
+            );
+            assert!(orchestrator.snapshot_cache.get(&key).is_none());
+            assert!(crate::cold_noop_cache::load(root, &key).is_none());
+        }
+        // A direct request still owns all ordinary compilation. Metadata demand
+        // must never turn that failing source into a successful no-op.
+        let error = orchestrator
+            .build_with_dependencies_with_semantics(
+                vec!["//:original".into()],
+                command("//:original")?,
+            )
+            .await
+            .expect_err("requested original library must execute its bad source");
+        assert!(format!("{error:#}").contains("unused"), "{error:#}");
+        let error = orchestrator.build_with_dependencies_with_semantics(
+            vec!["//:app".into(), "//:original".into()], command("//:app")?,
+        ).await.expect_err("a full requested root must override metadata-only demand in the same command");
+        assert!(format!("{error:#}").contains("unused"), "{error:#}");
+        let _ = crate::compiler_discovery::take_completed_diagnostic_processes(root);
+        std::fs::remove_file(root.join("public.h"))?;
+        let error = orchestrator
+            .build_with_dependencies_with_semantics(targets, semantics)
+            .await
+            .expect_err("missing real projected header must reject old outputs");
+        assert!(format!("{error:#}").contains("public.h"), "{error:#}");
+        assert_eq!(run()?, "43\n");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(target_os = "linux")]
     async fn source_backed_external_include_prefix_reaches_compile_and_invalidates_on_header_removal() -> Result<()> {

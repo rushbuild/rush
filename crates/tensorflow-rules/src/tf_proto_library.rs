@@ -893,8 +893,21 @@ impl TfProtoLibraryInstance {
         } else {
             None
         };
+        if let Some(selected) = context.native_action_selection() {
+            anyhow::ensure!(!selected.is_empty(), "empty proto execution demand");
+            for &action_id in selected {
+                anyhow::ensure!(registry.actions_of(owner).contains(&action_id),
+                    "proto execution demand names another owner");
+                let action = registry.declared_action(action_id);
+                anyhow::ensure!(registry.strings().str(action.mnemonic) == "ProtocCompile",
+                    "partial proto execution supports only real ProtocCompile actions");
+            }
+        }
         let mut specs = Vec::new();
         for &action_id in registry.actions_of(owner) {
+            if context.native_action_selection().is_some_and(|selected| !selected.contains(&action_id)) {
+                continue;
+            }
             let action = registry.declared_action(action_id);
             let mnemonic = registry.strings().str(action.mnemonic);
             anyhow::ensure!(
@@ -2839,8 +2852,28 @@ mod tests {
             .strings()
             .str(registry.declared_action(*id).mnemonic)
             != "ProtocCompile"));
+        // A non-header-only generation owner also has its own compile/archive.
+        // Header demand must select only generation, not those sibling actions.
+        let mut combined = make_tf_proto("combined_proto", false, false, false);
+        combined.srcs = vec!["subset/value.proto".into()];
+        combined.make_default_target_header_only = false;
+        combined.protoc = Some("@@protobuf//:protoc".into());
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(4), ConfigId::DEFAULT, "pkg", Some("owner"), &output,
+                &mut registry, &resolver, &toolchain, &root, &[],
+            ).with_labeled_exec_dep_providers(&tool_providers)
+                .with_native_execution_root(Some(&execution_root))
+                .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, &mut pending);
+            combined.analyze_declared_proto_result(&mut ctx, &[])?;
+        }
+        assert_eq!(registry.actions_of(TargetId(4)).len(), 3);
+        let combined_action = |mnemonic| registry.actions_of(TargetId(4)).iter().copied().find(|id|
+            registry.strings().str(registry.declared_action(*id).mnemonic) == mnemonic).unwrap();
+        let combined_generator = combined_action("ProtocCompile");
+        let combined_compile = combined_action("CppCompile");
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
-        let owner_context = BuildContext::new(root.clone(), output.clone())
+        let mut owner_context = BuildContext::new(root.clone(), output.clone())
             .with_package("pkg".into())
             .with_repository(Some("owner".into()))
             .with_dependencies(
@@ -2864,6 +2897,44 @@ mod tests {
             assert!(spec.declared_inputs.contains(&tool_path));
             assert_eq!(spec.mnemonic, "ProtocCompile");
         }
+        let (generation, other_owner_compile, foreign) = {
+            let registry = registry.lock().await;
+            (registry.actions_of(TargetId(2))[0], registry.actions_of(TargetId(3))[0],
+                registry.actions_of(TargetId(1))[0])
+        };
+        owner_context = owner_context.with_native_action_selection(Some(Arc::new(
+            std::collections::HashSet::from([generation]),
+        )));
+        let subset = owner.declared_proto_specs(&owner_context).await?;
+        assert_eq!(subset.len(), 1);
+        assert_eq!(subset[0].1.mnemonic, "ProtocCompile");
+        assert!(subset[0].1.declared_outputs.contains(&output.join("genfiles/pkg/nested/value.pb.h")));
+        assert!(!subset[0].1.declared_outputs.contains(&output.join("genfiles/pkg/other/value.pb.h")));
+        for selection in [
+            std::collections::HashSet::new(),
+            std::collections::HashSet::from([other_owner_compile]),
+            std::collections::HashSet::from([foreign]),
+            std::collections::HashSet::from([rush_action::ids::DeclaredActionId(u32::MAX)]),
+        ] {
+            owner_context = owner_context.with_native_action_selection(Some(Arc::new(selection)));
+            assert!(owner.declared_proto_specs(&owner_context).await.is_err(),
+                "empty, foreign and non-protoc execution demand must refuse before writing");
+            assert!(!output.exists());
+        }
+        owner_context = owner_context.with_native_action_selection(None);
+        assert_eq!(combined.declared_proto_specs(&owner_context).await?.len(), 3);
+        owner_context = owner_context.with_native_action_selection(Some(Arc::new(
+            std::collections::HashSet::from([combined_generator]),
+        )));
+        let selected = combined.declared_proto_specs(&owner_context).await?;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].1.mnemonic, "ProtocCompile");
+        owner_context = owner_context.with_native_action_selection(Some(Arc::new(
+            std::collections::HashSet::from([combined_compile]),
+        )));
+        let error = combined.declared_proto_specs(&owner_context).await.unwrap_err();
+        assert!(format!("{error:#}").contains("only real ProtocCompile"), "{error:#}");
+        assert!(!output.exists(), "action selection must not execute sibling compiles or create outputs");
         let missing = BuildContext::new(root, output)
             .with_package("pkg".into())
             .with_repository(Some("owner".into()))

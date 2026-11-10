@@ -453,6 +453,7 @@ pub struct BuildContext {
     options_header_config: Option<rush_action::ids::ConfigId>,
     options_header_inputs: Option<Arc<crate::providers::VerifiedOptionsHeaderInputs>>,
     pending_compile_declarations: Option<Arc<PendingCompileDeclarations>>,
+    native_action_selection: Option<Arc<std::collections::HashSet<rush_action::ids::DeclaredActionId>>>,
     /// Source root for the rule's owning repository.
     pub workspace_root: PathBuf,
     /// Main workspace root that owns shared caches and fetched toolchains.
@@ -645,6 +646,7 @@ impl BuildContext {
             options_header_config: None,
             options_header_inputs: None,
             pending_compile_declarations: None,
+            native_action_selection: None,
             main_workspace_root: workspace_root.clone(),
             native_execution_root: None,
             workspace_root,
@@ -809,6 +811,20 @@ impl BuildContext {
         self.native_compile_mode = mode;
         self.pending_compile_declarations = Some(declarations);
         self
+    }
+
+    /// Restrict a supported rule to analyzed actions demanded by real artifacts.
+    /// This is per-invocation state, never a retained freshness decision.
+    pub fn with_native_action_selection(
+        mut self,
+        actions: Option<Arc<std::collections::HashSet<rush_action::ids::DeclaredActionId>>>,
+    ) -> Self {
+        self.native_action_selection = actions;
+        self
+    }
+
+    pub fn native_action_selection(&self) -> Option<&std::collections::HashSet<rush_action::ids::DeclaredActionId>> {
+        self.native_action_selection.as_deref()
     }
 
     pub fn native_compile_mode(&self) -> NativeCompileMode {

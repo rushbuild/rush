@@ -663,6 +663,7 @@ fn convert_target_definition_to_rule(target_def: &rush_starlark::TargetDefinitio
         expand_macro_if_needed(&target_def.rule_type, &target_def.name, attributes)?;
 
     Ok(Rule {
+        cc_projection: None,
         name: target_def.name.clone(),
         rule_type: final_rule_type,
         attributes: final_attributes,
@@ -884,6 +885,7 @@ fn convert_rule_call(rule_call: &RuleCall) -> Result<Rule> {
     }
 
     Ok(Rule {
+        cc_projection: rule_call.cc_projection.clone(),
         name,
         rule_type: rule_call.rule_type.clone(),
         attributes,
@@ -1144,6 +1146,7 @@ fn convert_value(value: &StarlarkValue) -> Result<Value> {
         StarlarkValue::ModuleExtension(_) => {
             Err(anyhow!("module-extension declarations cannot become legacy rule attributes; delegate extension execution to Bazel"))
         }
+        StarlarkValue::ProjectionRule(_) | StarlarkValue::AttributeDefinition(_) => Err(anyhow::anyhow!("opaque rule/attribute declarations cannot become legacy attributes")),
         StarlarkValue::RuleFunction(name) => Ok(Value::String(format!("<rule:{}>", name))),
         StarlarkValue::NativeFunction(name) => Ok(Value::String(format!("<native:{}>", name))),
         StarlarkValue::Provider { name, .. } => Ok(Value::String(format!("<provider:{}>", name))),
@@ -1396,6 +1399,7 @@ collision = {Label("//cfg:flag"): "VALUE", "@@//cfg:flag": "OTHER"}
     #[test]
     fn configuration_rule_conversion_preserves_predicate_types() {
         let rule_call = RuleCall {
+            cc_projection: None,
             rule_type: "config_setting".to_string(),
             args: Vec::new(),
             kwargs: HashMap::from([

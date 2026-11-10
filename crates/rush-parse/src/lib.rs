@@ -48,6 +48,8 @@ pub struct Rule {
     pub rule_type: String,
     /// The attributes of the rule.
     pub attributes: HashMap<String, Value>,
+    /// Source-qualified native declaration, never parsed from user attributes.
+    pub cc_projection: Option<Arc<rush_starlark::CcProjectionDeclaration>>,
 }
 
 pub(crate) fn validate_unique_rule_names(rules: &[Rule], build_path: &Path) -> Result<()> {

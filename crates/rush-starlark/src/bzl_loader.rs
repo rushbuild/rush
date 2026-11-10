@@ -4411,6 +4411,7 @@ pub struct BzlLoader {
     /// Only used when global_cache is None
     /// Limited to 50 entries (was 1000, caused massive memory consumption)
     symbol_cache: LruCache<ModuleCacheKey, HashMap<String, Value>>,
+    local_symbol_manifests: Mutex<HashMap<ModuleCacheKey, DependencyManifest>>,
 
     /// Cache of previously scanned load() dependencies keyed by file fingerprint.
     /// Enables incremental dependency graph construction without reparsing unchanged files.
@@ -4687,6 +4688,7 @@ impl BzlLoader {
             // 2000 entries caused 27.5 GB, 20 entries = ~10 GB per BzlLoader
             program_cache: LruCache::new(NonZeroUsize::new(program_cache_size).unwrap()),
             symbol_cache: LruCache::new(NonZeroUsize::new(symbol_cache_size).unwrap()),
+            local_symbol_manifests: Mutex::new(HashMap::new()),
             load_dep_cache: Arc::new(DashMap::new()),
             evaluating_paths: HashSet::new(),
             external_repos: Arc::new(DashMap::new()),
@@ -4807,6 +4809,7 @@ impl BzlLoader {
             global_cache: self.global_cache.clone(), // Shared cache (Arc-based)
             program_cache: LruCache::new(NonZeroUsize::new(1).unwrap()), // Minimal local cache
             symbol_cache: LruCache::new(NonZeroUsize::new(1).unwrap()), // Minimal local cache
+            local_symbol_manifests: Mutex::new(HashMap::new()),
             load_dep_cache: Arc::clone(&self.load_dep_cache),
             evaluating_paths: HashSet::new(), // Each instance tracks its own evaluation
             external_repos: Arc::clone(&self.external_repos), // Shared external repo metadata
@@ -4852,11 +4855,44 @@ impl BzlLoader {
     /// Get symbols from cache (global if available, otherwise local)
     /// DISABLED FOR MEMORY: Returns None to force re-evaluation every time
     /// Trading CPU (re-evaluation) for RAM (no caching = no 900 MB per .bzl file)
+    fn admit_local_symbols(&mut self, key: &ModuleCacheKey) -> bool {
+        if key.context.is_none() {
+            return true;
+        }
+        let Some(io) = rush_incremental::tracked::current() else {
+            return true;
+        };
+        let manifest = self
+            .local_symbol_manifests
+            .lock()
+            .ok()
+            .and_then(|manifests| manifests.get(key).cloned());
+        let Some(manifest) = manifest.filter(|manifest| !manifest.is_empty()) else {
+            self.symbol_cache.pop(key);
+            return false;
+        };
+        let validated = io.validate_manifest(&manifest);
+        if !matches!(validated.staleness, rush_incremental::Staleness::Fresh) {
+            self.symbol_cache.pop(key);
+            if let Ok(mut manifests) = self.local_symbol_manifests.lock() {
+                manifests.remove(key);
+            }
+            return false;
+        }
+        io.record_deps(validated.refreshed.deps());
+        if let Ok(mut manifests) = self.local_symbol_manifests.lock() {
+            manifests.insert(key.clone(), validated.refreshed);
+        }
+        true
+    }
+
     fn get_symbols_cache(&mut self, key: &ModuleCacheKey) -> Option<HashMap<String, Value>> {
         if let Some(ref global) = self.global_cache {
             global.get_symbols_key(key)
-        } else {
+        } else if self.admit_local_symbols(key) {
             self.symbol_cache.get(key).cloned()
+        } else {
+            None
         }
     }
 
@@ -4874,6 +4910,9 @@ impl BzlLoader {
         if let Some(ref global) = self.global_cache {
             return global.get_symbols_subset_key(key, requested);
         }
+        if !self.admit_local_symbols(key) {
+            return None;
+        }
         self.symbol_cache.get(key).and_then(|symbols| {
             cached_symbols_with_fallback(symbols, key.label.as_deref().unwrap_or(""), requested)
         })
@@ -4890,6 +4929,9 @@ impl BzlLoader {
     ) -> Option<HashMap<String, Value>> {
         if let Some(ref global) = self.global_cache {
             return global.get_symbols_subset_no_stats_key(key, requested);
+        }
+        if !self.admit_local_symbols(key) {
+            return None;
         }
         self.symbol_cache.get(key).and_then(|symbols| {
             cached_symbols_with_fallback(symbols, key.label.as_deref().unwrap_or(""), requested)
@@ -4931,13 +4973,20 @@ impl BzlLoader {
             global.put_symbols_key(key, symbols, None)
         } else {
             self.symbol_cache.put(key, symbols);
-            None
+            if let Ok(mut manifests) = self.local_symbol_manifests.lock() {
+                manifests.retain(|key, _| self.symbol_cache.peek(key).is_some());
+            }
+            Some(0)
         }
     }
 
     fn set_dep_set_cache(&self, key: &ModuleCacheKey, generation: u64, dep_set: Vec<Dependency>) {
         if let Some(ref global) = self.global_cache {
             global.set_dep_set_key(key, generation, dep_set);
+        } else if self.symbol_cache.peek(key).is_some() {
+            if let Ok(mut manifests) = self.local_symbol_manifests.lock() {
+                manifests.insert(key.clone(), DependencyManifest::from_deps(dep_set));
+            }
         }
     }
 
@@ -5591,7 +5640,7 @@ impl BzlLoader {
         // Phase 2: Parse the file (brief lock).
         // Phase 5.C.4 commit 104: split into read and
         // parse subphases for sub-Starlark attribution.
-        let (program, subphase_read_dur, subphase_parse_dur, source_bytes) = {
+        let (program, subphase_read_dur, subphase_parse_dur, source_bytes, projection_origin) = {
             let _loader_guard = loader_arc
                 .lock()
                 .map_err(|e| anyhow!("Failed to lock .bzl loader: {}", e))?;
@@ -5614,7 +5663,13 @@ impl BzlLoader {
                 anyhow!("Failed to parse .bzl file {}: {}", bzl_path.display(), e)
             })?;
             let parse_dur = parse_start.elapsed();
-            (program, read_dur, parse_dur, source.len())
+            let origin = crate::cc_projection_definition::DefinitionOrigin::from_source(
+                &bzl_path,
+                module_key.label.as_deref().unwrap_or(bzl_label),
+                &source,
+                &program,
+            );
+            (program, read_dur, parse_dur, source.len(), origin)
         }; // Lock released here
 
         // #39 graph-RSS: this parsed Program is now live and stays live across
@@ -5659,6 +5714,7 @@ impl BzlLoader {
         // (includes time spent in transitive child .bzl
         // loads triggered from Starlark `load()`).
         let subphase_eval_start = std::time::Instant::now();
+        let origin_clone = projection_origin.clone();
         let context_clone = module_context.clone();
         let frame_clone = frame.clone();
         let eval_result = if tokio::runtime::Handle::try_current().is_ok() {
@@ -5672,6 +5728,7 @@ impl BzlLoader {
                 Some(loader_arc.clone()),
                 module_context.clone(),
                 frame.clone(),
+                projection_origin.clone(),
             )
         } else {
             // Not in tokio context, use timeout thread with runtime creation
@@ -5723,6 +5780,7 @@ impl BzlLoader {
                             Some(loader_clone),
                             context_clone,
                             frame_clone,
+                            origin_clone,
                         )
                     }
                     Err(e) => {
@@ -5732,6 +5790,7 @@ impl BzlLoader {
                             Some(loader_clone),
                             context_clone,
                             frame_clone,
+                            origin_clone,
                         )
                     }
                 };
@@ -5850,6 +5909,14 @@ impl BzlLoader {
         };
         let subphase_resolve_lazy_loads_dur =
             subphase_resolve_lazy_loads_start.elapsed();
+        if let Some(mark) = dep_mark.filter(|_| projection_origin.needs_seal()) {
+            let context = lock_loader_timed(&loader_arc)?.cc_projection_context(
+                module_key.label.as_deref().unwrap_or(bzl_label),
+                &bzl_path,
+            )?;
+            projection_origin.seal(context, rush_incremental::tracked::captured_since(mark));
+        }
+
         eprintln!("🔍 DEBUG: resolve_lazy_loads() completed for {}", bzl_label);
 
         // Phase 4: Cache the result (brief lock).
@@ -6680,6 +6747,21 @@ impl BzlLoader {
     /// Resolve the logical module owner before consulting any symbol cache.
     /// An explicit label wins over reverse path lookup: several repositories
     /// may intentionally expose the same canonical source directory.
+    pub(crate) fn cc_projection_context(
+        &self,
+        label: &str,
+        expected_path: &Path,
+    ) -> Result<String> {
+        let path = self.resolve_bzl_path(label)?;
+        anyhow::ensure!(
+            path == expected_path,
+            "projection defining module source was retargeted"
+        );
+        let (key, _, _) = self.module_cache_key(label, &path)?;
+        // This is an in-process equality stamp, never a persistent semantic hash.
+        Ok(key.inflight_key())
+    }
+
     fn module_cache_key(&self, label: &str, path: &Path) -> Result<(ModuleCacheKey, PathBuf, PathBuf)> {
         let mapping_is_complete = self.workspace_root.join("MODULE.bazel").is_file()
             && !self.workspace_root.join("WORKSPACE").exists()
@@ -6967,16 +7049,29 @@ impl BzlLoader {
         // Evaluate WITHOUT holding the loader lock (evaluation may recursively load other .bzl files)
         // We pass the loader_arc so nested loads can happen
         // CRITICAL: Pass &program by reference, NO CLONING (ASTs are huge!)
+        let projection_origin = crate::cc_projection_definition::DefinitionOrigin::from_source(
+            &bzl_path,
+            module_key.label.as_deref().unwrap_or(bzl_label),
+            &source,
+            &program,
+        );
         let subphase_eval_start = std::time::Instant::now();
         let symbols_map = match Self::evaluate_bzl_static(&program, loader_arc,
             module_key.context.clone().expect("qualified module context"),
-            BzlContextFrame { repo_root, package_dir, repository: Some(module_key.context.as_ref().and_then(|ctx| ctx.repository.clone()).unwrap_or_default()), load_stack: current_stack_snapshot(), workspace_repository_context: module_key.workspace_repository_context.clone() }) {
+            BzlContextFrame { repo_root, package_dir, repository: Some(module_key.context.as_ref().and_then(|ctx| ctx.repository.clone()).unwrap_or_default()), load_stack: current_stack_snapshot(), workspace_repository_context: module_key.workspace_repository_context.clone() }, projection_origin.clone()) {
             Ok(m) => m,
             Err(e) => {
                 let _ = pop_cold_load_frame(cold_load_start.elapsed().as_nanos() as u64);
                 return Err(e);
             }
         };
+        if let Some(mark) = dep_mark.filter(|_| projection_origin.needs_seal()) {
+            let context = self.cc_projection_context(
+                module_key.label.as_deref().unwrap_or(bzl_label),
+                &bzl_path,
+            )?;
+            projection_origin.seal(context, rush_incremental::tracked::captured_since(mark));
+        }
         let subphase_eval_dur = subphase_eval_start.elapsed();
         debug_log!("[DEBUG BzlLoader] Evaluation complete for: {}", bzl_label);
 
@@ -7083,6 +7178,7 @@ impl BzlLoader {
         loader_arc: Option<std::sync::Arc<std::sync::Mutex<BzlLoader>>>,
         context: DefinitionLabelContext,
         frame: BzlContextFrame,
+        projection_origin: Arc<crate::cc_projection_definition::DefinitionOrigin>,
     ) -> Result<HashMap<String, Value>> {
         let workspace_repository_context = frame.workspace_repository_context.clone();
         Self::push_thread_context_frame(frame);
@@ -7105,6 +7201,7 @@ impl BzlLoader {
             evaluator.set_bzl_loader(loader);
         }
         evaluator.set_definition_label_context(context);
+        evaluator.set_cc_projection_origin(projection_origin);
 
         // Evaluate the program
         evaluator

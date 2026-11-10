@@ -97,6 +97,7 @@ fn create_envoy_rules(count: usize) -> Vec<Rule> {
         );
 
         rules.push(Rule {
+            cc_projection: None,
             name: format!("envoy_lib_{i}"),
             rule_type: "envoy_cc_library".to_string(),
             attributes: attrs,
@@ -212,6 +213,7 @@ fn bench_envoy_macro_types(c: &mut Criterion) {
         );
 
         let rule = Rule {
+            cc_projection: None,
             name: "test".to_string(),
             rule_type: macro_type.to_string(),
             attributes: attrs,

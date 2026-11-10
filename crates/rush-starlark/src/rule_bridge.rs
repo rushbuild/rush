@@ -137,6 +137,7 @@ pub fn starlark_to_rule_value(value: &StarlarkValue) -> Result<RuleValue> {
         StarlarkValue::ModuleExtension(_) => {
             Err(anyhow!("Cannot convert a module-extension declaration to a rule attribute"))
         }
+        StarlarkValue::ProjectionRule(_) | StarlarkValue::AttributeDefinition(_) => Err(anyhow!("opaque rule/attribute declarations cannot become rule attributes")),
         StarlarkValue::RuleFunction(name) => Err(anyhow!(
             "Cannot convert rule function '{}' to rule attribute",
             name
@@ -325,6 +326,7 @@ mod tests {
         );
 
         let rule_call = RuleCall {
+            cc_projection: None,
             rule_type: "cc_library".to_string(),
             args: vec![],
             kwargs,

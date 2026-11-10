@@ -12,6 +12,11 @@ use std::collections::HashMap;
 
 /// Translate Envoy macro to standard Bazel rule
 pub fn translate_envoy_macro(rule: &Rule) -> Rule {
+    // An opaque declaration is not an Envoy macro registration. Preserve its
+    // selected-only refusal or qualified operation without reinterpretation.
+    if rule.cc_projection.is_some() {
+        return rule.clone();
+    }
     match rule.rule_type.as_str() {
         // Library variants
         "envoy_cc_library" => to_cc_library(rule),
@@ -131,6 +136,7 @@ mod tests {
         );
 
         let envoy_rule = Rule {
+            cc_projection: None,
             name: "mylib".to_string(),
             rule_type: "envoy_cc_library".to_string(),
             attributes: attrs,

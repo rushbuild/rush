@@ -330,6 +330,8 @@ impl AnalysisKey {
 pub fn daemon_compat_fingerprint() -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rush.daemon-compat.v2\n");
+    hasher.update(rush_starlark::cc_projection_definition::CC_PROJECTION_SEMANTICS_ABI.as_bytes());
+    hasher.update(b"\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\n");
     hasher.update(std::env::consts::ARCH.as_bytes());

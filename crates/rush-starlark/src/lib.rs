@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod builtins;
+pub mod cc_projection_definition;
 pub mod bzl_loader;
 pub mod config_defines;
 pub mod evaluator;
@@ -185,3 +186,5 @@ result = add(10, 20)
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
     }
 }
+
+pub use cc_projection_definition::{CcProjectionDeclaration, CcProjectionDefinitionIdentity, CcProjectionKind};

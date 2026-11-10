@@ -393,6 +393,10 @@ pub enum Value {
     },
     /// Rule function marker (for native.cc_library, etc.)
     RuleFunction(String),
+    /// Opaque source-qualified C++ projection candidate.
+    ProjectionRule(Arc<crate::cc_projection_definition::ProjectionRuleDefinition>),
+    /// Genuine attr.label_list descriptor; a dictionary cannot forge it.
+    AttributeDefinition(Arc<crate::cc_projection_definition::AttributeDefinition>),
     /// Native function marker (for native.glob, native.existing_rules, etc.)
     NativeFunction(String),
     /// Real module-extension declaration. Construction preserves its callable
@@ -518,6 +522,8 @@ impl PartialEq for Value {
             | (Self::Dict(b), Self::ImmutableMapping(a)) =>
                 a.kind == ImmutableMappingKind::FrozenDict && a.entries == *b,
             (Self::ModuleExtension(a), Self::ModuleExtension(b)) => Arc::ptr_eq(a, b),
+            (Self::ProjectionRule(a), Self::ProjectionRule(b)) => Arc::ptr_eq(a, b),
+            (Self::AttributeDefinition(a), Self::AttributeDefinition(b)) => Arc::ptr_eq(a, b),
             (
                 Self::Provider {
                     name: an,
@@ -1000,6 +1006,8 @@ impl Value {
             | Value::RuleFunction(_)
             | Value::NativeFunction(_)
             | Value::ImmutableMapping(_)
+            | Value::ProjectionRule(_)
+            | Value::AttributeDefinition(_)
             | Value::ModuleExtension(_)
             | Value::Provider { .. }
             | Value::ProviderInstance { .. }
@@ -1135,6 +1143,8 @@ impl Value {
             Value::Function { .. } => "<function>".to_string(),
             Value::Namespace(_) | Value::WorkspaceNativeNamespace { .. } => "<namespace>".to_string(),
             Value::RuleFunction(name) => format!("<rule:{}>", name),
+            Value::ProjectionRule(_) => "<source-qualified rule>".to_string(),
+            Value::AttributeDefinition(_) => "<attr.label_list>".to_string(),
             Value::NativeFunction(name) => format!("<native:{}>", name),
             Value::ImmutableMapping(view) => match view.kind {
                 ImmutableMappingKind::RuleView => format!("<native.ExistingRuleView for target '{}'>",
@@ -1282,6 +1292,35 @@ impl Value {
                 size_of::<Value>() + size_of::<ImmutableMapping>()
                     + view.entries.capacity() * (size_of::<String>() + size_of::<Value>())
                     + view.entries.iter().map(|(key,value)| key.capacity() + value.estimate_size_internal(visited)).sum::<usize>()
+            }
+            Value::ProjectionRule(candidate) => {
+                if !visited.insert(Arc::as_ptr(candidate) as usize) {
+                    return size_of::<Value>();
+                }
+                size_of::<Value>()
+                    + candidate.implementation.estimate_size_internal(visited)
+                    + candidate
+                        .attributes
+                        .values()
+                        .chain(candidate.options.values())
+                        .map(|value| value.estimate_size_internal(visited))
+                        .sum::<usize>()
+                    + candidate
+                        .origin
+                        .as_ref()
+                        .filter(|origin| visited.insert(Arc::as_ptr(origin) as usize))
+                        .map_or(0, |origin| origin.metadata_size())
+            }
+            Value::AttributeDefinition(attr) => {
+                if !visited.insert(Arc::as_ptr(attr) as usize) {
+                    return size_of::<Value>();
+                }
+                size_of::<Value>()
+                    + attr
+                        .arguments
+                        .iter()
+                        .map(|(key, value)| key.capacity() + value.estimate_size_internal(visited))
+                        .sum::<usize>()
             }
             Value::ModuleExtension(declaration) => {
                 if !visited.insert(Arc::as_ptr(declaration) as usize) {
@@ -1471,6 +1510,25 @@ impl ValueCensus {
                     self.walk_value(val, seen_envs);
                 }
             }
+            Value::ProjectionRule(candidate) => {
+                if seen_envs.insert(Arc::as_ptr(candidate) as usize) {
+                    self.walk_value(&candidate.implementation, seen_envs);
+                    for value in candidate
+                        .attributes
+                        .values()
+                        .chain(candidate.options.values())
+                    {
+                        self.walk_value(value, seen_envs);
+                    }
+                }
+            }
+            Value::AttributeDefinition(attr) => {
+                if seen_envs.insert(Arc::as_ptr(attr) as usize) {
+                    for value in attr.arguments.values() {
+                        self.walk_value(value, seen_envs);
+                    }
+                }
+            }
             Value::Function { params, body, closure, .. } => {
                 self.function_count += 1;
                 self.function_body_stmts += body.len();
@@ -1529,6 +1587,7 @@ pub struct Environment {
     /// Set only for a real .bzl evaluation and inherited by its closures.
     /// Label() can initialize definition_label_context in BUILD files too.
     bzl_definition_scope: bool,
+    cc_projection_origin: Option<Arc<crate::cc_projection_definition::DefinitionOrigin>>,
 }
 
 /// Retain the module namespace used by Label() inside a Starlark closure.
@@ -1541,12 +1600,18 @@ pub(crate) struct DefinitionLabelContext {
 }
 
 impl Environment {
+    pub(crate) fn cc_projection_origin(
+        &self,
+    ) -> Option<&Arc<crate::cc_projection_definition::DefinitionOrigin>> {
+        self.cc_projection_origin.as_ref()
+    }
     pub fn new() -> Self {
         Self {
             vars: Arc::new(std::sync::RwLock::new(HashMap::new())),
             parent: None,
             definition_label_context: None,
             bzl_definition_scope: false,
+            cc_projection_origin: None,
         }
     }
 
@@ -1555,6 +1620,7 @@ impl Environment {
             vars: Arc::new(std::sync::RwLock::new(HashMap::new())),
             definition_label_context: parent.definition_label_context.clone(),
             bzl_definition_scope: parent.bzl_definition_scope,
+            cc_projection_origin: parent.cc_projection_origin.clone(),
             parent: Some(parent),
         }
     }
@@ -1625,6 +1691,12 @@ impl Environment {
             }
         }
 
+        if let Some(origin) = &self.cc_projection_origin {
+            if visited.insert(Arc::as_ptr(origin) as usize) {
+                size += origin.metadata_size();
+            }
+        }
+
         // Size of vars HashMap (behind Arc<RwLock>)
         let vars_guard = self.vars.read().unwrap();
         size += vars_guard.capacity() * (size_of::<String>() + size_of::<Value>());
@@ -1691,6 +1763,11 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value> {
                 object.insert(key, value_to_json(value)?);
             }
             serde_json::Value::Object(object)
+        }
+        Value::ProjectionRule(_) | Value::AttributeDefinition(_) => {
+            return Err(anyhow!(
+                "opaque rule/attribute declarations are not JSON data values"
+            ));
         }
         Value::ModuleExtension(_) => {
             return Err(anyhow!("module-extension declarations are not JSON data values"));
@@ -1794,6 +1871,8 @@ pub struct RuleCall {
     pub args: Vec<Value>,
     /// Keyword arguments
     pub kwargs: HashMap<String, Value>,
+    /// Opaque declaration resolution, kept outside user attribute maps.
+    pub cc_projection: Option<Arc<crate::cc_projection_definition::CcProjectionDeclaration>>,
 }
 
 /// Internal marker preserving whether a `config_setting` wrote its own
@@ -1876,6 +1955,7 @@ fn source_file_rule_call(file: String, visibility: Vec<Value>) -> RuleCall {
     kwargs.insert("visibility".to_string(), Value::List(visibility));
 
     RuleCall {
+        cc_projection: None,
         rule_type: "source_file".to_string(),
         args: Vec::new(),
         kwargs,
@@ -2032,6 +2112,7 @@ fn expand_tf_custom_op_library(
 
     // Generate a cc_binary rule with expanded dependencies
     let rule_call = RuleCall {
+        cc_projection: None,
         rule_type: "cc_binary".to_string(),
         args: Vec::new(),
         kwargs: expanded_kwargs,
@@ -2070,6 +2151,7 @@ fn expand_cc_header_only_library(
     }
 
     let rule_call = RuleCall {
+        cc_projection: None,
         rule_type: "cc_header_only_library".to_string(),
         args: Vec::new(),
         kwargs: expanded_kwargs,
@@ -2108,6 +2190,7 @@ fn expand_tf_kernel_library(
         .entry("linkstatic".to_string())
         .or_insert(Value::Int(1));
     let rule_call = RuleCall {
+        cc_projection: None,
         rule_type: "tf_kernel_library".to_string(),
         args: Vec::new(),
         kwargs,
@@ -2125,6 +2208,7 @@ fn expand_gentbl_cc_library(
     // Starlark version is loaded. The Starlark version invokes
     // `mlir-tblgen` via a Bazel tool action rush can't execute directly.
     Ok(vec![RuleCall {
+        cc_projection: None,
         rule_type: "gentbl_cc_library".to_string(),
         args: Vec::new(),
         kwargs: kwargs.clone(),
@@ -2272,6 +2356,7 @@ fn expand_tf_gen_op_wrappers_cc(
             ]),
         );
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_cc_binary".to_string(),
             args: Vec::new(),
             kwargs: tool_kwargs,
@@ -2307,6 +2392,7 @@ fn expand_tf_gen_op_wrappers_cc(
             gen_kwargs.insert("visibility".to_string(), v.clone());
         }
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "genrule".to_string(),
             args: Vec::new(),
             kwargs: gen_kwargs,
@@ -2343,6 +2429,7 @@ fn expand_tf_gen_op_wrappers_cc(
         lib.insert("visibility".to_string(), v.clone());
     }
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "cc_library".to_string(),
         args: Vec::new(),
         kwargs: lib,
@@ -2379,6 +2466,7 @@ fn expand_tf_gen_op_wrappers_cc(
     ilib.insert("deps".to_string(), Value::List(int_deps));
     ilib.insert("alwayslink".to_string(), Value::Int(1));
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "cc_library".to_string(),
         args: Vec::new(),
         kwargs: ilib,
@@ -2474,6 +2562,7 @@ fn expand_tf_gen_op_wrapper_cc(
         ]),
     );
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "tf_cc_binary".to_string(),
         args: Vec::new(),
         kwargs: tool_kwargs,
@@ -2511,6 +2600,7 @@ fn expand_tf_gen_op_wrapper_cc(
         gen_kwargs.insert("visibility".to_string(), v.clone());
     }
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "genrule".to_string(),
         args: Vec::new(),
         kwargs: gen_kwargs,
@@ -2660,6 +2750,7 @@ fn expand_flatbuffer_cc_library(
     genrule_kwargs.insert("cmd".to_string(), Value::String(cmd));
     genrule_kwargs.insert("visibility".to_string(), visibility.clone());
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "genrule".to_string(),
         args: Vec::new(),
         kwargs: genrule_kwargs,
@@ -2704,6 +2795,7 @@ fn expand_flatbuffer_cc_library(
     cc_lib_kwargs.insert("linkstatic".to_string(), Value::Int(1));
     cc_lib_kwargs.insert("visibility".to_string(), visibility.clone());
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "cc_library".to_string(),
         args: Vec::new(),
         kwargs: cc_lib_kwargs,
@@ -2723,6 +2815,7 @@ fn expand_flatbuffer_cc_library(
     );
     fg_kwargs.insert("visibility".to_string(), visibility);
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "filegroup".to_string(),
         args: Vec::new(),
         kwargs: fg_kwargs,
@@ -2742,6 +2835,7 @@ fn expand_tf_gen_options_header(
     // The generated-file label belongs to this rule's declared output. The
     // package catalog resolves filename dependencies to the producer.
     Ok(vec![RuleCall {
+        cc_projection: None,
         rule_type: "tf_gen_options_header".to_string(),
         args: Vec::new(),
         kwargs: kwargs.clone(),
@@ -2797,6 +2891,7 @@ fn expand_tf_gpu_cc_test(
         cpu.insert("name".to_string(), Value::String(cpu_name.clone()));
         cpu.remove("suffix");
         calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_cc_test".to_string(),
             args: vec![],
             kwargs: cpu,
@@ -2832,6 +2927,7 @@ fn expand_tf_gpu_cc_test(
     gpu.insert("tags".to_string(), Value::List(gtags));
     gpu.remove("suffix");
     calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "tf_cc_test".to_string(),
         args: vec![],
         kwargs: gpu,
@@ -2846,6 +2942,7 @@ fn expand_tf_gpu_cc_test(
     suite.insert("tests".to_string(), Value::List(suite_tests));
     suite.insert("tags".to_string(), Value::List(tags));
     calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "test_suite".to_string(),
         args: vec![],
         kwargs: suite,
@@ -2900,6 +2997,7 @@ fn expand_cc_library_with_android_deps(
 
     // Return a cc_library call with the combined deps
     Ok(vec![RuleCall {
+        cc_projection: None,
         rule_type: "cc_library".to_string(),
         args: vec![],
         kwargs: new_kwargs,
@@ -3083,6 +3181,7 @@ fn expand_tf_proto_library(
         owner_kwargs.insert("name".to_string(), Value::String(gen_owner.clone()));
         owner_kwargs.remove("cc_libs");
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
             kwargs: owner_kwargs,
@@ -3103,6 +3202,7 @@ fn expand_tf_proto_library(
         );
         base_kwargs.insert("visibility".to_string(), default_visibility());
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
             kwargs: base_kwargs,
@@ -3153,6 +3253,7 @@ fn expand_tf_proto_library(
         impl_kwargs.insert("cc_libs".to_string(), runtime_dependencies);
         impl_kwargs.insert("visibility".to_string(), default_visibility());
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
             kwargs: impl_kwargs,
@@ -3164,6 +3265,7 @@ fn expand_tf_proto_library(
         cc_kwargs.insert("actual".to_string(), Value::String(format!(":{}", name)));
         cc_kwargs.insert("visibility".to_string(), default_visibility());
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "alias".to_string(),
             args: Vec::new(),
             kwargs: cc_kwargs,
@@ -3172,6 +3274,7 @@ fn expand_tf_proto_library(
         // Non-header-only: the base `{name}` carries the archive itself, so
         // `_cc` and `_cc_impl` are cheap aliases to it.
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
             kwargs: generation_kwargs,
@@ -3182,6 +3285,7 @@ fn expand_tf_proto_library(
         cc_kwargs.insert("actual".to_string(), Value::String(format!(":{}", name)));
         cc_kwargs.insert("visibility".to_string(), default_visibility());
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "alias".to_string(),
             args: Vec::new(),
             kwargs: cc_kwargs,
@@ -3192,6 +3296,7 @@ fn expand_tf_proto_library(
         cc_impl_kwargs.insert("actual".to_string(), Value::String(format!(":{}", name)));
         cc_impl_kwargs.insert("visibility".to_string(), default_visibility());
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "alias".to_string(),
             args: Vec::new(),
             kwargs: cc_impl_kwargs,
@@ -3215,6 +3320,7 @@ fn expand_tf_proto_library(
             )])),
     );
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "alias".to_string(),
         args: Vec::new(),
         kwargs: genproto_kwargs,
@@ -3237,6 +3343,7 @@ fn expand_tf_proto_library(
             )])),
     );
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "alias".to_string(),
         args: Vec::new(),
         kwargs: cc_genproto_kwargs,
@@ -3262,6 +3369,7 @@ fn expand_tf_proto_library(
             )])),
     );
     rule_calls.push(RuleCall {
+        cc_projection: None,
         rule_type: "alias".to_string(),
         args: Vec::new(),
         kwargs: cc_headers_kwargs,
@@ -3296,6 +3404,7 @@ fn expand_tf_proto_library(
             grpc_kwargs.insert("testonly".to_string(), testonly.clone());
         }
         rule_calls.push(RuleCall {
+            cc_projection: None,
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
             kwargs: grpc_kwargs,
@@ -3500,6 +3609,14 @@ impl Evaluator {
         debug_log!("[DEBUG Evaluator] set_current_repository: {:?}", repo);
         self.current_repository = repo;
         self.env.definition_label_context = None;
+        self.env.cc_projection_origin = None;
+    }
+
+    pub(crate) fn set_cc_projection_origin(
+        &mut self,
+        origin: Arc<crate::cc_projection_definition::DefinitionOrigin>,
+    ) {
+        self.env.cc_projection_origin = Some(origin);
     }
 
     pub(crate) fn set_definition_label_context(&mut self, context: DefinitionLabelContext) {
@@ -7914,7 +8031,7 @@ impl Evaluator {
         if let Expr::Ident(name) = function {
             // Check for built-in functions
             if let Some(builtin) = self.builtins.get(name).copied().filter(|_| {
-                name != "module_extension" || self.env.get(name).is_none()
+                (name != "module_extension" && name != "rule") || self.env.get(name).is_none()
             }) {
                 if name == "module_extension" {
                     if !self.env.bzl_definition_scope {
@@ -7949,6 +8066,16 @@ impl Evaluator {
                 if name == "package" {
                     self.record_package_metadata(&eval_args, &merged_kwargs_map)?;
                     return Ok(Value::None);
+                }
+                if name == "rule" && eval_args.is_empty() {
+                    if let Some(candidate) =
+                        crate::cc_projection_definition::ProjectionRuleDefinition::candidate(
+                            &merged_kwargs_map,
+                            self.env.cc_projection_origin.clone(),
+                        )
+                    {
+                        return Ok(Value::ProjectionRule(candidate));
+                    }
                 }
                 let eval_kwargs: Vec<(String, Value)> = merged_kwargs_map.into_iter().collect();
 
@@ -7994,6 +8121,10 @@ impl Evaluator {
                 Some(Value::NativeFunction(s)) => {
                     debug_log!("[DEBUG func_value] {}: NativeFunction({})", name, s)
                 }
+                Some(Value::ProjectionRule(_)) => debug_log!(
+                    "[DEBUG func_value] {}: source-qualified projection candidate",
+                    name
+                ),
                 Some(Value::Provider {
                     name: provider_name,
                     fields,
@@ -8168,6 +8299,7 @@ impl Evaluator {
                 );
                 // Regular rule call - capture it
                 let rule_call = RuleCall {
+                    cc_projection: None,
                     rule_type: name.clone(),
                     args: eval_args.clone(),
                     kwargs: eval_kwargs.clone(),
@@ -8397,6 +8529,19 @@ impl Evaluator {
 
                 result
             }
+            Value::ProjectionRule(candidate) => {
+                let eval_args = merge_args(args, args_unpack, self)?;
+                let eval_kwargs = merge_kwargs(kwargs, kwargs_unpack, self)?;
+                let declaration = candidate.resolve_call(self.bzl_loader.as_ref(), &eval_args, &eval_kwargs);
+                let rule_call = RuleCall {
+                    rule_type: "CustomRule".into(), args: eval_args, kwargs: eval_kwargs,
+                    cc_projection: Some(declaration),
+                };
+                if let Some(callback) = &self.rule_call_callback { callback(&rule_call); }
+                self.rule_calls.push(rule_call);
+                Ok(Value::None)
+            }
+            Value::AttributeDefinition(_) => Err(anyhow!("attribute definitions are not callable")),
             Value::RuleFunction(rule_type) => {
                 // This is a rule function call (like native.cc_library)
                 // Evaluate arguments and capture the rule call
@@ -8437,6 +8582,7 @@ impl Evaluator {
 
                 // Capture the rule call
                 let rule_call = RuleCall {
+                    cc_projection: None,
                     rule_type,
                     args: eval_args,
                     kwargs: eval_kwargs,
@@ -8483,7 +8629,7 @@ impl Evaluator {
                 }
                 // Existing-rule lookup honors ordinary star argument calls;
                 // preserve legacy dispatch behavior for unrelated native APIs.
-                let lookup = matches!(func_name.as_str(), "existing_rule" | "existing_rules");
+                let lookup = matches!(func_name.as_str(), "existing_rule" | "existing_rules" | "rule");
                 let mut eval_args = Vec::new();
                 if lookup { eval_args = merge_args(args, args_unpack, self)?; }
                 else { for arg in args { eval_args.push(self.eval_expression(arg)?); } }
@@ -8493,6 +8639,13 @@ impl Evaluator {
 
                 // Handle specific native functions
                 match func_name.as_str() {
+                    "rule" => {
+                        if let Some(candidate) = crate::cc_projection_definition::ProjectionRuleDefinition::candidate(&eval_kwargs, self.env.cc_projection_origin.clone()) {
+                            return Ok(Value::ProjectionRule(candidate));
+                        }
+                        let values = eval_kwargs.into_iter().collect::<Vec<_>>();
+                        return self.builtins.get("rule").context("rule builtin missing")?(&eval_args, &values);
+                    }
                     // Starlark json module (real, via serde_json).
                     "json.encode" => {
                         let v = eval_args.first().cloned().unwrap_or(Value::None);
@@ -8768,6 +8921,7 @@ impl Evaluator {
 
                         // Fallback: treat as a direct cc_header_only_library rule call
                         self.rule_calls.push(RuleCall {
+                            cc_projection: None,
                             rule_type: "cc_header_only_library".to_string(),
                             args: eval_args,
                             kwargs: eval_kwargs,
@@ -8776,6 +8930,10 @@ impl Evaluator {
                     }
                     // attr.* attribute descriptor functions
                     name if name.starts_with("attr.") => {
+                        if name == "attr.label_list" {
+                            if !eval_args.is_empty() { anyhow::bail!("attr.label_list accepts keyword arguments only"); }
+                            return Ok(Value::AttributeDefinition(Arc::new(crate::cc_projection_definition::AttributeDefinition::label_list(eval_kwargs))));
+                        }
                         // Create an attribute descriptor as a dict with the provided kwargs
                         // In real Bazel, these return Attribute objects, but for simplicity
                         // we represent them as dicts with metadata
