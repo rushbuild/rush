@@ -5300,11 +5300,11 @@ impl BuildOrchestrator {
             let is_exec_only = |d: &Label| -> bool {
                 !exec_only_deps.is_empty()
                     && exec_only_deps.iter().any(|raw| {
-                        rush_rules::providers::dep_label_matches(
-                            &d.to_string(),
-                            raw,
-                            &label.package,
-                        )
+                        rush_rules::providers::dep_label_matches_repository_exact(
+                            &d.to_string(), raw, &label.package, label.workspace.as_deref(),
+                        ) || (!raw.starts_with("@@") && rush_rules::providers::dep_label_matches(
+                            &d.to_string(), raw, &label.package,
+                        ))
                     })
             };
             let dep_providers_vec: Vec<Arc<ProviderSet>> = node
@@ -5328,6 +5328,15 @@ impl BuildOrchestrator {
                 .filter_map(|d| {
                     resolve_dep_provider(&built_providers, &d.to_string(), &label.package)
                         .map(|p| (d.to_string(), Arc::new(p.clone())))
+                })
+                .collect();
+            let labeled_exec_dep_providers_vec: Vec<(String, Arc<ProviderSet>)> = node
+                .dependencies
+                .iter()
+                .filter(|dependency| is_exec_only(dependency))
+                .filter_map(|dependency| {
+                    resolve_dep_provider(&built_providers, &dependency.to_string(), &label.package)
+                        .map(|provider| (dependency.to_string(), Arc::new(provider.clone())))
                 })
                 .collect();
             let target_id = rush_action::ids::TargetId(next_target_id);
@@ -5380,6 +5389,7 @@ impl BuildOrchestrator {
                         &extra_proto_paths,
                     )
                     .with_labeled_dep_providers(&labeled_dep_providers_vec)
+                    .with_labeled_exec_dep_providers(&labeled_exec_dep_providers_vec)
                     .with_native_execution_root(native_execroot.as_ref().map(|namespace| namespace.root()))
                     .with_native_compile_discovery(compile_mode,&mut pending_compile_declarations);
                 let mut analyze = || -> Result<_> {
@@ -14443,11 +14453,11 @@ fn build_committed_target_artifacts(
         .filter(|d| {
             exec_only_deps.is_empty()
                 || !exec_only_deps.iter().any(|raw| {
-                    rush_rules::providers::dep_label_matches(
-                        &d.to_string(),
-                        raw,
-                        &label.package,
-                    )
+                    rush_rules::providers::dep_label_matches_repository_exact(
+                        &d.to_string(), raw, &label.package, label.workspace.as_deref(),
+                    ) || (!raw.starts_with("@@") && rush_rules::providers::dep_label_matches(
+                        &d.to_string(), raw, &label.package,
+                    ))
                 })
         })
         .filter_map(|d| {
@@ -20862,6 +20872,516 @@ filegroup(name = "broken_branch", srcs = select({"//broken:condition": [], "//co
         Ok(())
     }
 
+    /// A staged genuine protoc checks routing/ownership, not a source-built
+    /// protoc closure or configured exec/target equivalence. Every process is
+    /// executed by the real owned diagnostic manager; this test never admits
+    /// tf_proto_library to the whole-graph writer allowlist.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires /usr/bin/protoc, g++, ar and matching protobuf development headers"]
+    async fn declared_proto_real_owned_generation_and_compilation() -> Result<()> {
+        use rush_action::ids::{ArtifactKind, ArtifactRegistry, ConfigId, TargetId};
+        use rush_rules::analysis_context::{AnalysisContext, StubIncludeResolver};
+        use rush_rules::context::{
+            ActionManager, NativeCompileMode, PendingCompileDeclarations, Toolchain,
+        };
+        use rush_rules::providers::{DefaultInfo, ProviderSet};
+        use rush_rules::{BuildRule, RuleInstance, Value};
+        struct CountReal {
+            inner: Arc<dyn ActionManager>,
+            counts: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl ActionManager for CountReal {
+            async fn execute(
+                &self,
+                action: rush_action::Action,
+            ) -> Result<rush_action::ActionResult> {
+                let name = action.mnemonic.clone();
+                let result = self.inner.execute(action).await?;
+                assert!(!result.cached && result.output_records.is_empty());
+                if result.exit_code == 0 {
+                    self.counts.lock().unwrap().push(name);
+                }
+                Ok(result)
+            }
+            async fn execute_pending_compile(
+                &self,
+                action: rush_action::Action,
+                pending: rush_rules::context::PendingCompileDeclaration,
+            ) -> Result<rush_action::ActionResult> {
+                let name = action.mnemonic.clone();
+                let result = self.inner.execute_pending_compile(action, pending).await?;
+                assert!(!result.cached && result.output_records.is_empty());
+                if result.exit_code == 0 {
+                    self.counts.lock().unwrap().push(name);
+                }
+                Ok(result)
+            }
+        }
+        fn proto(
+            name: &str,
+            source: &str,
+            generation_owner: Option<&str>,
+            dependencies: Vec<String>,
+        ) -> Result<Box<dyn RuleInstance>> {
+            let mut attrs = HashMap::from([
+                ("name".into(), Value::String(name.into())),
+                (
+                    "srcs".into(),
+                    Value::List(vec![Value::String(source.into())]),
+                ),
+                (
+                    "protodeps".into(),
+                    Value::List(dependencies.into_iter().map(Value::String).collect()),
+                ),
+                (
+                    "make_default_target_header_only".into(),
+                    Value::Bool(generation_owner.is_none()),
+                ),
+            ]);
+            if let Some(owner) = generation_owner {
+                attrs.insert(
+                    "_rush_tf_proto_role".into(),
+                    Value::String("cc_impl".into()),
+                );
+                attrs.insert(
+                    "_rush_tf_proto_generation_owner".into(),
+                    Value::String(owner.into()),
+                );
+            } else {
+                attrs.insert("protoc".into(), Value::String("@@tools//:protoc".into()));
+            }
+            tensorflow_rules::tf_proto_library::TfProtoLibraryRule.parse_attributes(&attrs)
+        }
+        let temp = TempDir::new()?;
+        let root = temp.path().canonicalize()?;
+        let output = root.join("output");
+        write_file(
+            &root.join("pkg/imported/value.proto"),
+            "syntax = \"proto3\"; package fixture; message Value { int32 number = 1; }\n",
+        )?;
+        write_file(&root.join("pkg/message.proto"), "syntax = \"proto3\"; package fixture; import \"pkg/imported/value.proto\"; message Message { Value value = 1; }\n")?;
+        anyhow::ensure!(
+            Path::new("/usr/bin/protoc").is_file(),
+            "explicit real protoc prerequisite is absent"
+        );
+        let resolver = StubIncludeResolver::new(root.clone());
+        let toolchain = Toolchain {
+            cc: "/usr/bin/gcc".into(),
+            cxx: "/usr/bin/g++".into(),
+            ar: "/usr/bin/ar".into(),
+            ld: "/usr/bin/g++".into(),
+            cflags: vec![],
+            cxxflags: vec![],
+            ldflags: vec![],
+        };
+        let mut registry = ArtifactRegistry::new();
+        let mut pending = PendingCompileDeclarations::default();
+        let tool_path = output.join("tools/protoc");
+        let tool_id;
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                Some("tools"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            );
+            let source =
+                ctx.register_source_artifact(Path::new("/usr/bin/protoc"), ArtifactKind::Source);
+            tool_id = ctx.register_generated_artifact(&tool_path, ArtifactKind::Executable, None);
+            ctx.declare_action("GenRule", vec![source], vec![tool_id])?;
+        }
+        let tool_provider = ProviderSet::empty().with_default_info(DefaultInfo {
+            files: vec![tool_id],
+        });
+        let tool_exec = vec![(
+            "@tools//:protoc".to_string(),
+            Arc::new(tool_provider.clone()),
+        )];
+        let dep_owner = proto("dep_genproto_owner", "imported/value.proto", None, vec![])?;
+        let dep_impl = proto(
+            "dep_cc_impl",
+            "imported/value.proto",
+            Some(":dep_genproto_owner"),
+            vec![":dep_genproto_owner".into()],
+        )?;
+        let owner = proto(
+            "messages_genproto_owner",
+            "message.proto",
+            None,
+            vec![":dep_cc_impl".into()],
+        )?;
+        let implementation = proto(
+            "messages_cc_impl",
+            "message.proto",
+            Some(":messages_genproto_owner"),
+            vec![":messages_genproto_owner".into(), ":dep_cc_impl".into()],
+        )?;
+        let mut analyze = |target: TargetId,
+                           rule: &dyn RuleInstance,
+                           labeled: &[(String, Arc<ProviderSet>)]|
+         -> Result<ProviderSet> {
+            let deps: Vec<_> = labeled
+                .iter()
+                .map(|(_, provider)| provider.clone())
+                .collect();
+            let mut ctx = AnalysisContext::new(
+                target,
+                ConfigId::DEFAULT,
+                "pkg",
+                Some("owner"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            )
+            .with_labeled_dep_providers(labeled)
+            .with_labeled_exec_dep_providers(&tool_exec)
+            .with_native_execution_root(Some(&root))
+            .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, &mut pending);
+            rule.validate_analysis_dependencies(&ctx)?;
+            let provider = rule.analyze(&mut ctx, &deps);
+            anyhow::ensure!(
+                ctx.native_namespace_analysis_error().is_none(),
+                "proto analysis refused: {:?}",
+                ctx.native_namespace_analysis_error()
+            );
+            Ok(provider)
+        };
+        let dep_owner_provider = analyze(TargetId(2), dep_owner.as_ref(), &[])?;
+        let dep_impl_provider = analyze(
+            TargetId(3),
+            dep_impl.as_ref(),
+            &[(
+                "@owner//pkg:dep_genproto_owner".into(),
+                Arc::new(dep_owner_provider.clone()),
+            )],
+        )?;
+        let owner_provider = analyze(
+            TargetId(4),
+            owner.as_ref(),
+            &[(
+                "@owner//pkg:dep_cc_impl".into(),
+                Arc::new(dep_impl_provider.clone()),
+            )],
+        )?;
+        analyze(
+            TargetId(5),
+            implementation.as_ref(),
+            &[
+                (
+                    "@owner//pkg:messages_genproto_owner".into(),
+                    Arc::new(owner_provider.clone()),
+                ),
+                (
+                    "@owner//pkg:dep_cc_impl".into(),
+                    Arc::new(dep_impl_provider.clone()),
+                ),
+            ],
+        )?;
+        drop(analyze);
+        let source_id = registry
+            .find_artifact_by_path(&root.join("pkg/imported/value.proto"), ConfigId::DEFAULT)
+            .unwrap();
+        let generated_id = registry
+            .find_artifact_by_path(
+                &output.join("genfiles/pkg/message.pb.cc"),
+                ConfigId::DEFAULT,
+            )
+            .unwrap();
+        let generation = registry.declared_action(registry.producer(generated_id).unwrap());
+        assert!(
+            generation.inputs.contains(&source_id),
+            "imported proto value must be a real generator input"
+        );
+        assert!(generation.inputs.contains(&tool_id));
+        assert_eq!(registry.strings().str(generation.mnemonic), "ProtocCompile");
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let cache = Arc::new(rush_cache::ActionCache::new());
+        let manager = Arc::new(crate::action_manager::RushActionManager::new(
+            cache.clone(),
+            Arc::new(rush_exec::LocalStrategy),
+            rush_resource::ResourceManager::new()?,
+        ));
+        let command = semantics_with_define_and_environment(
+            &root,
+            "//:proto-test",
+            "proto_test",
+            "true",
+            &[
+                ("RUSH_CPP_DISCOVERY", "uncached-diagnostic-v1"),
+                ("PROTOC", "/absent/poison-protoc"),
+                ("RUSH_PROTOC", "/absent/poison-protoc"),
+            ],
+        )?;
+        let lease = Arc::new(crate::compiler_discovery::WorkspaceLease::acquire(
+            &root,
+            NativeCompileMode::UncachedDiagnosticV1,
+        )?);
+        lease.token(true)?;
+        let header = output.join("genfiles/pkg/message.pb.h");
+        let generated = output.join("genfiles/pkg/message.pb.cc");
+        let object = output.join("pkg/messages_cc_impl/message.pb.o");
+        let mut first_object = Vec::new();
+        for pass in 0..2 {
+            if pass == 1 {
+                write_file(&root.join("pkg/message.proto"), "syntax = \"proto3\"; package fixture; import \"pkg/imported/value.proto\"; message Message { Value value = 1; int64 changed = 2; }\n")?;
+            }
+            let (cancel, cancellation) = tokio::sync::watch::channel(false);
+            let build = crate::compiler_discovery::DiagnosticBuild::new(
+                pending.clone(),
+                registry.clone(),
+                manager.clone(),
+                lease.clone(),
+                &command,
+                root.clone(),
+                cancel,
+                cancellation,
+            )?;
+            let counts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let counted = |target| -> Arc<dyn ActionManager> {
+                Arc::new(CountReal {
+                    inner: build.manager_for(target),
+                    counts: counts.clone(),
+                })
+            };
+            let cp_command = rush_action::Command {
+                executable: "/bin/cp".into(),
+                args: vec![
+                    "/usr/bin/protoc".into(),
+                    tool_path.to_string_lossy().into_owned(),
+                ],
+                working_dir: Some(root.clone()),
+                execution_info: rush_action::ExecutionInfo::default(),
+            };
+            let inputs = vec![rush_action::Artifact::Source("/usr/bin/protoc".into())];
+            let id = rush_action::Action::compute_id(&inputs, &cp_command, &HashMap::new())?;
+            let copied = counted(TargetId(1))
+                .execute(rush_action::Action {
+                    id,
+                    command: cp_command,
+                    env: HashMap::new(),
+                    inputs,
+                    outputs: vec![rush_action::Artifact::Source(tool_path.clone())],
+                    mnemonic: "GenRule".into(),
+                })
+                .await?;
+            assert_eq!(copied.exit_code, 0);
+            let context = |target, providers| {
+                BuildContext::new(root.clone(), output.clone())
+                    .with_package("pkg".into())
+                    .with_repository(Some("owner".into()))
+                    .with_toolchain(toolchain.clone())
+                    .with_dependencies(HashMap::new(), providers)
+                    .with_native_execution_root(Some(root.clone()))
+                    .with_artifact_registry(registry.clone())
+                    .with_native_compile_discovery(
+                        NativeCompileMode::UncachedDiagnosticV1,
+                        build.declarations.clone(),
+                    )
+                    .with_action_manager(counted(target))
+            };
+            dep_owner
+                .build(&context(
+                    TargetId(2),
+                    vec![("@tools//:protoc".into(), tool_provider.clone())],
+                ))
+                .await?;
+            dep_impl
+                .build(&context(
+                    TargetId(3),
+                    vec![(
+                        "@owner//pkg:dep_genproto_owner".into(),
+                        dep_owner_provider.clone(),
+                    )],
+                ))
+                .await?;
+            owner
+                .build(&context(
+                    TargetId(4),
+                    vec![
+                        ("@tools//:protoc".into(), tool_provider.clone()),
+                        ("@owner//pkg:dep_cc_impl".into(), dep_impl_provider.clone()),
+                    ],
+                ))
+                .await?;
+            use std::os::unix::fs::MetadataExt;
+            let before = std::fs::metadata(&generated)?;
+            let header_bytes = std::fs::read(&header)?;
+            let generated_bytes = std::fs::read(&generated)?;
+            implementation
+                .build(&context(
+                    TargetId(5),
+                    vec![
+                        (
+                            "@owner//pkg:messages_genproto_owner".into(),
+                            owner_provider.clone(),
+                        ),
+                        ("@owner//pkg:dep_cc_impl".into(), dep_impl_provider.clone()),
+                    ],
+                ))
+                .await?;
+            let after = std::fs::metadata(&generated)?;
+            assert_eq!(
+                (
+                    before.ino(),
+                    before.mtime(),
+                    before.mtime_nsec(),
+                    before.ctime(),
+                    before.ctime_nsec()
+                ),
+                (
+                    after.ino(),
+                    after.mtime(),
+                    after.mtime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec()
+                ),
+                "CcImpl rewrote generation-owner output"
+            );
+            assert_eq!(std::fs::read(&header)?, header_bytes);
+            assert_eq!(std::fs::read(&generated)?, generated_bytes);
+            let actual_counts = counts.lock().unwrap();
+            for (mnemonic, expected) in [
+                ("GenRule", 1),
+                ("ProtocCompile", 2),
+                ("CppCompile", 2),
+                ("CcArchive", 2),
+            ] {
+                assert_eq!(
+                    actual_counts
+                        .iter()
+                        .filter(|name| name.as_str() == mnemonic)
+                        .count(),
+                    expected,
+                    "{actual_counts:?}"
+                );
+            }
+            let bytes = std::fs::read(&object)?;
+            assert!(!bytes.is_empty());
+            if pass == 0 {
+                first_object = bytes;
+            } else {
+                assert_ne!(
+                    bytes, first_object,
+                    "real edited proto must change compiled generated object"
+                );
+            }
+            let archive = output.join("pkg/messages_cc_impl/libmessages_cc_impl.a");
+            let members = std::process::Command::new("/usr/bin/ar")
+                .arg("t")
+                .arg(&archive)
+                .output()?;
+            assert!(members.status.success());
+            assert!(String::from_utf8(members.stdout)?.contains("message.pb.o"));
+            assert_eq!(
+                cache.size(),
+                0,
+                "diagnostic generation/compile/archive must not publish action cache"
+            );
+        }
+        // A missing declared tool cannot be rescued by the ambient system
+        // binary or by seeded old generated files.
+        std::fs::remove_file(&tool_path)?;
+        let before = std::fs::read(&generated)?;
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let build = crate::compiler_discovery::DiagnosticBuild::new(
+            pending,
+            registry.clone(),
+            manager,
+            lease,
+            &command,
+            root.clone(),
+            cancel,
+            cancellation,
+        )?;
+        let context = BuildContext::new(root, output)
+            .with_package("pkg".into())
+            .with_repository(Some("owner".into()))
+            .with_dependencies(
+                HashMap::new(),
+                vec![("@tools//:protoc".into(), tool_provider)],
+            )
+            .with_artifact_registry(registry)
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                build.declarations.clone(),
+            )
+            .with_action_manager(build.manager_for(TargetId(4)));
+        let error = owner
+            .build(&context)
+            .await
+            .expect_err("missing declared tool must refuse");
+        assert!(
+            format!("{error:#}").contains("declared produced protoc"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&generated)?, before);
+        let runtime_source = context.workspace_root.join("foreign-runtime-source");
+        write_file(&runtime_source, "declared unrelated runtime input\n")?;
+        let label = Label::parse("@owner//pkg:messages_genproto_owner", None, None)?;
+        let mut graph = DependencyGraph::new();
+        graph.add_node(
+            label.clone(),
+            proto(
+                "messages_genproto_owner",
+                "message.proto",
+                None,
+                vec!["@foreign//:protoc".into()],
+            )?,
+        )?;
+        let node = graph.get(&label).unwrap();
+        let dependency_roots = HashMap::from([
+            (
+                "@tools//:protoc".to_string(),
+                rush_rules::nested_set::NestedSet::new(
+                    vec![Artifact {
+                        path: tool_path.clone(),
+                        artifact_type: ArtifactType::Executable,
+                    }],
+                    vec![],
+                ),
+            ),
+            (
+                "@foreign//:protoc".to_string(),
+                rush_rules::nested_set::NestedSet::new(
+                    vec![Artifact {
+                        path: runtime_source.clone(),
+                        artifact_type: ArtifactType::Source,
+                    }],
+                    vec![],
+                ),
+            ),
+        ]);
+        let forest = build_committed_target_artifacts(
+            &label,
+            &node,
+            vec![Artifact {
+                path: generated.clone(),
+                artifact_type: ArtifactType::Generated,
+            }],
+            &dependency_roots,
+        )?;
+        let files = forest.flatten();
+        assert!(
+            !files.iter().any(|artifact| artifact.path == tool_path),
+            "canonical root-package exec tool must not leak into runtime artifacts"
+        );
+        assert!(
+            files.iter().any(|artifact| artifact.path == runtime_source),
+            "same-basename foreign repository must retain its distinct runtime identity"
+        );
+        Ok(())
+    }
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(target_os = "linux")]
     async fn source_backed_external_include_prefix_reaches_compile_and_invalidates_on_header_removal() -> Result<()> {

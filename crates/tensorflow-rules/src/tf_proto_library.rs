@@ -1,21 +1,22 @@
 // TensorFlow protocol buffer library rule (tf_proto_library)
 //
-// This is a stub implementation of TensorFlow's tf_proto_library macro.
+// Declared-tool generation is an explicit uncached native bootstrap. The
+// generation owner alone writes .pb files; CcImpl consumes those declared
+// outputs. The historical unlabelled direct-factory literal path remains below.
 // The real Bazel macro creates multiple targets:
 //  - {name}: proto_library
 //  - {name}_proto_srcs: filegroup
 //  - {name}_cc: cc_proto_library
 //  - {name}_cc_headers_only: alias to {name}_cc
 //
-// For now, we just track .proto files as Source artifacts to allow parsing
-// BUILD files that use tf_proto_library.
+// The declared-tool branch intentionally supplies no reusable compiler/read
+// certificate and does not instantiate separate target/exec configurations.
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use rush_action::{Action, Artifact as ActionArtifact, Command, ExecutionInfo};
 use rush_rules::{
-    extract_bool, extract_string, extract_string_list, Artifact, ArtifactType, BuildRule,
-    RuleInstance, Value,
+    extract_string, Artifact, ArtifactType, BuildRule, RuleInstance, Value,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -228,6 +229,42 @@ enum TfProtoRole {
 
 pub struct TfProtoLibraryRule;
 
+fn proto_string_list(attrs: &HashMap<String, Value>, name: &str) -> Result<Vec<String>> {
+    match attrs.get(name) {
+        None => Ok(Vec::new()),
+        Some(Value::List(values)) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(label) => Ok(label.clone()),
+                _ => Err(anyhow!("tf_proto_library {name} elements must be strings")),
+            })
+            .collect(),
+        Some(_) => Err(anyhow!(
+            "tf_proto_library {name} must be a resolved string list"
+        )),
+    }
+}
+
+fn proto_bool(attrs: &HashMap<String, Value>, name: &str) -> Result<bool> {
+    match attrs.get(name) {
+        None | Some(Value::None) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Int(0)) => Ok(false),
+        Some(Value::Int(1)) => Ok(true),
+        Some(_) => Err(anyhow!("tf_proto_library {name} must be a boolean or 0/1")),
+    }
+}
+
+fn proto_optional_label(attrs: &HashMap<String, Value>, name: &str) -> Result<Option<String>> {
+    match attrs.get(name) {
+        None => Ok(None),
+        Some(Value::String(label)) if !label.is_empty() => Ok(Some(label.clone())),
+        Some(_) => Err(anyhow!(
+            "tf_proto_library {name} must be a nonempty declared label"
+        )),
+    }
+}
+
 impl BuildRule for TfProtoLibraryRule {
     fn name(&self) -> &str {
         "tf_proto_library"
@@ -235,35 +272,43 @@ impl BuildRule for TfProtoLibraryRule {
 
     fn parse_attributes(&self, attrs: &HashMap<String, Value>) -> Result<Box<dyn RuleInstance>> {
         let name = extract_string(attrs, "name")?;
-        let srcs = extract_string_list(attrs, "srcs").unwrap_or_default();
-        let protodeps = extract_string_list(attrs, "protodeps").unwrap_or_default();
+        let srcs = proto_string_list(attrs, "srcs")?;
+        let protodeps = proto_string_list(attrs, "protodeps")?;
         let cc_api_version = attrs
             .get("cc_api_version")
             .and_then(|v| v.as_int())
             .unwrap_or(2);
-        let make_default_target_header_only =
-            extract_bool(attrs, "make_default_target_header_only")?.unwrap_or(false);
+        let make_default_target_header_only = proto_bool(attrs, "make_default_target_header_only")?;
         // Either attribute triggers grpc codegen. TF's build_config.bzl
         // gates the `cc_grpc_library(...)` emission on `create_grpc_library`,
         // but `has_services = 1` is also a signal the proto has services.
-        let has_services = extract_bool(attrs, "has_services")?.unwrap_or(false);
-        let create_grpc_library = extract_bool(attrs, "create_grpc_library")?.unwrap_or(false);
+        let has_services = proto_bool(attrs, "has_services")?;
+        let create_grpc_library = proto_bool(attrs, "create_grpc_library")?;
         // TF's build_config.bzl forwards `use_grpc_namespace=True` into a
         // `services_namespace=grpc` flag for grpc_cpp_plugin. Combined with
         // the proto file's `package tensorflow;` declaration, the emitted
         // service classes end up in `tensorflow::grpc::*` (which is what
         // TF's own code — e.g. profiler_client.cc —
         // references).
-        let use_grpc_namespace = extract_bool(attrs, "use_grpc_namespace")?.unwrap_or(false);
+        let use_grpc_namespace = proto_bool(attrs, "use_grpc_namespace")?;
+        let grpc_version_requested = match attrs.get("cc_grpc_version") {
+            None | Some(Value::None) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(Value::Int(value)) => *value != 0,
+            Some(Value::String(value)) => !value.is_empty(),
+            Some(_) => {
+                return Err(anyhow!(
+                    "tf_proto_library cc_grpc_version must be a scalar version"
+                ))
+            }
+        };
 
         // Hidden role attr set by the tf_proto_library macro expander
         // (evaluator.rs) for the synthesized `{name}_cc_impl` impl-mode target.
-        let role = match extract_string(attrs, "_rush_tf_proto_role")
-            .unwrap_or_default()
-            .as_str()
-        {
-            "cc_impl" => TfProtoRole::CcImpl,
-            _ => TfProtoRole::Default,
+        let role = match attrs.get("_rush_tf_proto_role") {
+            None => TfProtoRole::Default,
+            Some(Value::String(role)) if role == "cc_impl" => TfProtoRole::CcImpl,
+            Some(_) => return Err(anyhow!("invalid tf_proto_library generation role")),
         };
 
         Ok(Box::new(TfProtoLibraryInstance {
@@ -274,8 +319,12 @@ impl BuildRule for TfProtoLibraryRule {
             make_default_target_header_only,
             has_services,
             create_grpc_library,
+            grpc_version_requested,
             use_grpc_namespace,
             role,
+            cc_libs: proto_string_list(attrs, "cc_libs")?,
+            protoc: proto_optional_label(attrs, "protoc")?,
+            generation_owner: proto_optional_label(attrs, "_rush_tf_proto_generation_owner")?,
         }))
     }
 }
@@ -290,13 +339,17 @@ struct TfProtoLibraryInstance {
     make_default_target_header_only: bool,
     has_services: bool,
     create_grpc_library: bool,
+    grpc_version_requested: bool,
     use_grpc_namespace: bool,
     role: TfProtoRole,
+    cc_libs: Vec<String>,
+    protoc: Option<String>,
+    generation_owner: Option<String>,
 }
 
 impl TfProtoLibraryInstance {
     fn generates_grpc(&self) -> bool {
-        self.has_services || self.create_grpc_library
+        self.has_services || self.create_grpc_library || self.grpc_version_requested
     }
 }
 
@@ -322,6 +375,675 @@ fn collect_dependency_include_dirs(
     paths
 }
 
+#[derive(Clone)]
+struct ProtoLayout {
+    source: PathBuf,
+    header: PathBuf,
+    generated: PathBuf,
+    object: PathBuf,
+}
+
+fn utf8_path(path: &std::path::Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("proto command path is not UTF-8: {}", path.display()))
+}
+
+fn exact_provider<'a>(
+    providers: impl Iterator<Item = (&'a str, &'a rush_rules::providers::ProviderSet)>,
+    label: &str,
+    package: &str,
+    repository: Option<&str>,
+) -> Result<&'a rush_rules::providers::ProviderSet> {
+    let matches: Vec<_> = providers
+        .filter(|(stored, _)| {
+            rush_rules::providers::dep_label_matches_repository_exact(
+                stored, label, package, repository,
+            )
+        })
+        .collect();
+    anyhow::ensure!(matches.len() == 1, "declared proto dependency {label} requires exactly one repository-qualified provider (found {})", matches.len());
+    Ok(matches[0].1)
+}
+
+fn executable_artifact(
+    registry: &rush_action::ids::ArtifactRegistry,
+    provider: &rush_rules::providers::ProviderSet,
+    config: rush_action::ids::ConfigId,
+) -> Result<rush_action::ids::ArtifactId> {
+    use rush_action::ids::ArtifactKind;
+    let files = &provider
+        .get_default_info()
+        .context("declared protoc has no DefaultInfo")?
+        .files;
+    let executables: Vec<_> = files
+        .iter()
+        .copied()
+        .filter(|id| registry.artifact(*id).kind == ArtifactKind::Executable)
+        .collect();
+    anyhow::ensure!(
+        executables.len() == 1,
+        "declared protoc requires exactly one Executable artifact"
+    );
+    let id = executables[0];
+    let data = registry.artifact(id);
+    let producer = data
+        .owner_action_declared
+        .context("declared protoc executable has no declared producer")?;
+    anyhow::ensure!(
+        !data.is_source
+            && registry.declared_action(producer).owner_target == data.owner_target
+            && registry.declared_action(producer).outputs.contains(&id)
+            && registry.find_artifact_by_path(registry.artifact_path(id), config) == Some(id),
+        "declared protoc executable has mismatched producer/configuration"
+    );
+    Ok(id)
+}
+
+fn set_proto_payload(
+    ctx: &mut rush_rules::analysis_context::AnalysisContext,
+    action: rush_action::ids::DeclaredActionId,
+    executable: &std::path::Path,
+    argv: &[String],
+) {
+    let executable = ctx.intern_path(executable);
+    let argv = argv.iter().map(|arg| ctx.intern_string(arg)).collect();
+    let cwd = ctx.native_execution_root().map(std::path::Path::to_owned);
+    let working_dir = cwd.as_deref().map(|path| ctx.intern_path(path));
+    ctx.set_executable_action(
+        action,
+        rush_action::ids::ExecutableAction {
+            executable,
+            argv,
+            env: Box::new([]),
+            working_dir,
+            env_policy: rush_action::ids::ActionEnvPolicy::InheritHost,
+        },
+    );
+}
+
+impl TfProtoLibraryInstance {
+    fn declared_mode(&self, mode: rush_rules::context::NativeCompileMode) -> Result<()> {
+        if self.srcs.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(mode == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
+            "declared tf_proto_library execution currently requires RUSH_CPP_DISCOVERY=uncached-diagnostic-v1; configured exec/target and reusable proto certificates are not implemented");
+        anyhow::ensure!(
+            !self.generates_grpc(),
+            "declared diagnostic tf_proto_library does not yet admit GRPC/plugin generation"
+        );
+        if self.role == TfProtoRole::Default {
+            anyhow::ensure!(self.protoc.is_some(), "diagnostic tf_proto_library requires its declared protoc tool; environment/bootstrap/system fallback is forbidden");
+        } else {
+            anyhow::ensure!(
+                self.generation_owner.is_some(),
+                "CcImpl requires its explicit generation-owner dependency"
+            );
+        }
+        Ok(())
+    }
+
+    fn layouts(
+        &self,
+        workspace: &std::path::Path,
+        output: &std::path::Path,
+        package: &str,
+    ) -> Result<Vec<ProtoLayout>> {
+        use std::path::{Component, Path};
+        let package_root = workspace.join(package);
+        let mut layouts = Vec::new();
+        for src in &self.srcs {
+            let input = Path::new(src);
+            anyhow::ensure!(
+                !src.contains(':')
+                    && !input
+                        .components()
+                        .any(|part| matches!(part, Component::ParentDir)),
+                "proto source must be an admitted package file path: {src}"
+            );
+            let source = package_root.join(input);
+            let relative = source
+                .strip_prefix(workspace)
+                .context("proto source is outside its source repository")?;
+            let package_relative = source
+                .strip_prefix(&package_root)
+                .context("proto source is outside its declaring package")?;
+            anyhow::ensure!(
+                source
+                    .extension()
+                    .is_some_and(|extension| extension == "proto"),
+                "proto source must end in .proto: {src}"
+            );
+            let layout = ProtoLayout {
+                header: output
+                    .join("genfiles")
+                    .join(relative.with_extension("pb.h")),
+                generated: output
+                    .join("genfiles")
+                    .join(relative.with_extension("pb.cc")),
+                object: output
+                    .join(package)
+                    .join(&self.name)
+                    .join(package_relative.with_extension("pb.o")),
+                source,
+            };
+            anyhow::ensure!(
+                !layouts
+                    .iter()
+                    .any(|prior: &ProtoLayout| prior.header == layout.header),
+                "duplicate proto generated output: {}",
+                layout.header.display()
+            );
+            layouts.push(layout);
+        }
+        Ok(layouts)
+    }
+
+    fn analyze_declared_proto(
+        &self,
+        ctx: &mut rush_rules::analysis_context::AnalysisContext,
+        deps: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
+    ) -> rush_rules::providers::ProviderSet {
+        match self.analyze_declared_proto_result(ctx, deps) {
+            Ok(provider) => provider,
+            Err(error) => {
+                ctx.fail_native_namespace_analysis(format!(
+                    "tf_proto_library {}: {error:#}",
+                    self.name
+                ));
+                rush_rules::providers::ProviderSet::empty()
+            }
+        }
+    }
+
+    fn analyze_declared_proto_result(
+        &self,
+        ctx: &mut rush_rules::analysis_context::AnalysisContext,
+        deps: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
+    ) -> Result<rush_rules::providers::ProviderSet> {
+        use rush_action::ids::{ArtifactKind, ConfigId};
+        use rush_rules::providers::{
+            CcInfo, DefaultInfo, DirectCcInfo, ProtoFilesInfo, ProviderSet,
+        };
+        self.declared_mode(ctx.native_compile_mode())?;
+        anyhow::ensure!(
+            ctx.config_id() == ConfigId::DEFAULT,
+            "declared proto bootstrap only admits the explicit legacy configuration"
+        );
+        let layouts = self.layouts(ctx.workspace_root(), ctx.output_dir(), ctx.package())?;
+        let proto_files = ProtoFilesInfo::from_direct_and_deps(
+            layouts
+                .iter()
+                .map(|layout| ctx.register_source_artifact(&layout.source, ArtifactKind::Source))
+                .collect(),
+            deps.iter()
+                .filter_map(|provider| provider.get_proto_files().cloned()),
+        );
+        let cc_deps = rush_rules::providers::extract_cc_infos(deps);
+        let mut headers = Vec::new();
+        let mut generated = Vec::new();
+        if self.role == TfProtoRole::CcImpl {
+            let owner = exact_provider(
+                ctx.labeled_dep_providers()
+                    .iter()
+                    .map(|(label, provider)| (label.as_str(), provider.as_ref())),
+                self.generation_owner
+                    .as_deref()
+                    .context("missing generation owner")?,
+                ctx.package(),
+                ctx.workspace(),
+            )?;
+            let owner_files = &owner
+                .get_default_info()
+                .context("generation owner has no generated file provider")?
+                .files;
+            for layout in &layouts {
+                let header = ctx
+                    .registry()
+                    .find_artifact_by_path(&layout.header, ctx.config_id())
+                    .context("generation owner did not declare expected .pb.h")?;
+                let source = ctx
+                    .registry()
+                    .find_artifact_by_path(&layout.generated, ctx.config_id())
+                    .context("generation owner did not declare expected .pb.cc")?;
+                for id in [header, source] {
+                    let data = ctx.registry().artifact(id);
+                    let producer = ctx
+                        .registry()
+                        .producer(id)
+                        .context("generation owner output has no producer")?;
+                    let action = ctx.registry().declared_action(producer);
+                    anyhow::ensure!(
+                        owner_files.contains(&id)
+                            && !data.is_source
+                            && action.owner_target == data.owner_target
+                            && ctx.registry().strings().str(action.mnemonic) == "ProtocCompile"
+                            && action.outputs.contains(&header)
+                            && action.outputs.contains(&source),
+                        "CcImpl expected output belongs to a different generation producer"
+                    );
+                }
+                headers.push(header);
+                generated.push(source);
+            }
+        } else {
+            let tool = if layouts.is_empty() {
+                None
+            } else {
+                let provider = exact_provider(
+                    ctx.labeled_exec_dep_providers()
+                        .iter()
+                        .map(|(label, provider)| (label.as_str(), provider.as_ref())),
+                    self.protoc.as_deref().context("missing declared protoc")?,
+                    ctx.package(),
+                    ctx.workspace(),
+                )?;
+                Some(executable_artifact(
+                    ctx.registry(),
+                    provider,
+                    ctx.config_id(),
+                )?)
+            };
+            for layout in &layouts {
+                headers.push(ctx.register_generated_artifact(
+                    &layout.header,
+                    ArtifactKind::Header,
+                    None,
+                ));
+                generated.push(ctx.register_generated_artifact(
+                    &layout.generated,
+                    ArtifactKind::Generated,
+                    None,
+                ));
+            }
+            for (index, layout) in layouts.iter().enumerate() {
+                let tool = tool.context("missing declared protoc artifact")?;
+                let mut inputs = vec![proto_files.direct_sources[index]];
+                for id in proto_files
+                    .transitive_sources
+                    .iter()
+                    .chain(std::iter::once(tool))
+                {
+                    if !inputs.contains(&id) {
+                        inputs.push(id);
+                    }
+                }
+                let action = ctx.declare_action(
+                    "ProtocCompile",
+                    inputs,
+                    vec![headers[index], generated[index]],
+                )?;
+                let executable = ctx.registry().artifact_path(tool).to_owned();
+                let mut argv = vec![
+                    "--experimental_allow_proto3_optional".to_string(),
+                    format!(
+                        "--cpp_out={}",
+                        utf8_path(&ctx.output_dir().join("genfiles"))?
+                    ),
+                    format!("--proto_path={}", utf8_path(ctx.workspace_root())?),
+                ];
+                for root in ctx.extra_proto_paths() {
+                    argv.push(format!("--proto_path={}", utf8_path(root)?));
+                }
+                argv.push(utf8_path(&layout.source)?);
+                set_proto_payload(ctx, action, &executable, &argv);
+            }
+        }
+        let mut objects = Vec::new();
+        if !self.make_default_target_header_only || self.role == TfProtoRole::CcImpl {
+            for (index, layout) in layouts.iter().enumerate() {
+                let object =
+                    ctx.register_generated_artifact(&layout.object, ArtifactKind::Object, None);
+                let mut inputs = vec![generated[index]];
+                for id in &headers {
+                    if !inputs.contains(id) {
+                        inputs.push(*id);
+                    }
+                }
+                let mut argv = vec![
+                    "-c".to_string(),
+                    "-fPIC".to_string(),
+                    "-std=c++17".to_string(),
+                ];
+                argv.extend(ctx.toolchain().cxxflags.clone());
+                argv.push(format!(
+                    "-I{}",
+                    utf8_path(
+                        layout
+                            .generated
+                            .parent()
+                            .context("generated source has no parent")?
+                    )?
+                ));
+                argv.push(format!(
+                    "-I{}",
+                    utf8_path(&ctx.output_dir().join("genfiles"))?
+                ));
+                argv.push(format!("-I{}", utf8_path(ctx.workspace_root())?));
+                for cc in &cc_deps {
+                    for id in cc
+                        .compilation
+                        .headers
+                        .iter()
+                        .chain(cc.compilation.textual_headers.iter())
+                    {
+                        if !inputs.contains(&id) {
+                            inputs.push(id);
+                        }
+                    }
+                    for (prefix, paths) in [
+                        ("-I", &cc.compilation.include_dirs),
+                        ("-iquote", &cc.compilation.quote_include_dirs),
+                        ("-isystem", &cc.compilation.system_include_dirs),
+                    ] {
+                        for id in paths.iter() {
+                            argv.push(format!(
+                                "{}{}",
+                                prefix,
+                                utf8_path(ctx.registry().paths().path(id))?
+                            ));
+                        }
+                    }
+                    for id in cc.compilation.defines.iter() {
+                        argv.push(format!("-D{}", ctx.registry().strings().str(id)));
+                    }
+                }
+                argv.extend([
+                    "-o".to_string(),
+                    utf8_path(&layout.object)?,
+                    utf8_path(&layout.generated)?,
+                ]);
+                let action = ctx.declare_incomplete_action(
+                    "CppCompile",
+                    inputs,
+                    vec![object],
+                    "pending compiler-discovered generated proto inputs",
+                )?;
+                ctx.record_pending_compile(action, generated[index], object)?;
+                let executable = ctx.toolchain().cxx.clone();
+                set_proto_payload(ctx, action, &executable, &argv);
+                objects.push(object);
+            }
+        }
+        let mut libraries = Vec::new();
+        let mut default_files = headers.clone();
+        default_files.extend(generated);
+        if !objects.is_empty() {
+            let library = ctx.register_generated_artifact(
+                &ctx.output_dir()
+                    .join(ctx.package())
+                    .join(&self.name)
+                    .join(format!("lib{}.a", self.name)),
+                ArtifactKind::StaticLibrary,
+                None,
+            );
+            let action = ctx.declare_action("CcArchive", objects.clone(), vec![library])?;
+            let mut argv = vec![
+                "rcs".to_string(),
+                utf8_path(ctx.registry().artifact_path(library))?,
+                "--thin".to_string(),
+            ];
+            for object in objects {
+                argv.push(utf8_path(ctx.registry().artifact_path(object))?);
+            }
+            let executable = ctx.toolchain().ar.clone();
+            set_proto_payload(ctx, action, &executable, &argv);
+            libraries.push(ctx.register_linker_input(library, self.role == TfProtoRole::CcImpl));
+            default_files = vec![library];
+        }
+        let mut direct = DirectCcInfo {
+            headers,
+            linker_inputs: libraries,
+            ..DirectCcInfo::default()
+        };
+        if !layouts.is_empty() {
+            direct
+                .include_dirs
+                .push(ctx.intern_path(&ctx.output_dir().join("genfiles")));
+        }
+        Ok(ProviderSet::empty()
+            .with_proto_files(proto_files)
+            .with_cc_info(CcInfo::from_direct_and_deps(direct, cc_deps))
+            .with_default_info(DefaultInfo {
+                files: default_files,
+            }))
+    }
+
+    async fn declared_proto_specs(
+        &self,
+        context: &rush_rules::context::BuildContext,
+    ) -> Result<
+        Vec<(
+            rush_rules::SchedulerActionKey,
+            rush_action::command_spec::NormalizedCommandSpec,
+        )>,
+    > {
+        use rush_action::ids::{ArtifactKind, ConfigId};
+        self.declared_mode(context.native_compile_mode())?;
+        let layouts = self.layouts(
+            &context.workspace_root,
+            &context.output_dir,
+            &context
+                .package_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )?;
+        if layouts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let registry = context
+            .artifact_registry
+            .as_ref()
+            .context("declared proto build has no analyzed artifact registry")?
+            .lock()
+            .await;
+        let primary = if self.make_default_target_header_only && self.role == TfProtoRole::Default {
+            &layouts[0].header
+        } else {
+            &layouts[0].object
+        };
+        let owner = registry
+            .artifact(
+                registry
+                    .find_artifact_by_path(primary, ConfigId::DEFAULT)
+                    .context("proto target has no analyzed output")?,
+            )
+            .owner_target;
+        let tool = if self.role == TfProtoRole::Default {
+            let provider = exact_provider(
+                context
+                    .dependency_providers
+                    .iter()
+                    .map(|(label, provider)| (label.as_str(), provider)),
+                self.protoc.as_deref().context("missing declared protoc")?,
+                &context
+                    .package_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                context.repository.as_deref(),
+            )?;
+            Some(executable_artifact(&registry, provider, ConfigId::DEFAULT)?)
+        } else {
+            None
+        };
+        let mut specs = Vec::new();
+        for &action_id in registry.actions_of(owner) {
+            let action = registry.declared_action(action_id);
+            let mnemonic = registry.strings().str(action.mnemonic);
+            anyhow::ensure!(
+                matches!(mnemonic, "ProtocCompile" | "CppCompile" | "CcArchive"),
+                "unexpected declared proto action {mnemonic}"
+            );
+            let executable = registry
+                .executable_action(action_id)
+                .context("declared proto action has no executable payload")?;
+            let executable_path = registry.paths().path(executable.executable).to_owned();
+            if mnemonic == "ProtocCompile" {
+                let tool = tool.context("CcImpl must not own ProtocCompile")?;
+                anyhow::ensure!(
+                    action.inputs.contains(&tool)
+                        && executable_path == registry.artifact_path(tool),
+                    "protoc payload does not name its declared produced executable"
+                );
+            }
+            let outputs: Vec<_> = action
+                .outputs
+                .iter()
+                .map(|id| registry.artifact_path(*id).to_owned())
+                .collect();
+            let mut spec = rush_action::command_spec::NormalizedCommandSpec {
+                mnemonic: mnemonic.to_string(),
+                executable: executable_path,
+                cwd: executable
+                    .working_dir
+                    .map(|id| registry.paths().path(id).to_owned()),
+                argv: executable
+                    .argv
+                    .iter()
+                    .map(|id| registry.strings().str(*id).to_owned())
+                    .collect(),
+                env: executable
+                    .env
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            registry.strings().str(*key).to_owned(),
+                            registry.strings().str(*value).to_owned(),
+                        )
+                    })
+                    .collect(),
+                declared_inputs: action
+                    .inputs
+                    .iter()
+                    .map(|id| registry.artifact_path(*id).to_owned())
+                    .collect(),
+                declared_outputs: outputs.clone(),
+                toolchain_identity: None,
+                param_files: Vec::new(),
+                env_policy: executable.env_policy,
+            };
+            spec.normalize();
+            specs.push((
+                rush_rules::SchedulerActionKey {
+                    mnemonic: mnemonic.to_string(),
+                    primary_output_path: outputs
+                        .first()
+                        .context("declared proto action has no output")?
+                        .clone(),
+                },
+                spec,
+            ));
+        }
+        anyhow::ensure!(
+            !specs.is_empty(),
+            "declared proto target has no analyzed action chain"
+        );
+        for layout in &layouts {
+            let header = registry
+                .find_artifact_by_path(&layout.header, ConfigId::DEFAULT)
+                .context("missing declared proto header")?;
+            let source = registry
+                .find_artifact_by_path(&layout.generated, ConfigId::DEFAULT)
+                .context("missing declared proto source")?;
+            anyhow::ensure!(
+                registry.artifact(header).kind == ArtifactKind::Header
+                    && registry.artifact(source).kind == ArtifactKind::Generated
+                    && registry.producer(header).is_some()
+                    && registry.producer(header) == registry.producer(source),
+                "missing/mismatched proto generation producer"
+            );
+        }
+        Ok(specs)
+    }
+
+    async fn build_declared_proto(
+        &self,
+        context: &rush_rules::context::BuildContext,
+    ) -> Result<Vec<Artifact>> {
+        let specs = self.declared_proto_specs(context).await?;
+        let mut artifacts = Vec::new();
+        for (_, spec) in specs {
+            if spec.mnemonic == "ProtocCompile" {
+                anyhow::ensure!(
+                    is_executable_file(&spec.executable),
+                    "declared produced protoc is missing or not executable: {}",
+                    spec.executable.display()
+                );
+            }
+            for output in &spec.declared_outputs {
+                if let Some(parent) = output.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            let inputs = spec
+                .declared_inputs
+                .iter()
+                .cloned()
+                .map(ActionArtifact::Source)
+                .collect::<Vec<_>>();
+            let command = Command {
+                executable: spec.executable,
+                args: spec.argv,
+                working_dir: spec.cwd,
+                execution_info: ExecutionInfo::default(),
+            };
+            let env = spec.env.into_iter().collect();
+            let id = Action::compute_id(&inputs, &command, &env)?;
+            let outputs = spec
+                .declared_outputs
+                .iter()
+                .cloned()
+                .map(ActionArtifact::Source)
+                .collect();
+            let result = context
+                .execute_action(Action {
+                    id,
+                    command,
+                    env,
+                    inputs,
+                    outputs,
+                    mnemonic: spec.mnemonic.clone(),
+                })
+                .await?;
+            anyhow::ensure!(
+                result.exit_code == 0,
+                "{} failed for {}: {}",
+                spec.mnemonic,
+                self.name,
+                String::from_utf8_lossy(&result.stderr)
+            );
+            for output in spec.declared_outputs {
+                anyhow::ensure!(
+                    std::fs::metadata(&output).is_ok_and(|metadata| metadata.is_file()),
+                    "{} did not produce {}",
+                    spec.mnemonic,
+                    output.display()
+                );
+                let artifact_type = if output.extension().is_some_and(|extension| extension == "h")
+                {
+                    ArtifactType::Header
+                } else if output
+                    .extension()
+                    .is_some_and(|extension| extension == "cc")
+                {
+                    ArtifactType::Generated
+                } else if output.extension().is_some_and(|extension| extension == "o") {
+                    ArtifactType::Object
+                } else {
+                    ArtifactType::StaticLibrary
+                };
+                artifacts.push(Artifact {
+                    path: output,
+                    artifact_type,
+                });
+            }
+        }
+        Ok(artifacts)
+    }
+}
 #[async_trait]
 impl RuleInstance for TfProtoLibraryInstance {
     fn target_name(&self) -> &str {
@@ -329,10 +1051,43 @@ impl RuleInstance for TfProtoLibraryInstance {
     }
 
     fn dependencies(&self) -> Vec<String> {
-        self.protodeps.clone()
+        let mut dependencies = self.protodeps.clone();
+        for runtime in &self.cc_libs {
+            if !dependencies.contains(runtime) {
+                dependencies.push(runtime.clone());
+            }
+        }
+        if self.role == TfProtoRole::Default && !self.srcs.is_empty() {
+            if let Some(tool) = &self.protoc {
+                if !dependencies.contains(tool) {
+                    dependencies.push(tool.clone());
+                }
+            }
+        }
+        dependencies
+    }
+
+    fn exec_only_dependencies(&self) -> Vec<String> {
+        if self.role == TfProtoRole::Default && !self.srcs.is_empty() {
+            self.protoc.iter().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn validate_analysis_dependencies(&self, ctx: &rush_rules::analysis_context::AnalysisContext) -> Result<()> {
+        if self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+            || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            self.declared_mode(ctx.native_compile_mode())?;
+        }
+        Ok(())
     }
 
     async fn build(&self, context: &rush_rules::context::BuildContext) -> Result<Vec<Artifact>> {
+        if self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+            || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            return self.build_declared_proto(context).await;
+        }
         // Real implementation: Run protoc to generate .pb.h and .pb.cc files
         // Then compile them to .o and .a
         let mut artifacts = Vec::new();
@@ -766,6 +1521,10 @@ impl RuleInstance for TfProtoLibraryInstance {
         ctx: &mut rush_rules::analysis_context::AnalysisContext,
         dep_providers: &[std::sync::Arc<rush_rules::providers::ProviderSet>],
     ) -> rush_rules::providers::ProviderSet {
+        if self.srcs.is_empty() || self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+            || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            return self.analyze_declared_proto(ctx, dep_providers);
+        }
         use rush_action::ids::{ArtifactId, ArtifactKind, ExecutableAction, StringId};
         use rush_rules::providers::{
             CcInfo, DefaultInfo, DirectCcInfo, LinkFragment, ProviderSet,
@@ -1234,11 +1993,9 @@ impl RuleInstance for TfProtoLibraryInstance {
     fn scheduler_shape_unsupported(&self) -> Option<&'static str> {
         if self.generates_grpc() {
             Some(
-                "tf_proto_library grpc path not scheduler-verified \
-                 (has_services or create_grpc_library is set; \
-                 grpc migration deferred to commit 31d, blocked \
-                 on grpc_cpp_plugin install — see \
-                 docs/known-failing-tests.md)",
+                "tf_proto_library GRPC/plugin generation is not supported by \
+                 the native scheduler (has_services, create_grpc_library or \
+                 cc_grpc_version requests the plugin)",
             )
         } else {
             None
@@ -1256,7 +2013,11 @@ impl RuleInstance for TfProtoLibraryInstance {
     /// instant grpc lands as scheduler-eligible — no
     /// retrofit needed.
     fn scheduler_required_tools(&self) -> Vec<rush_rules::RequiredTool> {
-        let mut tools = vec![rush_rules::RequiredTool::Protoc];
+        let mut tools = if self.protoc.is_some() || self.role == TfProtoRole::CcImpl || self.srcs.is_empty() {
+            Vec::new()
+        } else {
+            vec![rush_rules::RequiredTool::Protoc]
+        };
         if self.generates_grpc() {
             tools.push(rush_rules::RequiredTool::GrpcCppPlugin);
         }
@@ -1274,6 +2035,10 @@ impl RuleInstance for TfProtoLibraryInstance {
         rush_rules::SchedulerActionKey,
         rush_action::command_spec::NormalizedCommandSpec,
     )> {
+        if self.protoc.is_some() || self.role == TfProtoRole::CcImpl
+            || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            return self.declared_proto_specs(context).await.unwrap_or_default();
+        }
         use rush_action::command_spec::NormalizedCommandSpec;
         use rush_rules::cc_command_spec::{CcArchiveCommandSpec, CcCompileCommandSpec, IncludeLayout};
         use rush_rules::SchedulerActionKey;
@@ -1743,6 +2508,308 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn declared_proto_rejects_malformed_inputs_instead_of_empty_aggregation() -> Result<()> {
+        let base = HashMap::from([
+            ("name".into(), Value::String("messages".into())),
+            (
+                "srcs".into(),
+                Value::List(vec![Value::String("message.proto".into())]),
+            ),
+            ("protoc".into(), Value::String("@@tools//:protoc".into())),
+        ]);
+        for attribute in ["srcs", "protodeps", "cc_libs"] {
+            for invalid in [
+                Value::List(vec![Value::Int(1)]),
+                Value::Dict(HashMap::new()),
+                Value::String("select(unresolved)".into()),
+                Value::None,
+            ] {
+                let mut attrs = base.clone();
+                attrs.insert(attribute.into(), invalid);
+                let error = TfProtoLibraryRule
+                    .parse_attributes(&attrs)
+                    .err()
+                    .context("malformed declared proto collection was silently dropped")?;
+                assert!(error.to_string().contains(attribute), "{error:#}");
+            }
+        }
+        for (attribute, invalid) in [
+            ("_rush_tf_proto_role", Value::String("unknown".into())),
+            ("_rush_tf_proto_generation_owner", Value::None),
+            ("protoc", Value::String(String::new())),
+            ("has_services", Value::List(Vec::new())),
+            ("has_services", Value::String("true".into())),
+            ("make_default_target_header_only", Value::Int(2)),
+            (
+                "make_default_target_header_only",
+                Value::String("true".into()),
+            ),
+            ("create_grpc_library", Value::Dict(HashMap::new())),
+        ] {
+            let mut attrs = base.clone();
+            attrs.insert(attribute.into(), invalid);
+            assert!(TfProtoLibraryRule.parse_attributes(&attrs).is_err());
+        }
+        let aggregate = TfProtoLibraryRule.parse_attributes(&HashMap::from([
+            ("name".into(), Value::String("aggregate".into())),
+            ("srcs".into(), Value::List(Vec::new())),
+            (
+                "protodeps".into(),
+                Value::List(vec![Value::String(":real_dependency".into())]),
+            ),
+            ("has_services".into(), Value::None),
+        ]))?;
+        assert_eq!(aggregate.dependencies(), vec![":real_dependency"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn declared_proto_grpc_version_refuses_before_output_creation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let output = temp.path().join("must-not-exist");
+        for version in [
+            Value::String("1.0".into()),
+            Value::Bool(true),
+            Value::Int(1),
+        ] {
+            let rule = TfProtoLibraryRule.parse_attributes(&HashMap::from([
+                ("name".into(), Value::String("messages".into())),
+                (
+                    "srcs".into(),
+                    Value::List(vec![Value::String("message.proto".into())]),
+                ),
+                ("protoc".into(), Value::String("@@tools//:protoc".into())),
+                ("has_services".into(), Value::None),
+                ("cc_grpc_version".into(), version),
+            ]))?;
+            assert!(rule.scheduler_shape_unsupported().is_some());
+            let context =
+                rush_rules::context::BuildContext::new(temp.path().into(), output.clone())
+                    .with_native_compile_discovery(
+                        rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
+                        Arc::new(rush_rules::context::PendingCompileDeclarations::default()),
+                    );
+            let error = rule.build(&context).await.unwrap_err();
+            assert!(format!("{error:#}").contains("GRPC/plugin"), "{error:#}");
+            assert!(
+                !output.exists(),
+                "unsupported plugin must refuse before any write"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn declared_proto_owner_and_impl_share_outputs_and_pending_producers() -> Result<()> {
+        use rush_action::ids::ArtifactKind;
+        use rush_rules::context::{BuildContext, NativeCompileMode, PendingCompileDeclarations};
+        use rush_rules::providers::DefaultInfo;
+        let temp = TempDir::new()?;
+        let root = temp.path().join("source");
+        let output = temp.path().join("output");
+        let execution_root = temp.path().join("main-execution");
+        let resolver = StubIncludeResolver::new(root.clone());
+        let toolchain = Toolchain::default();
+        let mut registry = ArtifactRegistry::new();
+        let mut pending = PendingCompileDeclarations::default();
+        let tool;
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(1),
+                ConfigId::DEFAULT,
+                "",
+                Some("protobuf"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            );
+            tool = ctx.register_generated_artifact(
+                &output.join("protoc"),
+                ArtifactKind::Executable,
+                None,
+            );
+            ctx.declare_action("CppLink", Vec::new(), vec![tool])?;
+        }
+        let tool_path = registry.artifact_path(tool).to_owned();
+        let tool_providers = vec![(
+            "@protobuf//:protoc".to_string(),
+            Arc::new(ProviderSet::empty().with_default_info(DefaultInfo { files: vec![tool] })),
+        )];
+        let mut owner = make_tf_proto("messages_genproto_owner", false, false, false);
+        owner.srcs = vec!["nested/value.proto".into(), "other/value.proto".into()];
+        owner.make_default_target_header_only = true;
+        owner.protoc = Some("@@protobuf//:protoc".into());
+        let owner_provider;
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(2),
+                ConfigId::DEFAULT,
+                "pkg",
+                Some("owner"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            )
+            .with_labeled_exec_dep_providers(&tool_providers)
+            .with_native_execution_root(Some(&execution_root))
+            .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, &mut pending);
+            owner_provider = owner.analyze_declared_proto_result(&mut ctx, &[])?;
+            assert!(ctx.native_namespace_analysis_error().is_none());
+        }
+        assert!(
+            pending.iter().next().is_none(),
+            "generation owner must not compile"
+        );
+        assert_eq!(registry.actions_of(TargetId(2)).len(), 2);
+        assert!(registry
+            .find_artifact_by_path(
+                &output.join("genfiles/pkg/nested/value.pb.cc"),
+                ConfigId::DEFAULT
+            )
+            .is_some());
+        assert!(registry
+            .find_artifact_by_path(
+                &output.join("genfiles/pkg/other/value.pb.cc"),
+                ConfigId::DEFAULT
+            )
+            .is_some());
+        let mut implementation = make_tf_proto("messages_cc_impl", false, false, false);
+        implementation.srcs = owner.srcs.clone();
+        implementation.role = TfProtoRole::CcImpl;
+        implementation.generation_owner = Some(":messages_genproto_owner".into());
+        implementation.protodeps = vec![":messages_genproto_owner".into()];
+        let labeled = vec![(
+            "@owner//pkg:messages_genproto_owner".into(),
+            Arc::new(owner_provider),
+        )];
+        {
+            let mut ctx = AnalysisContext::new(
+                TargetId(3),
+                ConfigId::DEFAULT,
+                "pkg",
+                Some("owner"),
+                &output,
+                &mut registry,
+                &resolver,
+                &toolchain,
+                &root,
+                &[],
+            )
+            .with_labeled_dep_providers(&labeled)
+            .with_native_execution_root(Some(&execution_root))
+            .with_native_compile_discovery(NativeCompileMode::UncachedDiagnosticV1, &mut pending);
+            implementation.analyze_declared_proto_result(&mut ctx, &[labeled[0].1.clone()])?;
+        }
+        assert_eq!(pending.iter().count(), 2);
+        for record in pending.iter() {
+            assert_eq!(
+                record.required_producers().len(),
+                2,
+                "both real generated header producers must precede each compile"
+            );
+        }
+        assert!(registry.actions_of(TargetId(3)).iter().all(|id| registry
+            .strings()
+            .str(registry.declared_action(*id).mnemonic)
+            != "ProtocCompile"));
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let owner_context = BuildContext::new(root.clone(), output.clone())
+            .with_package("pkg".into())
+            .with_repository(Some("owner".into()))
+            .with_dependencies(
+                HashMap::new(),
+                tool_providers
+                    .iter()
+                    .map(|(label, provider)| (label.clone(), provider.as_ref().clone()))
+                    .collect(),
+            )
+            .with_artifact_registry(registry.clone())
+            .with_native_execution_root(Some(execution_root.clone()))
+            .with_native_compile_discovery(
+                NativeCompileMode::UncachedDiagnosticV1,
+                Arc::new(pending),
+            );
+        let specs = owner.declared_proto_specs(&owner_context).await?;
+        assert_eq!(specs.len(), 2);
+        for (_, spec) in specs {
+            assert_eq!(spec.executable, tool_path);
+            assert_eq!(spec.cwd.as_ref(), Some(&execution_root));
+            assert!(spec.declared_inputs.contains(&tool_path));
+            assert_eq!(spec.mnemonic, "ProtocCompile");
+        }
+        let missing = BuildContext::new(root, output)
+            .with_package("pkg".into())
+            .with_repository(Some("owner".into()))
+            .with_artifact_registry(registry);
+        assert!(
+            owner.build_declared_proto(&missing).await.is_err(),
+            "literal mode must not silently replace the declared tool"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn declared_proto_requires_exact_generated_executable_and_exec_only_edge() -> Result<()> {
+        use rush_action::ids::ArtifactKind;
+        use rush_rules::providers::DefaultInfo;
+        let mut registry = ArtifactRegistry::new();
+        let root = PathBuf::from("/source");
+        let output = PathBuf::from("/output");
+        let resolver = StubIncludeResolver::new(root.clone());
+        let toolchain = Toolchain::default();
+        let mut ctx = AnalysisContext::new(
+            TargetId(1),
+            ConfigId::DEFAULT,
+            "",
+            None,
+            &output,
+            &mut registry,
+            &resolver,
+            &toolchain,
+            &root,
+            &[],
+        );
+        let source_tool = ctx.register_source_artifact(
+            std::path::Path::new("/existing-protoc"),
+            ArtifactKind::Executable,
+        );
+        let provider = ProviderSet::empty().with_default_info(DefaultInfo {
+            files: vec![source_tool],
+        });
+        assert!(
+            executable_artifact(ctx.registry(), &provider, ConfigId::DEFAULT).is_err(),
+            "a resident binary without a declared producer is not the tool"
+        );
+        let mut rule = make_tf_proto("messages", false, false, false);
+        rule.protoc = Some("@@protobuf//:protoc".into());
+        rule.cc_libs = vec!["@@protobuf//:protobuf".into()];
+        assert_eq!(rule.exec_only_dependencies(), vec!["@@protobuf//:protoc"]);
+        assert!(rule
+            .dependencies()
+            .contains(&"@@protobuf//:protobuf".to_string()));
+        assert!(
+            rule.scheduler_required_tools().is_empty(),
+            "declared tool must not trigger global protoc probing"
+        );
+        let foreign = vec![("@foreign//:protoc".to_string(), Arc::new(provider))];
+        assert!(exact_provider(
+            foreign
+                .iter()
+                .map(|(label, value)| (label.as_str(), value.as_ref())),
+            "@@protobuf//:protoc",
+            "",
+            None
+        )
+        .is_err());
+        Ok(())
+    }
+    #[test]
     fn analysis_compile_uses_dependency_proto_include_root() {
         let temp = TempDir::new().unwrap();
         let workspace_root = temp.path().join("workspace");
@@ -1939,8 +3006,12 @@ mod tests {
             make_default_target_header_only: false,
             has_services,
             create_grpc_library,
+            grpc_version_requested: false,
             use_grpc_namespace,
             role: TfProtoRole::Default,
+            cc_libs: Vec::new(),
+            protoc: None,
+            generation_owner: None,
         }
     }
 

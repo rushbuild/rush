@@ -2934,12 +2934,56 @@ fn rewrite_proto_label_to_cc_impl(label: &str) -> String {
     if label.contains(':') {
         // Target component is the trailing `:...` segment.
         format!("{}_cc_impl", label)
-    } else {
+    } else if label.starts_with("//") || label.starts_with('@') {
         let last = label.rsplit('/').next().unwrap_or(label);
         format!("{}:{}_cc_impl", label, last)
+    } else {
+        format!("{}_cc_impl", label)
     }
 }
 
+/// Rewrite dependency leaves without selecting branches or distributing a
+/// configurable expression into its Cartesian branch product.
+fn rewrite_proto_dependencies(value: &Value) -> Result<Value> {
+    fn shared(value: &Arc<Value>, memo: &mut HashMap<usize, Arc<Value>>) -> Result<Arc<Value>> {
+        let identity = Arc::as_ptr(value) as usize;
+        if let Some(rewritten) = memo.get(&identity) {
+            return Ok(rewritten.clone());
+        }
+        let rewritten = Arc::new(walk(value, memo)?);
+        memo.insert(identity, rewritten.clone());
+        Ok(rewritten)
+    }
+    fn walk(value: &Value, memo: &mut HashMap<usize, Arc<Value>>) -> Result<Value> {
+        match value {
+            Value::List(values) | Value::Tuple(values) | Value::FrozenList(values) => {
+                let rewritten = values.iter().map(|value| match value {
+                    Value::String(label) => Ok(Value::String(rewrite_proto_label_to_cc_impl(label))),
+                    Value::Label { .. } => {
+                        let mut value = value.clone();
+                        if let Value::Label { label, name, .. } = &mut value {
+                            *label = rewrite_proto_label_to_cc_impl(label);
+                            *name = format!("{name}_cc_impl");
+                        }
+                        Ok(value)
+                    }
+                    _ => anyhow::bail!("tf_proto_library protodeps elements must be label strings or Label values"),
+                }).collect::<Result<Vec<_>>>()?;
+                Ok(Value::List(rewritten))
+            }
+            Value::Select(branches) => Ok(Value::Select(branches.iter()
+                .map(|(condition, branch)| Ok((condition.clone(), walk(branch, memo)?)))
+                .collect::<Result<HashMap<_, _>>>()?)),
+            Value::Configurable { op: ConfigurableOp::Add, left, right } => Ok(Value::Configurable {
+                op: ConfigurableOp::Add,
+                left: shared(left, memo)?,
+                right: shared(right, memo)?,
+            }),
+            _ => anyhow::bail!("tf_proto_library protodeps must be a list-like label collection or configurable list concatenation"),
+        }
+    }
+    walk(value, &mut HashMap::new())
+}
 /// Expand tf_proto_library macro (TensorFlow protocol buffers).
 ///
 /// tf_proto_library creates:
@@ -2963,10 +3007,31 @@ fn expand_tf_proto_library(
     };
 
     let mut rule_calls = Vec::new();
+    let mut generation_kwargs = kwargs.clone();
+    generation_kwargs.entry("protoc".to_string()).or_insert_with(|| {
+        Value::String("@com_google_protobuf//:protoc".to_string())
+    });
+
+    // Preserve TSL's actual runtime choice as ordinary configuration metadata.
+    // No repository-name predicate or unconditional host protobuf is inferred.
+    let runtime = Value::Select(HashMap::from([
+        ("@local_xla//xla/tsl:tsl_protobuf_header_only".to_string(),
+            Value::List(vec![Value::String("@com_google_protobuf//:protobuf_headers".to_string())])),
+        ("//conditions:default".to_string(),
+            Value::List(vec![Value::String("@com_google_protobuf//:protobuf".to_string())])),
+    ]));
+    let explicit_runtime = kwargs.get("cc_libs").cloned().unwrap_or(Value::List(Vec::new()));
+    Value::configurable_result_kinds(ConfigurableOp::Add, &explicit_runtime, &runtime)?;
+    let runtime_dependencies = Value::Configurable {
+        op: ConfigurableOp::Add,
+        left: Arc::new(explicit_runtime),
+        right: Arc::new(runtime),
+    };
+    generation_kwargs.insert("cc_libs".to_string(), runtime_dependencies.clone());
 
     let header_only = matches!(
         kwargs.get("make_default_target_header_only"),
-        Some(Value::Bool(true))
+        Some(Value::Bool(true) | Value::Int(1))
     );
     let default_visibility = || {
         kwargs
@@ -3015,8 +3080,9 @@ fn expand_tf_proto_library(
 
         // gen owner = today's base header-only behavior (protoc + headers, no
         // archive), just under a private name.
-        let mut owner_kwargs = kwargs.clone();
+        let mut owner_kwargs = generation_kwargs.clone();
         owner_kwargs.insert("name".to_string(), Value::String(gen_owner.clone()));
+        owner_kwargs.remove("cc_libs");
         rule_calls.push(RuleCall {
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
@@ -3052,16 +3118,26 @@ fn expand_tf_proto_library(
         if let Some(srcs) = kwargs.get("srcs") {
             impl_kwargs.insert("srcs".to_string(), srcs.clone());
         }
-        let mut impl_protodeps: Vec<Value> =
-            vec![Value::String(format!(":{}", gen_owner))];
-        if let Some(Value::List(pds) | Value::Tuple(pds) | Value::FrozenList(pds)) = kwargs.get("protodeps") {
-            for pd in pds {
-                if let Value::String(l) = pd {
-                    impl_protodeps.push(Value::String(rewrite_proto_label_to_cc_impl(l)));
+        let prefix = Value::String(format!(":{}", gen_owner));
+        let impl_protodeps = match kwargs.get("protodeps") {
+            None => Value::List(vec![prefix]),
+            Some(value) => match rewrite_proto_dependencies(value)? {
+                Value::List(mut dependencies) => {
+                    dependencies.insert(0, prefix);
+                    Value::List(dependencies)
                 }
-            }
-        }
-        impl_kwargs.insert("protodeps".to_string(), Value::List(impl_protodeps));
+                conditional => Value::Configurable {
+                    op: ConfigurableOp::Add,
+                    left: Arc::new(Value::List(vec![prefix])),
+                    right: Arc::new(conditional),
+                },
+            },
+        };
+        impl_kwargs.insert("protodeps".to_string(), impl_protodeps);
+        impl_kwargs.insert(
+            "_rush_tf_proto_generation_owner".to_string(),
+            Value::String(format!(":{}", gen_owner)),
+        );
         impl_kwargs.insert(
             "_rush_tf_proto_role".to_string(),
             Value::String("cc_impl".to_string()),
@@ -3069,6 +3145,7 @@ fn expand_tf_proto_library(
         for k in [
             "has_services",
             "create_grpc_library",
+            "cc_grpc_version",
             "use_grpc_namespace",
             "cc_api_version",
         ] {
@@ -3076,6 +3153,7 @@ fn expand_tf_proto_library(
                 impl_kwargs.insert(k.to_string(), v.clone());
             }
         }
+        impl_kwargs.insert("cc_libs".to_string(), runtime_dependencies);
         impl_kwargs.insert("visibility".to_string(), default_visibility());
         rule_calls.push(RuleCall {
             rule_type: "tf_proto_library".to_string(),
@@ -3099,7 +3177,7 @@ fn expand_tf_proto_library(
         rule_calls.push(RuleCall {
             rule_type: "tf_proto_library".to_string(),
             args: Vec::new(),
-            kwargs: kwargs.clone(),
+            kwargs: generation_kwargs,
         });
 
         let mut cc_kwargs = HashMap::new();
@@ -3463,6 +3541,55 @@ impl Evaluator {
         Ok(Arc::new(environment))
     }
 
+    fn qualify_proto_tool_label(&self, requested: &Value) -> Result<String> {
+        let input = match requested {
+            Value::Label { label, .. } => return Ok(label.clone()),
+            Value::String(label) => label,
+            _ => anyhow::bail!("tf_proto_library protoc must be a label string or Label"),
+        };
+        let owner = self
+            .current_repository
+            .as_deref()
+            .unwrap_or("")
+            .trim_start_matches('@');
+        if input.starts_with("@@") {
+            return Ok(input.clone());
+        }
+        if let Some(explicit) = input.strip_prefix('@') {
+            let (repository, target) = explicit
+                .split_once("//")
+                .context("tf_proto_library protoc repository label must contain //")?;
+            let canonical = if repository.is_empty() {
+                String::new()
+            } else if let Some(loader) = &self.bzl_loader {
+                let context = loader
+                    .lock()
+                    .map_err(|error| anyhow!("Failed to lock proto tool label context: {error}"))?
+                    .definition_label_context_for_owner(
+                        self.current_repository.as_deref(),
+                        &self.current_package,
+                    )?;
+                match context.repository_mapping.get(repository) {
+                    Some(mapped) => mapped.clone(),
+                    None if context.mapping_is_complete => {
+                        anyhow::bail!("tf_proto_library protoc repository '@{}' is not visible from BUILD repository '{}'", repository, owner);
+                    }
+                    None => repository.to_string(),
+                }
+            } else {
+                repository.to_string()
+            };
+            Ok(format!("@@{canonical}//{target}"))
+        } else if input.starts_with("//") {
+            Ok(format!("@@{owner}{input}"))
+        } else {
+            Ok(format!(
+                "@@{owner}//{}:{}",
+                self.current_package,
+                input.strip_prefix(':').unwrap_or(input)
+            ))
+        }
+    }
     fn qualify_label_argument(&mut self, arguments: &mut [Value]) -> Result<()> {
         let Some(Value::String(label)) = arguments.first_mut() else {
             return Ok(());
@@ -8002,6 +8129,16 @@ impl Evaluator {
                     );
                     debug_log!("[MACRO] Expanding {} macro", name);
 
+                    // A proto generator is a declared tool dependency, not a
+                    // process-wide protoc search. Qualify string attributes in
+                    // the BUILD caller's repository mapping before expansion.
+                    if name == "tf_proto_library" {
+                        let requested = eval_kwargs.get("protoc").cloned().unwrap_or_else(|| {
+                            Value::String("@com_google_protobuf//:protoc".to_string())
+                        });
+                        let label = self.qualify_proto_tool_label(&requested)?;
+                        eval_kwargs.insert("protoc".to_string(), Value::String(label));
+                    }
                     // Expand the macro into one or more rule calls
                     let expanded_rules = expander(name, &eval_args, &eval_kwargs)?;
 
@@ -10360,6 +10497,239 @@ dict_value = {"base": "yes"} | select({
             .contains("configurable + to float and float"));
     }
 
+    #[test]
+    fn tf_proto_integer_header_only_retains_separate_implementation() -> Result<()> {
+        for (value, split) in [
+            (Value::Bool(true), true),
+            (Value::Int(1), true),
+            (Value::Int(0), false),
+        ] {
+            let calls = expand_tf_proto_library(
+                "tf_proto_library",
+                &[],
+                &HashMap::from([
+                    ("name".into(), Value::String("messages".into())),
+                    (
+                        "srcs".into(),
+                        Value::List(vec![Value::String("message.proto".into())]),
+                    ),
+                    ("make_default_target_header_only".into(), value),
+                ]),
+            )?;
+            let implementation = calls
+                .iter()
+                .find(|call| {
+                    call.kwargs.get("name") == Some(&Value::String("messages_cc_impl".into()))
+                })
+                .unwrap();
+            assert_eq!(implementation.rule_type == "tf_proto_library", split);
+            assert_eq!(
+                calls.iter().any(|call| call.kwargs.get("name")
+                    == Some(&Value::String("messages_genproto_owner".into()))),
+                split
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tf_proto_impl_preserves_label_and_conditional_dependency_structure() -> Result<()> {
+        let typed = Value::Label {
+            label: "@@repository//dependency:messages".into(),
+            package: "dependency".into(),
+            name: "messages".into(),
+            workspace_name: "repository".into(),
+            workspace_root: "external/repository".into(),
+        };
+        for collection in [
+            Value::List(vec![typed.clone()]),
+            Value::Tuple(vec![typed.clone()]),
+            Value::FrozenList(vec![typed]),
+        ] {
+            let Value::List(values) = rewrite_proto_dependencies(&collection)? else {
+                panic!("expected rewritten native list");
+            };
+            let Value::Label { label, name, .. } = &values[0] else {
+                panic!("typed dependency lost its Label identity");
+            };
+            assert_eq!(
+                label.rsplit_once(':').unwrap().1,
+                name,
+                "Label target name must agree with its rewritten canonical identity"
+            );
+            assert_eq!(
+                values,
+                vec![Value::Label {
+                    label: "@@repository//dependency:messages_cc_impl".into(),
+                    package: "dependency".into(),
+                    name: "messages_cc_impl".into(),
+                    workspace_name: "repository".into(),
+                    workspace_root: "external/repository".into()
+                }]
+            );
+        }
+        let selector = Arc::new(Value::Select(HashMap::from([
+            (
+                "@@conditions//:chosen".into(),
+                Value::Tuple(vec![Value::String("//dependency:messages".into())]),
+            ),
+            (
+                "//conditions:default".into(),
+                Value::List(vec![Value::String("local".into())]),
+            ),
+        ])));
+        let dependencies = Value::Configurable {
+            op: ConfigurableOp::Add,
+            left: selector.clone(),
+            right: selector,
+        };
+        let calls = expand_tf_proto_library(
+            "tf_proto_library",
+            &[],
+            &HashMap::from([
+                ("name".into(), Value::String("root".into())),
+                (
+                    "srcs".into(),
+                    Value::List(vec![Value::String("root.proto".into())]),
+                ),
+                ("make_default_target_header_only".into(), Value::Bool(true)),
+                ("protodeps".into(), dependencies.clone()),
+            ]),
+        )?;
+        let owner = calls
+            .iter()
+            .find(|call| {
+                call.kwargs.get("name") == Some(&Value::String("root_genproto_owner".into()))
+            })
+            .unwrap();
+        assert_eq!(
+            owner.kwargs.get("protodeps"),
+            Some(&dependencies),
+            "generation closure must retain original source deps"
+        );
+        let implementation = calls
+            .iter()
+            .find(|call| call.kwargs.get("name") == Some(&Value::String("root_cc_impl".into())))
+            .unwrap();
+        let Some(Value::Configurable {
+            left: prefix,
+            right,
+            ..
+        }) = implementation.kwargs.get("protodeps")
+        else {
+            panic!("missing owner plus conditional impl dependencies");
+        };
+        assert_eq!(
+            prefix.as_ref(),
+            &Value::List(vec![Value::String(":root_genproto_owner".into())])
+        );
+        let Value::Configurable { left, right, .. } = right.as_ref() else {
+            panic!("lost concatenation");
+        };
+        assert!(
+            Arc::ptr_eq(left, right),
+            "shared metadata must remain shared, not expand exponentially"
+        );
+        let Value::Select(branches) = left.as_ref() else {
+            panic!("lost select");
+        };
+        assert_eq!(
+            branches.get("@@conditions//:chosen"),
+            Some(&Value::List(vec![Value::String(
+                "//dependency:messages_cc_impl".into()
+            )]))
+        );
+        assert_eq!(
+            branches.get("//conditions:default"),
+            Some(&Value::List(vec![Value::String("local_cc_impl".into())]))
+        );
+        assert!(rewrite_proto_dependencies(&Value::List(vec![Value::Bool(true)])).is_err());
+        assert!(rewrite_proto_dependencies(&Value::String(":not_a_list".into())).is_err());
+        Ok(())
+    }
+    #[test]
+    fn tf_proto_macro_preserves_declared_tool_owner_and_runtime_select() -> Result<()> {
+        let mut evaluator = Evaluator::new();
+        evaluator.set_current_repository(Some("consumer".into()));
+        evaluator.set_current_package("pkg".into());
+        let tool = evaluator.qualify_proto_tool_label(&Value::String("//tools:protoc".into()))?;
+        assert_eq!(tool, "@@consumer//tools:protoc");
+        assert_eq!(
+            evaluator.qualify_proto_tool_label(&Value::String("@//tools:protoc".into()))?,
+            "@@//tools:protoc"
+        );
+        let attributes = HashMap::from([
+            ("name".into(), Value::String("messages".into())),
+            (
+                "srcs".into(),
+                Value::List(vec![Value::String("nested/value.proto".into())]),
+            ),
+            ("make_default_target_header_only".into(), Value::Bool(true)),
+            ("protoc".into(), Value::String(tool.clone())),
+            ("cc_grpc_version".into(), Value::String("1.0".into())),
+            (
+                "cc_libs".into(),
+                Value::List(vec![Value::String(":runtime".into())]),
+            ),
+        ]);
+        let calls = expand_tf_proto_library("tf_proto_library", &[], &attributes)?;
+        let generation = calls
+            .iter()
+            .find(|call| {
+                call.kwargs.get("name") == Some(&Value::String("messages_genproto_owner".into()))
+            })
+            .unwrap();
+        let implementation = calls
+            .iter()
+            .find(|call| call.kwargs.get("name") == Some(&Value::String("messages_cc_impl".into())))
+            .unwrap();
+        let base = calls
+            .iter()
+            .find(|call| call.kwargs.get("name") == Some(&Value::String("messages".into())))
+            .unwrap();
+        assert_eq!(generation.kwargs.get("protoc"), Some(&Value::String(tool)));
+        assert!(!generation.kwargs.contains_key("cc_libs"));
+        assert!(!base.kwargs.contains_key("protoc"));
+        assert!(!implementation.kwargs.contains_key("protoc"));
+        for target in [generation, implementation] {
+            assert_eq!(
+                target.kwargs.get("cc_grpc_version"),
+                Some(&Value::String("1.0".into()))
+            );
+        }
+        assert_eq!(
+            implementation.kwargs.get("_rush_tf_proto_generation_owner"),
+            Some(&Value::String(":messages_genproto_owner".into()))
+        );
+        let Some(Value::Configurable {
+            op: ConfigurableOp::Add,
+            left,
+            right,
+        }) = implementation.kwargs.get("cc_libs")
+        else {
+            panic!("runtime conditional must remain unresolved metadata");
+        };
+        assert_eq!(
+            left.as_ref(),
+            &Value::List(vec![Value::String(":runtime".into())])
+        );
+        let Value::Select(branches) = right.as_ref() else {
+            panic!("missing runtime select");
+        };
+        assert_eq!(
+            branches.get("@local_xla//xla/tsl:tsl_protobuf_header_only"),
+            Some(&Value::List(vec![Value::String(
+                "@com_google_protobuf//:protobuf_headers".into()
+            )]))
+        );
+        assert_eq!(
+            branches.get("//conditions:default"),
+            Some(&Value::List(vec![Value::String(
+                "@com_google_protobuf//:protobuf".into()
+            )]))
+        );
+        Ok(())
+    }
     #[test]
     fn test_function_call() {
         let root = tempfile::tempdir().unwrap();

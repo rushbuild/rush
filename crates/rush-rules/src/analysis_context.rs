@@ -174,6 +174,10 @@ pub struct AnalysisContext<'a> {
     /// slice via `with_labeled_dep_providers`.
     labeled_dep_providers:
         &'a [(String, std::sync::Arc<crate::providers::ProviderSet>)],
+    // Tool dependencies are available for executable resolution only, and are
+    // deliberately absent from target compilation/link-provider merging.
+    labeled_exec_dep_providers:
+        &'a [(String, std::sync::Arc<crate::providers::ProviderSet>)],
 }
 
 impl<'a> AnalysisContext<'a> {
@@ -205,6 +209,7 @@ impl<'a> AnalysisContext<'a> {
             native_namespace_error: None,
             extra_proto_paths,
             labeled_dep_providers: &[],
+            labeled_exec_dep_providers: &[],
         }
     }
 
@@ -283,6 +288,22 @@ impl<'a> AnalysisContext<'a> {
     ) -> Self {
         self.labeled_dep_providers = providers;
         self
+    }
+
+    /// Attach actual providers of declared exec-only dependencies. This view
+    /// does not instantiate a separate exec configuration in the legacy graph.
+    pub fn with_labeled_exec_dep_providers(
+        mut self,
+        providers: &'a [(String, std::sync::Arc<crate::providers::ProviderSet>)],
+    ) -> Self {
+        self.labeled_exec_dep_providers = providers;
+        self
+    }
+
+    pub fn labeled_exec_dep_providers(
+        &self,
+    ) -> &[(String, std::sync::Arc<crate::providers::ProviderSet>)] {
+        self.labeled_exec_dep_providers
     }
 
     /// Borrow the labeled dep providers slice (in `node.dependencies`
