@@ -4464,11 +4464,12 @@ cc_library(
             .bzl_loader
             .lock()
             .map_err(|error| anyhow::anyhow!("Failed to lock .bzl loader: {error}"))?
-            .resolve_repository_for_owner(
+            .resolve_repository_for_owner_with_target(
                 repository,
                 canonical_label,
                 current_repository,
                 current_repo_root,
+                Some(rest),
             )
             .with_context(|| {
                 format!(

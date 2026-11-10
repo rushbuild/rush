@@ -6274,6 +6274,22 @@ impl BzlLoader {
         owner_repository: Option<&str>,
         owner_repo_root: &Path,
     ) -> Result<Option<(String, PathBuf)>> {
+        self.resolve_repository_for_owner_with_target(apparent, canonical_label, owner_repository, owner_repo_root, None)
+    }
+
+    /// Resolve a repository for an exact graph/configuration target. Keep this
+    /// target purpose distinct from .bzl module admission: a module-only proof
+    /// must not authorize fetching or loading a graph target. The target path
+    /// is owner-relative; repository mapping is applied before constructing the
+    /// canonical materialization label.
+    pub fn resolve_repository_for_owner_with_target(
+        &self,
+        apparent: &str,
+        canonical_label: bool,
+        owner_repository: Option<&str>,
+        owner_repo_root: &Path,
+        requested_target: Option<&str>,
+    ) -> Result<Option<(String, PathBuf)>> {
         let owner_mapping = |owner: &str, apparent: &str| {
             self.repo_mappings.get(owner).and_then(|mapping| {
                 mapping
@@ -6323,11 +6339,23 @@ impl BzlLoader {
                     apparent.to_string()
                 }
             };
+            let target = requested_target.map(|target| format!("@{repository}//{target}"));
             let registered = self.external_repos.get(&repository).map(|path| path.value().clone());
             if let Some(path) = registered {
-                let path = self.admit_registered_workspace_repository(&repository, &path)?;
+                let path = self.admit_registered_workspace_repository_with_purpose(
+                    &repository, &path, target.as_deref(), false,
+                )?;
                 self.external_repos.insert(repository.clone(), path.clone());
                 return Ok(Some((repository, path)));
+            }
+            if target.is_some() && (rush_incremental::tracked::exists(&self.workspace_root.join("WORKSPACE"))
+                || rush_incremental::tracked::exists(&self.workspace_root.join("WORKSPACE.bazel"))) {
+                let path = Self::fetch_declared_workspace_repository_for_label(&self.workspace_root, &repository, target.as_deref())?;
+                if let Some(path) = path {
+                    self.add_managed_workspace_source(repository.clone(), path.clone());
+                    return Ok(Some((repository, path)));
+                }
+                return Ok(None);
             }
             Self::push_thread_context(owner_repo_root.to_path_buf(), PathBuf::new());
             let fetched = self.try_fetch_known_repo(&repository, canonical_label, None, None);
@@ -8023,11 +8051,11 @@ impl BzlLoader {
         Self::fetch_repo_via_bazel_with_policy(workspace_root, repo_name, false, true, requested_label, required_module)
     }
 
-    fn admit_registered_workspace_repository(&self, repo_name: &str, path: &Path) -> Result<PathBuf> {
-        self.admit_registered_workspace_repository_for_label(repo_name, path, None)
+    fn admit_registered_workspace_repository_for_label(&self, repo_name: &str, path: &Path, requested_label: Option<&str>) -> Result<PathBuf> {
+        self.admit_registered_workspace_repository_with_purpose(repo_name, path, requested_label, true)
     }
 
-    fn admit_registered_workspace_repository_for_label(&self, repo_name: &str, path: &Path, requested_label: Option<&str>) -> Result<PathBuf> {
+    fn admit_registered_workspace_repository_with_purpose(&self, repo_name: &str, path: &Path, requested_label: Option<&str>, module_source: bool) -> Result<PathBuf> {
         if repo_name == "bazel_tools" {
             return self.admit_builtin_repository(repo_name, Some(path))?
                 .ok_or_else(|| anyhow!("bazel_tools has no admitted source root"));
@@ -8044,9 +8072,9 @@ impl BzlLoader {
                 || self.workspace_root.join("WORKSPACE.bazel").exists())
                 && self.is_implicit_system_adapter(repo_name, path);
             if declared_adapter || managed {
-                let materialized = match requested_label {
-                    Some(module) => Self::fetch_declared_workspace_repository_for_module(&self.workspace_root, repo_name, module),
-                    None => Self::fetch_declared_workspace_repository(&self.workspace_root, repo_name),
+                let materialized = match (requested_label, module_source) {
+                    (Some(module), true) => Self::fetch_declared_workspace_repository_for_module(&self.workspace_root, repo_name, module),
+                    _ => Self::fetch_declared_workspace_repository_for_label(&self.workspace_root, repo_name, requested_label),
                 }?;
                 let materialized = materialized.ok_or_else(|| anyhow!("declared repository @{} has no verified source root", repo_name))?;
                 self.add_managed_workspace_source(repo_name.to_string(), materialized.clone());

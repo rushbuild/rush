@@ -791,3 +791,89 @@ async fn automatic_bazel_tools_loads_real_supplier_and_revalidates_analyzer_cont
     assert_ne!(before_stat.ino(), after_stat.ino(), "replacement control did not actually replace the RC file");
     drop(shutdown);
 }
+
+/// A configuration condition names one package/target. Its source admission
+/// must not recursively load unrelated packages in the same generated repo.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires explicitly configured RUSH_BAZEL_PATH pointing to Bazel 6.5.0"]
+async fn configuration_repository_materialization_keeps_exact_target_scope() {
+    let binary = PathBuf::from(std::env::var_os("RUSH_BAZEL_PATH").expect("set exact Bazel 6.5.0"));
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "bazel 6.5.0");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("rules.bzl"), r#"
+def _generate(ctx):
+    ctx.file("WORKSPACE", "workspace(name = 'condition_source')\n")
+    ctx.file("BUILD", "exports_files(['defs.bzl'])\n")
+    ctx.file("defs.bzl", "VALUE = 42\n")
+    ctx.file("settings/BUILD", "config_setting(name = 'enabled', values = {'compilation_mode': 'opt'}, visibility = ['//visibility:public'])\n")
+    ctx.file("selected/BUILD", "alias(name = 'requires_broken', actual = '//unrelated:bad')\n")
+    ctx.file("unrelated/BUILD", "fail('unrelated package must not be loaded for selected condition')\n")
+condition_source = repository_rule(implementation = _generate)
+"#).unwrap();
+    std::fs::write(root.join("WORKSPACE"), r#"
+workspace(name = "exact_condition_source")
+load("//:rules.bzl", "condition_source")
+condition_source(name = "condition_source")
+"#).unwrap();
+    std::fs::write(root.join("BUILD"), r#"
+exports_files(["rules.bzl"])
+filegroup(name = "chosen")
+filegroup(name = "root", srcs = select({
+    "@condition_source//settings:enabled": [":chosen"],
+    "//conditions:default": ["//missing:wrong_branch"],
+}))
+filegroup(name = "invalid_requested_package", srcs = select({
+    "@condition_source//unrelated:enabled": [],
+    "//conditions:default": [],
+}))
+"#).unwrap();
+    let cache = rush_build::cache_paths::workspace_cache_root(root);
+    assert!(cache.starts_with(root));
+    let output_base = cache.join("bazel_output_base");
+    let _shutdown = BazelShutdown { binary: binary.clone(), output: output_base.clone(), workspace: root.to_owned() };
+    let recursive = Command::new(&binary).arg("--output_base").arg(&output_base)
+        .args(["fetch", "@condition_source//..."]).current_dir(root).output().unwrap();
+    assert!(!recursive.status.success(), "recursive negative control unexpectedly succeeded");
+    assert!(String::from_utf8_lossy(&recursive.stderr).contains("unrelated package must not be loaded"));
+
+    let orchestrator = BuildOrchestrator::with_config(root.to_owned(), rush_build::BuildConfig::Opt);
+    // This runs the actual configured-package preloader and target dependency
+    // walk. A successful selected condition must not hide a bad requested one.
+    orchestrator.build_with_dependencies(vec!["//:root".into()]).await.unwrap();
+    let error = orchestrator.build_with_dependencies(vec!["//:invalid_requested_package".into()]).await.unwrap_err();
+    assert!(format!("{error:#}").contains("unrelated package must not be loaded"), "{error:#}");
+
+    // Owner-relative aliases must render the canonical repository name in the
+    // exact fetch goal. Use a fresh proof/output base so reuse cannot conceal
+    // an accidentally apparent-name materialization request.
+    let mapped_root = root.join("mapped");
+    std::fs::create_dir(&mapped_root).unwrap();
+    for name in ["rules.bzl", "WORKSPACE", "BUILD"] {
+        std::fs::copy(root.join(name), mapped_root.join(name)).unwrap();
+    }
+    let mapped_cache = rush_build::cache_paths::workspace_cache_root(&mapped_root);
+    let _mapped_shutdown = BazelShutdown { binary, output: mapped_cache.join("bazel_output_base"), workspace: mapped_root.clone() };
+    let mapped = BuildOrchestrator::with_workspace(mapped_root.clone());
+    let io = mapped.install_fresh_tracked_io_for_test();
+    tokio::task::block_in_place(|| rush_incremental::tracked::scope(io, || {
+        let mut loader = rush_starlark::BzlLoader::new(mapped_root.clone());
+        loader.set_repo_mapping_for("consumer", HashMap::from([("apparent_condition".into(), "condition_source".into())]));
+        let module = loader.load_bzl("@condition_source//:defs.bzl", &[("VALUE".into(), "VALUE".into())], None).unwrap();
+        assert_eq!(module["VALUE"], rush_starlark::Value::Int(42));
+        // An exact module-only proof cannot authorize a graph target. Fetching
+        // a selected alias must still traverse its real target dependency.
+        let error = loader.resolve_repository_for_owner_with_target(
+            "apparent_condition", false, Some("consumer"), &mapped_root.join("consumer"), Some("selected:requires_broken"),
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("fetch @condition_source//selected:requires_broken"), "{error:#}");
+        let (name, source) = loader.resolve_repository_for_owner_with_target(
+            "apparent_condition", false, Some("consumer"), &mapped_root.join("consumer"), Some("settings:enabled"),
+        ).unwrap().unwrap();
+        assert_eq!(name, "condition_source");
+        assert!(source.join("settings/BUILD").is_file());
+        assert!(source.join("unrelated/BUILD").is_file());
+    }));
+}
