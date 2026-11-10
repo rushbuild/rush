@@ -82,6 +82,7 @@ pub mod metrics;
 pub mod mmap_io;
 pub mod optimization;
 pub mod output_tree;
+pub(crate) mod native_execroot;
 pub mod persistent_workers;
 pub mod profile;
 pub mod profiling;
