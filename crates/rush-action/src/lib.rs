@@ -15,6 +15,7 @@ pub mod action_manifest;
 pub mod artifact_value;
 pub mod canonical_action_key;
 pub mod command_spec;
+pub mod compiler_discovery;
 pub mod external_action_key;
 pub mod ids;
 pub mod scheduler;
