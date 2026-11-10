@@ -4,7 +4,7 @@
 
 //! Per-command compile policy, pending declarations and uncached diagnostics.
 //!
-//! Only the explicit diagnostic mode defers literal-header proof. It executes
+//! Owned always-run modes defer literal-header proof. They execute
 //! real commands with no reusable cache/snapshot authority. A declaration/order
 //! or parsed depfile is not proof of complete read-time inputs or SDK values.
 
@@ -17,18 +17,154 @@ use std::collections::HashSet;
 
 pub(crate) const COMPILE_DISCOVERY_ENV: &[u8] = b"RUSH_CPP_DISCOVERY";
 
-/// Decode only this immutable client's bytes. Absence resets to Literal;
-/// unknown, empty or non-UTF8 values refuse instead of inheriting daemon state.
-/// Calling this does not enable any execution or change a cache policy.
-pub(crate) fn requested_compile_mode(command: &CommandSemantics) -> Result<NativeCompileMode> {
+/// Authored request policy, distinct from an attempt's effective execution mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestedCompilePolicy {
+    Auto,
+    LiteralOnly,
+    AlwaysRunLocalV1,
+    LegacyDiagnostic,
+}
+impl RequestedCompilePolicy {
+    pub(crate) fn initial_mode(self) -> NativeCompileMode {
+        match self {
+            Self::Auto | Self::LiteralOnly => NativeCompileMode::Literal,
+            Self::AlwaysRunLocalV1 => NativeCompileMode::AlwaysRunLocalV1,
+            Self::LegacyDiagnostic => NativeCompileMode::UncachedDiagnosticV1,
+        }
+    }
+}
+
+/// Decode immutable client bytes, never the resident process environment.
+pub(crate) fn requested_compile_policy(
+    command: &CommandSemantics,
+) -> Result<RequestedCompilePolicy> {
     match command.getenv(COMPILE_DISCOVERY_ENV) {
-        None | Some(b"literal") => Ok(NativeCompileMode::Literal),
-        Some(b"uncached-diagnostic-v1") => Ok(NativeCompileMode::UncachedDiagnosticV1),
+        None => Ok(RequestedCompilePolicy::Auto),
+        Some(b"literal") => Ok(RequestedCompilePolicy::LiteralOnly),
+        Some(b"always-run-local-v1") => Ok(RequestedCompilePolicy::AlwaysRunLocalV1),
+        Some(b"uncached-diagnostic-v1") => Ok(RequestedCompilePolicy::LegacyDiagnostic),
         Some(_) => Err(anyhow!(
-            "RUSH_CPP_DISCOVERY requires literal or uncached-diagnostic-v1"
+            "RUSH_CPP_DISCOVERY requires literal, always-run-local-v1 or uncached-diagnostic-v1"
         )),
     }
 }
+
+/// Initial mode only. Strict nested test builds intentionally do not perform
+/// the build entrypoint's Auto transition while their outer shared lease lives.
+pub(crate) fn requested_compile_mode(command: &CommandSemantics) -> Result<NativeCompileMode> {
+    Ok(requested_compile_policy(command)?.initial_mode())
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum AutoAttemptStage {
+    Registry(
+        NativeCompileMode,
+        std::sync::Weak<tokio::sync::Mutex<ArtifactRegistry>>,
+    ),
+    PrewriterRefusal,
+    RequestFinished,
+    AfterLiteralUnwind,
+    BeforeOwnedLease,
+    BeforeExecution(NativeCompileMode),
+}
+
+/// One effective analysis/execution attempt. It owns no lease or registry, so
+/// returning from an attempt really releases those before any Auto transition.
+/// Cancellation originates at the public caller and is never reset on retry.
+pub(crate) struct NativeCompileAttempt {
+    pub(crate) mode: NativeCompileMode,
+    pub(crate) cancel: tokio::sync::watch::Sender<bool>,
+    pub(crate) cancelled: tokio::sync::watch::Receiver<bool>,
+    prewriter: std::sync::atomic::AtomicBool,
+}
+impl NativeCompileAttempt {
+    pub(crate) fn new(
+        mode: NativeCompileMode,
+        cancel: tokio::sync::watch::Sender<bool>,
+        cancelled: tokio::sync::watch::Receiver<bool>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            mode,
+            cancel,
+            cancelled,
+            prewriter: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    pub(crate) fn before_execution(&self) -> Result<()> {
+        // Irreversible for this attempt, including any tail reanalysis.
+        self.prewriter
+            .store(false, std::sync::atomic::Ordering::Release);
+        if self.mode.is_owned_always_run() {
+            self.check_cancelled()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        ensure!(
+            !*self.cancelled.borrow(),
+            "native command was cancelled before owned execution"
+        );
+        Ok(())
+    }
+
+    /// Called ONLY by the fresh PASS-A analysis refusal boundary. A scanner
+    /// reason from runtime/restore cannot manufacture this private wrapper.
+    pub(crate) fn prewriter_refusal(
+        self: &std::sync::Arc<Self>,
+        label: &str,
+        required: &rush_rules::analysis_context::CompilerExecutionRequired,
+    ) -> anyhow::Error {
+        PrewriterCompilerExecutionRequired {
+            attempt: std::sync::Arc::downgrade(self),
+            label: label.to_owned(),
+            required: required.clone(),
+        }
+        .into()
+    }
+
+    pub(crate) fn retry_reason(
+        self: &std::sync::Arc<Self>,
+        error: &anyhow::Error,
+    ) -> Option<String> {
+        if self.mode != NativeCompileMode::Literal
+            || !self.prewriter.load(std::sync::atomic::Ordering::Acquire)
+            || *self.cancelled.borrow()
+        {
+            return None;
+        }
+        let refusal = error.downcast_ref::<PrewriterCompilerExecutionRequired>()?;
+        let owner = refusal.attempt.upgrade()?;
+        std::sync::Arc::ptr_eq(self, &owner).then(|| refusal.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct PrewriterCompilerExecutionRequired {
+    attempt: std::sync::Weak<NativeCompileAttempt>,
+    label: String,
+    required: rush_rules::analysis_context::CompilerExecutionRequired,
+}
+impl std::fmt::Debug for NativeCompileAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeCompileAttempt")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for PrewriterCompilerExecutionRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native execution namespace analysis refused for {}: {}",
+            self.label, self.required
+        )
+    }
+}
+impl std::error::Error for PrewriterCompilerExecutionRequired {}
 
 /// Check a pending record against its build registry and a caller-reported
 /// producer sequence. This only checks structural ordering: the later manager
@@ -389,7 +525,7 @@ impl WorkspaceLease {
         let authority = AdmissionDirectory::open(workspace, true)?;
         hook()?;
         let file = authority.lease(true)?;
-        let operation = if mode == NativeCompileMode::UncachedDiagnosticV1 {
+        let operation = if mode.is_owned_always_run() {
             nix::fcntl::FlockArg::LockExclusiveNonblock
         } else {
             nix::fcntl::FlockArg::LockSharedNonblock
@@ -627,6 +763,7 @@ pub(crate) struct DiagnosticOwnedExecution {
 /// Execution state exists for one diagnostic invocation only. Successful actual
 /// actions/targets add completion facts; the table never leaves this build.
 pub(crate) struct DiagnosticBuild {
+    mode: NativeCompileMode,
     cancel: tokio::sync::watch::Sender<bool>,
     cancelled: tokio::sync::watch::Receiver<bool>,
     pub(crate) declarations: std::sync::Arc<rush_rules::context::PendingCompileDeclarations>,
@@ -664,6 +801,34 @@ impl DiagnosticBuild {
         cancel: tokio::sync::watch::Sender<bool>,
         cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> Result<std::sync::Arc<Self>> {
+        Self::new_with_mode(
+            declarations,
+            registry,
+            manager,
+            lease,
+            command,
+            workspace,
+            cancel,
+            cancelled,
+            requested_compile_mode(command)?,
+        )
+    }
+
+    pub(crate) fn new_with_mode(
+        declarations: rush_rules::context::PendingCompileDeclarations,
+        registry: std::sync::Arc<tokio::sync::Mutex<ArtifactRegistry>>,
+        manager: std::sync::Arc<crate::action_manager::RushActionManager>,
+        lease: std::sync::Arc<WorkspaceLease>,
+        command: &CommandSemantics,
+        workspace: std::path::PathBuf,
+        cancel: tokio::sync::watch::Sender<bool>,
+        cancelled: tokio::sync::watch::Receiver<bool>,
+        mode: NativeCompileMode,
+    ) -> Result<std::sync::Arc<Self>> {
+        ensure!(
+            mode.is_owned_always_run(),
+            "owned execution requires an owned effective mode"
+        );
         let environment = command
             .env()
             .iter()
@@ -679,6 +844,7 @@ impl DiagnosticBuild {
             .map(|pending| DiagnosticObservationRequest::new(pending.clone()))
             .collect();
         Ok(std::sync::Arc::new(Self {
+            mode,
             compile_observations,
             declarations: std::sync::Arc::new(declarations),
             registry,
@@ -699,6 +865,17 @@ impl DiagnosticBuild {
             cancel,
             cancelled,
         }))
+    }
+
+    pub(crate) fn matches_snapshot(
+        &self,
+        snapshot: &crate::analysis_snapshot::AnalysisSnapshot,
+    ) -> bool {
+        self.mode == snapshot.native_compile_mode
+            && self.mode.is_owned_always_run()
+            && std::sync::Arc::ptr_eq(&self.registry, &snapshot.artifact_registry)
+            && self.command.config_fingerprint() == snapshot.built_under.config_fingerprint()
+            && self.workspace == snapshot.key.workspace_realpath
     }
 
     pub(crate) fn manager_for(
@@ -858,7 +1035,7 @@ impl CancelOwnedExecution {
     pub(crate) fn new(sender: tokio::sync::watch::Sender<bool>) -> Self {
         Self(Some(sender))
     }
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.0.take();
     }
 }
@@ -888,7 +1065,7 @@ impl rush_rules::context::ActionManager for DiagnosticManager {
             "inline options belongs to another target"
         );
         ensure!(
-            requested_compile_mode(&self.build.command)? == NativeCompileMode::UncachedDiagnosticV1,
+            self.build.mode.is_owned_always_run(),
             "inline options requires this build's diagnostic request"
         );
         {
@@ -1491,6 +1668,27 @@ mod tests {
         let diagnostic = request(Some(b"uncached-diagnostic-v1"));
         let reset = request(None);
         let literal = request(Some(b"literal"));
+        let production = request(Some(b"always-run-local-v1"));
+        assert_eq!(
+            requested_compile_policy(&reset).unwrap(),
+            RequestedCompilePolicy::Auto
+        );
+        assert_eq!(
+            requested_compile_policy(&literal).unwrap(),
+            RequestedCompilePolicy::LiteralOnly
+        );
+        assert_eq!(
+            requested_compile_mode(&production).unwrap(),
+            NativeCompileMode::AlwaysRunLocalV1
+        );
+        assert!(requested_compile_mode(&production)
+            .unwrap()
+            .is_owned_always_run());
+        assert_ne!(
+            production.config_fingerprint(),
+            diagnostic.config_fingerprint()
+        );
+        assert_ne!(production.config_fingerprint(), reset.config_fingerprint());
         assert_eq!(
             requested_compile_mode(&diagnostic).unwrap(),
             NativeCompileMode::UncachedDiagnosticV1
@@ -1519,6 +1717,84 @@ mod tests {
             requested_compile_mode(&diagnostic).unwrap(),
             NativeCompileMode::UncachedDiagnosticV1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_auto_policy_retry_requires_live_exact_attempt_and_prewriter_phase() -> Result<()> {
+        use anyhow::Context;
+        use rush_rules::BuildRule;
+        let temp = tempfile::tempdir()?;
+        std::fs::write(
+            temp.path().join("value.cc"),
+            "#define JOIN(a,b) a ## b\nint value(){return JOIN(4,2);}\n",
+        )?;
+        let rule = rush_rules::rules_cc::CcLibraryRule.parse_attributes(
+            &std::collections::HashMap::from([
+                ("name".into(), rush_rules::Value::String("value".into())),
+                (
+                    "srcs".into(),
+                    rush_rules::Value::List(vec![rush_rules::Value::String("value.cc".into())]),
+                ),
+            ]),
+        )?;
+        let mut registry = ArtifactRegistry::new();
+        let resolver = StubIncludeResolver::new(temp.path().to_path_buf());
+        let toolchain = Toolchain::default();
+        let extra = Vec::new();
+        let mut context = AnalysisContext::new(
+            TargetId(1),
+            ConfigId::DEFAULT,
+            "",
+            None,
+            temp.path(),
+            &mut registry,
+            &resolver,
+            &toolchain,
+            temp.path(),
+            &extra,
+        )
+        .with_native_execution_root(Some(temp.path()));
+        rush_incremental::tracked::test_scope(temp.path(), || {
+            rule.analyze(&mut context, &[]);
+        });
+        let required = context
+            .native_namespace_analysis_failure()
+            .and_then(|failure| failure.compiler_execution_required())
+            .context("real scanner did not report token pasting")?;
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let attempt = NativeCompileAttempt::new(
+            NativeCompileMode::Literal,
+            cancel.clone(),
+            cancelled.clone(),
+        );
+        let error = attempt.prewriter_refusal("//:value", required);
+        assert!(attempt.retry_reason(&error).is_some());
+        let unrelated = NativeCompileAttempt::new(
+            NativeCompileMode::Literal,
+            cancel.clone(),
+            cancelled.clone(),
+        );
+        assert!(unrelated.retry_reason(&error).is_none());
+        assert!(attempt
+            .retry_reason(&anyhow!("token pasting requires compiler execution"))
+            .is_none());
+        attempt.before_execution()?;
+        assert!(
+            attempt.retry_reason(&error).is_none(),
+            "no retry after restore or any writer boundary"
+        );
+        let fresh =
+            NativeCompileAttempt::new(NativeCompileMode::Literal, cancel.clone(), cancelled);
+        let refusal = fresh.prewriter_refusal("//:value", required);
+        cancel.send(true)?;
+        assert!(fresh.retry_reason(&refusal).is_none());
+        drop(fresh);
+        assert!(
+            unrelated.retry_reason(&refusal).is_none(),
+            "retired invocation cannot authorize new one"
+        );
+        Ok(())
     }
 
     fn artifact(
@@ -1834,10 +2110,10 @@ mod tests {
     fn compiler_discovery_workspace_lease_excludes_cross_process_writers() -> Result<()> {
         const CHILD: &str = "RUSH_TEST_DISCOVERY_LEASE_CHILD";
         if let Some(root) = std::env::var_os(CHILD) {
-            let mode = if std::env::var("RUSH_TEST_DISCOVERY_LEASE_MODE").unwrap() == "exclusive" {
-                NativeCompileMode::UncachedDiagnosticV1
-            } else {
-                NativeCompileMode::Literal
+            let mode = match std::env::var("RUSH_TEST_DISCOVERY_LEASE_MODE").unwrap().as_str() {
+                "exclusive" => NativeCompileMode::UncachedDiagnosticV1,
+                "production" => NativeCompileMode::AlwaysRunLocalV1,
+                _ => NativeCompileMode::Literal,
             };
             let expected = std::env::var("RUSH_TEST_DISCOVERY_LEASE_OK").unwrap() == "yes";
             assert_eq!(
@@ -1858,6 +2134,7 @@ mod tests {
         let shared = WorkspaceLease::acquire(temp.path(), NativeCompileMode::Literal)?;
         run("shared", true)?;
         run("exclusive", false)?;
+        run("production", false)?;
         drop(shared);
         let exclusive =
             WorkspaceLease::acquire(temp.path(), NativeCompileMode::UncachedDiagnosticV1)?;
@@ -1865,6 +2142,40 @@ mod tests {
         run("exclusive", false)?;
         drop(exclusive);
         run("exclusive", true)?;
+        let production = WorkspaceLease::acquire(temp.path(), NativeCompileMode::AlwaysRunLocalV1)?;
+        run("shared", false)?;
+        run("exclusive", false)?;
+        run("production", false)?;
+        drop(production);
+        run("production", true)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compiler_auto_policy_production_revocation_is_visible_to_fresh_process() -> Result<()> {
+        const CHILD: &str = "RUSH_TEST_ALWAYS_RUN_REVOKE_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let lease = WorkspaceLease::acquire(Path::new(&root), NativeCompileMode::Literal)?;
+            assert_ne!(
+                format!("{:?}", lease.token(false)?),
+                std::env::var("RUSH_TEST_OLD_NATIVE_DOMAIN")?
+            );
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let before = {
+            let shared = WorkspaceLease::acquire(temp.path(), NativeCompileMode::Literal)?;
+            shared.token(false)?
+        };
+        {
+            let owned = WorkspaceLease::acquire(temp.path(), NativeCompileMode::AlwaysRunLocalV1)?;
+            assert_ne!(owned.token(true)?, before);
+        }
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "compiler_discovery::tests::compiler_auto_policy_production_revocation_is_visible_to_fresh_process", "--nocapture"])
+            .env(CHILD, temp.path()).env("RUSH_TEST_OLD_NATIVE_DOMAIN", format!("{before:?}")).status()?;
+        ensure!(status.success(), "fresh native domain reader failed");
         Ok(())
     }
 

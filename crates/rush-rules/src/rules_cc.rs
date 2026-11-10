@@ -740,8 +740,7 @@ async fn runtime_quote_roots(context: &BuildContext, mut paths: Vec<PathBuf>) ->
         &context.workspace_root,
         &context.output_dir,
         context.native_execution_root().is_some()
-            || context.native_compile_mode()
-                == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+            || context.native_compile_mode().is_owned_always_run(),
     ) {
         if !paths.contains(&root) {
             paths.push(root);
@@ -1186,6 +1185,8 @@ fn namespace_compile_headers(
     let mut selected = HashSet::new();
     let mut visited = HashSet::new();
     let mut forced = search.forced.clone();
+    let mut requires_compiler = false;
+    let mut conditional_includes = false;
     while let Some(path) = queue.pop() {
         let canonical = tracked::canonicalize(&path).with_context(|| format!(
             "native execution namespace requires source/header {} before header admission", path.display()))?;
@@ -1199,8 +1200,13 @@ fn namespace_compile_headers(
             .ok_or_else(|| anyhow!("native execution namespace requires descriptor-bound regular-file reads for {}", path.display()))?;
         let body = std::str::from_utf8(&read.contents)
             .with_context(|| format!("namespace header/source {} must be UTF-8", path.display()))?;
-        let mut includes = namespace_literal_includes(body)
+        let parsed = namespace_checked_literal_includes(body)
             .with_context(|| format!("header admission for {}", path.display()))?;
+        requires_compiler |= parsed.requires_compiler;
+        conditional_includes |= !parsed.conditional_includes.is_empty();
+        // The actual compiler selects conditional edges. Resolving both
+        // branches here could pick a shadow header from an inactive branch.
+        let mut includes = parsed.includes;
         if path == source {
             // -include searches cwd before the ordinary quote/include chains.
             includes.extend(forced.drain(..).map(|token| (token, true, true)));
@@ -1267,6 +1273,14 @@ fn namespace_compile_headers(
             }
         }
     }
+    // A soft source/header cannot hide a later hard read, search, provider or
+    // lexical error. Never return a usable header certificate with this flag.
+    if requires_compiler {
+        return Err(crate::analysis_context::CompilerExecutionRequired::token_pasting().into());
+    }
+    if conditional_includes {
+        return Err(crate::analysis_context::CompilerExecutionRequired::conditional_includes().into());
+    }
     let mut selected: Vec<_> = selected.into_iter().collect();
     selected.sort();
     Ok(selected)
@@ -1297,13 +1311,8 @@ fn namespace_implicit_sdk_path(path: &Path) -> bool {
         .iter().any(|root| path.starts_with(root))
 }
 
-fn namespace_refuse_unsupported_preprocessor_tokens(body: &str) -> Result<()> {
-    if body.contains("??=")
-        || body.contains("??/")
-        || body.contains("%:")
-        || body.contains("##")
-        || body.contains('\0')
-    {
+fn namespace_refuse_hard_preprocessor_tokens(body: &str) -> Result<()> {
+    if body.contains("??=") || body.contains("??/") || body.contains("%:") || body.contains('\0') {
         return Err(anyhow!(
             "native execution namespace does not admit alternative preprocessor tokens"
         ));
@@ -1357,11 +1366,66 @@ fn namespace_phase2_logical_lines(body: &str) -> Result<String> {
     String::from_utf8(joined).context("namespace logical-line UTF-8")
 }
 
+struct NamespaceLiteralIncludes {
+    includes: Vec<(String, bool, bool)>,
+    conditional_includes: Vec<(String, bool, bool)>,
+    requires_compiler: bool,
+}
+
+#[cfg(test)]
 fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
+    let parsed = namespace_checked_literal_includes(body)?;
+    if parsed.requires_compiler {
+        return Err(crate::analysis_context::CompilerExecutionRequired::token_pasting().into());
+    }
+    if !parsed.conditional_includes.is_empty() {
+        return Err(crate::analysis_context::CompilerExecutionRequired::conditional_includes().into());
+    }
+    Ok(parsed.includes)
+}
+
+/// Track directive structure without evaluating the preprocessor expression.
+/// Each frame records whether its #else branch has already appeared.
+fn namespace_record_conditional(name: &str, operand: &str, stack: &mut Vec<bool>) -> Result<bool> {
+    match name {
+        "if" | "ifdef" | "ifndef" => {
+            anyhow::ensure!(
+                !operand.is_empty(),
+                "native execution namespace has an empty #{name} conditional"
+            );
+            stack.push(false);
+        }
+        "elif" | "elifdef" | "elifndef" => {
+            anyhow::ensure!(
+                !operand.is_empty() && stack.last() == Some(&false),
+                "native execution namespace has a malformed #{name} conditional"
+            );
+        }
+        "else" => {
+            anyhow::ensure!(
+                operand.is_empty() && stack.last() == Some(&false),
+                "native execution namespace has a malformed #else conditional"
+            );
+            *stack.last_mut().unwrap() = true;
+        }
+        "endif" => {
+            anyhow::ensure!(
+                operand.is_empty() && stack.pop().is_some(),
+                "native execution namespace has a malformed #endif conditional"
+            );
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Keep the literal edges even when token pasting requires real execution, so
+/// the caller can finish every existing hard header/search/ownership check.
+fn namespace_checked_literal_includes(body: &str) -> Result<NamespaceLiteralIncludes> {
     // Guard both raw and joined bytes: joining can reveal unsupported tokens.
-    namespace_refuse_unsupported_preprocessor_tokens(body)?;
+    namespace_refuse_hard_preprocessor_tokens(body)?;
     let logical = namespace_phase2_logical_lines(body)?;
-    namespace_refuse_unsupported_preprocessor_tokens(&logical)?;
+    namespace_refuse_hard_preprocessor_tokens(&logical)?;
     let body = logical.as_str();
     // Phase 2 precedes comment, quote, and directive recognition. This remains
     // a literal-include profile, not macro expansion or conditional evaluation.
@@ -1369,6 +1433,7 @@ fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
     let mut chars = body.chars().peekable();
     let mut quote = None;
     let mut block = false;
+    let mut token_pasting = false;
     while let Some(ch) = chars.next() {
         if block {
             if ch == '*' && chars.peek() == Some(&'/') { chars.next(); block = false; cleaned.push(' '); }
@@ -1380,6 +1445,9 @@ fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
             if ch == '\\' { if let Some(escaped) = chars.next() { cleaned.push(escaped); } }
             else if ch == delimiter { quote = None; }
             continue;
+        }
+        if ch == '#' && chars.peek() == Some(&'#') {
+            token_pasting = true;
         }
         if ch == 'R' && chars.peek() == Some(&'"') {
             return Err(anyhow!("native execution namespace does not admit raw-string include scanning"));
@@ -1413,26 +1481,58 @@ fn namespace_literal_includes(body: &str) -> Result<Vec<(String, bool, bool)>> {
     }
     if block { return Err(anyhow!("unterminated comment during namespace header admission")); }
     let mut includes = Vec::new();
+    let mut conditional_includes = Vec::new();
+    let mut conditional_stack = Vec::new();
     for line in cleaned.lines() {
         let Some(directive) = line.trim_start().strip_prefix('#') else { continue; };
         let directive = directive.trim_start();
         let end = directive.find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).unwrap_or(directive.len());
         let name = &directive[..end];
+        let operand = directive[end..].trim();
+        if namespace_record_conditional(name, operand, &mut conditional_stack)? {
+            continue;
+        }
         if matches!(name, "include_next" | "import" | "embed") {
             return Err(anyhow!("native execution namespace does not admit #{name}"));
         }
         if name != "include" { continue; }
-        let operand = directive[end..].trim();
         let (quoted, rest, closing) = if let Some(rest) = operand.strip_prefix('"') { (true, rest, '"') }
             else if let Some(rest) = operand.strip_prefix('<') { (false, rest, '>') }
             else { return Err(anyhow!("native execution namespace does not admit macro #include operands")); };
         let end = rest.find(closing).ok_or_else(|| anyhow!("unterminated #include operand"))?;
-        if end == 0 || !rest[end + 1..].trim().is_empty() || rest[..end].contains('\\') {
+        // A literal filename is not a token-paste operator. Preserve the old
+        // hard refusal even when a real ## macro elsewhere set the soft flag.
+        if end == 0
+            || !rest[end + 1..].trim().is_empty()
+            || rest[..end].contains('\\')
+            || rest[..end].contains("##")
+        {
             return Err(anyhow!("native execution namespace does not admit #include operand {operand:?}"));
         }
-        includes.push((rest[..end].to_string(), quoted, false));
+        let edge = (rest[..end].to_string(), quoted, false);
+        if conditional_stack.is_empty() {
+            includes.push(edge);
+        } else {
+            conditional_includes.push(edge);
+        }
     }
-    Ok(includes)
+    anyhow::ensure!(conditional_stack.is_empty(),
+        "native execution namespace has unterminated conditional directives");
+    // This flag is not an admission result. Only after all hard checks above
+    // may a caller either keep walking these literal edges or return soft.
+    // Preserve the old hard refusal for raw ## spellings that are not an
+    // operator in this existing lexer (comments, strings or header names).
+    // The Auto reason is limited to actual token-paste operator spellings.
+    if logical.contains("##") && !token_pasting {
+        return Err(anyhow!(
+            "native execution namespace does not admit alternative preprocessor tokens"
+        ));
+    }
+    Ok(NamespaceLiteralIncludes {
+        includes,
+        conditional_includes,
+        requires_compiler: token_pasting,
+    })
 }
 
 fn analysis_declare_compile(
@@ -1450,7 +1550,7 @@ fn analysis_declare_compile(
     // filegroup. It is not necessarily consumed by this translation unit.
     // Path interning preserves existing generated ArtifactIds and producers.
     let owned_headers = if ctx.native_execution_root().is_some()
-        || ctx.native_compile_mode() == crate::context::NativeCompileMode::UncachedDiagnosticV1
+        || ctx.native_compile_mode().is_owned_always_run()
     {
         let expanded = expand_cc_binary_srcs(owned_srcs, |label| {
             ctx.get_dependency_provider(label)
@@ -1465,7 +1565,7 @@ fn analysis_declare_compile(
     } else {
         Vec::new()
     };
-    if ctx.native_compile_mode() == crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+    if ctx.native_compile_mode().is_owned_always_run() {
         let declaration = (|| -> Result<_> {
             anyhow::ensure!(matches!(mnemonic, "CppCompile" | "CCompile") && outputs.len() == 1,
                 "diagnostic discovery requires a direct single-object C/C++ compile");
@@ -1490,7 +1590,7 @@ fn analysis_declare_compile(
         })();
         return match declaration {
             Ok(id) => Some(id),
-            Err(error) => { ctx.fail_native_namespace_analysis(format!("{error:#}")); None }
+            Err(error) => { ctx.fail_native_namespace_analysis_error(&error); None }
         };
     }
     if let Some(cwd) = ctx.native_execution_root().map(Path::to_path_buf) {
@@ -1529,7 +1629,7 @@ fn analysis_declare_compile(
             },
             Err(error) => {
                 eprintln!("native execution namespace header admission: {error:#}");
-                ctx.fail_native_namespace_analysis(format!("{error:#}"));
+                ctx.fail_native_namespace_analysis_error(&error);
                 let _ = ctx.declare_incomplete_action(mnemonic, inputs, outputs,
                     "native execution namespace header admission failed; fatal analysis error forbids snapshot adoption and runtime retry");
                 return None;
@@ -1561,7 +1661,7 @@ async fn runtime_namespace_headers(
         .map(|path| path.display().to_string()).unwrap_or_default();
     let owned_headers = cc_binary_owned_header_paths(
         &context.workspace_root, &package, &expanded);
-    if context.native_compile_mode() == crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+    if context.native_compile_mode().is_owned_always_run() {
         // Match PASS-A's declared upper bound, not a guessed include closure.
         // The literal scanner cannot decide post-producer/macro-selected reads
         // here. Preserve every actual CcInfo header until the typed manager
@@ -1608,7 +1708,7 @@ async fn extend_runtime_namespace_inputs(
     owned_srcs: &[String],
 ) -> Result<()> {
     if context.native_execution_root().is_none()
-        && context.native_compile_mode() != crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+        && !context.native_compile_mode().is_owned_always_run() {
         return Ok(());
     }
     let existing: Vec<_> = inputs.iter().filter_map(|input| match input {
@@ -1616,7 +1716,7 @@ async fn extend_runtime_namespace_inputs(
         _ => None,
     }).collect();
     let headers = runtime_namespace_headers(context, source, &command.args, &existing, owned_srcs).await?;
-    if context.native_compile_mode() != crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+    if !context.native_compile_mode().is_owned_always_run() {
         inputs.retain(|input| match input {
             ActionArtifact::Source(path) => path == source,
             _ => true,
@@ -1636,11 +1736,11 @@ async fn namespace_compile_spec(
     owned_srcs: &[String],
 ) -> Result<rush_action::command_spec::NormalizedCommandSpec> {
     if context.native_execution_root().is_none()
-        && context.native_compile_mode() != crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+        && !context.native_compile_mode().is_owned_always_run() {
         return Ok(spec);
     }
     let headers = runtime_namespace_headers(context, source, &spec.argv, &spec.declared_inputs, owned_srcs).await?;
-    if context.native_compile_mode() != crate::context::NativeCompileMode::UncachedDiagnosticV1 {
+    if !context.native_compile_mode().is_owned_always_run() {
         spec.declared_inputs.retain(|path| path == source);
     }
     for header in headers {
@@ -2386,7 +2486,7 @@ impl RuleInstance for CcLibraryInstance {
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
         if let Err(error) = reject_framework_include_roots(dep_providers.iter().map(|provider| provider.as_ref())) {
-            ctx.fail_native_namespace_analysis(error.to_string());
+            ctx.fail_native_namespace_analysis_error(&error);
             return ProviderSet::empty();
         }
         let native_working_dir = analysis_native_working_dir(ctx);
@@ -2449,8 +2549,7 @@ impl RuleInstance for CcLibraryInstance {
             ctx.workspace_root(),
             ctx.output_dir(),
             ctx.native_execution_root().is_some()
-                || ctx.native_compile_mode()
-                    == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+                || ctx.native_compile_mode().is_owned_always_run(),
         );
         let direct_quote_dirs: Vec<_> = direct_quote_paths
             .iter()
@@ -5482,7 +5581,7 @@ impl RuleInstance for CcBinaryInstance {
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
         if let Err(error) = reject_framework_include_roots(dep_providers.iter().map(|provider| provider.as_ref())) {
-            ctx.fail_native_namespace_analysis(error.to_string());
+            ctx.fail_native_namespace_analysis_error(&error);
             return ProviderSet::empty();
         }
         let native_working_dir = analysis_native_working_dir(ctx);
@@ -5542,8 +5641,7 @@ impl RuleInstance for CcBinaryInstance {
                 ctx.workspace_root(),
                 ctx.output_dir(),
                 ctx.native_execution_root().is_some()
-                    || ctx.native_compile_mode()
-                        == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+                    || ctx.native_compile_mode().is_owned_always_run(),
             ) {
                 if !compile_quote_paths.contains(&path) {
                     compile_quote_paths.push(path);
@@ -12293,7 +12391,7 @@ impl RuleInstance for CcTestInstance {
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
         if let Err(error) = reject_framework_include_roots(dep_providers.iter().map(|provider| provider.as_ref())) {
-            ctx.fail_native_namespace_analysis(error.to_string());
+            ctx.fail_native_namespace_analysis_error(&error);
             return ProviderSet::empty();
         }
         let native_working_dir = analysis_native_working_dir(ctx);
@@ -14071,7 +14169,7 @@ impl RuleInstance for CcProtoLibraryInstance {
         dep_providers: &[std::sync::Arc<ProviderSet>],
     ) -> ProviderSet {
         if let Err(error) = reject_framework_include_roots(dep_providers.iter().map(|provider| provider.as_ref())) {
-            ctx.fail_native_namespace_analysis(error.to_string());
+            ctx.fail_native_namespace_analysis_error(&error);
             return ProviderSet::empty();
         }
         let native_working_dir = analysis_native_working_dir(ctx);
@@ -19432,6 +19530,338 @@ mod native_proto_source_metadata_tests {
             std::iter::empty()
         )
         .is_err());
+        Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod auto_compile_refusal_tests {
+    use super::*;
+    use crate::analysis_context::{
+        AnalysisContext, CompilerExecutionReason, CompilerExecutionRequired, StubIncludeResolver,
+    };
+    use rush_action::ids::{ArtifactRegistry, ConfigId, TargetId};
+
+    #[test]
+    fn conditional_includes_require_compiler_without_evaluating_guards() {
+        let body = "#include \"always.h\"\n#ifndef HEADER_GUARD\n#define HEADER_GUARD\n#if 0\n#include <alloc.h>\n#elif defined(OTHER)\n#include \"other.h\"\n#else\n#include \"selected.h\"\n#endif\n#endif\n#include \"later.h\"\n";
+        let parsed = namespace_checked_literal_includes(body).unwrap();
+        assert_eq!(
+            parsed.includes,
+            [
+                ("always.h".into(), true, false),
+                ("later.h".into(), true, false)
+            ]
+        );
+        assert_eq!(
+            parsed.conditional_includes,
+            [
+                ("alloc.h".into(), false, false),
+                ("other.h".into(), true, false),
+                ("selected.h".into(), true, false)
+            ]
+        );
+        assert!(!parsed.requires_compiler);
+        let error = namespace_literal_includes(body).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<CompilerExecutionRequired>()
+                .unwrap()
+                .reason(),
+            CompilerExecutionReason::ConditionalIncludes
+        );
+        // A conditional that selects no include edge adds no unknown read.
+        assert!(namespace_literal_includes(
+            "#ifndef HEADER_GUARD\n#define HEADER_GUARD\nint value;\n#endif\n"
+        )
+        .unwrap()
+        .is_empty());
+        for body in [
+            "#else\n",
+            "#elif X\n",
+            "#endif\n",
+            "#if X\n",
+            "#if\n#endif\n",
+            "#ifdef\n#endif\n",
+            "#if X\n#else\n#else\n#endif\n",
+            "#if X\n#else\n#elif Y\n#endif\n",
+            "#if X\n#endif X\n",
+        ] {
+            let error = namespace_literal_includes(body).unwrap_err();
+            assert!(
+                error.downcast_ref::<CompilerExecutionRequired>().is_none(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains("conditional"), "{error:#}");
+        }
+        // Directive names are recognized after the existing phase-2 join.
+        let parsed = namespace_checked_literal_includes(
+            "#ifd\\\nef GUARD\n#include \"guarded.h\"\n#en\\\ndif\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.conditional_includes.len(), 1);
+        for hard in [
+            "#if 0\n#include HEADER\n#endif\n",
+            "#if 0\n#include_next \"other.h\"\n#endif\n",
+            "#if 0\n#include <unterminated\n#endif\n",
+            "#if __has_include(\"other.h\")\n#endif\n",
+        ] {
+            assert!(
+                namespace_literal_includes(hard)
+                    .unwrap_err()
+                    .downcast_ref::<CompilerExecutionRequired>()
+                    .is_none(),
+                "{hard:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_edges_do_not_hide_unconditional_namespace_hard_failures() -> Result<()> {
+        use rush_incremental::tracked;
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.cc");
+        let header = temp.path().join("owned.h");
+        let later = temp.path().join("later.h");
+        let unrelated = temp.path().join("fft");
+        std::fs::create_dir(&unrelated)?;
+        std::fs::write(unrelated.join("alloc.h"), "#error INACTIVE_WRONG_HEADER\n")?;
+        std::fs::write(&header, "#define VALUE 42\n")?;
+        std::fs::write(&later, "#define LATER 1\n")?;
+        let guarded = "#include \"owned.h\"\n#if defined(MSDOS)\n#include <alloc.h>\n#endif\n";
+        let argv = vec![format!("-I{}", unrelated.display())];
+        std::fs::write(&source, guarded)?;
+        let error = tracked::test_scope(temp.path(), || {
+            namespace_compile_headers(
+                &source,
+                &argv,
+                temp.path(),
+                &[source.clone(), header.clone()],
+            )
+        })
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<CompilerExecutionRequired>()
+                .unwrap()
+                .reason(),
+            CompilerExecutionReason::ConditionalIncludes
+        );
+        std::fs::write(&source, format!("{guarded}#include \"later.h\"\n"))?;
+        let error = tracked::test_scope(temp.path(), || {
+            namespace_compile_headers(
+                &source,
+                &argv,
+                temp.path(),
+                &[source.clone(), header.clone()],
+            )
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<CompilerExecutionRequired>().is_none());
+        assert!(
+            format!("{error:#}").contains("undeclared header"),
+            "{error:#}"
+        );
+        std::fs::write(later.with_extension("h.gch"), "unadmitted PCH\n")?;
+        let error = tracked::test_scope(temp.path(), || {
+            namespace_compile_headers(
+                &source,
+                &argv,
+                temp.path(),
+                &[source.clone(), header.clone(), later.clone()],
+            )
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<CompilerExecutionRequired>().is_none());
+        assert!(
+            format!("{error:#}").contains("precompiled header"),
+            "{error:#}"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the existing SDK/user ambiguity refusal ahead of the soft
+            // conditional reason. This uses the same implicit SDK policy.
+            let shadow = temp.path().join("stdint.h");
+            std::fs::write(&shadow, "#error SHADOW_HEADER\n")?;
+            std::fs::write(&source, format!("{guarded}#include <stdint.h>\n"))?;
+            let argv = vec![
+                "-I/usr/include".into(),
+                format!("-I{}", temp.path().display()),
+            ];
+            let error = tracked::test_scope(temp.path(), || {
+                namespace_compile_headers(
+                    &source,
+                    &argv,
+                    temp.path(),
+                    &[source.clone(), header.clone(), shadow.clone()],
+                )
+            })
+            .unwrap_err();
+            assert!(error.downcast_ref::<CompilerExecutionRequired>().is_none());
+            assert!(
+                format!("{error:#}").contains("ambiguous SDK/user"),
+                "{error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn auto_compile_refusal_is_typed_and_hard_analysis_has_priority() {
+        let soft = namespace_literal_includes("#define JOIN(a,b) a ## b\n").unwrap_err();
+        assert_eq!(
+            soft.downcast_ref::<CompilerExecutionRequired>()
+                .unwrap()
+                .reason(),
+            CompilerExecutionReason::TokenPasting
+        );
+        for hard in [
+            "#define JOIN(a,b) a ## b\n__has_include(\"x.h\")",
+            "#define JOIN(a,b) a ## b\n%:include \"x.h\"",
+            "#define JOIN(a,b) a ## b\n.inc\\\nlude \"x.h\"",
+            "#define JOIN(a,b) a ## b\n\0",
+            "#define JOIN(a,b) a ## b\n#include_next \"x.h\"\n",
+            "#define JOIN(a,b) a ## b\n#include HEADER\n",
+            "#define JOIN(a,b) a ## b\nauto text = R\"tag(raw)tag\";\n",
+            "#define JOIN(a,b) a ## b\n#include \"unterminated\n",
+            "#define JOIN(a,b) a ## b\n#include <>\n",
+            "#define JOIN(a,b) a ## b\n/* unterminated comment",
+            "// ## in a comment\n",
+            "const char* text = \"##\";\n",
+            "#include <header##name.h>\n",
+            "#include \"header##name.h\"\n",
+            "#define JOIN(a,b) a ## b\n#include <header##name.h>\n",
+            "#define JOIN(a,b) a ## b\n#include \"header##name.h\"\n",
+            "#define JOIN(a,b) a ## b\n#include <header#\\\n#name.h>\n",
+        ] {
+            let error = namespace_literal_includes(hard).unwrap_err();
+            assert!(
+                error.downcast_ref::<CompilerExecutionRequired>().is_none(),
+                "{error:#}"
+            );
+        }
+        let mut registry = ArtifactRegistry::new();
+        let root = Path::new("/auto-refusal-fixture");
+        let resolver = StubIncludeResolver::new(root.to_path_buf());
+        let toolchain = crate::context::Toolchain::default();
+        let extra = Vec::new();
+        let mut context = AnalysisContext::new(
+            TargetId(0),
+            ConfigId::DEFAULT,
+            "",
+            None,
+            root,
+            &mut registry,
+            &resolver,
+            &toolchain,
+            root,
+            &extra,
+        );
+        context.fail_native_namespace_analysis_error(&soft);
+        assert!(context
+            .native_namespace_analysis_failure()
+            .unwrap()
+            .compiler_execution_required()
+            .is_some());
+        context.fail_native_namespace_analysis("wrong declared producer");
+        context.fail_native_namespace_analysis_error(&soft);
+        assert_eq!(
+            context.native_namespace_analysis_error(),
+            Some("wrong declared producer")
+        );
+        assert!(context
+            .native_namespace_analysis_failure()
+            .unwrap()
+            .compiler_execution_required()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_compile_refusal_waits_for_later_header_and_search_hard_failures() -> Result<()> {
+        use rush_incremental::tracked;
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.cc");
+        let first = temp.path().join("first.h");
+        let later = temp.path().join("later.h");
+        let soft = "#define JOIN(a,b) a ## b\n";
+        std::fs::write(
+            &source,
+            format!("{soft}#include \"first.h\"\n#include \"later.h\"\n"),
+        )?;
+        std::fs::write(&first, soft)?;
+        for (bytes, expected) in [
+            (b"#include_next \"other.h\"\n".as_slice(), "#include_next"),
+            (b"#include HEADER\n".as_slice(), "macro #include"),
+            (b"R\"tag(raw)tag\";\n".as_slice(), "raw-string"),
+            (b"#include <unterminated\n".as_slice(), "angle header"),
+            (
+                b"#define JOIN(a,b) a ## b\n#include <header##name.h>\n".as_slice(),
+                "#include operand",
+            ),
+            (
+                b"#define JOIN(a,b) a ## b\n#include \"header##name.h\"\n".as_slice(),
+                "#include operand",
+            ),
+            (b"\xff".as_slice(), "UTF-8"),
+        ] {
+            std::fs::write(&later, bytes)?;
+            let error = tracked::test_scope(temp.path(), || {
+                namespace_compile_headers(
+                    &source,
+                    &[],
+                    temp.path(),
+                    &[source.clone(), first.clone(), later.clone()],
+                )
+            })
+            .unwrap_err();
+            assert!(
+                error.downcast_ref::<CompilerExecutionRequired>().is_none(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        std::fs::write(&later, "#pragma once\n")?;
+        // The same valid file is not authorized merely because token pasting
+        // already requires the actual compiler. Exact provider/source ownership
+        // still runs, including the first winning include candidate.
+        let error = tracked::test_scope(temp.path(), || {
+            namespace_compile_headers(&source, &[], temp.path(), &[source.clone(), first.clone()])
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<CompilerExecutionRequired>().is_none());
+        assert!(
+            format!("{error:#}").contains("undeclared header"),
+            "{error:#}"
+        );
+        let precompiled = temp.path().join("later.h.gch");
+        std::fs::write(&precompiled, "not an admitted PCH\n")?;
+        let error = tracked::test_scope(temp.path(), || {
+            namespace_compile_headers(
+                &source,
+                &[],
+                temp.path(),
+                &[source.clone(), first.clone(), later.clone()],
+            )
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<CompilerExecutionRequired>().is_none());
+        assert!(
+            format!("{error:#}").contains("precompiled header"),
+            "{error:#}"
+        );
+        std::fs::remove_file(precompiled)?;
+        // Only the fully checked walk may finally report the soft reason.
+        let error = tracked::test_scope(temp.path(), || {
+            namespace_compile_headers(&source, &[], temp.path(), &[source.clone(), first, later])
+        })
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<CompilerExecutionRequired>().is_some(),
+            "{error:#}"
+        );
         Ok(())
     }
 }

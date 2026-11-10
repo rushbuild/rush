@@ -584,7 +584,7 @@ impl TfProtoLibraryInstance {
         if self.srcs.is_empty() {
             return Ok(());
         }
-        anyhow::ensure!(mode == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
+        anyhow::ensure!(mode.is_owned_always_run(),
             "declared tf_proto_library execution currently requires RUSH_CPP_DISCOVERY=uncached-diagnostic-v1; configured exec/target and reusable proto certificates are not implemented");
         anyhow::ensure!(
             !self.generates_grpc(),
@@ -1284,7 +1284,7 @@ impl RuleInstance for TfProtoLibraryInstance {
                 .validate_declared_imports(ctx.registry(), ctx.config_id())?;
         }
         if self.protoc.is_some() || self.role != TfProtoRole::Default
-            || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            || ctx.native_compile_mode().is_owned_always_run() {
             self.declared_mode(ctx.native_compile_mode())?;
         }
         Ok(())
@@ -1295,7 +1295,7 @@ impl RuleInstance for TfProtoLibraryInstance {
             context.dependency_providers_ordered.iter().map(|(_, provider)| provider).chain(context.dependency_providers.values()),
         )?;
         if self.protoc.is_some() || self.role != TfProtoRole::Default
-            || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            || context.native_compile_mode().is_owned_always_run() {
             return self.build_declared_proto(context).await;
         }
         // Real implementation: Run protoc to generate .pb.h and .pb.cc files
@@ -1738,7 +1738,7 @@ impl RuleInstance for TfProtoLibraryInstance {
             return rush_rules::providers::ProviderSet::empty();
         }
         if self.srcs.is_empty() || self.protoc.is_some() || self.role != TfProtoRole::Default
-            || ctx.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            || ctx.native_compile_mode().is_owned_always_run() {
             return self.analyze_declared_proto(ctx, dep_providers);
         }
         use rush_action::ids::{ArtifactId, ArtifactKind, ExecutableAction, StringId};
@@ -2268,7 +2268,7 @@ impl RuleInstance for TfProtoLibraryInstance {
             return Vec::new();
         }
         if self.protoc.is_some() || self.role != TfProtoRole::Default
-            || context.native_compile_mode() == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+            || context.native_compile_mode().is_owned_always_run() {
             return self.declared_proto_specs(context).await.unwrap_or_default();
         }
         use rush_action::command_spec::NormalizedCommandSpec;

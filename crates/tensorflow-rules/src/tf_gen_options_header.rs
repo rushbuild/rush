@@ -302,7 +302,7 @@ impl RuleInstance for TfGenOptionsHeaderInstance {
             .join("genfiles")
             .join(package)
             .join(&self.output_header);
-        if context.native_compile_mode() == NativeCompileMode::UncachedDiagnosticV1 {
+        if context.native_compile_mode().is_owned_always_run() {
             context.execute_inline_options_header(&out_path).await?;
             return Ok(vec![Artifact {
                 path: out_path,

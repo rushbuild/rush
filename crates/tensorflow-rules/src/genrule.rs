@@ -452,8 +452,7 @@ impl RuleInstance for GenruleInstance {
         println!("  Command: {}", expanded_cmd);
 
         // Execute the command
-        let (success, stderr) = if context.native_compile_mode()
-            == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1 {
+        let (success, stderr) = if context.native_compile_mode().is_owned_always_run() {
             let inputs: Vec<_> = src_paths.iter().chain(tool_paths.values())
                 .map(|path| rush_action::Artifact::Source(path.clone())).collect();
             let command = rush_action::Command { executable: std::path::PathBuf::from("sh"),

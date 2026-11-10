@@ -1604,6 +1604,163 @@ mod diagnostic_direct_translation_unit_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_conditional_dependencies_remain_observations_and_execute_each_time() -> Result<()> {
+        for declared in [false, true] {
+            let temporary = tempfile::tempdir()?;
+            let root = temporary.path().canonicalize()?;
+            let source = root.join("main.cc");
+            let header = root.join("selected.h");
+            let object = root.join("main.o");
+            let executable = root.join("program");
+            std::fs::write(&source, "int main(){return 0;}\n")?;
+            std::fs::write(&header, "#error INACTIVE_HEADER_MUST_NOT_BE_READ\n")?;
+            let mut registry = ArtifactRegistry::new();
+            let pending = declare_compile(
+                &mut registry,
+                &root,
+                &source,
+                if declared { Some(&header) } else { None },
+                &object,
+                TargetId(1),
+            )?;
+            let resolver = StubIncludeResolver::new(root.clone());
+            let toolchain = Toolchain::default();
+            let link_id = {
+                let mut ctx = AnalysisContext::new(
+                    TargetId(2),
+                    ConfigId::DEFAULT,
+                    "",
+                    None,
+                    &root,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    &root,
+                    &[],
+                );
+                let output =
+                    ctx.register_generated_artifact(&executable, ArtifactKind::Executable, None);
+                ctx.declare_action("CppLink", vec![pending.object()], vec![output])?
+            };
+            let artifact_count = registry.artifact_count();
+            let cache = Arc::new(ActionCache::new());
+            let manager = RushActionManager::new(
+                cache.clone(),
+                Arc::new(rush_exec::LocalStrategy),
+                ResourceManager::new()?,
+            );
+            let lease = Arc::new(crate::compiler_discovery::WorkspaceLease::acquire(
+                &root,
+                rush_rules::context::NativeCompileMode::AlwaysRunLocalV1,
+            )?);
+            lease.token(true)?;
+            let mut last_active_id = None;
+            for (stage, active, value) in [(0, false, 42), (1, true, 43), (2, true, 43), (3, true, 44)]
+            {
+                std::fs::write(&source, format!("#define ACTIVE {}\n#if ACTIVE\n#include \"selected.h\"\n#else\n#define VALUE 42\n#endif\nint main(){{return VALUE;}}\n", usize::from(active)))?;
+                std::fs::write(
+                    &header,
+                    if active {
+                        format!("#define VALUE {value}\n")
+                    } else {
+                        "#error INACTIVE_HEADER_MUST_NOT_BE_READ\n".into()
+                    },
+                )?;
+                let mut inputs = vec![Artifact::Source(source.clone())];
+                if declared {
+                    inputs.push(Artifact::Source(header.clone()));
+                }
+                let action = compile(&source, &object, inputs, &root)?;
+                let id = action.id.clone();
+                if stage >= 2 && !declared {
+                    assert_eq!(Some(id.clone()), last_active_id);
+                }
+                if active {
+                    last_active_id = Some(id.clone());
+                }
+                let observed = owned_observed(
+                    &manager,
+                    &registry,
+                    pending.action(),
+                    TargetId(1),
+                    action,
+                    Some(pending.clone()),
+                    &root,
+                    &lease,
+                )
+                .await?;
+                anyhow::ensure!(
+                    observed.result.exit_code == 0,
+                    "actual conditional compile failed: {}",
+                    String::from_utf8_lossy(&observed.result.stderr)
+                );
+                assert!(!observed.result.cached && observed.result.output_records.is_empty());
+                assert!(cache.get(&id).is_none());
+                let observation = observed
+                    .compile_observation
+                    .ok_or_else(|| anyhow::anyhow!("actual compile omitted observation"))?;
+                assert!(observation.positive_names().contains(&source));
+                assert_eq!(observation.positive_names().contains(&header), active);
+                assert_eq!(observation.declaration(), &pending);
+                assert_eq!(
+                    registry
+                        .find_artifact_by_path(&header, ConfigId::DEFAULT)
+                        .is_some(),
+                    declared
+                );
+                assert_eq!(
+                    registry.artifact_count(),
+                    artifact_count,
+                    "positive names acquired registry authority"
+                );
+                let inputs = vec![Artifact::Source(object.clone())];
+                let command = Command {
+                    executable: selected_driver(&source),
+                    args: vec![
+                        object.display().to_string(),
+                        "-o".into(),
+                        executable.display().to_string(),
+                    ],
+                    working_dir: Some(root.clone()),
+                    execution_info: ExecutionInfo::default(),
+                };
+                let env = HashMap::new();
+                let link = Action {
+                    id: Action::compute_id(&inputs, &command, &env)?,
+                    command,
+                    env,
+                    inputs,
+                    outputs: vec![Artifact::Source(executable.clone())],
+                    mnemonic: "CppLink".into(),
+                };
+                let link_key = link.id.clone();
+                let result = owned(
+                    &manager,
+                    &registry,
+                    link_id,
+                    TargetId(2),
+                    link,
+                    None,
+                    &root,
+                    &lease,
+                )
+                .await?;
+                anyhow::ensure!(result.exit_code == 0, "actual conditional link failed");
+                assert!(
+                    !result.cached
+                        && result.output_records.is_empty()
+                        && cache.get(&link_key).is_none()
+                );
+                assert_eq!(
+                    std::process::Command::new(&executable).status()?.code(),
+                    Some(value)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_diagnostic_compiles_original_batch_shape_and_relinks_header_changes(
     ) -> Result<()> {
         let temporary = tempfile::TempDir::new()?;

@@ -204,13 +204,20 @@ fn read_verified_options_header_source(
     );
     Ok(read.contents.to_vec())
 }
-/// Requested native compile policy. This in-memory value is not execution or
-/// cache authority. Diagnostic selection is explicit per immutable request.
+/// Effective native compile policy for one attempt. This value alone is not
+/// execution or cache authority; owned modes require the request-owned manager.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NativeCompileMode {
     #[default]
     Literal,
+    AlwaysRunLocalV1,
     UncachedDiagnosticV1,
+}
+
+impl NativeCompileMode {
+    pub fn is_owned_always_run(self) -> bool {
+        matches!(self, Self::AlwaysRunLocalV1 | Self::UncachedDiagnosticV1)
+    }
 }
 
 /// Pre-producer compile shape, tied to one build's artifact registry. It is
@@ -761,7 +768,7 @@ impl BuildContext {
     /// Form a closed request from this build's existing producer declaration.
     pub async fn execute_inline_options_header(&self, output_path: &Path) -> Result<()> {
         anyhow::ensure!(
-            self.native_compile_mode == NativeCompileMode::UncachedDiagnosticV1,
+            self.native_compile_mode.is_owned_always_run(),
             "owned inline options execution requires the explicit diagnostic profile"
         );
         let inputs = self.options_header_inputs()?;
@@ -1334,7 +1341,7 @@ impl BuildContext {
             );
         }
         if let Some(manager) = &self.action_manager {
-            if self.native_compile_mode == NativeCompileMode::UncachedDiagnosticV1
+            if self.native_compile_mode.is_owned_always_run()
                 && matches!(action.mnemonic.as_str(), "CppCompile" | "CCompile") {
                 let paths: Vec<_> = action.outputs.iter().map(|out| match out {
                     rush_action::Artifact::Source(path) => path.as_path(),

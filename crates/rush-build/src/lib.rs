@@ -729,6 +729,10 @@ pub struct BuildOrchestrator {
     /// behind a `Mutex` so the `&self`/`Clone` orchestrator can set it once.
     tracked_io: Arc<std::sync::Mutex<Option<Arc<rush_incremental::RealTrackedIo>>>>,
     feature_flag_command: Arc<std::sync::Mutex<Option<configured_flag_metadata::FeatureFlagCommandState>>>,
+    #[cfg(test)]
+    auto_attempt_hook: Arc<std::sync::Mutex<Option<Arc<
+        dyn Fn(compiler_discovery::AutoAttemptStage) -> Result<()> + Send + Sync,
+    >>>>,
 
     /// Retained analysis snapshots (persistent-daemon Run-wiring brick).
     ///
@@ -950,6 +954,8 @@ impl Clone for BuildOrchestrator {
             action_manager: Arc::clone(&self.action_manager),
             tracked_io: Arc::clone(&self.tracked_io),
             feature_flag_command: Arc::clone(&self.feature_flag_command),
+            #[cfg(test)]
+            auto_attempt_hook: Arc::clone(&self.auto_attempt_hook),
             snapshot_cache: Arc::clone(&self.snapshot_cache),
             reuse_counters: Arc::clone(&self.reuse_counters),
             watcher: Arc::clone(&self.watcher),
@@ -1265,6 +1271,8 @@ impl BuildOrchestrator {
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
             feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            auto_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1480,6 +1488,8 @@ impl BuildOrchestrator {
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
             feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            auto_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1653,6 +1663,8 @@ impl BuildOrchestrator {
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
             feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            auto_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1826,6 +1838,8 @@ impl BuildOrchestrator {
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
             feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            auto_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -1990,6 +2004,8 @@ impl BuildOrchestrator {
             )),
             tracked_io: Arc::new(std::sync::Mutex::new(None)),
             feature_flag_command: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            auto_attempt_hook: Arc::new(std::sync::Mutex::new(None)),
             snapshot_cache: Arc::new(crate::analysis_snapshot::SnapshotCache::default()),
             reuse_counters: Arc::new(crate::analysis_snapshot::ReuseCounters::new()),
             watcher: Arc::new(crate::workspace_watcher::WorkspaceWatcher::unarmed()),
@@ -6881,7 +6897,7 @@ cc_library(
         let test_semantics = rush_command_core::CommandSemantics::from_process();
         anyhow::ensure!(crate::compiler_discovery::requested_compile_mode(&test_semantics)?
             == rush_rules::context::NativeCompileMode::Literal,
-            "diagnostic compiler discovery is a build-only profile");
+            "always-run native compilation is a build-only profile; nested test builds remain literal");
         let _native_lease = crate::compiler_discovery::WorkspaceLease::acquire(&self.workspace_root,
             rush_rules::context::NativeCompileMode::Literal)?;
         _native_lease.token(false)?;

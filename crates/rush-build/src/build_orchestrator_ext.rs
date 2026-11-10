@@ -2510,48 +2510,179 @@ impl BuildOrchestrator {
         target_patterns: Vec<String>,
         semantics: rush_command_core::CommandSemantics,
     ) -> Result<()> {
-        if crate::compiler_discovery::requested_compile_mode(&semantics)? == rush_rules::context::NativeCompileMode::Literal {
-            // Legacy blocking jobs must keep the shared lease and command lock
-            // even if their public caller abandons its future.
-            let owner = self.clone();
-            let handle = tokio::runtime::Handle::current();
-            return tokio::task::spawn_blocking(move || handle.block_on(async move {
+        // One cancellation signal survives both attempts. Dropping the public
+        // caller never creates a fresh false signal during the Auto transition.
+        crate::compiler_discovery::requested_compile_policy(&semantics)?;
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let mut cancel_on_drop =
+            crate::compiler_discovery::CancelOwnedExecution::new(cancel.clone());
+        let owner = self.clone();
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
                 let command_lock = crate::workspace_command_lock(&owner.workspace_root);
                 let _command_guard = command_lock.lock().await;
-                owner.build_with_dependencies_with_semantics_locked(target_patterns,semantics).await
-            })).await.map_err(|e|anyhow!("owned native command failed: {e}"))?;
-        }
-        let command_lock = crate::workspace_command_lock(&self.workspace_root);
-        let _command_guard = command_lock.lock().await;
-        self.build_with_dependencies_with_semantics_locked(target_patterns, semantics).await
+                let result = owner
+                    .build_native_request_locked(target_patterns, semantics, cancel, cancelled)
+                    .await;
+                #[cfg(test)]
+                owner.auto_attempt_event(
+                    crate::compiler_discovery::AutoAttemptStage::RequestFinished,
+                )?;
+                result
+            })
+        })
+        .await
+        .map_err(|error| anyhow!("owned native command failed: {error}"))?;
+        cancel_on_drop.disarm();
+        result
     }
 
+    #[cfg(test)]
+    fn auto_attempt_event(&self, event: crate::compiler_discovery::AutoAttemptStage) -> Result<()> {
+        let hook = self.auto_attempt_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(event)?;
+        }
+        Ok(())
+    }
+
+    async fn build_native_request_locked(
+        &self,
+        target_patterns: Vec<String>,
+        semantics: rush_command_core::CommandSemantics,
+        cancel: tokio::sync::watch::Sender<bool>,
+        cancelled: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        use crate::compiler_discovery::{NativeCompileAttempt, RequestedCompilePolicy};
+        let policy = crate::compiler_discovery::requested_compile_policy(&semantics)?;
+        let attempt =
+            NativeCompileAttempt::new(policy.initial_mode(), cancel.clone(), cancelled.clone());
+        let result = self
+            .build_native_attempt_locked(
+                target_patterns.clone(),
+                semantics.clone(),
+                attempt.clone(),
+            )
+            .await;
+        let reason = match &result {
+            Err(error) if policy == RequestedCompilePolicy::Auto => attempt.retry_reason(error),
+            _ => None,
+        };
+        let Some(reason) = reason else {
+            return result;
+        };
+        // PASS-A has returned: all local graph/provider/registry/pending values
+        // and the shared lease are gone. Do not retain the first attempt's IO
+        // or feature-analysis capsule in the persistent orchestrator slots.
+        drop(result);
+        drop(attempt);
+        *self
+            .tracked_io
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        *self
+            .feature_flag_command
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        self.reset_config_pre_registration();
+        #[cfg(test)]
+        self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::AfterLiteralUnwind)?;
+        let owned = NativeCompileAttempt::new(
+            rush_rules::context::NativeCompileMode::AlwaysRunLocalV1,
+            cancel,
+            cancelled,
+        );
+        owned.check_cancelled()?;
+        eprintln!("Always-run native C/C++ fallback: {reason}; selected invocation reuse disabled");
+        // Deliberately one retry. An owned attempt's failures return directly.
+        self.build_native_attempt_locked(target_patterns, semantics, owned)
+            .await
+    }
+
+    /// Strict nested test-command boundary. Its caller already holds a shared
+    /// lease, so it cannot perform an Auto exclusive transition in this cut.
     pub(crate) async fn build_with_dependencies_with_semantics_locked(
         &self,
         target_patterns: Vec<String>,
         semantics: rush_command_core::CommandSemantics,
     ) -> Result<()> {
+        let mode = crate::compiler_discovery::requested_compile_mode(&semantics)?;
+        anyhow::ensure!(
+            !mode.is_owned_always_run(),
+            "always-run native compilation is a build-only profile"
+        );
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let attempt = crate::compiler_discovery::NativeCompileAttempt::new(mode, cancel, cancelled);
+        self.build_native_attempt_locked(target_patterns, semantics, attempt)
+            .await
+    }
+
+    async fn build_native_attempt_locked(
+        &self,
+        target_patterns: Vec<String>,
+        semantics: rush_command_core::CommandSemantics,
+        attempt: Arc<crate::compiler_discovery::NativeCompileAttempt>,
+    ) -> Result<()> {
         use rush_rules::context::NativeCompileMode;
-        let compile_mode = crate::compiler_discovery::requested_compile_mode(&semantics)?;
-        let diagnostic_mode = compile_mode == NativeCompileMode::UncachedDiagnosticV1;
+        let compile_mode = attempt.mode;
+        let diagnostic_mode = compile_mode.is_owned_always_run();
         if diagnostic_mode {
-            anyhow::ensure!(cfg!(target_os = "linux"), "uncached compiler discovery diagnostic requires Linux");
-            anyhow::ensure!(self.remote_executor.is_none(), "diagnostic compiler discovery requires local execution");
-            anyhow::ensure!(semantics.getenv(b"RUSH_USE_SCHEDULER") != Some(b"1"),
-                "diagnostic compiler discovery requires legacy execution; disable the scheduler");
+            anyhow::ensure!(
+                cfg!(target_os = "linux"),
+                "uncached compiler discovery diagnostic requires Linux"
+            );
+            anyhow::ensure!(
+                self.remote_executor.is_none(),
+                "diagnostic compiler discovery requires local execution"
+            );
+            anyhow::ensure!(
+                semantics.getenv(b"RUSH_USE_SCHEDULER") != Some(b"1"),
+                "diagnostic compiler discovery requires legacy execution; disable the scheduler"
+            );
             let arguments = rush_command_core::build_arguments::from_command(&semantics)
                 .map_err(|e|anyhow!("diagnostic compiler discovery requires the immutable expanded request: {e}"))?;
-            anyhow::ensure!(!arguments.iter().any(|arg|matches!(arg.as_str(),
-                "--use-scheduler"|"--use_scheduler"|"--use-scheduler=true"|"--use_scheduler=true")),
-                "diagnostic compiler discovery does not support scheduler execution");
+            anyhow::ensure!(
+                !arguments.iter().any(|arg| matches!(
+                    arg.as_str(),
+                    "--use-scheduler"
+                        | "--use_scheduler"
+                        | "--use-scheduler=true"
+                        | "--use_scheduler=true"
+                )),
+                "diagnostic compiler discovery does not support scheduler execution"
+            );
         }
-        let native_lease = Arc::new(crate::compiler_discovery::WorkspaceLease::acquire(&self.workspace_root,compile_mode)?);
-        let native_admission_token = native_lease.token(diagnostic_mode)?;
-        let (diagnostic_cancel, diagnostic_cancelled) = tokio::sync::watch::channel(false);
-        let _diagnostic_cancel_scope = diagnostic_mode.then(||crate::compiler_discovery::CancelOwnedExecution::new(diagnostic_cancel.clone()));
+        #[cfg(test)]
         if diagnostic_mode {
-            self.snapshot_cache.invalidate_workspace(&std::fs::canonicalize(&self.workspace_root)?);
-            eprintln!("UNCACHED compiler discovery diagnostic: no retained or action-cache authority");
+            self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::BeforeOwnedLease)?;
+        }
+        if diagnostic_mode {
+            attempt.check_cancelled()?;
+        }
+        let native_lease = Arc::new(crate::compiler_discovery::WorkspaceLease::acquire(
+            &self.workspace_root,
+            compile_mode,
+        )?);
+        // Check again after acquisition, before rotating/publishing authority.
+        if diagnostic_mode {
+            attempt.check_cancelled()?;
+        }
+        let native_admission_token = native_lease.token(diagnostic_mode)?;
+        let diagnostic_cancel = attempt.cancel.clone();
+        let diagnostic_cancelled = attempt.cancelled.clone();
+        if diagnostic_mode {
+            self.snapshot_cache
+                .invalidate_workspace(&std::fs::canonicalize(&self.workspace_root)?);
+            match compile_mode {
+                NativeCompileMode::UncachedDiagnosticV1 => eprintln!(
+                    "UNCACHED compiler discovery diagnostic: no retained or action-cache authority"
+                ),
+                NativeCompileMode::AlwaysRunLocalV1 => {
+                    eprintln!("Always-run native C/C++: selected invocation reuse disabled")
+                }
+                NativeCompileMode::Literal => unreachable!(),
+            }
         }
         let mut pending_compile_declarations = rush_rules::context::PendingCompileDeclarations::default();
         let _profile_build_with_dependencies = self
@@ -3151,9 +3282,10 @@ impl BuildOrchestrator {
                                             // (a recursive async fn needs
                                             // indirection for a finite future).
                                             return Box::pin(
-                                                self.build_with_dependencies_with_semantics_locked(
+                                                self.build_native_attempt_locked(
                                                     target_patterns,
                                                     command_semantics,
+                                                    attempt.clone(),
                                                 ),
                                             )
                                             .await;
@@ -3196,8 +3328,14 @@ impl BuildOrchestrator {
                                 // fast and reflects the just-built file state.
                                 // (Codex trap: refresh after a fallback rebuild.)
                                 if let Some(plan) = pass_b_prune_plan {
+                                    #[cfg(test)]
+                                    self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::BeforeExecution(compile_mode))?;
+                                    attempt.before_execution()?;
                                     self.execute_analyzed_with_prune(&candidate, plan).await?;
                                 } else {
+                                    #[cfg(test)]
+                                    self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::BeforeExecution(compile_mode))?;
+                                    attempt.before_execution()?;
                                     self.execute_analyzed_inner(&candidate, None, None).await?;
                                 }
                             }
@@ -5369,6 +5507,10 @@ impl BuildOrchestrator {
         // and build() (`&`) borrow patterns.
         let artifact_registry: Arc<tokio::sync::Mutex<rush_action::ids::ArtifactRegistry>> =
             Arc::new(tokio::sync::Mutex::new(rush_action::ids::ArtifactRegistry::new()));
+        #[cfg(test)]
+        self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::Registry(
+            compile_mode, Arc::downgrade(&artifact_registry),
+        ))?;
         if diagnostic_mode && build_order.iter().any(|label| {
             graph.get(label).is_some_and(|node| node.rule_instance.options_header_declaration().is_some())
         }) {
@@ -5636,6 +5778,12 @@ impl BuildOrchestrator {
                     let providers = node.rule_instance.analyze(&mut analysis_ctx, &dep_providers_vec);
                     if native_execroot.is_some() || diagnostic_mode {
                         if let Some(error) = analysis_ctx.native_namespace_analysis_error() {
+                            if let Some(required) = analysis_ctx.native_namespace_analysis_failure()
+                                .and_then(|failure| failure.compiler_execution_required()) {
+                                #[cfg(test)]
+                                self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::PrewriterRefusal)?;
+                                return Err(attempt.prewriter_refusal(&label.to_string(), required));
+                            }
                             anyhow::bail!("native execution namespace analysis refused for {label}: {error}");
                         }
                     }
@@ -6922,6 +7070,7 @@ impl BuildOrchestrator {
             let snap = std::sync::Arc::new(crate::analysis_snapshot::AnalysisSnapshot {
                 key: analysis_key.clone(),
                 native_admission_token,
+                native_compile_mode: compile_mode,
                 key_hash,
                 built_under: command_semantics.clone(),
                 manifest,
@@ -6960,11 +7109,14 @@ impl BuildOrchestrator {
         // is the half that runs on BOTH the fresh-analyze and the reuse path.
         let _profile_execute_analyzed = self.profiler.scope("execute_analyzed", "build");
         let diagnostic = if diagnostic_mode {
-            Some(crate::compiler_discovery::DiagnosticBuild::new(pending_compile_declarations,
+            Some(crate::compiler_discovery::DiagnosticBuild::new_with_mode(pending_compile_declarations,
                 snapshot.artifact_registry.clone(), self.action_manager.clone(), native_lease.clone(),
-                &semantics, std::fs::canonicalize(&self.workspace_root)?, diagnostic_cancel, diagnostic_cancelled)?)
+                &semantics, std::fs::canonicalize(&self.workspace_root)?, diagnostic_cancel, diagnostic_cancelled, compile_mode)?)
         } else { None };
         census_phase("after diagnostic manager", "before execution demand");
+        #[cfg(test)]
+        self.auto_attempt_event(crate::compiler_discovery::AutoAttemptStage::BeforeExecution(compile_mode))?;
+        attempt.before_execution()?;
         self.execute_analyzed_inner(&snapshot,None,diagnostic).await?;
         drop(_profile_execute_analyzed);
         // (The freshness ledger is captured inside execute_analyzed on a
@@ -7175,8 +7327,7 @@ impl BuildOrchestrator {
         tokio::task::spawn_blocking(move || handle.block_on(async move {
         let command_lock = crate::workspace_command_lock(&owner.workspace_root);
         let _command_guard = command_lock.lock().await;
-        anyhow::ensure!(crate::compiler_discovery::requested_compile_mode(&snapshot.built_under)?
-            == rush_rules::context::NativeCompileMode::Literal,
+        anyhow::ensure!(snapshot.native_compile_mode == rush_rules::context::NativeCompileMode::Literal,
             "diagnostic plans are private and cannot be reused through execute_analyzed");
         anyhow::ensure!(std::fs::canonicalize(&owner.workspace_root)? == snapshot.key.workspace_realpath,
             "native snapshot belongs to a different workspace; refusing execution");
@@ -7204,8 +7355,9 @@ impl BuildOrchestrator {
     ) -> Result<()> {
         let diagnostic_mode = diagnostic.is_some();
         anyhow::ensure!(snapshot.admission_is_current(), "native snapshot admission was revoked; analyze again");
-        anyhow::ensure!(diagnostic_mode == (crate::compiler_discovery::requested_compile_mode(&snapshot.built_under)?
-            == rush_rules::context::NativeCompileMode::UncachedDiagnosticV1), "diagnostic execution state is missing or mismatched");
+        anyhow::ensure!(diagnostic_mode == snapshot.native_compile_mode.is_owned_always_run()
+            && diagnostic.as_ref().is_none_or(|build| build.matches_snapshot(snapshot)),
+            "owned execution state is missing or mismatched");
         anyhow::ensure!(!diagnostic_mode || (prune_plan.is_none() && self.remote_executor.is_none()),
             "diagnostic execution cannot prune or use remote execution");
         if let Some(namespace) = &snapshot.native_execroot {
@@ -8463,7 +8615,7 @@ impl BuildOrchestrator {
                 let context = context.with_native_action_selection(execution_demand.as_ref()
                     .and_then(|plan| plan.selected_actions.get(&cur).cloned()));
                 let context = if let Some(build) = &diagnostic {
-                    context.with_native_compile_discovery(rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
+                    context.with_native_compile_discovery(snapshot.native_compile_mode,
                         build.declarations.clone())
                 } else { context };
                 let context = if let Some(inputs) = snapshot.options_header_inputs.get(&label.to_string()) {
@@ -27521,6 +27673,777 @@ genrule(name = "read_main_namespace", outs = ["copy.txt"],
         std::fs::remove_file(namespace.root().join("foreign-entry"))?;
         let error = orchestrator.build_with_dependencies_with_semantics(negative.clone(), request(&source, &negative, &[])?).await.expect_err("missing include flag must fail");
         assert!(format!("{error:#}").to_ascii_lowercase().contains("compil"), "{error:#}");
+        Ok(())
+    }
+}
+
+// Actual RunRequest/daemon entrypoint controls. These fixtures execute genuine
+// C++ compilers and linkers; no successful output/provider is synthesized.
+#[cfg(all(test, target_os = "linux"))]
+mod native_auto_policy_driver_tests {
+    use super::*;
+    use crate::compiler_discovery::AutoAttemptStage;
+    use bytes::Bytes;
+    use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+    use rush_rules::context::NativeCompileMode;
+    use std::sync::{Condvar, Mutex};
+
+    struct Fixture {
+        _temporary: tempfile::TempDir,
+        main: PathBuf,
+        repository: PathBuf,
+        orchestrator: BuildOrchestrator,
+    }
+
+    impl Fixture {
+        async fn new() -> Result<Self> {
+            once_cell::sync::Lazy::force(&super::source_file_resolution_tests::TEST_CLONE_CACHE);
+            let temporary = tempfile::tempdir()?;
+            let main = temporary.path().join("main");
+            let repository = temporary.path().join("repository");
+            std::fs::create_dir_all(&main)?;
+            std::fs::create_dir_all(&repository)?;
+            std::fs::write(main.join("WORKSPACE"), "workspace(name='auto_policy')\n")?;
+            std::fs::write(
+                main.join("BUILD"),
+                "filegroup(name='main_only',srcs=['data.txt'])\n",
+            )?;
+            std::fs::write(main.join("data.txt"), "main source only\n")?;
+            std::fs::write(
+                repository.join("BUILD"),
+                r#"
+cc_library(name="value",srcs=["value.cc"],hdrs=["value.h"])
+cc_binary(name="app",srcs=["main.cc"],deps=[":value"])
+"#,
+            )?;
+            std::fs::write(repository.join("value.h"), "#define VALUE 42\n")?;
+            std::fs::write(
+                repository.join("value.cc"),
+                "#include \"value.h\"\nint value(){return VALUE;}\n",
+            )?;
+            std::fs::write(repository.join("main.cc"), "#include <stdio.h>\nint value();\nint main(){printf(\"%d\\n\",value());return 0;}\n")?;
+            let orchestrator = BuildOrchestrator::with_workspace(main.clone());
+            orchestrator
+                .external_repo_paths
+                .lock()
+                .await
+                .insert("auto".into(), repository.clone());
+            orchestrator
+                .bzl_loader
+                .lock()
+                .unwrap()
+                .add_external_repo("auto".into(), repository.clone());
+            Ok(Self {
+                _temporary: temporary,
+                main,
+                repository,
+                orchestrator,
+            })
+        }
+
+        fn command(&self, policy: Option<&str>) -> Result<rush_command_core::CommandSemantics> {
+            use std::os::unix::ffi::OsStrExt;
+            let mut environment = vec![
+                EnvironmentVariable {
+                    name: Bytes::from_static(b"PATH"),
+                    value: Bytes::from_static(b"/usr/bin:/bin"),
+                },
+                EnvironmentVariable {
+                    name: Bytes::from_static(b"RUSH_EFFECTIVE_BUILD_ARGUMENTS_V1"),
+                    value: Bytes::from(rush_command_core::build_arguments::encode(&[])),
+                },
+            ];
+            if let Some(policy) = policy {
+                environment.push(EnvironmentVariable {
+                    name: Bytes::from_static(b"RUSH_CPP_DISCOVERY"),
+                    value: Bytes::copy_from_slice(policy.as_bytes()),
+                });
+            }
+            let mut request = RunRequest {
+                argv: vec![
+                    Bytes::from_static(b"rush"),
+                    Bytes::from_static(b"build"),
+                    Bytes::from_static(b"@auto//:app"),
+                ],
+                working_directory: Bytes::copy_from_slice(self.main.as_os_str().as_bytes()),
+                environment,
+                protocol_major: rush_protocol::PROTOCOL_MAJOR,
+                protocol_minor: rush_protocol::PROTOCOL_MINOR,
+                ..Default::default()
+            };
+            rush_command_core::populate_workspace_config(&mut request, &self.main);
+            Ok(rush_command_core::CommandSemantics::from_run_request(
+                &request,
+            )?)
+        }
+
+        fn key(
+            &self,
+            command: &rush_command_core::CommandSemantics,
+        ) -> crate::analysis_snapshot::AnalysisKey {
+            crate::analysis_snapshot::AnalysisKey::new(
+                command,
+                self.main.clone(),
+                vec!["@auto//:app".into()],
+            )
+        }
+
+        async fn build(&self, command: &rush_command_core::CommandSemantics) -> Result<()> {
+            self.orchestrator
+                .build_with_dependencies_with_semantics(vec!["@auto//:app".into()], command.clone())
+                .await
+        }
+
+        fn executable(&self) -> PathBuf {
+            cache_paths::workspace_output_root(&self.main).join("external/repo-auto/app")
+        }
+
+        fn run(&self) -> Result<Vec<u8>> {
+            let result = std::process::Command::new(self.executable())
+                .current_dir(&self.main)
+                .output()?;
+            anyhow::ensure!(result.status.success(), "real fixture executable failed");
+            Ok(result.stdout)
+        }
+
+        fn assert_real_owned_counts(&self) {
+            let mut counts = std::collections::BTreeMap::new();
+            for (mnemonic, _) in
+                crate::compiler_discovery::take_completed_diagnostic_processes(&self.main)
+            {
+                *counts.entry(mnemonic).or_insert(0usize) += 1;
+            }
+            assert_eq!(
+                counts,
+                std::collections::BTreeMap::from([
+                    ("CppCompile".into(), 2),
+                    ("CppArchive".into(), 1),
+                    ("CppLink".into(), 1),
+                ])
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_conditional_includes_use_real_branches_without_reuse() -> Result<()> {
+        let fixture = Fixture::new().await?;
+        let command = fixture.command(None)?;
+        let fingerprint = *command.config_fingerprint();
+        fixture.build(&command).await?;
+        assert_eq!(fixture.run()?, b"42\n");
+        let old = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .unwrap();
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let seen = modes.clone();
+        *fixture.orchestrator.auto_attempt_hook.lock().unwrap() = Some(Arc::new(move |event| {
+            if let AutoAttemptStage::Registry(mode, _) = event {
+                seen.lock().unwrap().push(mode);
+            }
+            Ok(())
+        }));
+        let extra = fixture.repository.join("extra.h");
+        std::fs::write(fixture.repository.join("value.h"), "#ifndef VALUE_GUARD\n#define VALUE_GUARD\n#if defined(USE_EXTRA)\n#include \"extra.h\"\n#else\n#define VALUE 42\n#endif\n#endif\n")?;
+        for (active, value) in [(false, 42), (false, 42), (true, 43), (true, 43), (true, 44)] {
+            std::fs::write(
+                &extra,
+                if active {
+                    format!("#define VALUE {value}\n")
+                } else {
+                    "#error INACTIVE_HEADER_MUST_NOT_BE_READ\n".into()
+                },
+            )?;
+            std::fs::write(
+                fixture.repository.join("value.cc"),
+                format!(
+                    "{}#include \"value.h\"\nint value(){{return VALUE;}}\n",
+                    if active { "#define USE_EXTRA 1\n" } else { "" }
+                ),
+            )?;
+            fixture.build(&command).await?;
+            assert_eq!(fixture.run()?, format!("{value}\n").as_bytes());
+            fixture.assert_real_owned_counts();
+            assert!(fixture
+                .orchestrator
+                .snapshot_cache
+                .get(&fixture.key(&command))
+                .is_none());
+            assert!(crate::cold_noop_cache::load(&fixture.main, &fixture.key(&command)).is_none());
+            assert_eq!(*command.config_fingerprint(), fingerprint);
+        }
+        assert!(!old.admission_is_current());
+        assert!(format!(
+            "{:#}",
+            fixture
+                .orchestrator
+                .execute_analyzed(&old)
+                .await
+                .unwrap_err()
+        )
+        .contains("revoked"));
+        assert_eq!(
+            *modes.lock().unwrap(),
+            (0..5)
+                .flat_map(|_| [
+                    NativeCompileMode::Literal,
+                    NativeCompileMode::AlwaysRunLocalV1
+                ])
+                .collect::<Vec<_>>()
+        );
+        std::fs::write(fixture.repository.join("value.h"), "#define VALUE 45\n")?;
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#include \"value.h\"\nint value(){return VALUE;}\n",
+        )?;
+        fixture.build(&command).await?;
+        assert_eq!(fixture.run()?, b"45\n");
+        assert_eq!(
+            fixture
+                .orchestrator
+                .snapshot_cache
+                .get(&fixture.key(&command))
+                .unwrap()
+                .native_compile_mode,
+            NativeCompileMode::Literal
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_conditional_edges_preserve_late_hard_refusals() -> Result<()> {
+        let fixture = Fixture::new().await?;
+        let command = fixture.command(None)?;
+        fixture.build(&command).await?;
+        let old = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .unwrap();
+        let binary = std::fs::read(fixture.executable())?;
+        let crossed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = crossed.clone();
+        *fixture.orchestrator.auto_attempt_hook.lock().unwrap() = Some(Arc::new(move |event| {
+            if matches!(
+                event,
+                AutoAttemptStage::BeforeOwnedLease | AutoAttemptStage::BeforeExecution(_)
+            ) {
+                observed.store(true, std::sync::atomic::Ordering::Release);
+                anyhow::bail!("hard conditional fixture crossed execution boundary");
+            }
+            Ok(())
+        }));
+        std::fs::write(fixture.repository.join("undeclared.h"), "#pragma once\n")?;
+        let conditional = "#if 0\n#include \"unselected.h\"\n#endif\n";
+        for (tail, header, expected) in [
+            (
+                "#include \"undeclared.h\"\n",
+                "#define VALUE 42\n",
+                "undeclared header",
+            ),
+            (
+                "#include_next \"value.h\"\n",
+                "#define VALUE 42\n",
+                "#include_next",
+            ),
+            (
+                "#include \"value.h\"\n",
+                "#include HEADER\n",
+                "macro #include",
+            ),
+            ("#endif\n", "#define VALUE 42\n", "conditional"),
+            (
+                "#include \"value.h\"\n",
+                "#if __has_include(\"other.h\")\n#endif\n",
+                "include-availability",
+            ),
+        ] {
+            std::fs::write(
+                fixture.repository.join("value.cc"),
+                format!("{conditional}{tail}"),
+            )?;
+            std::fs::write(fixture.repository.join("value.h"), header)?;
+            let error = fixture
+                .build(&command)
+                .await
+                .expect_err("unconditional hard failure must win");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(!crossed.load(std::sync::atomic::Ordering::Acquire));
+            assert!(old.admission_is_current());
+            assert_eq!(std::fs::read(fixture.executable())?, binary);
+            assert!(
+                crate::compiler_discovery::take_completed_diagnostic_processes(&fixture.main)
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_reanalyzes_source_and_header_and_revokes_retained_arc() -> Result<()>
+    {
+        let fixture = Fixture::new().await?;
+        let command = fixture.command(None)?;
+        let original_fingerprint = *command.config_fingerprint();
+        fixture.build(&command).await?;
+        assert_eq!(fixture.run()?, b"42\n");
+        let old = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .context("literal seed missing")?;
+        assert_eq!(old.native_compile_mode, NativeCompileMode::Literal);
+        assert!(old.admission_is_current());
+        let first_registry = Arc::new(Mutex::new(
+            None::<std::sync::Weak<tokio::sync::Mutex<rush_action::ids::ArtifactRegistry>>>,
+        ));
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let first = first_registry.clone();
+        let seen = modes.clone();
+        *fixture.orchestrator.auto_attempt_hook.lock().unwrap() = Some(Arc::new(move |event| {
+            if let AutoAttemptStage::Registry(mode, registry) = event {
+                if mode == NativeCompileMode::Literal {
+                    *first.lock().unwrap() = Some(registry);
+                } else {
+                    assert!(
+                        first.lock().unwrap().as_ref().unwrap().upgrade().is_none(),
+                        "literal registry survived into exclusive retry"
+                    );
+                }
+                seen.lock().unwrap().push(mode);
+            }
+            Ok(())
+        }));
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#include \"value.h\"\n#define JOIN(a,b) a ## b\nint value(){return JOIN(4,3);}\n",
+        )?;
+        for _ in 0..2 {
+            fixture.build(&command).await?;
+            assert_eq!(fixture.run()?, b"43\n");
+            fixture.assert_real_owned_counts();
+            assert!(fixture
+                .orchestrator
+                .snapshot_cache
+                .get(&fixture.key(&command))
+                .is_none());
+            assert!(crate::cold_noop_cache::load(&fixture.main, &fixture.key(&command)).is_none());
+        }
+        assert!(
+            !old.admission_is_current(),
+            "Auto owned retry did not revoke old Arc"
+        );
+        let error = fixture
+            .orchestrator
+            .execute_analyzed(&old)
+            .await
+            .expect_err("old Arc must refuse");
+        assert!(format!("{error:#}").contains("revoked"), "{error:#}");
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#include \"value.h\"\nint value(){return VALUE;}\n",
+        )?;
+        std::fs::write(
+            fixture.repository.join("value.h"),
+            "#define JOIN(a,b) a ## b\n#define VALUE JOIN(4,4)\n",
+        )?;
+        fixture.build(&command).await?;
+        assert_eq!(fixture.run()?, b"44\n");
+        fixture.assert_real_owned_counts();
+        assert_eq!(
+            *command.config_fingerprint(),
+            original_fingerprint,
+            "fallback mutated authored semantics"
+        );
+        assert_eq!(
+            *modes.lock().unwrap(),
+            vec![
+                NativeCompileMode::Literal,
+                NativeCompileMode::AlwaysRunLocalV1,
+                NativeCompileMode::Literal,
+                NativeCompileMode::AlwaysRunLocalV1,
+                NativeCompileMode::Literal,
+                NativeCompileMode::AlwaysRunLocalV1
+            ]
+        );
+        std::fs::write(fixture.repository.join("value.h"), "#define VALUE 45\n")?;
+        fixture.build(&command).await?;
+        assert_eq!(fixture.run()?, b"45\n");
+        let current = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .context("fresh supported literal plan missing")?;
+        assert_eq!(current.native_compile_mode, NativeCompileMode::Literal);
+        assert!(current.admission_is_current() && !old.admission_is_current());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_fresh_generated_producer_cannot_adopt_prior_output() -> Result<()> {
+        let fixture = Fixture::new().await?;
+        let command = fixture.command(None)?;
+        fixture.build(&command).await?;
+        assert_eq!(fixture.run()?, b"42\n");
+        let old = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .unwrap();
+        std::fs::write(
+            fixture.repository.join("BUILD"),
+            r#"
+cc_binary(name="tool",srcs=["tool.cc"])
+genrule(name="generated",srcs=["value.h.in"],tools=[":tool"],outs=["generated.h"],cmd="cp $(SRCS) $@")
+cc_library(name="value",srcs=["value.cc"],hdrs=[":generated"])
+cc_binary(name="app",srcs=["main.cc"],deps=[":value"])
+"#,
+        )?;
+        std::fs::write(
+            fixture.repository.join("tool.cc"),
+            "#define JOIN(a,b) a ## b\nint main(){return JOIN(0,0);}\n",
+        )?;
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#include \"generated.h\"\nint value(){return VALUE;}\n",
+        )?;
+        for value in [42, 43] {
+            std::fs::write(
+                fixture.repository.join("value.h.in"),
+                format!("#define VALUE {value}\n"),
+            )?;
+            fixture.build(&command).await?;
+            assert_eq!(fixture.run()?, format!("{value}\n").as_bytes());
+            let generated = cache_paths::workspace_output_root(&fixture.main)
+                .join("external/repo-auto/genfiles/generated.h");
+            assert_eq!(
+                std::fs::read(generated)?,
+                std::fs::read(fixture.repository.join("value.h.in"))?
+            );
+            let mut counts = std::collections::BTreeMap::new();
+            for (mnemonic, _) in
+                crate::compiler_discovery::take_completed_diagnostic_processes(&fixture.main)
+            {
+                *counts.entry(mnemonic).or_insert(0usize) += 1;
+            }
+            assert_eq!(
+                counts,
+                std::collections::BTreeMap::from([
+                    ("GenRule".into(), 1),
+                    ("CppCompile".into(), 3),
+                    ("CppArchive".into(), 1),
+                    ("CppLink".into(), 2),
+                ])
+            );
+        }
+        assert!(!old.admission_is_current());
+        let binary = std::fs::read(fixture.executable())?;
+        std::fs::remove_file(fixture.repository.join("value.h.in"))?;
+        fixture
+            .build(&command)
+            .await
+            .expect_err("failed current producer cannot use old generated header");
+        assert_eq!(std::fs::read(fixture.executable())?, binary);
+        assert_eq!(fixture.run()?, b"43\n");
+        assert!(fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_literal_hard_and_compiler_failure_do_not_retry_writers(
+    ) -> Result<()> {
+        let fixture = Fixture::new().await?;
+        let command = fixture.command(None)?;
+        fixture.build(&command).await?;
+        let old = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .unwrap();
+        let binary = std::fs::read(fixture.executable())?;
+        let namespace = old.native_execroot.as_ref().unwrap();
+        std::fs::write(namespace.root().join("foreign-entry"), b"preserve")?;
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#define JOIN(a,b) a ## b\nint value(){return JOIN(4,3);}\n",
+        )?;
+        let error = fixture
+            .build(&command)
+            .await
+            .expect_err("namespace corruption is hard");
+        assert!(format!("{error:#}").contains("native execution namespace"));
+        assert!(
+            crate::compiler_discovery::take_completed_diagnostic_processes(&fixture.main)
+                .is_empty()
+        );
+        assert!(
+            old.admission_is_current(),
+            "hard failure must not transition authority"
+        );
+        std::fs::remove_file(namespace.root().join("foreign-entry"))?;
+        let literal = fixture.command(Some("literal"))?;
+        fixture
+            .build(&literal)
+            .await
+            .expect_err("explicit literal must remain strict");
+        assert!(old.admission_is_current());
+        assert_eq!(std::fs::read(fixture.executable())?, binary);
+        // The real compiler gets one owned attempt and fails. It must not adopt
+        // an old ELF or retry execution under a third attempt.
+        std::fs::write(fixture.repository.join("value.cc"), "#define JOIN(a,b) a ## b\n#error real compiler must fail\nint value(){return JOIN(4,3);}\n")?;
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let seen = modes.clone();
+        *fixture.orchestrator.auto_attempt_hook.lock().unwrap() = Some(Arc::new(move |event| {
+            if let AutoAttemptStage::Registry(mode, _) = event {
+                seen.lock().unwrap().push(mode);
+            }
+            Ok(())
+        }));
+        fixture
+            .build(&command)
+            .await
+            .expect_err("actual compiler failure cannot become success");
+        assert_eq!(
+            *modes.lock().unwrap(),
+            vec![
+                NativeCompileMode::Literal,
+                NativeCompileMode::AlwaysRunLocalV1
+            ]
+        );
+        assert_eq!(std::fs::read(fixture.executable())?, binary);
+        assert!(fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_mixed_token_paste_and_late_hard_checks_never_enter_owned_execution(
+    ) -> Result<()> {
+        let fixture = Fixture::new().await?;
+        let command = fixture.command(None)?;
+        fixture.build(&command).await?;
+        let old = fixture
+            .orchestrator
+            .snapshot_cache
+            .get(&fixture.key(&command))
+            .unwrap();
+        let binary = std::fs::read(fixture.executable())?;
+        let crossed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let boundary = crossed.clone();
+        *fixture.orchestrator.auto_attempt_hook.lock().unwrap() = Some(Arc::new(move |event| {
+            if matches!(
+                event,
+                AutoAttemptStage::BeforeOwnedLease | AutoAttemptStage::BeforeExecution(_)
+            ) {
+                boundary.store(true, std::sync::atomic::Ordering::Release);
+                anyhow::bail!("late hard refusal crossed the owned/execution boundary");
+            }
+            Ok(())
+        }));
+        std::fs::write(fixture.repository.join("undeclared.h"), "#pragma once\n")?;
+        for (source, header, expected) in [
+            (
+                "#define JOIN(a,b) a ## b\n#include_next \"value.h\"\n",
+                "#define VALUE 42\n",
+                "#include_next",
+            ),
+            (
+                "#define JOIN(a,b) a ## b\n#include \"undeclared.h\"\n",
+                "#define VALUE 42\n",
+                "undeclared header",
+            ),
+            (
+                "#define JOIN(a,b) a ## b\n#include \"value.h\"\n",
+                "#include HEADER\n",
+                "macro #include",
+            ),
+        ] {
+            std::fs::write(fixture.repository.join("value.cc"), source)?;
+            std::fs::write(fixture.repository.join("value.h"), header)?;
+            let error = fixture
+                .build(&command)
+                .await
+                .expect_err("hard scanner/closure failure must win over token paste");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(!crossed.load(std::sync::atomic::Ordering::Acquire));
+            assert!(
+                old.admission_is_current(),
+                "hard failure rotated owned authority"
+            );
+            assert_eq!(std::fs::read(fixture.executable())?, binary);
+            assert!(
+                crate::compiler_discovery::take_completed_diagnostic_processes(&fixture.main)
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_cancel_preserves_signal_before_and_between_leases() -> Result<()> {
+        for between in [false, true] {
+            let fixture = Fixture::new().await?;
+            std::fs::write(
+                fixture.repository.join("value.cc"),
+                "#define JOIN(a,b) a ## b\nint value(){return JOIN(4,2);}\n",
+            )?;
+            let command = fixture.command(None)?;
+            let pause = Arc::new((Mutex::new(false), Condvar::new()));
+            let worker_pause = pause.clone();
+            let owned_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let entered = owned_entered.clone();
+            let (arrived, arrival) = tokio::sync::oneshot::channel();
+            let arrived = Mutex::new(Some(arrived));
+            let (finished, finish) = tokio::sync::oneshot::channel();
+            let finished = Mutex::new(Some(finished));
+            *fixture.orchestrator.auto_attempt_hook.lock().unwrap() =
+                Some(Arc::new(move |event| {
+                    if matches!(event, AutoAttemptStage::BeforeOwnedLease) {
+                        entered.store(true, std::sync::atomic::Ordering::Release);
+                        anyhow::bail!("cancelled caller reached owned lease acquisition");
+                    }
+                    if matches!(event, AutoAttemptStage::RequestFinished) {
+                        if let Some(sender) = finished.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                    let stop = if between {
+                        matches!(event, AutoAttemptStage::AfterLiteralUnwind)
+                    } else {
+                        matches!(event, AutoAttemptStage::PrewriterRefusal)
+                    };
+                    if stop {
+                        if let Some(sender) = arrived.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                        let (lock, ready) = &*worker_pause;
+                        let guard = lock.lock().unwrap();
+                        drop(ready.wait_while(guard, |released| !*released).unwrap());
+                    }
+                    Ok(())
+                }));
+            let owner = fixture.orchestrator.clone();
+            let caller = tokio::spawn(async move {
+                owner
+                    .build_with_dependencies_with_semantics(vec!["@auto//:app".into()], command)
+                    .await
+            });
+            let arrival_result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), arrival).await;
+            // Collect observations without asserting while the real worker is
+            // paused. A failed control must still cancel, release and observe
+            // the worker-finished acknowledgement before returning its error.
+            let probe = crate::compiler_discovery::WorkspaceLease::acquire(
+                &fixture.main,
+                NativeCompileMode::AlwaysRunLocalV1,
+            );
+            let exclusive_available = probe.is_ok();
+            drop(probe);
+            caller.abort();
+            let caller_result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), caller).await;
+            *pause.0.lock().unwrap() = true;
+            pause.1.notify_all();
+            let finished_result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), finish).await;
+            arrival_result??;
+            finished_result??;
+            assert!(caller_result?.unwrap_err().is_cancelled());
+            // Between attempts the first registry/shared lease are gone; at
+            // the refusal pause the first shared lease still excludes writers.
+            assert_eq!(exclusive_available, between);
+            assert!(!owned_entered.load(std::sync::atomic::Ordering::Acquire));
+            assert!(
+                crate::compiler_discovery::take_completed_diagnostic_processes(&fixture.main)
+                    .is_empty()
+            );
+            assert!(!fixture.executable().exists());
+            let _lease = crate::compiler_discovery::WorkspaceLease::acquire(
+                &fixture.main,
+                NativeCompileMode::Literal,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_explicit_always_run_is_not_diagnostic_relabeling() -> Result<()> {
+        let fixture = Fixture::new().await?;
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#define JOIN(a,b) a ## b\nint value(){return JOIN(4,2);}\n",
+        )?;
+        let command = fixture.command(Some("always-run-local-v1"))?;
+        let fingerprint = *command.config_fingerprint();
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let seen = modes.clone();
+        *fixture.orchestrator.auto_attempt_hook.lock().unwrap() = Some(Arc::new(move |event| {
+            if let AutoAttemptStage::Registry(mode, _) = event {
+                seen.lock().unwrap().push(mode);
+            }
+            Ok(())
+        }));
+        for _ in 0..2 {
+            fixture.build(&command).await?;
+            assert_eq!(fixture.run()?, b"42\n");
+            fixture.assert_real_owned_counts();
+            assert!(fixture
+                .orchestrator
+                .snapshot_cache
+                .get(&fixture.key(&command))
+                .is_none());
+        }
+        assert_eq!(
+            *modes.lock().unwrap(),
+            vec![NativeCompileMode::AlwaysRunLocalV1; 2]
+        );
+        assert_eq!(*command.config_fingerprint(), fingerprint);
+        assert_eq!(
+            command.getenv(b"RUSH_CPP_DISCOVERY"),
+            Some(b"always-run-local-v1".as_slice())
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_auto_policy_nested_test_boundary_never_upgrades_shared_lease() -> Result<()> {
+        let fixture = Fixture::new().await?;
+        std::fs::write(
+            fixture.repository.join("value.cc"),
+            "#define JOIN(a,b) a ## b\nint value(){return JOIN(4,2);}\n",
+        )?;
+        let _lease = crate::compiler_discovery::WorkspaceLease::acquire(
+            &fixture.main,
+            NativeCompileMode::Literal,
+        )?;
+        fixture
+            .orchestrator
+            .build_with_dependencies_with_semantics_locked(
+                vec!["@auto//:app".into()],
+                fixture.command(None)?,
+            )
+            .await
+            .expect_err("nested test build must retain strict analysis");
+        for policy in ["always-run-local-v1", "uncached-diagnostic-v1"] {
+            let error = fixture
+                .orchestrator
+                .build_with_dependencies_with_semantics_locked(
+                    vec!["@auto//:app".into()],
+                    fixture.command(Some(policy))?,
+                )
+                .await
+                .expect_err("nested test build must refuse explicit owned modes");
+            assert!(format!("{error:#}").contains("build-only"));
+        }
+        assert!(!fixture.executable().exists());
         Ok(())
     }
 }

@@ -411,6 +411,9 @@ fn current_exe_identity() -> std::sync::Arc<[u8; 32]> {
 pub struct AnalysisSnapshot {
     /// Revocation token sampled before this analysis, never refreshed in place.
     pub(crate) native_admission_token: [u8; 32],
+    /// Effective attempt policy, independent of authored Auto request bytes.
+    /// Owned plans are ephemeral and require their matching request state.
+    pub(crate) native_compile_mode: rush_rules::context::NativeCompileMode,
     /// Reuse-admission identity.
     pub key: AnalysisKey,
     /// Cached stable hash of [`key`](Self::key), used by validation tokens.

@@ -38,6 +38,61 @@
 //! - No `register_action` / producer registry plumbing — that's
 //!   phase 5.C0.
 
+/// Finite source-admission reason requiring the actual compiler, not a cache proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompilerExecutionRequired {
+    reason: CompilerExecutionReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompilerExecutionReason {
+    TokenPasting,
+    ConditionalIncludes,
+}
+
+impl CompilerExecutionRequired {
+    // Only native rule admission can mint this reason. The build driver still
+    // accepts it only from its own fresh PASS-A failure boundary.
+    pub(crate) fn token_pasting() -> Self {
+        Self {
+            reason: CompilerExecutionReason::TokenPasting,
+        }
+    }
+
+    pub(crate) fn conditional_includes() -> Self {
+        Self {
+            reason: CompilerExecutionReason::ConditionalIncludes,
+        }
+    }
+
+    pub fn reason(&self) -> CompilerExecutionReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for CompilerExecutionRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            CompilerExecutionReason::TokenPasting => f.write_str("native execution namespace does not admit alternative preprocessor tokens: token pasting requires compiler execution"),
+            CompilerExecutionReason::ConditionalIncludes => f.write_str("native execution namespace conditional includes require compiler execution"),
+        }
+    }
+}
+impl std::error::Error for CompilerExecutionRequired {}
+
+/// An analysis refusal, with hard structural failures taking priority over a
+/// semantic request for real compiler execution in the same analyze() call.
+#[derive(Clone, Debug)]
+pub struct NativeNamespaceAnalysisFailure {
+    message: String,
+    required: Option<CompilerExecutionRequired>,
+}
+impl NativeNamespaceAnalysisFailure {
+    pub fn compiler_execution_required(&self) -> Option<&CompilerExecutionRequired> {
+        self.required.as_ref()
+    }
+}
+
 use rush_action::ids::{
     ArtifactId, ArtifactKey, ArtifactKind, ArtifactRegistry, ConfigId, DeclaredAction,
     DeclaredActionId, LinkerInputData, LinkerInputId, PathId, ProducerError, StringId, TargetId,
@@ -155,7 +210,7 @@ pub struct AnalysisContext<'a> {
     native_execution_root: Option<&'a Path>,
     /// Fatal admission failure for the source-only namespace profile. An
     /// incomplete action is insufficient: runtime may materialize its input.
-    native_namespace_error: Option<String>,
+    native_namespace_error: Option<NativeNamespaceAnalysisFailure>,
     /// Phase 5.C.4: external workspace roots from the build's
     /// repository registration. Used by analyze() to add
     /// `-I<extra>` flags so cross-repo includes resolve (e.g.
@@ -253,7 +308,7 @@ impl<'a> AnalysisContext<'a> {
         object: ArtifactId,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.native_compile_mode == crate::context::NativeCompileMode::UncachedDiagnosticV1,
+            self.native_compile_mode.is_owned_always_run(),
             "literal compile mode cannot record a pending discovery request"
         );
         let record = crate::context::PendingCompileDeclaration::from_registry(
@@ -279,17 +334,43 @@ impl<'a> AnalysisContext<'a> {
         self.native_execution_root
     }
 
-    /// Preserve the first failed namespace proof for the orchestrator to reject
-    /// before provider/snapshot adoption. This is independent of declaration
-    /// completeness, which ordinary legacy genrules may legitimately require.
+    /// Hard failures cannot be hidden by an earlier compiler-only semantic refusal.
     pub fn fail_native_namespace_analysis(&mut self, error: impl Into<String>) {
-        if self.native_namespace_error.is_none() {
-            self.native_namespace_error = Some(error.into());
+        if self
+            .native_namespace_error
+            .as_ref()
+            .is_none_or(|old| old.required.is_some())
+        {
+            self.native_namespace_error = Some(NativeNamespaceAnalysisFailure {
+                message: error.into(),
+                required: None,
+            });
+        }
+    }
+
+    /// Preserve a typed scanner reason through anyhow context. Other errors
+    /// remain hard; no diagnostic text participates in classification.
+    pub fn fail_native_namespace_analysis_error(&mut self, error: &anyhow::Error) {
+        if let Some(required) = error.downcast_ref::<CompilerExecutionRequired>() {
+            if self.native_namespace_error.is_none() {
+                self.native_namespace_error = Some(NativeNamespaceAnalysisFailure {
+                    message: format!("{error:#}"),
+                    required: Some(required.clone()),
+                });
+            }
+        } else {
+            self.fail_native_namespace_analysis(format!("{error:#}"));
         }
     }
 
     pub fn native_namespace_analysis_error(&self) -> Option<&str> {
-        self.native_namespace_error.as_deref()
+        self.native_namespace_error
+            .as_ref()
+            .map(|failure| failure.message.as_str())
+    }
+
+    pub fn native_namespace_analysis_failure(&self) -> Option<&NativeNamespaceAnalysisFailure> {
+        self.native_namespace_error.as_ref()
     }
 
     /// Attach the labeled dep providers (in `node.dependencies` order).
