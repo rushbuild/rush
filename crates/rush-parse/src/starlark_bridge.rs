@@ -849,6 +849,8 @@ fn convert_rule_call(rule_call: &RuleCall) -> Result<Rule> {
     for (key, value) in &rule_call.kwargs {
         let converted = if rule_call.rule_type == "expand_template" && key == "substitutions" {
             convert_expand_template_substitutions(value)?
+        } else if rule_call.rule_type == "tf_gen_options_header" && key == "build_settings" {
+            convert_options_build_settings(value)?
         } else if rule_call.rule_type == "config_setting" && key == "flag_values" {
             convert_config_setting_flag_values(value)?
         } else if (rule_call.rule_type == "config_setting"
@@ -1009,6 +1011,59 @@ fn convert_configurable_value(value: &StarlarkValue) -> Result<Value> {
     }
 }
 
+/// Preserve the typed label->identifier attribute of this native consumer.
+/// Ordinary legacy dictionaries still use the bounded summary conversion.
+fn convert_options_build_settings(value: &StarlarkValue) -> Result<Value> {
+    if let StarlarkValue::Select(conditions) = value {
+        return Ok(Value::Select(
+            conditions
+                .iter()
+                .map(|(condition, branch)| {
+                    Ok((condition.clone(), convert_options_build_settings(branch)?))
+                })
+                .collect::<Result<HashMap<_, _>>>()?,
+        ));
+    }
+    if let StarlarkValue::Configurable { op, left, right } = value {
+        return Ok(Value::Configurable {
+            op: *op,
+            left: Box::new(convert_options_build_settings(left)?),
+            right: Box::new(convert_options_build_settings(right)?),
+        });
+    }
+    let values = match value {
+        StarlarkValue::Dict(values) => values,
+        StarlarkValue::ImmutableMapping(view) if view.frozen_dictionary().is_some() => {
+            view.frozen_dictionary().unwrap()
+        }
+        _ => {
+            return Err(anyhow!(
+                "tf_gen_options_header.build_settings must be a label-keyed string dictionary"
+            ))
+        }
+    };
+    let mut entries = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        let key =
+            rush_starlark::evaluator::configuration_label_dictionary_key(key).ok_or_else(|| {
+                anyhow!("tf_gen_options_header.build_settings key must be a string or Label")
+            })?;
+        let StarlarkValue::String(identifier) = value else {
+            return Err(anyhow!(
+                "tf_gen_options_header.build_settings value for {key:?} must be a string"
+            ));
+        };
+        if entries
+            .insert(key.clone(), Value::String(identifier.clone()))
+            .is_some()
+        {
+            return Err(anyhow!(
+                "tf_gen_options_header.build_settings repeats label key {key:?}"
+            ));
+        }
+    }
+    Ok(Value::Dict(entries))
+}
 fn convert_config_setting_flag_values(value: &StarlarkValue) -> Result<Value> {
     let StarlarkValue::Dict(values) = value else {
         return convert_configurable_value(value);
@@ -1132,6 +1187,140 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn parse_options_header_fixture(settings: &str) -> Result<Arc<BuildFile>> {
+        let root = tempfile::tempdir()?;
+        let package = root.path().join("registration");
+        std::fs::create_dir(&package)?;
+        std::fs::write(root.path().join("WORKSPACE"), "")?;
+        let build = package.join("BUILD");
+        std::fs::write(
+            &build,
+            format!(
+                r#"
+tf_gen_options_header(
+    name = "gen_registration_options",
+    build_settings = {settings},
+    output_header = "options.h",
+    template = "options.h.tpl",
+    visibility = ["//visibility:public"],
+)
+cc_library(name = "registration", hdrs = ["options.h"])
+"#
+            ),
+        )?;
+        rush_incremental::tracked::test_scope(root.path(), || {
+            parse_build_file_with_loader(
+                &build,
+                rush_starlark::BzlLoader::new(root.path().to_owned()),
+            )
+        })
+    }
+
+    #[test]
+    fn options_header_full_build_parse_preserves_typed_mapping_and_output_declaration() -> Result<()>
+    {
+        // Exact registration macro attributes from TensorFlow2.17, plus a
+        // condition-shaped ordinary setting key to forbid select guessing.
+        let parsed = parse_options_header_fixture(
+            r#"{
+            "//tensorflow:enable_registration_v2": "REGISTRATION_V2",
+            "//conditions:ordinary_setting": "ORDINARY",
+        }"#,
+        )?;
+        assert_eq!(parsed.rules.len(), 2);
+        let producer = parsed
+            .rules
+            .iter()
+            .find(|rule| rule.name == "gen_registration_options")
+            .unwrap();
+        assert_eq!(producer.rule_type, "tf_gen_options_header");
+        assert!(
+            matches!(producer.attributes.get("output_header"), Some(Value::String(value)) if value == "options.h")
+        );
+        assert!(
+            matches!(producer.attributes.get("template"), Some(Value::String(value)) if value == "options.h.tpl")
+        );
+        let Some(Value::Dict(mapping)) = producer.attributes.get("build_settings") else {
+            panic!("typed native settings must not become a legacy summary or Select");
+        };
+        assert_eq!(mapping.len(), 2);
+        assert!(
+            matches!(mapping.get("//tensorflow:enable_registration_v2"), Some(Value::String(value)) if value == "REGISTRATION_V2")
+        );
+        assert!(
+            matches!(mapping.get("//conditions:ordinary_setting"), Some(Value::String(value)) if value == "ORDINARY")
+        );
+        assert!(
+            !parsed.rules.iter().any(|rule| rule.name == "options.h"),
+            "filename belongs to the real producer, not a fabricated rule"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn options_header_full_build_parse_refuses_nonstring_and_wrong_key_types() -> Result<()> {
+        for settings in [
+            r#"{"//cfg:flag": True}"#,
+            r#"{"//cfg:flag": 7}"#,
+            r#"{"//cfg:flag": ["VALUE"]}"#,
+            r#"{7: "VALUE"}"#,
+            r#"{("//cfg:flag",): "VALUE"}"#,
+            r#"["//cfg:flag"]"#,
+            r#""not a dictionary""#,
+        ] {
+            let error = parse_options_header_fixture(settings).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("tf_gen_options_header.build_settings"),
+                "{settings}: {text}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn options_header_typed_conversion_retains_configurable_maps_without_global_dict_change(
+    ) -> Result<()> {
+        let mapping = StarlarkValue::Dict(HashMap::from([(
+            "//cfg:flag".into(),
+            StarlarkValue::String("VALUE".into()),
+        )]));
+        assert!(
+            matches!(convert_value(&mapping)?, Value::String(_)),
+            "unrelated legacy dictionary conversion must remain unchanged"
+        );
+        let conditional =
+            StarlarkValue::Select(HashMap::from([("//conditions:default".into(), mapping)]));
+        let Value::Select(conditions) = convert_options_build_settings(&conditional)? else {
+            panic!("actual Select must remain configurable");
+        };
+        assert!(
+            matches!(conditions.get("//conditions:default"), Some(Value::Dict(entries))
+            if matches!(entries.get("//cfg:flag"), Some(Value::String(value)) if value == "VALUE"))
+        );
+        let root = tempfile::tempdir()?;
+        rush_incremental::tracked::test_scope(root.path(), || -> Result<()> {
+            let mut evaluator = Evaluator::new();
+            evaluator.eval_program(&parse(
+                r#"typed = {Label("//cfg:flag"): "VALUE"}
+collision = {Label("//cfg:flag"): "VALUE", "@@//cfg:flag": "OTHER"}
+"#,
+            )?)?;
+            let Value::Dict(mapping) =
+                convert_options_build_settings(&evaluator.get_var("typed").unwrap())?
+            else {
+                panic!("Label keys must survive as typed label strings");
+            };
+            assert!(
+                matches!(mapping.get("@@//cfg:flag"), Some(Value::String(value)) if value == "VALUE")
+            );
+            assert!(
+                convert_options_build_settings(&evaluator.get_var("collision").unwrap()).is_err(),
+                "distinct Starlark keys must not silently overwrite one native label key"
+            );
+            Ok(())
+        })
+    }
     #[test]
     fn frozen_attribute_dictionary_has_transparent_legacy_and_configurable_conversion() {
         let root = tempfile::tempdir().unwrap();

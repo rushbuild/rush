@@ -114,6 +114,7 @@ impl IncludeResolver for StubIncludeResolver {
 /// helper methods so borrow checking enforces "only one rule at
 /// a time can register artifacts during its analysis."
 pub struct AnalysisContext<'a> {
+    options_header_inputs: Option<&'a crate::providers::VerifiedOptionsHeaderInputs>,
     native_compile_mode: crate::context::NativeCompileMode,
     pending_compile_declarations: Option<&'a mut crate::context::PendingCompileDeclarations>,
     target: TargetId,
@@ -194,6 +195,7 @@ impl<'a> AnalysisContext<'a> {
         extra_proto_paths: &'a [PathBuf],
     ) -> Self {
         Self {
+            options_header_inputs: None,
             native_compile_mode: crate::context::NativeCompileMode::Literal,
             pending_compile_declarations: None,
             target,
@@ -213,6 +215,19 @@ impl<'a> AnalysisContext<'a> {
         }
     }
 
+    /// Optional target-specific inputs already qualified by the orchestrator.
+    /// No record is inferred from registry booleans or ambient thread state.
+    pub fn with_options_header_inputs(
+        mut self,
+        inputs: Option<&'a crate::providers::VerifiedOptionsHeaderInputs>,
+    ) -> Self {
+        self.options_header_inputs = inputs;
+        self
+    }
+
+    pub fn options_header_inputs(&self) -> Option<&crate::providers::VerifiedOptionsHeaderInputs> {
+        self.options_header_inputs
+    }
     /// Attach explicit per-command discovery metadata. Merely carrying the
     /// policy does not clear or bypass an existing fatal namespace error.
     pub fn with_native_compile_discovery(

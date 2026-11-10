@@ -2736,10 +2736,9 @@ fn expand_tf_gen_options_header(
     _args: &[Value],
     kwargs: &HashMap<String, Value>,
 ) -> Result<Vec<RuleCall>> {
-    // Route through rush's native TfGenOptionsHeaderRule which renders the
-    // .tpl into a concrete options.h with every TF_OPTION_<X>() macro set
-    // to false. TF's Starlark version invokes a code-generator tool rush
-    // doesn't build.
+    // Preserve the template and setting-label mapping for the native rule.
+    // Rendering requires genuine configured BuildSettingInfo values and a
+    // verified implementation of TensorFlow's inline template action.
     // The generated-file label belongs to this rule's declared output. The
     // package catalog resolves filename dependencies to the producer.
     Ok(vec![RuleCall {
@@ -8002,9 +8001,8 @@ impl Evaluator {
             // correct shape for our native proto compilation path to apply.
             const MACRO_PRIORITY_OVERRIDE: &[&str] = &[
                 "tf_proto_library",
-                // Starlark invokes a template-rendering codegen binary;
-                // route instead to the native expander which does the
-                // `.tpl` → `options.h` substitution directly.
+                // Preserve TensorFlow's inline template action as a native
+                // declaration; configured provider validation precedes writing.
                 "tf_gen_options_header",
                 // Starlark runs mlir-tblgen via a Bazel tool action; route
                 // to rush's native GentblCcLibraryRule which runs

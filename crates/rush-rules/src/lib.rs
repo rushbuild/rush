@@ -130,6 +130,12 @@ pub trait RuleInstance: Send + Sync {
     /// Get dependencies
     fn dependencies(&self) -> Vec<String>;
 
+    /// Literal options-consumer declaration, when implemented by this rule.
+    /// The orchestrator separately qualifies source and configured providers.
+    fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {
+        None
+    }
+
     /// Resolved visibility specifications for this target.
     ///
     /// `None` means no visibility list was resolved: the package has no
@@ -513,6 +519,10 @@ impl RuleInstance for RuleMetadataInstance {
 
     fn dependencies(&self) -> Vec<String> {
         self.inner.dependencies()
+    }
+
+    fn options_header_declaration(&self) -> Option<providers::OptionsHeaderDeclaration> {
+        self.inner.options_header_declaration()
     }
 
     fn visibility(&self) -> Option<&[String]> {

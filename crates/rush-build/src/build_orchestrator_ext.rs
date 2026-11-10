@@ -2089,6 +2089,55 @@ async fn dump_action_graph_json(
 }
 
 impl BuildOrchestrator {
+    /// Only the selected options-constructor leaf preserves explicit owner
+    /// roots ahead of a stale same-name archive registry. Automatic/managed
+    /// roots still require the existing genuine repository admission path.
+    fn selected_explicit_options_constructor_source(
+        &self,
+        registered: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        let mut loader = self
+            .bzl_loader
+            .lock()
+            .map_err(|_| anyhow!("BzlLoader lock poisoned while selecting options constructor"))?;
+        let selected = loader.preferred_registered_repository_path("bazel_skylib", registered);
+        let Some(path) = selected else {
+            return Ok(None);
+        };
+        if loader.is_implicit_system_adapter("bazel_skylib", &path)
+            || loader.is_managed_workspace_source("bazel_skylib", &path)
+        {
+            return Ok(None);
+        }
+        // Update only this already-explicit selected path. Keep old path-bound
+        // origins so stale mirrors never acquire explicit source authority.
+        loader.add_external_repo("bazel_skylib".to_owned(), path.clone());
+        Ok(Some(path))
+    }
+
+    async fn admit_options_header_constructor_source(&self) -> Result<PathBuf> {
+        let registered = self
+            .external_repo_paths
+            .lock()
+            .await
+            .get("bazel_skylib")
+            .cloned();
+        // The selector's std::MutexGuard is dropped before the async mirror
+        // lock is acquired. Both registries then name the same preferred root.
+        if let Some(path) =
+            self.selected_explicit_options_constructor_source(registered.as_deref())?
+        {
+            self.external_repo_paths
+                .lock()
+                .await
+                .insert("bazel_skylib".to_owned(), path.clone());
+            return Ok(path);
+        }
+        let constructor = Label::parse("@bazel_skylib//rules:common_settings.bzl", None, None)?;
+        self.registered_external_repository_path("bazel_skylib", &constructor)
+            .await?
+            .context("options renderer requires an admitted bazel_skylib source root")
+    }
     /// Build targets with dependency resolution
     ///
     /// This method:
@@ -5203,7 +5252,37 @@ impl BuildOrchestrator {
         // and build() (`&`) borrow patterns.
         let artifact_registry: Arc<tokio::sync::Mutex<rush_action::ids::ArtifactRegistry>> =
             Arc::new(tokio::sync::Mutex::new(rush_action::ids::ArtifactRegistry::new()));
+        if diagnostic_mode && build_order.iter().any(|label| {
+            graph.get(label).is_some_and(|node| node.rule_instance.options_header_declaration().is_some())
+        }) {
+            // The provider constructor is an analysis source dependency, even
+            // when no native executable target uses its repository.
+            self.admit_options_header_constructor_source().await?;
+        }
         let resolver_repo_paths = self.external_repo_paths.lock().await.clone();
+        let mut options_header_inputs = HashMap::new();
+        if diagnostic_mode {
+            for label in &build_order {
+                let node = graph.get(label)
+                    .ok_or_else(|| anyhow!("options consumer missing from graph: {label}"))?;
+                let Some(declaration) = node.rule_instance.options_header_declaration() else {
+                    continue;
+                };
+                let request = self.with_tracked_scope(|| {
+                    crate::native_options_header::qualified_tf_request(
+                        &self.workspace_root, label, declaration, &resolver_repo_paths,
+                    )
+                })?;
+                let template = Label::parse(&request.template_label, None, None)?;
+                let source = graph.get(&template)
+                    .ok_or_else(|| anyhow!("options template is not a selected native dependency: {template}"))?;
+                anyhow::ensure!(source.rule_instance.rule_type() == "source_file"
+                    && node.dependencies.contains(&template),
+                    "options header requires its direct SOURCE template dependency: {template}");
+                let inputs = self.with_tracked_scope(|| self.resolve_options_header_inputs(&request))?;
+                options_header_inputs.insert(label.to_string(), inputs);
+            }
+        }
         // A source registry is not an execution layout. Build a separate owned
         // MAIN view only when this requested closure actually uses externals.
         let native_repositories = build_order.iter().filter_map(|label| label.workspace.as_ref())
@@ -5390,6 +5469,7 @@ impl BuildOrchestrator {
                     )
                     .with_labeled_dep_providers(&labeled_dep_providers_vec)
                     .with_labeled_exec_dep_providers(&labeled_exec_dep_providers_vec)
+                    .with_options_header_inputs(options_header_inputs.get(&label.to_string()).map(Arc::as_ref))
                     .with_native_execution_root(native_execroot.as_ref().map(|namespace| namespace.root()))
                     .with_native_compile_discovery(compile_mode,&mut pending_compile_declarations);
                 let mut analyze = || -> Result<_> {
@@ -6598,7 +6678,9 @@ impl BuildOrchestrator {
             for label in &build_order {
                 let node = graph.get(label).ok_or_else(||anyhow!("diagnostic node missing: {label}"))?;
                 let kind = node.rule_instance.rule_type();
-                let writer = matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
+                let inline_options = kind == "tf_gen_options_header"
+                    && options_header_inputs.contains_key(&label.to_string());
+                let writer = inline_options || matches!(kind,"cc_library"|"cc_binary"|"genrule"|"tf_proto_library");
                 anyhow::ensure!(writer || matches!(kind,"filegroup"|"alias"|"source_file"|"config_setting"
                     |"constraint_setting"|"constraint_value"|"platform"|"toolchain_type"|"package_group"|"exports_files"),
                     "uncached compiler diagnostic does not audit rule {kind} at {label}; use the default profile until its actual writer lifecycle is supported");
@@ -6608,6 +6690,8 @@ impl BuildOrchestrator {
                     let supported = match kind {
                         "genrule" => mnemonic == "GenRule",
                         "tf_proto_library" => matches!(mnemonic,"ProtocCompile"|"CppCompile"|"CcArchive"),
+                        "tf_gen_options_header" => inline_options && mnemonic == "GenOptionsHeader"
+                            && matches!(&action.status, rush_action::ids::ActionDeclarationStatus::Complete),
                         _ => matches!(mnemonic,"CCompile"|"CppCompile"|"CcArchive"|"CppArchive"|"CcLink"|"CppLink"),
                     };
                     anyhow::ensure!(writer && supported,
@@ -6663,6 +6747,7 @@ impl BuildOrchestrator {
                 build_order,
                 artifact_registry,
                 analysis_providers: built_providers,
+                options_header_inputs,
                 pass_b_prune_index: std::sync::Mutex::new(None),
                 static_archive_materialization,
                 target_id_by_label,
@@ -8101,6 +8186,11 @@ impl BuildOrchestrator {
                 let context = if let Some(build) = &diagnostic {
                     context.with_native_compile_discovery(rush_rules::context::NativeCompileMode::UncachedDiagnosticV1,
                         build.declarations.clone())
+                } else { context };
+                let context = if let Some(inputs) = snapshot.options_header_inputs.get(&label.to_string()) {
+                    context.with_options_header_command(snapshot.built_under.clone())
+                        .with_options_header_inputs(Arc::clone(inputs))?
+                        .with_options_header_config(rush_action::ids::ConfigId::DEFAULT)
                 } else { context };
 
                 let target_id_for_dispatch = target_id_by_label.get(&label.to_string()).copied();
@@ -20624,12 +20714,12 @@ filegroup(
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn registration_generated_output_loads_fresh_producer_before_source_fallback() -> Result<()> {
+    async fn registration_generated_output_requires_verified_producer_before_source_fallback() -> Result<()> {
         assert_registration_generated_output_producer(false).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn registration_generated_output_can_be_requested_as_a_root() -> Result<()> {
+    async fn registration_generated_output_root_keeps_unverified_producer_refusal() -> Result<()> {
         assert_registration_generated_output_producer(true).await
     }
 
@@ -20673,15 +20763,16 @@ cc_library(name = "registration", hdrs = ["options.h"])
             } else {
                 "//consumer:root"
             };
-            orchestrator.build_with_dependencies(vec![root.to_string()]).await?;
+            let error = orchestrator.build_with_dependencies(vec![root.to_string()]).await
+                .expect_err("an unverified options producer must not manufacture a default value");
+            let message = format!("{error:#}");
+            assert!(message.contains("gen_registration_options") && message.contains("options header"),
+                "resolve the filename to its real producer before refusing absent configuration: {message}");
 
             let generated_header = cache_paths::workspace_output_root(workspace_root)
                 .join("genfiles/registration/options.h");
-            assert_eq!(
-                std::fs::read_to_string(&generated_header)?,
-                "#define TF_OPTION_REGISTRATION_V2() false\n",
-                "the producer must render the header (stale_source={stale_source}, direct_root={direct_root})",
-            );
+            assert!(!generated_header.exists(),
+                "unverified configuration must not write an options header");
             if stale_source {
                 assert_eq!(
                     std::fs::read_to_string(&source_header)?,
@@ -21529,6 +21620,185 @@ local_repository(name = "flatbuffers", path = "real")
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn options_constructor_explicit_source_beats_archive_and_reconciles_both_registries(
+    ) -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        for stale_origin in ["automatic", "managed"] {
+            for stale_side in ["loader", "async-mirror"] {
+                let temp = TempDir::new()?;
+                let root = temp.path().canonicalize()?;
+                write_file(
+                    &root.join("WORKSPACE"),
+                    "workspace(name = \"constructor_sources\")\n",
+                )?;
+                write_file(&root.join("BUILD"), "filegroup(name = \"root\")\n")?;
+                let explicit = root.join("provided-skylib");
+                let stale = root.join("old-skylib");
+                let provided_bytes =
+                    "# explicit source ownership sentinel; not a provider fixture\n";
+                let stale_bytes = "# preserve old automatic/managed materialization\n";
+                write_file(&explicit.join("rules/common_settings.bzl"), provided_bytes)?;
+                write_file(&stale.join("rules/common_settings.bzl"), stale_bytes)?;
+                let orchestrator = BuildOrchestrator::with_workspace(root.clone());
+                // No process environment mutation. If the old archive-fetch
+                // branch is accidentally reached, this captured command has
+                // no analyzer to launch and cannot contact the archive URL.
+                let command = semantics_with_environment(&root, "//:root", &[("PATH", "")])?;
+                let io = Arc::new(rush_incremental::RealTrackedIo::new(command, &root));
+                *orchestrator.tracked_io.lock().unwrap() = Some(io.clone());
+                assert!(orchestrator
+                    .with_tracked_scope(|| {
+                        rush_starlark::BzlLoader::selected_repository_analysis_binary(&root)
+                    })?
+                    .is_none());
+                let archive = rush_parse::HttpArchive {
+                    name: "bazel_skylib".into(),
+                    urls: vec!["https://example.invalid/never-fetched-skylib.tar.gz".into()],
+                    sha256: Some("f".repeat(64)),
+                    strip_prefix: None,
+                    build_file: None,
+                    build_file_content: None,
+                    repo_mapping: HashMap::new(),
+                };
+                orchestrator
+                    .repository_manager
+                    .register_http_archive(archive.clone());
+                {
+                    let mut loader = orchestrator.bzl_loader.lock().unwrap();
+                    if stale_origin == "automatic" {
+                        loader.add_implicit_system_adapter("bazel_skylib".into(), stale.clone());
+                    } else {
+                        loader.add_managed_workspace_source("bazel_skylib".into(), stale.clone());
+                    }
+                    if stale_side == "async-mirror" {
+                        loader.add_external_repo("bazel_skylib".into(), explicit.clone());
+                    }
+                }
+                orchestrator.external_repo_paths.lock().await.insert(
+                    "bazel_skylib".into(),
+                    if stale_side == "loader" {
+                        explicit.clone()
+                    } else {
+                        stale.clone()
+                    },
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        orchestrator
+                            .admit_options_header_constructor_source()
+                            .await?,
+                        explicit,
+                        "{stale_origin}/{stale_side}"
+                    );
+                    assert_eq!(
+                        orchestrator
+                            .external_repo_paths
+                            .lock()
+                            .await
+                            .get("bazel_skylib"),
+                        Some(&explicit)
+                    );
+                    let loader = orchestrator.bzl_loader.lock().unwrap();
+                    assert_eq!(
+                        loader.external_repo_path("bazel_skylib"),
+                        Some(explicit.clone())
+                    );
+                    assert!(!loader.is_implicit_system_adapter("bazel_skylib", &explicit));
+                    assert!(!loader.is_managed_workspace_source("bazel_skylib", &explicit));
+                    assert_eq!(
+                        loader.is_implicit_system_adapter("bazel_skylib", &stale),
+                        stale_origin == "automatic"
+                    );
+                    assert_eq!(
+                        loader.is_managed_workspace_source("bazel_skylib", &stale),
+                        stale_origin == "managed"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read_to_string(explicit.join("rules/common_settings.bzl"))?,
+                    provided_bytes
+                );
+                assert_eq!(
+                    std::fs::read_to_string(stale.join("rules/common_settings.bzl"))?,
+                    stale_bytes
+                );
+                assert_eq!(
+                    orchestrator
+                        .repository_manager
+                        .get_http_archive("bazel_skylib")
+                        .unwrap()
+                        .urls,
+                    archive.urls,
+                    "constructor selection must not remove/change the generic archive declaration"
+                );
+                assert!(
+                    !io.manifest()
+                        .deps()
+                        .iter()
+                        .any(|dependency| matches!(dependency, Dependency::ProcessProbe { .. })),
+                    "explicit constructor selection must not invoke external analysis"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn options_constructor_automatic_and_managed_sources_cannot_take_explicit_shortcut(
+    ) -> Result<()> {
+        once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
+        for origin in ["automatic", "managed"] {
+            let temp = TempDir::new()?;
+            let root = temp.path().canonicalize()?;
+            let source = root.join("unadmitted-skylib");
+            write_file(
+                &root.join("WORKSPACE"),
+                "workspace(name = \"strict_constructor\")\n",
+            )?;
+            write_file(
+                &source.join("rules/common_settings.bzl"),
+                "# unadmitted bytes must remain unchanged\n",
+            )?;
+            let orchestrator = BuildOrchestrator::with_workspace(root.clone());
+            {
+                let mut loader = orchestrator.bzl_loader.lock().unwrap();
+                if origin == "automatic" {
+                    loader.add_implicit_system_adapter("bazel_skylib".into(), source.clone());
+                } else {
+                    loader.add_managed_workspace_source("bazel_skylib".into(), source.clone());
+                }
+            }
+            for registered in [None, Some(source.as_path())] {
+                assert!(
+                    orchestrator
+                        .selected_explicit_options_constructor_source(registered)?
+                        .is_none(),
+                    "{origin} must continue through the strict registered-source admission route"
+                );
+            }
+            let loader = orchestrator.bzl_loader.lock().unwrap();
+            assert_eq!(
+                loader.external_repo_path("bazel_skylib"),
+                Some(source.clone())
+            );
+            assert_eq!(
+                loader.is_implicit_system_adapter("bazel_skylib", &source),
+                origin == "automatic"
+            );
+            assert_eq!(
+                loader.is_managed_workspace_source("bazel_skylib", &source),
+                origin == "managed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(source.join("rules/common_settings.bzl"))?,
+                "# unadmitted bytes must remain unchanged\n"
+            );
+            // Deliberately do not call the async admission fallback here: a
+            // real managed/automatic proof may need an actual analyzer.
+        }
+        Ok(())
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn builtin_repository_graph_admission_keeps_explicit_sources_and_active_mirrors() -> Result<()> {
         let temp = TempDir::new()?;

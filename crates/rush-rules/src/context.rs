@@ -13,12 +13,197 @@ pub trait ActionManager: Send + Sync {
     /// Execute an action
     async fn execute(&self, action: Action) -> Result<ActionResult>;
 
+    /// Real builtin expansion has no subprocess or cache fallback.
+    async fn execute_inline_options_header(&self, _action: InlineOptionsHeaderAction) -> Result<()> {
+        anyhow::bail!("owned inline options execution is unsupported by this manager")
+    }
+
     async fn execute_pending_compile(&self, _action: Action,
         _pending: PendingCompileDeclaration) -> Result<ActionResult> {
         anyhow::bail!("pending compiler discovery execution is unsupported by this manager")
     }
 }
 
+/// Closed, nonserialized request for one real inline options-header producer.
+/// Registry IDs and paths are checked again by the target-specific manager.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineOptionsHeaderAction {
+    action: rush_action::ids::DeclaredActionId,
+    target: rush_action::ids::TargetId,
+    config: rush_action::ids::ConfigId,
+    source: rush_action::ids::ArtifactId,
+    output: rush_action::ids::ArtifactId,
+    source_path: PathBuf,
+    output_path: PathBuf,
+    inputs: Arc<crate::providers::VerifiedOptionsHeaderInputs>,
+}
+
+impl InlineOptionsHeaderAction {
+    pub fn from_registry(
+        registry: &rush_action::ids::ArtifactRegistry,
+        action: rush_action::ids::DeclaredActionId,
+        target: rush_action::ids::TargetId,
+        config: rush_action::ids::ConfigId,
+        inputs: Arc<crate::providers::VerifiedOptionsHeaderInputs>,
+    ) -> Result<Self> {
+        use rush_action::ids::{ActionDeclarationStatus, ArtifactKind};
+        anyhow::ensure!(
+            (action.0 as usize) < registry.declared_action_count(),
+            "inline options action is not in this registry"
+        );
+        let declaration = registry.declared_action(action);
+        anyhow::ensure!(
+            declaration.owner_target == target
+                && registry.strings().str(declaration.mnemonic) == "GenOptionsHeader"
+                && matches!(declaration.status, ActionDeclarationStatus::Complete),
+            "inline options requires its complete target-owned GenOptionsHeader declaration"
+        );
+        anyhow::ensure!(
+            declaration.inputs.len() == 1 && declaration.outputs.len() == 1,
+            "inline options requires exactly one SOURCE input and one output"
+        );
+        let source = declaration.inputs[0];
+        let output = declaration.outputs[0];
+        for id in [source, output] {
+            anyhow::ensure!(
+                (id.0 as usize) < registry.artifact_count(),
+                "inline options artifact is not in this registry"
+            );
+            anyhow::ensure!(
+                registry.find_artifact_by_path(registry.artifact_path(id), config) == Some(id),
+                "inline options artifact belongs to another native configuration"
+            );
+        }
+        let source_data = registry.artifact(source);
+        let output_data = registry.artifact(output);
+        anyhow::ensure!(
+            source != output
+                && source_data.is_source
+                && source_data.owner_action.is_none()
+                && source_data.owner_action_declared.is_none()
+                && registry.artifact_path(source).as_os_str()
+                    == inputs.request.template_path.as_os_str(),
+            "inline options requires the exact declared SOURCE template artifact"
+        );
+        anyhow::ensure!(
+            !output_data.is_source
+                && output_data.kind == ArtifactKind::Header
+                && output_data.owner_target == target
+                && output_data.owner_action_declared == Some(action),
+            "inline options header is not owned by its declaration"
+        );
+        let source_path = registry.artifact_path(source).to_owned();
+        let output_path = registry.artifact_path(output).to_owned();
+        anyhow::ensure!(
+            source_path.is_absolute() && output_path.is_absolute(),
+            "inline options requires absolute native input/output paths"
+        );
+        Ok(Self {
+            action,
+            target,
+            config,
+            source,
+            output,
+            source_path,
+            output_path,
+            inputs,
+        })
+    }
+
+    pub fn validate_registry(&self, registry: &rush_action::ids::ArtifactRegistry) -> Result<()> {
+        let current = Self::from_registry(
+            registry,
+            self.action,
+            self.target,
+            self.config,
+            self.inputs.clone(),
+        )?;
+        anyhow::ensure!(
+            current == *self
+                && current.source_path.as_os_str() == self.source_path.as_os_str()
+                && current.output_path.as_os_str() == self.output_path.as_os_str(),
+            "inline options declaration changed"
+        );
+        Ok(())
+    }
+
+    pub fn action(&self) -> rush_action::ids::DeclaredActionId {
+        self.action
+    }
+    pub fn target(&self) -> rush_action::ids::TargetId {
+        self.target
+    }
+    pub fn output_path(&self) -> &Path {
+        &self.output_path
+    }
+    pub fn inputs(&self) -> &crate::providers::VerifiedOptionsHeaderInputs {
+        &self.inputs
+    }
+
+    /// Explicit captured command/MAIN root are supplied by the owning build.
+    /// This method creates fresh IO and grants no cache/read certificate.
+    pub fn read_template(
+        &self,
+        command: &rush_command_core::CommandSemantics,
+        main_workspace_root: &Path,
+    ) -> Result<Vec<u8>> {
+        read_verified_options_header_source(command, main_workspace_root, &self.inputs)
+    }
+}
+
+fn read_verified_options_header_source(
+    command: &rush_command_core::CommandSemantics,
+    main_workspace_root: &Path,
+    inputs: &crate::providers::VerifiedOptionsHeaderInputs,
+) -> Result<Vec<u8>> {
+    use rush_incremental::TrackedIo;
+    anyhow::ensure!(
+        command.config_fingerprint() == &inputs.command_fingerprint,
+        "options header configured inputs belong to another command"
+    );
+    anyhow::ensure!(
+        main_workspace_root.is_absolute() && inputs.request.template_path.is_absolute(),
+        "options header requires absolute MAIN workspace and SOURCE template paths"
+    );
+    let io = Arc::new(rush_incremental::RealTrackedIo::new(
+        command.clone(),
+        main_workspace_root,
+    ));
+    let (actual_root, actual_path) = rush_incremental::tracked::scope(io.clone(), || {
+        Ok::<_, std::io::Error>((
+            rush_incremental::tracked::canonicalize(main_workspace_root)?,
+            rush_incremental::tracked::canonicalize(&inputs.request.template_path)?,
+        ))
+    })?;
+    anyhow::ensure!(
+        actual_root == inputs.main_workspace_root,
+        "options header configured inputs belong to another workspace"
+    );
+    anyhow::ensure!(
+        actual_path == inputs.template.path,
+        "options header template artifact resolution changed"
+    );
+    let read = io
+        .read_canonical_regular_file(&inputs.template.path)?
+        .ok_or_else(|| anyhow::anyhow!("options header requires descriptor-bound source reads"))?;
+    anyhow::ensure!(
+        read.metadata == inputs.template.metadata
+            && blake3::hash(&read.contents).as_bytes() == &inputs.template.digest,
+        "options header SOURCE template changed after configured analysis"
+    );
+    io.refresh_filesystem_observations();
+    let (final_root, final_path) = rush_incremental::tracked::scope(io, || {
+        Ok::<_, std::io::Error>((
+            rush_incremental::tracked::canonicalize(main_workspace_root)?,
+            rush_incremental::tracked::canonicalize(&inputs.request.template_path)?,
+        ))
+    })?;
+    anyhow::ensure!(
+        final_root == inputs.main_workspace_root && final_path == inputs.template.path,
+        "options header MAIN/template resolution changed during read"
+    );
+    Ok(read.contents.to_vec())
+}
 /// Requested native compile policy. This in-memory value is not execution or
 /// cache authority. Diagnostic selection is explicit per immutable request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,6 +449,9 @@ impl Toolchain {
 /// Build context passed to rule execution
 pub struct BuildContext {
     native_compile_mode: NativeCompileMode,
+    options_header_command: Option<rush_command_core::CommandSemantics>,
+    options_header_config: Option<rush_action::ids::ConfigId>,
+    options_header_inputs: Option<Arc<crate::providers::VerifiedOptionsHeaderInputs>>,
     pending_compile_declarations: Option<Arc<PendingCompileDeclarations>>,
     /// Source root for the rule's owning repository.
     pub workspace_root: PathBuf,
@@ -453,6 +641,9 @@ impl BuildContext {
     pub fn new(workspace_root: PathBuf, output_dir: PathBuf) -> Self {
         Self {
             native_compile_mode: NativeCompileMode::Literal,
+            options_header_command: None,
+            options_header_config: None,
+            options_header_inputs: None,
             pending_compile_declarations: None,
             main_workspace_root: workspace_root.clone(),
             native_execution_root: None,
@@ -473,6 +664,142 @@ impl BuildContext {
         }
     }
 
+    /// Bind optional configured inputs to this actual captured native request.
+    /// A new command always retires the previous options-header input record.
+    pub fn with_options_header_command(
+        mut self,
+        command: rush_command_core::CommandSemantics,
+    ) -> Self {
+        self.options_header_command = Some(command);
+        self.options_header_inputs = None;
+        self.options_header_config = None;
+        self
+    }
+
+    /// Native registry configuration, independent of the Bazel checksum/ID.
+    pub fn with_options_header_config(mut self, config: rush_action::ids::ConfigId) -> Self {
+        self.options_header_config = Some(config);
+        self
+    }
+
+    /// Attach genuine configured inputs only after the native command is bound.
+    pub fn with_options_header_inputs(
+        mut self,
+        inputs: Arc<crate::providers::VerifiedOptionsHeaderInputs>,
+    ) -> Result<Self> {
+        let command = self
+            .options_header_command
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("options header has no captured native command"))?;
+        anyhow::ensure!(
+            command.config_fingerprint() == &inputs.command_fingerprint,
+            "options header configured inputs belong to another command"
+        );
+        anyhow::ensure!(
+            self.main_workspace_root.is_absolute(),
+            "options header requires an absolute native MAIN workspace"
+        );
+        let io = Arc::new(rush_incremental::RealTrackedIo::new(
+            command.clone(),
+            &self.main_workspace_root,
+        ));
+        let actual_root = rush_incremental::tracked::scope(io, || {
+            rush_incremental::tracked::canonicalize(&self.main_workspace_root)
+        })?;
+        anyhow::ensure!(
+            actual_root == inputs.main_workspace_root,
+            "options header configured inputs belong to another workspace"
+        );
+        self.options_header_inputs = Some(inputs);
+        Ok(self)
+    }
+
+    pub fn options_header_inputs(&self) -> Result<&crate::providers::VerifiedOptionsHeaderInputs> {
+        let command = self
+            .options_header_command
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("options header has no captured native command"))?;
+        let inputs = self.options_header_inputs.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("options header requires genuine configured BuildSettingInfo inputs")
+        })?;
+        anyhow::ensure!(
+            command.config_fingerprint() == &inputs.command_fingerprint,
+            "options header configured inputs belong to another command"
+        );
+        anyhow::ensure!(
+            self.main_workspace_root.is_absolute(),
+            "options header requires an absolute native MAIN workspace"
+        );
+        let io = Arc::new(rush_incremental::RealTrackedIo::new(
+            command.clone(),
+            &self.main_workspace_root,
+        ));
+        let actual_root = rush_incremental::tracked::scope(io, || {
+            rush_incremental::tracked::canonicalize(&self.main_workspace_root)
+        })?;
+        anyhow::ensure!(
+            actual_root == inputs.main_workspace_root,
+            "options header configured inputs belong to another workspace"
+        );
+        Ok(inputs)
+    }
+
+    /// Read the same canonical SOURCE template through the descriptor-bound IO
+    /// capability. No TLS lookup, ordinary-read fallback or generated template
+    /// is admitted. Runtime observations do not publish a reusable certificate.
+    pub fn read_options_header_template(&self) -> Result<Vec<u8>> {
+        let inputs = self.options_header_inputs()?;
+        read_verified_options_header_source(
+            self.options_header_command.as_ref().unwrap(),
+            &self.main_workspace_root,
+            inputs,
+        )
+    }
+
+    /// Form a closed request from this build's existing producer declaration.
+    pub async fn execute_inline_options_header(&self, output_path: &Path) -> Result<()> {
+        anyhow::ensure!(
+            self.native_compile_mode == NativeCompileMode::UncachedDiagnosticV1,
+            "owned inline options execution requires the explicit diagnostic profile"
+        );
+        let inputs = self.options_header_inputs()?;
+        let config = self.options_header_config.ok_or_else(|| {
+            anyhow::anyhow!("inline options has no explicit native configuration")
+        })?;
+        let registry = self
+            .artifact_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("inline options has no native artifact registry"))?;
+        let request = {
+            let registry = registry.lock().await;
+            let matches = registry
+                .declared_actions()
+                .filter(|(_, action)| {
+                    registry.strings().str(action.mnemonic) == "GenOptionsHeader"
+                        && action.outputs.len() == 1
+                        && registry.artifact_path(action.outputs[0]).as_os_str()
+                            == output_path.as_os_str()
+                })
+                .map(|(id, action)| (id, action.owner_target))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                matches.len() == 1,
+                "inline options requires one exact declared output producer"
+            );
+            InlineOptionsHeaderAction::from_registry(
+                &registry,
+                matches[0].0,
+                matches[0].1,
+                config,
+                Arc::new(inputs.clone()),
+            )?
+        };
+        self.action_manager
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("inline options has no action manager"))?
+            .execute_inline_options_header(request)
+            .await
+    }
     /// Carry this build's explicit compile policy and pending declarations.
     pub fn with_native_compile_discovery(
         mut self,

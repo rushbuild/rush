@@ -9,6 +9,7 @@
 #![allow(missing_docs)]
 
 mod configured_flag_metadata;
+mod native_options_header;
 pub(crate) mod compiler_discovery;
 pub(crate) mod configuration_table;
 pub(crate) mod configured_target;
@@ -5015,6 +5016,79 @@ cc_library(
             analysis
         };
         analysis.validate_registered_condition(&scope, canonical_label)
+    }
+
+    /// Resolve only a consumed options-header declaration through the same
+    /// immutable configured-analysis capsule used for flag predicates. No
+    /// provider is attached and no inline writer is enabled by this method.
+    pub(crate) fn resolve_options_header_inputs(
+        &self,
+        request: &rush_rules::providers::OptionsHeaderRequest,
+    ) -> Result<std::sync::Arc<rush_rules::providers::VerifiedOptionsHeaderInputs>> {
+        let scope = self.config_registry_scope();
+        let generation = rush_starlark::config_defines::feature_flag_generation(&scope);
+        let command = self
+            .feature_flag_command
+            .lock()
+            .map_err(|_| anyhow::anyhow!("configured command lock poisoned"))?
+            .clone()
+            .context("options header has no immutable native command request")?;
+        let analysis = if let Some(analysis) = command.analysis.clone() {
+            analysis
+        } else {
+            let binary =
+                rush_starlark::BzlLoader::resolve_configured_analysis_binary(&self.workspace_root)?;
+            let cache_root = command
+                .semantics
+                .getenv(b"RUSH_WORKSPACE_CACHE_ROOT")
+                .map(|value| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::ffi::OsStrExt;
+                        PathBuf::from(std::ffi::OsStr::from_bytes(value))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        PathBuf::from(String::from_utf8_lossy(value).into_owned())
+                    }
+                })
+                .unwrap_or_else(|| self.workspace_root.join(".cache/rush"));
+            let analysis =
+                configured_flag_metadata::ConfiguredFeatureFlagAnalysis::new_with_toolchain(
+                    &self.workspace_root,
+                    &binary,
+                    &cache_root.join("bazel_output_base"),
+                    &command.semantics,
+                    rush_rules::context::Toolchain::default(),
+                )?;
+            let mut slot = self
+                .feature_flag_command
+                .lock()
+                .map_err(|_| anyhow::anyhow!("configured command lock poisoned"))?;
+            let current = slot
+                .as_mut()
+                .context("native command ended during options metadata preparation")?;
+            anyhow::ensure!(
+                current.semantics.config_fingerprint() == command.semantics.config_fingerprint(),
+                "native command changed during options metadata preparation"
+            );
+            current.analysis = Some(analysis.clone());
+            analysis
+        };
+        let inputs = analysis.resolve_options_header_inputs(request)?;
+        let current = self
+            .feature_flag_command
+            .lock()
+            .map_err(|_| anyhow::anyhow!("configured command lock poisoned"))?
+            .clone()
+            .context("native command ended during options metadata analysis")?;
+        anyhow::ensure!(
+            current.semantics.config_fingerprint() == command.semantics.config_fingerprint()
+                && inputs.command_fingerprint == *command.semantics.config_fingerprint()
+                && generation == rush_starlark::config_defines::feature_flag_generation(&scope),
+            "native command or configured metadata generation changed during options analysis"
+        );
+        Ok(inputs)
     }
 
     fn preload_configuration_metadata_roots(

@@ -732,6 +732,69 @@ impl CustomProvider {
     }
 }
 
+/// Literal declared attributes needed to prepare one selected options consumer.
+/// This shape is not provider, source or execution authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptionsHeaderDeclaration {
+    pub template: String,
+    pub output_header: String,
+    pub build_settings: std::collections::BTreeMap<String, String>,
+}
+/// Native inputs expected from the real TensorFlow options-header declaration.
+/// Labels are canonical and the path is the exact native SOURCE artifact.
+/// Generated templates remain unsupported until their producer is routed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptionsHeaderRequest {
+    pub consumer_label: String,
+    pub template_label: String,
+    pub output_label: String,
+    pub settings: std::collections::BTreeMap<String, String>,
+    pub template_path: PathBuf,
+    pub provider_key: String,
+    /// Caller-qualified consumer implementation; never learned from the same
+    /// metadata query used to admit this request.
+    pub expected_implementation_hash: String,
+}
+
+/// A genuine configured provider value, independent of the raw option value.
+/// Alias observations keep both their requested and consumed producer identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredBuildSettingInfo {
+    pub requested_label: String,
+    pub producer_label: String,
+    pub consumed_label: String,
+    pub provider_key: String,
+    pub value: bool,
+    pub configuration_checksum: String,
+    pub configuration_id: u64,
+    pub observed_occurrences: usize,
+}
+
+pub use rush_incremental::CanonicalRegularFileMetadata as OptionsHeaderSourceMetadata;
+
+/// Descriptor-bound bytes of the native source template observed in analysis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptionsHeaderSource {
+    pub label: String,
+    pub path: PathBuf,
+    pub digest: [u8; 32],
+    pub metadata: OptionsHeaderSourceMetadata,
+}
+
+/// Immutable result of two genuine configured analysis rounds for one request.
+/// This value alone grants no cache/read certificate or writer completion.
+/// A caller must bind it to the captured native command and template artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedOptionsHeaderInputs {
+    pub request: OptionsHeaderRequest,
+    pub command_fingerprint: [u8; 32],
+    pub main_workspace_root: PathBuf,
+    pub consumer_configuration: String,
+    pub consumer_configuration_id: u64,
+    pub settings: std::collections::BTreeMap<String, ConfiguredBuildSettingInfo>,
+    pub template: OptionsHeaderSource,
+}
+
 /// Typed bundle of providers attached to an analyzed target.
 ///
 /// Replaces the previous `HashMap<String, Provider>`. Well-known

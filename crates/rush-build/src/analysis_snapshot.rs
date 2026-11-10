@@ -443,6 +443,12 @@ pub struct AnalysisSnapshot {
     /// The per-target analysis providers (`CcInfo` etc.) — PASS-A output,
     /// consumed by PASS-B to assemble each target's dep providers.
     pub analysis_providers: HashMap<String, ProviderSet>,
+    /// Genuine configured inputs retained for each selected diagnostic inline
+    /// writer. These records alone supply no cache or execution authority.
+    pub(crate) options_header_inputs: HashMap<
+        String,
+        Arc<rush_rules::providers::VerifiedOptionsHeaderInputs>,
+    >,
     /// Cached pruned PASS-B planner index. Populated after the first full
     /// successful PASS-B run, when legacy rules have declared their actions.
     pub pass_b_prune_index: Mutex<Option<Arc<PassBPruneIndex>>>,

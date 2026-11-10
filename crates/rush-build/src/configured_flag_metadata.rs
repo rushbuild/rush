@@ -392,6 +392,402 @@ impl ConfiguredFeatureFlagAnalysis {
     }
 }
 
+// The provider constructor is an input from the native API's defining module,
+// never a match on the exported name alone. target.files is queried even when
+// empty: metadata-only treatment must not discard a producer's real outputs.
+const OPTIONS_PROVIDER_EXPRESSION: &str = r#"json.encode({"label":str(target.label),"configuration":"CHECKSUM","provider_keys":sorted([str(k) for k in (providers(target) or {})]),"files":[str(f.path) for f in target.files.to_list()],"info":{"key":PROVIDER_KEY,"type":type(providers(target)[PROVIDER_KEY].value),"value":providers(target)[PROVIDER_KEY].value} if PROVIDER_KEY in (providers(target) or {}) else None,"raw_options":[{"label":str(k),"type":type(v),"value":v} for k,v in (build_options(target) or {}).items() if not str(k).startswith("//command_line_option:")]})"#;
+
+#[derive(Debug, PartialEq, Eq)]
+struct OptionsHeaderRound {
+    metadata: BTreeMap<(String, String), Value>,
+    raw_occurrences: BTreeMap<(String, String), usize>,
+    domains: BTreeMap<String, BTreeMap<String, usize>>,
+    providers: BTreeMap<(String, String), Vec<Value>>,
+    settings: BTreeMap<String, rush_rules::providers::ConfiguredBuildSettingInfo>,
+    consumer_configuration: String,
+    consumer_configuration_id: u64,
+    template_label: String,
+}
+
+impl ConfiguredFeatureFlagAnalysis {
+    /// Observe genuine configured BuildSettingInfo values for a native options
+    /// consumer. This uses the existing immutable query capsule and records all
+    /// probes; it does not attach providers, cache results or complete a writer.
+    /// Only SOURCE templates and empty-file metadata setting producers qualify.
+    pub(crate) fn resolve_options_header_inputs(
+        &self,
+        request: &rush_rules::providers::OptionsHeaderRequest,
+    ) -> Result<std::sync::Arc<rush_rules::providers::VerifiedOptionsHeaderInputs>> {
+        validate_options_request(request)?;
+        if tracked::config_fingerprint() != self.fingerprint {
+            bail!("options header metadata scope differs from its captured native command");
+        }
+        let source_path = tracked::canonicalize(&request.template_path)?;
+        let first_source = tracked::read_canonical_regular_file(&source_path)?
+            .context("options header requires descriptor-bound SOURCE template reads")?;
+        let first = self.options_header_round(request)?;
+        let second = self.options_header_round(request)?;
+        let second_path = tracked::canonicalize(&request.template_path)?;
+        let second_source = tracked::read_canonical_regular_file(&second_path)?
+            .context("options header requires descriptor-bound SOURCE template reads")?;
+        if first != second
+            || source_path != second_path
+            || first_source.metadata != second_source.metadata
+            || first_source.contents != second_source.contents
+            || tracked::config_fingerprint() != self.fingerprint
+        {
+            bail!(
+                "options header configured inputs or SOURCE template changed between fresh rounds"
+            );
+        }
+        Ok(std::sync::Arc::new(
+            rush_rules::providers::VerifiedOptionsHeaderInputs {
+                request: request.clone(),
+                command_fingerprint: self.fingerprint,
+                main_workspace_root: tracked::canonicalize(&self.workspace)?,
+                consumer_configuration: first.consumer_configuration,
+                consumer_configuration_id: first.consumer_configuration_id,
+                settings: first.settings,
+                template: rush_rules::providers::OptionsHeaderSource {
+                    label: first.template_label,
+                    path: source_path,
+                    digest: *blake3::hash(&first_source.contents).as_bytes(),
+                    metadata: first_source.metadata,
+                },
+            },
+        ))
+    }
+
+    fn options_header_round(
+        &self,
+        request: &rush_rules::providers::OptionsHeaderRequest,
+    ) -> Result<OptionsHeaderRound> {
+        let expression = format!("deps({})", query_label(&request.consumer_label)?);
+        let bytes = self.cquery(
+            &expression,
+            &[
+                "--output=jsonproto",
+                "--proto:output_rule_attrs=all",
+                "--proto:definition_stack=true",
+            ],
+        )?;
+        let declaration = ConfiguredDeclaration::parse_consumer(
+            &bytes,
+            &request.consumer_label,
+            |rule, attrs| validate_options_consumer(rule, attrs, request),
+        )?;
+        let mut observations = BTreeMap::new();
+        for (checksum, expected) in &declaration.domains {
+            // Unconfigured SOURCE nodes remain in the complete JSONproto
+            // domain. They have no setting provider and are checked separately.
+            if checksum == "null" {
+                continue;
+            }
+            let formatter = OPTIONS_PROVIDER_EXPRESSION
+                .replace("CHECKSUM", checksum)
+                .replace(
+                    "PROVIDER_KEY",
+                    &serde_json::to_string(&request.provider_key)?,
+                );
+            let output = self.cquery(
+                &format!("config({expression}, '{checksum}')"),
+                &["--output=starlark", &format!("--starlark:expr={formatter}")],
+            )?;
+            let rows = options_provider_rows(&output, checksum, expected)?;
+            for (label, rows) in rows {
+                observations.insert((label, checksum.clone()), rows);
+            }
+        }
+        finish_options_round(request, declaration, &bytes, observations)
+    }
+}
+
+fn validate_options_request(request: &rush_rules::providers::OptionsHeaderRequest) -> Result<()> {
+    for label in std::iter::once(&request.consumer_label)
+        .chain(std::iter::once(&request.template_label))
+        .chain(std::iter::once(&request.output_label))
+        .chain(request.settings.keys())
+    {
+        if canonical(label)? != *label {
+            bail!("options header request label is not canonical: {label}");
+        }
+        query_label(label)?;
+    }
+    if !request.template_path.is_absolute() {
+        bail!("options header template artifact is not absolute");
+    }
+    let (module, export) = request
+        .provider_key
+        .rsplit_once('%')
+        .context("options header lacks a complete provider constructor identity")?;
+    if export != "BuildSettingInfo" || query_label(module)? != module {
+        bail!("options header provider constructor identity is not canonical");
+    }
+    if request.expected_implementation_hash.len() != 64
+        || !request
+            .expected_implementation_hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("options header lacks a qualified expected consumer implementation hash");
+    }
+    // Rule attributes currently carry an unordered dictionary. Refuse any
+    // noncommuting substitution order rather than guess which value wins.
+    let mut identifiers = BTreeSet::new();
+    for identifier in request.settings.values() {
+        if identifier.is_empty()
+            || !identifier
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            bail!("options header supports nonempty literal macro identifiers only");
+        }
+        if identifiers.iter().any(|other: &&str| {
+            other.starts_with(identifier.as_str()) || identifier.starts_with(*other)
+        }) {
+            bail!("options header has duplicate or overlapping substitutions without ordered native attributes");
+        }
+        identifiers.insert(identifier.as_str());
+    }
+    Ok(())
+}
+
+fn validate_options_consumer(
+    rule: &Value,
+    attrs: &BTreeMap<String, Value>,
+    request: &rush_rules::providers::OptionsHeaderRequest,
+) -> Result<()> {
+    if string(rule, "ruleClass")? != "tf_gen_options_header" {
+        bail!("configured options consumer is not tf_gen_options_header");
+    }
+    if dictionary(
+        attrs,
+        "build_settings",
+        "LABEL_KEYED_STRING_DICT",
+        "labelKeyedStringDictValue",
+        true,
+    )? != request.settings
+    {
+        bail!("configured options build_settings differs from the native declaration");
+    }
+    for (name, kind, expected) in [
+        ("template", "LABEL", &request.template_label),
+        ("output_header", "OUTPUT", &request.output_label),
+    ] {
+        let attr = attrs
+            .get(name)
+            .with_context(|| format!("configured options lacks {name}"))?;
+        if string(attr, "type")? != kind || canonical(string(attr, "stringValue")?)? != *expected {
+            bail!("configured options {name} differs from native declaration");
+        }
+    }
+    let implementation_attr = attrs
+        .get("$rule_implementation_hash")
+        .context("configured options lacks genuine implementation metadata")?;
+    if string(implementation_attr, "type")? != "STRING" {
+        bail!("configured options implementation metadata has the wrong type");
+    }
+    let implementation = string(implementation_attr, "stringValue")?;
+    if implementation.len() != 64 || !implementation.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("configured options implementation metadata is malformed");
+    }
+    if implementation != request.expected_implementation_hash {
+        bail!("configured options consumer implementation differs from the qualified renderer");
+    }
+    Ok(())
+}
+
+fn options_provider_rows(
+    bytes: &[u8],
+    configuration: &str,
+    expected: &BTreeMap<String, usize>,
+) -> Result<BTreeMap<String, Vec<Value>>> {
+    let mut rows: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for row in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
+        let row = row.context("invalid options provider JSON")?;
+        if string(&row, "configuration")? != configuration {
+            bail!("options provider has a foreign configuration association");
+        }
+        let label = canonical(string(&row, "label")?)?;
+        let files = row
+            .get("files")
+            .and_then(Value::as_array)
+            .context("options provider lacks complete DefaultInfo.files")?;
+        if files.iter().any(|v| v.as_str().is_none()) {
+            bail!("options provider file path is not a string");
+        }
+        let keys = row
+            .get("provider_keys")
+            .and_then(Value::as_array)
+            .context("options provider lacks constructor keys")?;
+        let mut unique = BTreeSet::new();
+        for key in keys {
+            if !unique.insert(
+                key.as_str()
+                    .context("provider key is not a string")?
+                    .to_owned(),
+            ) {
+                bail!("duplicate options provider constructor key");
+            }
+        }
+        if row.get("info").is_none() {
+            bail!("options provider lacks an explicit info result");
+        }
+        rows.entry(label).or_default().push(row);
+    }
+    let actual = rows
+        .iter()
+        .map(|(label, values)| (label.clone(), values.len()))
+        .collect::<BTreeMap<_, _>>();
+    if &actual != expected {
+        bail!("options provider records do not cover the exact alias/configuration domain");
+    }
+    // Alias+actual projection can legitimately repeat one consumed target.
+    // Preserve every row/count and require full payload equality, not label-only
+    // deduplication or equality of just the boolean value.
+    for values in rows.values() {
+        if values.iter().any(|v| v != &values[0]) {
+            bail!("options alias observations disagree on the complete provider payload");
+        }
+    }
+    Ok(rows)
+}
+
+fn finish_options_round(
+    request: &rush_rules::providers::OptionsHeaderRequest,
+    declaration: ConfiguredDeclaration,
+    bytes: &[u8],
+    observations: BTreeMap<(String, String), Vec<Value>>,
+) -> Result<OptionsHeaderRound> {
+    let raw: Value = serde_json::from_slice(bytes)?;
+    let consumer_keys = declaration
+        .metadata
+        .keys()
+        .filter(|(label, _)| label == &request.consumer_label)
+        .collect::<Vec<_>>();
+    if consumer_keys.len() != 1 || consumer_keys[0].1 == "null" {
+        bail!("options consumer must have one unambiguous configured identity");
+    }
+    let checksum = consumer_keys[0].1.clone();
+    let ids = raw["configurations"]
+        .as_array()
+        .context("missing configuration table")?
+        .iter()
+        .filter(|row| row.get("checksum").and_then(Value::as_str) == Some(checksum.as_str()))
+        .map(|row| {
+            row.get("id")
+                .and_then(Value::as_u64)
+                .filter(|v| *v != 0)
+                .context("invalid options configuration ID")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if ids.len() != 1 {
+        bail!("options configuration checksum has ambiguous numeric identity");
+    }
+    let configuration_id = ids[0];
+    let template_label = declaration.resolve_alias(&request.template_label)?;
+    let mut templates = 0;
+    for row in raw["results"]
+        .as_array()
+        .context("missing configured results")?
+    {
+        let target = &row["target"];
+        match target.get("type").and_then(Value::as_str) {
+            Some("SOURCE_FILE")
+                if canonical(string(&target["sourceFile"], "name")?)? == template_label =>
+            {
+                if string(&row["configuration"], "checksum")? != "null" {
+                    bail!("SOURCE template unexpectedly has a configured identity");
+                }
+                templates += 1;
+            }
+            Some("GENERATED_FILE")
+                if canonical(string(&target["generatedFile"], "name")?)? == template_label =>
+            {
+                bail!("generated options templates require exact native producer/ArtifactId routing; SOURCE templates only");
+            }
+            _ => (),
+        }
+    }
+    if templates != 1 {
+        bail!("options template is not exactly one authoritative SOURCE_FILE");
+    }
+    let mut producers = BTreeSet::new();
+    let mut settings = BTreeMap::new();
+    for requested in request.settings.keys() {
+        let producer = declaration.resolve_alias(requested)?;
+        if !producers.insert(producer.clone()) {
+            bail!("options settings reference one producer through multiple aliases");
+        }
+        let identities = declaration
+            .metadata
+            .keys()
+            .filter(|(label, _)| label == &producer)
+            .collect::<Vec<_>>();
+        if identities.len() != 1 || identities[0].1 != checksum {
+            bail!("options setting producer is missing or has an ambiguous/foreign configuration: {producer}");
+        }
+        for label in [requested, &producer] {
+            if declaration
+                .raw_occurrences
+                .get(&(label.clone(), checksum.clone()))
+                .is_some_and(|n| *n != 1)
+            {
+                bail!("options setting has repeated raw configured producer identities");
+            }
+        }
+        let rows = observations
+            .get(&(producer.clone(), checksum.clone()))
+            .context("options setting has no configured provider observations")?;
+        let row = &rows[0];
+        if !row["files"].as_array().context("missing files")?.is_empty() {
+            bail!("options setting DefaultInfo.files is nonempty; metadata-only native execution would drop producer outputs");
+        }
+        let info = row
+            .get("info")
+            .filter(|v| !v.is_null())
+            .context("options setting lacks the genuine required BuildSettingInfo provider")?;
+        if string(info, "key")? != request.provider_key
+            || !row["provider_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some(request.provider_key.as_str()))
+        {
+            bail!("options setting has a foreign BuildSettingInfo constructor");
+        }
+        if string(info, "type")? != "bool" {
+            bail!("options BuildSettingInfo.value must be bool");
+        }
+        let value = info
+            .get("value")
+            .and_then(Value::as_bool)
+            .context("options provider bool is malformed")?;
+        settings.insert(
+            requested.clone(),
+            rush_rules::providers::ConfiguredBuildSettingInfo {
+                requested_label: requested.clone(),
+                producer_label: producer,
+                consumed_label: string(row, "label")?.to_owned(),
+                provider_key: request.provider_key.clone(),
+                value,
+                configuration_checksum: checksum.clone(),
+                configuration_id,
+                observed_occurrences: rows.len(),
+            },
+        );
+    }
+    Ok(OptionsHeaderRound {
+        metadata: declaration.metadata,
+        raw_occurrences: declaration.raw_occurrences,
+        domains: declaration.domains,
+        providers: observations,
+        settings,
+        consumer_configuration: checksum,
+        consumer_configuration_id: configuration_id,
+        template_label,
+    })
+}
 // This expression always emits a JSON record, including source files whose
 // providers() is None. Errors/empty/missing records cannot silently become false.
 const PROVIDER_EXPRESSION: &str = r#"json.encode({"label":str(target.label),"options":[{"label":str(k),"type":type(v),"value":v} for k,v in (build_options(target) or {}).items() if not str(k).startswith("//command_line_option:")],"feature":{"type":type(providers(target)["FeatureFlagInfo"].value),"value":providers(target)["FeatureFlagInfo"].value} if "FeatureFlagInfo" in (providers(target) or {}) else None,"toolchain":{"compiler":providers(target)["CcToolchainInfo"].compiler,"executable":providers(target)["CcToolchainInfo"].compiler_executable,"cpu":providers(target)["CcToolchainInfo"].cpu,"toolchain_id":providers(target)["CcToolchainInfo"].toolchain_id} if "CcToolchainInfo" in (providers(target) or {}) else None})"#;
@@ -421,6 +817,50 @@ struct ConfiguredDeclaration {
 }
 impl ConfiguredDeclaration {
     fn parse(bytes: &[u8], expected: &FeatureFlagPredicate) -> Result<Self> {
+        Self::parse_consumer(bytes, &expected.label, |rule, attrs| {
+            if string(rule, "ruleClass")? != "config_setting" {
+                bail!("configured condition is not a genuine config_setting");
+            }
+            let actual = FeatureFlagPredicate {
+                label: expected.label.clone(),
+                define_values: dictionary(
+                    attrs,
+                    "define_values",
+                    "STRING_DICT",
+                    "stringDictValue",
+                    false,
+                )?,
+                native_values: dictionary(
+                    attrs,
+                    "values",
+                    "STRING_DICT",
+                    "stringDictValue",
+                    false,
+                )?,
+                flag_values: dictionary(
+                    attrs,
+                    "flag_values",
+                    "LABEL_KEYED_STRING_DICT",
+                    "labelKeyedStringDictValue",
+                    true,
+                )?,
+                constraint_values: labels(attrs, "constraint_values")?,
+            };
+            if actual != *expected {
+                bail!(
+                    "Bazel condition predicate disagrees with native declaration: {}",
+                    expected.label
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn parse_consumer(
+        bytes: &[u8],
+        consumer: &str,
+        mut validate: impl FnMut(&Value, &BTreeMap<String, Value>) -> Result<()>,
+    ) -> Result<Self> {
         let value: Value =
             serde_json::from_slice(bytes).context("invalid configured query JSON proto")?;
         let results = value
@@ -517,38 +957,8 @@ impl ConfiguredDeclaration {
             }
             let rule = target_value;
             let attributes = attributes(rule)?;
-            if label == expected.label {
-                if string(rule, "ruleClass")? != "config_setting" {
-                    bail!("configured condition is not a genuine config_setting");
-                }
-                let actual = FeatureFlagPredicate {
-                    label: label.clone(),
-                    define_values: dictionary(
-                        &attributes,
-                        "define_values",
-                        "STRING_DICT",
-                        "stringDictValue",
-                        false,
-                    )?,
-                    native_values: dictionary(
-                        &attributes,
-                        "values",
-                        "STRING_DICT",
-                        "stringDictValue",
-                        false,
-                    )?,
-                    flag_values: dictionary(
-                        &attributes,
-                        "flag_values",
-                        "LABEL_KEYED_STRING_DICT",
-                        "labelKeyedStringDictValue",
-                        true,
-                    )?,
-                    constraint_values: labels(&attributes, "constraint_values")?,
-                };
-                if actual != *expected {
-                    bail!("Bazel condition predicate disagrees with native declaration: {label}");
-                }
+            if label == consumer {
+                validate(rule, &attributes)?;
                 saw_condition = true;
             }
             if string(rule, "ruleClass")? == "alias" {
@@ -1091,6 +1501,213 @@ fn project_build_arguments(tokens: &[String]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    fn options_request() -> rush_rules::providers::OptionsHeaderRequest {
+        rush_rules::providers::OptionsHeaderRequest {
+            consumer_label: "//:header".into(),
+            template_label: "//:options.tpl".into(),
+            output_label: "//:options.h".into(),
+            template_path: "/source/options.tpl".into(),
+            provider_key: "@bazel_skylib//rules:common_settings.bzl%BuildSettingInfo".into(),
+            expected_implementation_hash: "b".repeat(64),
+            settings: BTreeMap::from([("//:flag_alias".into(), "VALUE".into())]),
+        }
+    }
+
+    // Minimal public-label form of actual Bazel6.5 oracle02 JSONproto and
+    // alias+actual provider projection. Extra raw observations are retained.
+    fn options_fixture(value: bool) -> (Value, Vec<Value>) {
+        let cfg = "a".repeat(64);
+        let rule = |name: &str, kind: &str, attrs: Vec<Value>| {
+            serde_json::json!({
+                "target":{"type":"RULE","rule":{"name":name,"ruleClass":kind,"attribute":attrs}},
+                "configuration":{"checksum":cfg},"configurationId":1})
+        };
+        let source = serde_json::json!({"target":{"type":"SOURCE_FILE","sourceFile":{"name":"//:options.tpl"}},
+                "configuration":{"checksum":"null"},"configurationId":0});
+        let consumer = rule(
+            "//:header",
+            "tf_gen_options_header",
+            vec![
+                serde_json::json!({"name":"build_settings","type":"LABEL_KEYED_STRING_DICT","labelKeyedStringDictValue":[{"key":"//:flag_alias","value":"VALUE"}]}),
+                serde_json::json!({"name":"template","type":"LABEL","stringValue":"//:options.tpl"}),
+                serde_json::json!({"name":"output_header","type":"OUTPUT","stringValue":"//:options.h"}),
+                serde_json::json!({"name":"$rule_implementation_hash","type":"STRING","stringValue":"b".repeat(64)}),
+            ],
+        );
+        let alias = rule(
+            "//:flag_alias",
+            "alias",
+            vec![serde_json::json!({"name":"actual","type":"LABEL","stringValue":"//:flag"})],
+        );
+        let producer = rule("//:flag", "bool_flag", vec![]);
+        let metadata = serde_json::json!({"configurations":[{"id":1,"checksum":cfg}],
+                "results":[consumer,alias,producer,source]});
+        let ordinary = serde_json::json!({"label":"@//:header","configuration":cfg,
+                "provider_keys":["FileProvider"],"files":["bazel-out/config/bin/options.h"],"info":null,"raw_options":[]});
+        let provider = serde_json::json!({"label":"@//:flag","configuration":cfg,
+                "provider_keys":["@bazel_skylib//rules:common_settings.bzl%BuildSettingInfo","FileProvider"],"files":[],
+                "info":{"key":"@bazel_skylib//rules:common_settings.bzl%BuildSettingInfo","type":"bool","value":value},
+                "raw_options":[{"label":"//:flag","type":"bool","value":!value}]});
+        (metadata, vec![ordinary, provider.clone(), provider])
+    }
+
+    fn options_fixture_round(
+        request: &rush_rules::providers::OptionsHeaderRequest,
+        metadata: &Value,
+        rows: &[Value],
+    ) -> Result<OptionsHeaderRound> {
+        let bytes = serde_json::to_vec(metadata)?;
+        let declaration =
+            ConfiguredDeclaration::parse_consumer(&bytes, &request.consumer_label, |rule, attrs| {
+                validate_options_consumer(rule, attrs, request)
+            })?;
+        let cfg = "a".repeat(64);
+        let data = rows
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = options_provider_rows(data.as_bytes(), &cfg, &declaration.domains[&cfg])?;
+        let observations = parsed
+            .into_iter()
+            .map(|(label, values)| ((label, cfg.clone()), values))
+            .collect();
+        finish_options_round(request, declaration, &bytes, observations)
+    }
+
+    #[test]
+    fn options_header_metadata_preserves_genuine_provider_alias_and_raw_value_distinction() {
+        for value in [false, true, false] {
+            let request = options_request();
+            let (metadata, rows) = options_fixture(value);
+            let round = options_fixture_round(&request, &metadata, &rows).unwrap();
+            let setting = &round.settings["//:flag_alias"];
+            assert_eq!(setting.producer_label, "//:flag");
+            assert_eq!(setting.consumed_label, "@//:flag");
+            assert_eq!(setting.provider_key, request.provider_key);
+            assert_eq!(setting.value, value);
+            assert_eq!(setting.observed_occurrences, 2);
+            assert_eq!(setting.configuration_id, 1);
+            assert_eq!(
+                round.raw_occurrences[&("//:flag_alias".into(), "a".repeat(64))],
+                1
+            );
+            assert_eq!(
+                round.providers[&("//:flag".into(), "a".repeat(64))].len(),
+                2
+            );
+            assert_eq!(
+                round.providers[&("//:flag".into(), "a".repeat(64))][0]["raw_options"][0]["value"],
+                !value
+            );
+        }
+    }
+
+    #[test]
+    fn options_header_metadata_refuses_wrong_constructor_type_outputs_and_domain() {
+        let request = options_request();
+        let (metadata, rows) = options_fixture(true);
+        let mut wrong = rows.clone();
+        for row in &mut wrong[1..] {
+            row["info"]["key"] = "//:foreign.bzl%BuildSettingInfo".into();
+        }
+        assert!(options_fixture_round(&request, &metadata, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign"));
+        let mut wrong = rows.clone();
+        for row in &mut wrong[1..] {
+            row["info"]["type"] = "string".into();
+            row["info"]["value"] = "true".into();
+        }
+        assert!(options_fixture_round(&request, &metadata, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("must be bool"));
+        let mut wrong = rows.clone();
+        for row in &mut wrong[1..] {
+            row["files"] = serde_json::json!(["dropped-output"]);
+        }
+        assert!(options_fixture_round(&request, &metadata, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("drop producer outputs"));
+        let mut wrong = rows.clone();
+        wrong.pop();
+        assert!(options_fixture_round(&request, &metadata, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("exact alias/configuration domain"));
+        let mut wrong = rows.clone();
+        wrong[2]["info"]["value"] = false.into();
+        assert!(options_fixture_round(&request, &metadata, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("complete provider payload"));
+        let mut wrong = rows.clone();
+        wrong[1]["configuration"] = "c".repeat(64).into();
+        assert!(options_fixture_round(&request, &metadata, &wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign configuration"));
+        let mut wrong = metadata.clone();
+        wrong["results"][0]["configurationId"] = 7.into();
+        assert!(options_fixture_round(&request, &wrong, &rows).is_err());
+        let mut wrong = metadata.clone();
+        let producer = wrong["results"][2].clone();
+        wrong["results"].as_array_mut().unwrap().push(producer);
+        assert!(options_fixture_round(&request, &wrong, &rows)
+            .unwrap_err()
+            .to_string()
+            .contains("repeated raw"));
+    }
+
+    #[test]
+    fn options_header_metadata_refuses_changed_consumer_and_generated_or_missing_template() {
+        let request = options_request();
+        validate_options_request(&request).unwrap();
+        let (metadata, rows) = options_fixture(true);
+        let mut wrong = metadata.clone();
+        wrong["results"][0]["target"]["rule"]["attribute"][0]["labelKeyedStringDictValue"][0]
+            ["value"] = "OTHER".into();
+        assert!(options_fixture_round(&request, &wrong, &rows)
+            .unwrap_err()
+            .to_string()
+            .contains("native declaration"));
+        let mut wrong = metadata.clone();
+        wrong["results"][0]["target"]["rule"]["attribute"][3]["stringValue"] =
+            "c".repeat(64).into();
+        assert!(options_fixture_round(&request, &wrong, &rows)
+            .unwrap_err()
+            .to_string()
+            .contains("qualified renderer"));
+        let mut unqualified = request.clone();
+        unqualified.expected_implementation_hash.clear();
+        assert!(validate_options_request(&unqualified)
+            .unwrap_err()
+            .to_string()
+            .contains("qualified expected"));
+        let mut wrong = metadata.clone();
+        wrong["results"][3]["target"] = serde_json::json!({"type":"GENERATED_FILE","generatedFile":{"name":"//:options.tpl","generatingRule":"//:writer"}});
+        assert!(options_fixture_round(&request, &wrong, &rows)
+            .unwrap_err()
+            .to_string()
+            .contains("SOURCE templates only"));
+        let mut wrong = metadata.clone();
+        wrong["results"].as_array_mut().unwrap().pop();
+        assert!(options_fixture_round(&request, &wrong, &rows)
+            .unwrap_err()
+            .to_string()
+            .contains("SOURCE_FILE"));
+        let mut wrong = request.clone();
+        wrong
+            .settings
+            .insert("//:other".into(), "VALUE_SUFFIX".into());
+        assert!(validate_options_request(&wrong)
+            .unwrap_err()
+            .to_string()
+            .contains("overlapping"));
+    }
     #[test]
     fn configured_startup_projection_keeps_order_boundaries_and_refuses_overrides() {
         let tokens = [
@@ -1781,6 +2398,324 @@ mod tests {
                 rush_incremental::Staleness::Stale { .. }
             ));
         });
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires genuine Bazel6.5 and full Skylib1.3 archive; set RUSH_TEST_BAZEL6_5 and RUSH_TEST_SKYLIB_ARCHIVE"]
+    fn options_header_genuine_bazel65_values_alias_reset_and_context_binding() {
+        use bytes::Bytes;
+        use rush_incremental::{RealTrackedIo, TrackedIo};
+        use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::Arc;
+        let binary = PathBuf::from(
+            std::env::var_os("RUSH_TEST_BAZEL6_5").expect("set genuine pinned Bazel6.5"),
+        );
+        let archive = PathBuf::from(
+            std::env::var_os("RUSH_TEST_SKYLIB_ARCHIVE")
+                .expect("set complete authenticated Skylib1.3 archive"),
+        )
+        .canonicalize()
+        .unwrap();
+        let escaped = archive
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|&b| {
+                if b.is_ascii_alphanumeric() || b"/._-".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect::<String>();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("home")).unwrap();
+        std::fs::write(root.join("WORKSPACE"),format!(r###"workspace(name="options_provider_fixture")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(name="bazel_skylib",urls=["file://{escaped}"],type="tar.gz",sha256="74d544d96f4a5bb630d465ca8bbcfe231e3594e5aae57e1edbf17a6eb3ca2506")
+"###)).unwrap();
+        // Small real rule fixture implementing the same public TF2.17 template
+        // API. The unchanged upstream implementation is separately exercised
+        // by the private byte oracle; no replacement BuildSettingInfo is used.
+        let qualified_header_source = r###"load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
+def _header(ctx):
+    substitutions = {}
+    for target, identifier in ctx.attr.build_settings.items():
+        substitutions["#define_option " + identifier] = "// %s\n#define TF_OPTION_%s() %s" % (target.label, identifier, {True:"true",False:"false"}[target[BuildSettingInfo].value])
+    ctx.actions.expand_template(template=ctx.file.template, output=ctx.outputs.output_header, substitutions=substitutions)
+    return [DefaultInfo(files=depset([ctx.outputs.output_header]))]
+tf_gen_options_header = rule(implementation=_header,attrs={"template":attr.label(allow_single_file=True),"output_header":attr.output(),"build_settings":attr.label_keyed_string_dict(providers=[BuildSettingInfo])})
+def _inverted(ctx):
+    return [BuildSettingInfo(value=not ctx.build_setting_value)]
+inverted_bool = rule(implementation=_inverted,build_setting=config.bool(flag=True))
+def _output(ctx):
+    out = ctx.actions.declare_file(ctx.label.name + ".kept")
+    ctx.actions.write(out,"required output")
+    return [BuildSettingInfo(value=True),DefaultInfo(files=depset([out]))]
+output_bool = rule(implementation=_output,build_setting=config.bool(flag=True))
+"###;
+        std::fs::write(root.join("header.bzl"), qualified_header_source).unwrap();
+        std::fs::write(root.join("foreign.bzl"),"BuildSettingInfo=provider(fields=[\"value\"])\ndef _impl(ctx):\n    return [BuildSettingInfo(value=False)]\nforeign_bool=rule(implementation=_impl,build_setting=config.bool(flag=True))\n").unwrap();
+        let template = b"  #define_option VALUE\r\nunknown:#define_option OTHER\nend";
+        std::fs::write(root.join("options.tpl"), template).unwrap();
+        let mut build = String::from(
+            r###"load("@bazel_skylib//rules:common_settings.bzl","bool_flag","string_flag")
+load(":header.bzl","tf_gen_options_header","inverted_bool","output_bool")
+load(":foreign.bzl","foreign_bool")
+bool_flag(name="flag",build_setting_default=False)
+string_flag(name="text",build_setting_default="wrong-type")
+inverted_bool(name="inverted",build_setting_default=False)
+output_bool(name="output_flag",build_setting_default=False)
+foreign_bool(name="foreign",build_setting_default=False)
+alias(name="flag_alias",actual=":flag")
+"###,
+        );
+        for (name, setting) in [
+            ("header", "flag"),
+            ("header_alias", "flag_alias"),
+            ("header_inverted", "inverted"),
+            ("header_string", "text"),
+            ("header_foreign", "foreign"),
+            ("header_output", "output_flag"),
+        ] {
+            build.push_str(&format!("tf_gen_options_header(name=\"{name}\",template=\"options.tpl\",output_header=\"{name}.h\",build_settings={{\":{setting}\":\"VALUE\"}})\n"));
+        }
+        std::fs::write(root.join("BUILD"), build).unwrap();
+        let startup = vec![
+            "--host_jvm_args=-Xmx512m".to_owned(),
+            "--host_jvm_args=-XX:ActiveProcessorCount=8".to_owned(),
+        ];
+        let environment = vec![
+            (
+                b"HOME".to_vec(),
+                root.join("home").as_os_str().as_bytes().to_vec(),
+            ),
+            (b"PATH".to_vec(), b"/usr/bin:/bin".to_vec()),
+            (b"LANG".to_vec(), b"C.UTF-8".to_vec()),
+            (b"CUDA_VISIBLE_DEVICES".to_vec(), Vec::new()),
+            (b"HIP_VISIBLE_DEVICES".to_vec(), Vec::new()),
+            (b"ROCR_VISIBLE_DEVICES".to_vec(), Vec::new()),
+        ];
+        let output_base = root.join("output-base");
+        let make_command = |flags: &[&str]| {
+            let mut tokens = vec!["--jobs=8".to_owned()];
+            tokens.extend(flags.iter().map(|s| s.to_string()));
+            let mut env = environment
+                .iter()
+                .map(|(name, value)| EnvironmentVariable {
+                    name: Bytes::copy_from_slice(name),
+                    value: Bytes::copy_from_slice(value),
+                })
+                .collect::<Vec<_>>();
+            env.push(EnvironmentVariable {
+                name: Bytes::from(
+                    rush_command_core::build_arguments::EFFECTIVE_BUILD_ARGUMENTS_ENV,
+                ),
+                value: Bytes::from(rush_command_core::build_arguments::encode_with_startup(
+                    &tokens, &startup,
+                )),
+            });
+            CommandSemantics::from_run_request(&RunRequest {
+                argv: vec![
+                    Bytes::from_static(b"rush"),
+                    Bytes::from_static(b"build"),
+                    Bytes::from_static(b"//:header"),
+                ],
+                environment: env,
+                working_directory: Bytes::copy_from_slice(root.as_os_str().as_bytes()),
+                protocol_major: rush_protocol::PROTOCOL_MAJOR,
+                protocol_minor: rush_protocol::PROTOCOL_MINOR,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Test-only qualification: source bytes are the fixed, reviewed fixture
+            // above. Production callers must supply their independently source-bound
+            // implementation identity, never trust a same-query observed hash.
+            let qualification_command = make_command(&[]);
+            let qualification_io =
+                Arc::new(RealTrackedIo::new(qualification_command.clone(), &root));
+            let expected_implementation_hash =
+                tracked::scope(qualification_io, || -> Result<String> {
+                    anyhow::ensure!(
+                        tracked::read_file(&root.join("header.bzl"))?.as_ref()
+                            == qualified_header_source.as_bytes()
+                    );
+                    let analysis = ConfiguredFeatureFlagAnalysis::new_with_toolchain(
+                        &root,
+                        &binary,
+                        &output_base,
+                        &qualification_command,
+                        rush_rules::context::Toolchain::default(),
+                    )?;
+                    let bytes = analysis.cquery(
+                        "deps(//:header)",
+                        &[
+                            "--output=jsonproto",
+                            "--proto:output_rule_attrs=all",
+                            "--proto:definition_stack=true",
+                        ],
+                    )?;
+                    let mut expected = None;
+                    ConfiguredDeclaration::parse_consumer(&bytes, "//:header", |rule, attrs| {
+                        anyhow::ensure!(string(rule, "ruleClass")? == "tf_gen_options_header");
+                        expected = Some(
+                            string(
+                                attrs
+                                    .get("$rule_implementation_hash")
+                                    .context("missing fixture implementation")?,
+                                "stringValue",
+                            )?
+                            .to_owned(),
+                        );
+                        Ok(())
+                    })?;
+                    anyhow::ensure!(
+                        tracked::read_file(&root.join("header.bzl"))?.as_ref()
+                            == qualified_header_source.as_bytes()
+                    );
+                    expected.context("no qualified fixture implementation")
+                })
+                .unwrap();
+            let request_for =
+                |name: &str, setting: &str| rush_rules::providers::OptionsHeaderRequest {
+                    consumer_label: format!("//:{name}"),
+                    template_label: "//:options.tpl".into(),
+                    output_label: format!("//:{name}.h"),
+                    settings: BTreeMap::from([(format!("//:{setting}"), "VALUE".into())]),
+                    template_path: root.join("options.tpl"),
+                    provider_key: "@bazel_skylib//rules:common_settings.bzl%BuildSettingInfo"
+                        .into(),
+                    expected_implementation_hash: expected_implementation_hash.clone(),
+                };
+            let resolve = |name: &str, setting: &str, flags: &[&str]| {
+                let command = make_command(flags);
+                let io = Arc::new(RealTrackedIo::new(command.clone(), &root));
+                let value = tracked::scope(io.clone(), || {
+                    let analysis = ConfiguredFeatureFlagAnalysis::new_with_toolchain(
+                        &root,
+                        &binary,
+                        &output_base,
+                        &command,
+                        rush_rules::context::Toolchain::default(),
+                    )?;
+                    analysis.resolve_options_header_inputs(&request_for(name, setting))
+                });
+                // All genuine query/tool/source observations stay in the manifest;
+                // the structured record alone is not a reusable certificate.
+                assert!(io
+                    .manifest()
+                    .deps()
+                    .iter()
+                    .any(|d| matches!(d, rush_incremental::Dependency::ProcessProbe { .. })));
+                (command, value)
+            };
+            let (default_command, default) = resolve("header", "flag", &[]);
+            let default = default.unwrap();
+            assert!(!default.settings["//:flag"].value);
+            let (override_command, overridden) = resolve("header", "flag", &["--//:flag=true"]);
+            let overridden = overridden.unwrap();
+            assert!(overridden.settings["//:flag"].value);
+            let (_, reset) = resolve("header", "flag", &[]);
+            assert!(!reset.unwrap().settings["//:flag"].value);
+            let (_, alias) = resolve("header_alias", "flag_alias", &[]);
+            let alias = alias.unwrap();
+            assert_eq!(alias.settings["//:flag_alias"].producer_label, "//:flag");
+            assert_eq!(alias.settings["//:flag_alias"].consumed_label, "@//:flag");
+            let (_, inverted) = resolve("header_inverted", "inverted", &[]);
+            assert!(inverted.unwrap().settings["//:inverted"].value);
+            let (_, inverted) = resolve("header_inverted", "inverted", &["--//:inverted=true"]);
+            assert!(!inverted.unwrap().settings["//:inverted"].value);
+            for (name, setting) in [
+                ("header_string", "text"),
+                ("header_foreign", "foreign"),
+                ("header_output", "output_flag"),
+            ] {
+                assert!(
+                    resolve(name, setting, &[]).1.is_err(),
+                    "unsupported actual provider/output shape must refuse"
+                );
+            }
+            let make_context =
+                || rush_rules::context::BuildContext::new(root.clone(), root.join("native-output"));
+            assert!(make_context()
+                .with_options_header_inputs(default.clone())
+                .is_err());
+            assert!(make_context()
+                .with_options_header_command(override_command)
+                .with_options_header_inputs(default.clone())
+                .is_err());
+            let context = make_context()
+                .with_options_header_command(default_command.clone())
+                .with_options_header_inputs(default.clone())
+                .unwrap();
+            assert_eq!(context.read_options_header_template().unwrap(), template);
+            let other_root = root.join("other-main");
+            std::fs::create_dir(&other_root).unwrap();
+            let mut changed_root = make_context()
+                .with_options_header_command(default_command.clone())
+                .with_options_header_inputs(default.clone())
+                .unwrap();
+            changed_root.main_workspace_root = other_root;
+            assert!(changed_root.options_header_inputs().is_err());
+            assert!(changed_root.read_options_header_template().is_err());
+            let rendered =
+                tensorflow_rules::tf_gen_options_header::render_options_header(template, &default)
+                    .unwrap();
+            assert_eq!(
+                rendered,
+                b"  // @//:flag\n#define TF_OPTION_VALUE() false\r\nunknown:#define_option OTHER\nend"
+            );
+            assert!(context
+                .with_options_header_command(default_command.clone())
+                .options_header_inputs()
+                .is_err());
+            std::fs::write(root.join("options.tpl"), b"changed:#define_option VALUE").unwrap();
+            let context = make_context()
+                .with_options_header_command(default_command)
+                .with_options_header_inputs(default.clone())
+                .unwrap();
+            assert!(context.read_options_header_template().is_err());
+            let (_, changed) = resolve("header", "flag", &[]);
+            assert_ne!(changed.unwrap().template.digest, default.template.digest);
+            // Genuine BuildSettingInfo inversion above is supported. Changing
+            // the consumer renderer itself under the same declaration is not.
+            let changed_renderer = qualified_header_source.replace(
+                "target[BuildSettingInfo].value]",
+                "not target[BuildSettingInfo].value]",
+            );
+            assert_ne!(changed_renderer, qualified_header_source);
+            std::fs::write(root.join("header.bzl"), changed_renderer).unwrap();
+            let error = resolve("header", "flag", &[]).1.unwrap_err();
+            assert!(
+                error.to_string().contains("qualified renderer"),
+                "{error:#}"
+            );
+        }));
+        let mut shutdown = std::process::Command::new(&binary);
+        shutdown
+            .args(&startup)
+            .arg("--ignore_all_rc_files")
+            .arg(format!("--output_base={}", output_base.display()))
+            .arg("--max_idle_secs=30")
+            .arg("shutdown")
+            .current_dir(&root)
+            .env_clear();
+        for (key, value) in &environment {
+            shutdown.env(os_string(key), os_string(value));
+        }
+        let stopped = shutdown.output().unwrap();
+        assert!(
+            stopped.status.success(),
+            "own Bazel shutdown failed: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+        if let Err(error) = outcome {
+            std::panic::resume_unwind(error);
+        }
     }
     #[cfg(unix)]
     #[test]

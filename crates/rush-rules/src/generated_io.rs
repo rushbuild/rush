@@ -61,15 +61,7 @@ fn forbidden_markers() -> &'static [&'static str] {
     .as_slice()
 }
 
-/// Write content to `path`, refusing if it looks like a stub.
-///
-/// Use this from every rush code path that materializes a file whose
-/// contents rush computed (including `.bzl`, `.inc`, `.h`, `.cc`
-/// headers stashed under the external cache). The marker list above
-/// is kept intentionally blunt: false positives are OK (add a real
-/// implementation or escape the phrase), false negatives are the bug
-/// this is meant to prevent.
-pub fn write_generated_file(path: &Path, content: &str) -> Result<()> {
+fn validate_generated_content(path: &Path, content: &str) -> Result<()> {
     let content_lower = content.to_ascii_lowercase();
     for marker in forbidden_markers() {
         if content_lower.contains(&marker.to_ascii_lowercase()) {
@@ -85,6 +77,18 @@ pub fn write_generated_file(path: &Path, content: &str) -> Result<()> {
             ));
         }
     }
+    Ok(())
+}
+/// Write content to `path`, refusing if it looks like a stub.
+///
+/// Use this from every rush code path that materializes a file whose
+/// contents rush computed (including `.bzl`, `.inc`, `.h`, `.cc`
+/// headers stashed under the external cache). The marker list above
+/// is kept intentionally blunt: false positives are OK (add a real
+/// implementation or escape the phrase), false negatives are the bug
+/// this is meant to prevent.
+pub fn write_generated_file(path: &Path, content: &str) -> Result<()> {
+    validate_generated_content(path, content)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -92,6 +96,113 @@ pub fn write_generated_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Guarded atomic publication for an already-owned inline producer. The caller
+/// retains its workspace lease and checks cancellation/source facts at each
+/// boundary. A preexisting output is never opened or truncated.
+#[cfg(unix)]
+pub fn write_generated_file_atomically(
+    path: &Path,
+    content: &str,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    validate_generated_content(path, content)?;
+    check()?;
+    anyhow::ensure!(
+        path.is_absolute(),
+        "inline output requires an absolute path"
+    );
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("inline output has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    // No symlinked output directories in this first inline profile. This is a
+    // cooperative workspace-lease protocol, not hostile filesystem authority.
+    anyhow::ensure!(
+        std::fs::canonicalize(parent)?.as_os_str() == parent.as_os_str(),
+        "inline output parent must be canonical and unsymlinked"
+    );
+    let parent_before = std::fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        parent_before.is_dir(),
+        "inline output parent is not a directory"
+    );
+    struct Temporary(std::path::PathBuf);
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let mut attempts = 0;
+    let (temporary, mut file) = loop {
+        anyhow::ensure!(attempts < 32, "inline temporary namespace is occupied");
+        attempts += 1;
+        let name = parent.join(format!(
+            ".rush-inline-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&name)
+        {
+            Ok(file) => break (Temporary(name), file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let opened = file.metadata()?;
+    anyhow::ensure!(opened.is_file(), "inline temporary is not regular");
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut actual = Vec::new();
+    file.read_to_end(&mut actual)?;
+    anyhow::ensure!(
+        actual == content.as_bytes(),
+        "inline temporary bytes differ from rendered content"
+    );
+    check()?;
+    let named = std::fs::symlink_metadata(&temporary.0)?;
+    let parent_after = std::fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        named.is_file()
+            && named.dev() == opened.dev()
+            && named.ino() == opened.ino()
+            && parent_after.is_dir()
+            && parent_before.dev() == parent_after.dev()
+            && parent_before.ino() == parent_after.ino(),
+        "inline output directory/temporary identity changed"
+    );
+    std::fs::rename(&temporary.0, path)?;
+    let published = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        published.is_file()
+            && published.dev() == opened.dev()
+            && published.ino() == opened.ino()
+            && published.len() == content.len() as u64,
+        "inline published output is not the owned regular file"
+    );
+    check()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_generated_file_atomically(
+    _path: &Path,
+    _content: &str,
+    _check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    Err(anyhow!(
+        "owned inline options publication requires Unix descriptor identity"
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,4 +244,45 @@ mod tests {
         let back = std::fs::read_to_string(&path).unwrap();
         assert_eq!(back, "#include <cstdint>\nint x = 42;\n");
     }
+    #[cfg(unix)]
+    #[test]
+    fn inline_options_atomic_write_preserves_alias_victims_and_failed_publication() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let victim = root.path().join("victim.h");
+        let output = root.path().join("output.h");
+        std::fs::write(&victim, "old victim")?;
+        for symbolic in [false, true] {
+            if symbolic {
+                symlink(&victim, &output)?;
+            } else {
+                std::fs::hard_link(&victim, &output)?;
+            }
+            write_generated_file_atomically(&output, "new header", || Ok(()))?;
+            assert_eq!(std::fs::read_to_string(&victim)?, "old victim");
+            assert_eq!(std::fs::read_to_string(&output)?, "new header");
+            assert!(std::fs::symlink_metadata(&output)?.is_file());
+            std::fs::remove_file(&output)?;
+        }
+        std::fs::write(&output, "retained header")?;
+        let mut boundaries = 0;
+        assert!(
+            write_generated_file_atomically(&output, "rejected header", || {
+                boundaries += 1;
+                anyhow::ensure!(boundaries < 2, "controlled prepublication failure");
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&output)?, "retained header");
+        assert!(!std::fs::read_dir(root.path())?.any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rush-inline-")));
+        assert!(write_generated_file_atomically(&output, "empty stub", || Ok(())).is_err());
+        assert_eq!(std::fs::read_to_string(&output)?, "retained header");
+        Ok(())
+    }
+
 }

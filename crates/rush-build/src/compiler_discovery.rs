@@ -512,11 +512,18 @@ pub(crate) struct DiagnosticBuild {
     cancelled: tokio::sync::watch::Receiver<bool>,
     pub(crate) declarations: std::sync::Arc<rush_rules::context::PendingCompileDeclarations>,
     pub(crate) registry: std::sync::Arc<tokio::sync::Mutex<ArtifactRegistry>>,
-    completed: std::sync::Mutex<Vec<DeclaredActionId>>,
+    completed: std::sync::Arc<std::sync::Mutex<Vec<DeclaredActionId>>>,
     manager: std::sync::Arc<crate::action_manager::RushActionManager>,
     pub(crate) lease: std::sync::Arc<WorkspaceLease>,
     environment: Vec<(String, String)>,
+    command: CommandSemantics,
     workspace: std::path::PathBuf,
+    #[cfg(test)]
+    inline_finished: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    inline_hook: std::sync::Mutex<
+        Option<std::sync::Arc<dyn Fn(InlineOptionsStage) -> Result<()> + Send + Sync>>,
+    >,
 }
 
 impl DiagnosticBuild {
@@ -543,11 +550,16 @@ impl DiagnosticBuild {
         Ok(std::sync::Arc::new(Self {
             declarations: std::sync::Arc::new(declarations),
             registry,
-            completed: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             manager,
             lease,
             environment,
+            command: command.clone(),
             workspace,
+            #[cfg(test)]
+            inline_finished: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            inline_hook: std::sync::Mutex::new(None),
             cancel,
             cancelled,
         }))
@@ -563,6 +575,32 @@ impl DiagnosticBuild {
         })
     }
 
+    /// Inline completion has a stricter cancellation commit boundary than the
+    /// existing process path. Acquire locks in the existing registry->completed
+    /// order, then check cancellation immediately before synchronous insertion.
+    async fn note_inline_action(
+        &self,
+        action: &rush_rules::context::InlineOptionsHeaderAction,
+    ) -> Result<()> {
+        let registry = self.registry.lock().await;
+        action.validate_registry(&registry)?;
+        ensure!(
+            std::fs::symlink_metadata(action.output_path())
+                .is_ok_and(|metadata| metadata.is_file()),
+            "inline options output is not a completed regular file"
+        );
+        let mut completed = self.completed.lock().unwrap_or_else(|p| p.into_inner());
+        ensure!(
+            !*self.cancelled.borrow(),
+            "inline options cancelled before producer completion"
+        );
+        // No await or lock acquisition between this check and publication.
+        // Cancellation after this successful commit is not a rollback promise.
+        if !completed.contains(&action.action()) {
+            completed.push(action.action());
+        }
+        Ok(())
+    }
     async fn note_action(&self, id: DeclaredActionId) -> Result<()> {
         let registry = self.registry.lock().await;
         let action = registry.declared_action(id);
@@ -579,6 +617,16 @@ impl DiagnosticBuild {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineOptionsStage {
+    BeforeRead,
+    BeforeWrite,
+    BeforePublish,
+    AfterPublish,
+    #[cfg(test)]
+    BeforeCompletionLock,
 }
 
 struct DiagnosticManager {
@@ -611,6 +659,133 @@ impl rush_rules::context::ActionManager for DiagnosticManager {
             "diagnostic C/C++ execution requires a typed pending declaration"
         );
         self.execute_owned(action, None).await
+    }
+    async fn execute_inline_options_header(
+        &self,
+        action: rush_rules::context::InlineOptionsHeaderAction,
+    ) -> Result<()> {
+        ensure!(
+            action.target() == self.target,
+            "inline options belongs to another target"
+        );
+        ensure!(
+            requested_compile_mode(&self.build.command)? == NativeCompileMode::UncachedDiagnosticV1,
+            "inline options requires this build's diagnostic request"
+        );
+        {
+            let registry = self.build.registry.lock().await;
+            action.validate_registry(&registry)?;
+        }
+        ensure!(
+            self.build.command.config_fingerprint() == &action.inputs().command_fingerprint,
+            "inline options inputs belong to another captured command"
+        );
+        ensure!(
+            !*self.build.cancelled.borrow(),
+            "inline options build was cancelled"
+        );
+        let mut cancel_on_drop = CancelOwnedExecution::new(self.build.cancel.clone());
+        let build = self.build.clone();
+        let task = tokio::spawn(async move {
+            #[cfg(test)]
+            let finished = build.inline_finished.clone();
+            let result = async {
+                let blocking_build = build.clone();
+                let blocking_action = action.clone();
+                // This blocking operation holds its own build/lease Arc. Dropping
+                // either caller or async waiter cannot detach its writer authority.
+                tokio::task::spawn_blocking(move || {
+                    let boundary = |stage| -> Result<()> {
+                        ensure!(
+                            !*blocking_build.cancelled.borrow(),
+                            "inline options build was cancelled"
+                        );
+                        #[cfg(test)]
+                        {
+                            let hook = blocking_build
+                                .inline_hook
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            if let Some(hook) = hook {
+                                hook(stage)?;
+                            }
+                        }
+                        #[cfg(not(test))]
+                        let _ = stage;
+                        ensure!(
+                            !*blocking_build.cancelled.borrow(),
+                            "inline options build was cancelled"
+                        );
+                        Ok(())
+                    };
+                    boundary(InlineOptionsStage::BeforeRead)?;
+                    let source = blocking_action
+                        .read_template(&blocking_build.command, &blocking_build.workspace)?;
+                    let rendered = tensorflow_rules::tf_gen_options_header::render_options_header(
+                        &source,
+                        blocking_action.inputs(),
+                    )?;
+                    let text = std::str::from_utf8(&rendered)
+                        .map_err(|_| anyhow!("inline options requires a UTF-8 SOURCE template"))?;
+                    let mut checks = 0;
+                    rush_rules::generated_io::write_generated_file_atomically(
+                        blocking_action.output_path(),
+                        text,
+                        || {
+                            let stage = match checks {
+                                0 => InlineOptionsStage::BeforeWrite,
+                                1 => InlineOptionsStage::BeforePublish,
+                                _ => InlineOptionsStage::AfterPublish,
+                            };
+                            checks += 1;
+                            boundary(stage)?;
+                            let current = blocking_action.read_template(
+                                &blocking_build.command,
+                                &blocking_build.workspace,
+                            )?;
+                            ensure!(
+                                current == source,
+                                "inline options template changed during write"
+                            );
+                            Ok(())
+                        },
+                    )
+                })
+                .await
+                .map_err(|error| anyhow!("owned inline options writer failed: {error}"))??;
+                ensure!(
+                    !*build.cancelled.borrow(),
+                    "inline options cancelled before producer completion"
+                );
+                #[cfg(test)]
+                {
+                    let hook = build
+                        .inline_hook
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if let Some(hook) = hook {
+                        hook(InlineOptionsStage::BeforeCompletionLock)?;
+                    }
+                }
+                build.note_inline_action(&action).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            // Weak::upgrade()==None alone is not a destructor/lease-release
+            // acknowledgement. Tests observe this only after owned work and
+            // the task's build reference have actually finished dropping.
+            drop(build);
+            #[cfg(test)]
+            finished.send_modify(|count| *count += 1);
+            result
+        });
+        let result = task
+            .await
+            .map_err(|error| anyhow!("owned inline options task failed: {error}"))?;
+        cancel_on_drop.disarm();
+        result
     }
     async fn execute_pending_compile(
         &self,
@@ -2316,4 +2491,497 @@ cc_binary(name="app",srcs=["main.cc"],deps=[":writer"])
         assert!(std::fs::symlink_metadata(&marker)?.file_type().is_symlink());
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    struct InlineOptionsFixture {
+        build: Arc<DiagnosticBuild>,
+        action: rush_rules::context::InlineOptionsHeaderAction,
+        pending: PendingCompileDeclaration,
+        compile: rush_action::Action,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inline_options_fixture(root: &Path) -> Result<InlineOptionsFixture> {
+        use rush_incremental::TrackedIo;
+        use rush_rules::providers::{
+            ConfiguredBuildSettingInfo, OptionsHeaderRequest, OptionsHeaderSource,
+            VerifiedOptionsHeaderInputs,
+        };
+        let source = root.join("consumer.cc");
+        let template = root.join("options.tpl");
+        let header = root.join("genfiles/options.h");
+        let object = root.join("consumer.o");
+        std::fs::write(
+            &source,
+            "#include \"options.h\"\nint actual_option(){return TF_OPTION_VALUE() ? 43 : 42;}\n",
+        )?;
+        std::fs::write(&template, "#define_option VALUE\n")?;
+        std::fs::create_dir(header.parent().unwrap())?;
+        std::fs::write(&header, "previous output must not count as completed\n")?;
+        let command = build_request(root, "//:consumer", Some(b"uncached-diagnostic-v1"))?;
+        let io = rush_incremental::RealTrackedIo::new(command.clone(), root);
+        let read = io
+            .read_canonical_regular_file(&template)?
+            .ok_or_else(|| anyhow!("bound read unsupported"))?;
+        let provider_key = "@bazel_skylib//rules:common_settings.bzl%BuildSettingInfo".to_owned();
+        // Structural lifecycle fixture only: genuine provider/query semantics
+        // are separately tested by the real Bazel options integration.
+        let inputs = Arc::new(VerifiedOptionsHeaderInputs {
+            request: OptionsHeaderRequest {
+                consumer_label: "//:header".into(),
+                template_label: "//:options.tpl".into(),
+                output_label: "//:options.h".into(),
+                settings: std::collections::BTreeMap::from([("//:flag".into(), "VALUE".into())]),
+                template_path: template.clone(),
+                provider_key: provider_key.clone(),
+                expected_implementation_hash: "b".repeat(64),
+            },
+            command_fingerprint: *command.config_fingerprint(),
+            main_workspace_root: root.to_owned(),
+            consumer_configuration: "a".repeat(64),
+            consumer_configuration_id: 1,
+            settings: std::collections::BTreeMap::from([(
+                "//:flag".into(),
+                ConfiguredBuildSettingInfo {
+                    requested_label: "//:flag".into(),
+                    producer_label: "//:flag".into(),
+                    consumed_label: "@//:flag".into(),
+                    provider_key,
+                    value: true,
+                    configuration_checksum: "a".repeat(64),
+                    configuration_id: 1,
+                    observed_occurrences: 1,
+                },
+            )]),
+            template: OptionsHeaderSource {
+                label: "//:options.tpl".into(),
+                path: template.clone(),
+                digest: *blake3::hash(&read.contents).as_bytes(),
+                metadata: read.metadata,
+            },
+        });
+        let mut registry = ArtifactRegistry::new();
+        let config = ConfigId(7);
+        let template_id = artifact(
+            &mut registry,
+            template.to_str().unwrap(),
+            true,
+            ArtifactKind::Source,
+            TargetId(3),
+            config,
+        );
+        let header_id = artifact(
+            &mut registry,
+            header.to_str().unwrap(),
+            false,
+            ArtifactKind::Header,
+            TargetId(1),
+            config,
+        );
+        let writer = declare(
+            &mut registry,
+            TargetId(1),
+            "GenOptionsHeader",
+            vec![template_id],
+            vec![header_id],
+            false,
+        );
+        let action = rush_rules::context::InlineOptionsHeaderAction::from_registry(
+            &registry,
+            writer,
+            TargetId(1),
+            config,
+            inputs,
+        )?;
+        let source_id = artifact(
+            &mut registry,
+            source.to_str().unwrap(),
+            true,
+            ArtifactKind::Source,
+            TargetId(2),
+            config,
+        );
+        let object_id = artifact(
+            &mut registry,
+            object.to_str().unwrap(),
+            false,
+            ArtifactKind::Object,
+            TargetId(2),
+            config,
+        );
+        let compile_id = declare(
+            &mut registry,
+            TargetId(2),
+            "CppCompile",
+            vec![source_id, header_id],
+            vec![object_id],
+            true,
+        );
+        let pending = PendingCompileDeclaration::from_registry(
+            &registry,
+            compile_id,
+            TargetId(2),
+            config,
+            source_id,
+            object_id,
+        )?;
+        let mut declarations = PendingCompileDeclarations::default();
+        declarations.record(pending.clone())?;
+        let compile_inputs = vec![
+            rush_action::Artifact::Source(source.clone()),
+            rush_action::Artifact::Source(header.clone()),
+        ];
+        let compile_command = rush_action::Command {
+            executable: "/usr/bin/g++".into(),
+            args: vec![
+                "-I".into(),
+                header.parent().unwrap().display().to_string(),
+                "-c".into(),
+                source.display().to_string(),
+                "-o".into(),
+                object.display().to_string(),
+            ],
+            working_dir: Some(root.to_owned()),
+            execution_info: Default::default(),
+        };
+        let env = std::collections::HashMap::new();
+        let compile = rush_action::Action {
+            id: rush_action::Action::compute_id(&compile_inputs, &compile_command, &env)?,
+            inputs: compile_inputs,
+            outputs: vec![rush_action::Artifact::Source(object)],
+            command: compile_command,
+            env,
+            mnemonic: "CppCompile".into(),
+        };
+        let manager = Arc::new(crate::action_manager::RushActionManager::new_with_cas(
+            Arc::new(rush_cache::ActionCache::new()),
+            Arc::new(rush_exec::LocalStrategy),
+            rush_resource::ResourceManager::new()?,
+            None,
+        ));
+        let lease = Arc::new(WorkspaceLease::acquire(
+            root,
+            NativeCompileMode::UncachedDiagnosticV1,
+        )?);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let build = DiagnosticBuild::new(
+            declarations,
+            Arc::new(tokio::sync::Mutex::new(registry)),
+            manager,
+            lease,
+            &command,
+            root.to_owned(),
+            cancel,
+            cancelled,
+        )?;
+        Ok(InlineOptionsFixture {
+            build,
+            action,
+            pending,
+            compile,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_options_owned_write_releases_actual_pending_compile_only_after_completion(
+    ) -> Result<()> {
+        use rush_rules::context::ActionManager;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let fixture = inline_options_fixture(&root)?;
+        let compiler = fixture.build.manager_for(TargetId(2));
+        assert!(
+            compiler
+                .execute_pending_compile(fixture.compile.clone(), fixture.pending.clone())
+                .await
+                .is_err(),
+            "preexisting header bytes cannot report a producer complete"
+        );
+        assert!(!root.join("consumer.o").exists());
+        assert!(
+            fixture
+                .build
+                .manager
+                .execute_inline_options_header(fixture.action.clone())
+                .await
+                .is_err(),
+            "ordinary manager must not acquire inline authority"
+        );
+        assert!(fixture
+            .build
+            .manager_for(TargetId(99))
+            .execute_inline_options_header(fixture.action.clone())
+            .await
+            .is_err());
+        let inputs = Arc::new(fixture.action.inputs().clone());
+        let context = || {
+            BuildContext::new(root.clone(), root.clone())
+                .with_options_header_command(fixture.build.command.clone())
+                .with_artifact_registry(fixture.build.registry.clone())
+                .with_action_manager(fixture.build.manager_for(TargetId(1)))
+                .with_native_compile_discovery(
+                    NativeCompileMode::UncachedDiagnosticV1,
+                    fixture.build.declarations.clone(),
+                )
+        };
+        let absent_config = context().with_options_header_inputs(inputs.clone())?;
+        assert!(absent_config
+            .execute_inline_options_header(fixture.action.output_path())
+            .await
+            .is_err());
+        let wrong_config = context()
+            .with_options_header_config(ConfigId(8))
+            .with_options_header_inputs(inputs.clone())?;
+        assert!(wrong_config
+            .execute_inline_options_header(fixture.action.output_path())
+            .await
+            .is_err());
+        let context = context()
+            .with_options_header_config(ConfigId(7))
+            .with_options_header_inputs(inputs)?;
+        context
+            .execute_inline_options_header(fixture.action.output_path())
+            .await?;
+        assert_eq!(
+            std::fs::read(fixture.action.output_path())?,
+            b"// @//:flag\n#define TF_OPTION_VALUE() true\n"
+        );
+        assert_eq!(
+            *fixture.build.completed.lock().unwrap(),
+            vec![fixture.action.action()]
+        );
+        let result = compiler
+            .execute_pending_compile(fixture.compile.clone(), fixture.pending.clone())
+            .await?;
+        ensure!(
+            result.exit_code == 0,
+            "real dependent compiler failed: {:?}",
+            result
+        );
+        assert!(!result.cached && result.output_records.is_empty());
+        assert!(root.join("consumer.o").is_file());
+        let processes = take_completed_diagnostic_processes(&root);
+        assert_eq!(
+            processes,
+            vec![("CppCompile".to_owned(), fixture.pending.action())],
+            "inline expansion must not invent a completed process"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_options_source_write_and_identity_failures_never_complete_producer(
+    ) -> Result<()> {
+        for failure in ["source", "write", "changed-source-after-render"] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let fixture = inline_options_fixture(&root)?;
+            let previous = std::fs::read(fixture.action.output_path())?;
+            if failure == "source" {
+                std::fs::write(
+                    &fixture.action.inputs().request.template_path,
+                    "changed template\n",
+                )?;
+            } else {
+                let template = fixture.action.inputs().request.template_path.clone();
+                *fixture.build.inline_hook.lock().unwrap() = Some(Arc::new(move |stage| {
+                    if stage == InlineOptionsStage::BeforePublish {
+                        if failure == "write" {
+                            anyhow::bail!("controlled inline writer failure");
+                        }
+                        std::fs::write(&template, "changed after rendering\n")?;
+                    }
+                    Ok(())
+                }));
+            }
+            let error = fixture
+                .build
+                .manager_for(TargetId(1))
+                .execute_inline_options_header(fixture.action.clone())
+                .await
+                .unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(
+                detail.contains(if failure == "write" {
+                    "controlled inline writer failure"
+                } else {
+                    "SOURCE template changed"
+                }),
+                "{detail}"
+            );
+            assert!(fixture.build.completed.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read(fixture.action.output_path())?, previous);
+            assert!(fixture
+                .build
+                .manager_for(TargetId(2))
+                .execute_pending_compile(fixture.compile.clone(), fixture.pending.clone())
+                .await
+                .is_err());
+            assert!(!root.join("consumer.o").exists());
+            assert!(!std::fs::read_dir(root.join("genfiles"))?.any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rush-inline-")));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_options_caller_drop_holds_lease_until_blocking_writer_stops() -> Result<()> {
+        for pause in [
+            InlineOptionsStage::BeforePublish,
+            InlineOptionsStage::AfterPublish,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let fixture = inline_options_fixture(&root)?;
+            let previous = std::fs::read(fixture.action.output_path())?;
+            let mut finished = fixture.build.inline_finished.subscribe();
+            let completed = fixture.build.completed.clone();
+            let weak_build = Arc::downgrade(&fixture.build);
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            *fixture.build.inline_hook.lock().unwrap() = Some(Arc::new(move |stage| {
+                if stage == pause {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .map_err(|error| anyhow!("controlled writer release missing: {error}"))?;
+                }
+                Ok(())
+            }));
+            let manager = fixture.build.manager_for(TargetId(1));
+            let mut call = Box::pin(manager.execute_inline_options_header(fixture.action.clone()));
+            tokio::select! {
+                result = &mut call => anyhow::bail!("writer returned before controlled boundary: {result:?}"),
+                result = entered_rx => result?,
+            }
+            assert!(fixture.build.completed.lock().unwrap().is_empty());
+            drop(call);
+            assert!(
+                *fixture.build.cancelled.borrow(),
+                "caller Drop must signal existing build cancellation"
+            );
+            drop(manager);
+            let output_path = fixture.action.output_path().to_owned();
+            drop(fixture);
+            // Only the owned worker may now retain build/lease authority.
+            // The completion observer and acknowledgement retain neither.
+
+            assert!(weak_build.upgrade().is_some());
+            assert!(WorkspaceLease::acquire(&root, NativeCompileMode::Literal).is_err());
+            release_tx.send(())?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), finished.changed()).await??;
+            assert!(
+                weak_build.upgrade().is_none(),
+                "owned acknowledgement must follow the final build drop"
+            );
+            assert!(
+                completed.lock().unwrap().is_empty(),
+                "cancelled writer must never complete its producer"
+            );
+            let lease = WorkspaceLease::acquire(&root, NativeCompileMode::Literal)?;
+            if pause == InlineOptionsStage::BeforePublish {
+                assert_eq!(std::fs::read(&output_path)?, previous);
+            } else {
+                assert_eq!(
+                    std::fs::read(&output_path)?,
+                    b"// @//:flag\n#define TF_OPTION_VALUE() true\n"
+                );
+            }
+            assert!(!root.join("consumer.o").exists());
+            assert!(!std::fs::read_dir(root.join("genfiles"))?.any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rush-inline-")));
+            drop(lease);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_options_cancel_while_final_registry_lock_waits_never_publishes_completion(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let fixture = inline_options_fixture(&root)?;
+        let completed = fixture.build.completed.clone();
+        let registry = fixture.build.registry.clone();
+        let weak_build = Arc::downgrade(&fixture.build);
+        let mut finished = fixture.build.inline_finished.subscribe();
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let published_tx = std::sync::Mutex::new(Some(published_tx));
+        let (at_lock_tx, at_lock_rx) = tokio::sync::oneshot::channel();
+        let at_lock_tx = std::sync::Mutex::new(Some(at_lock_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *fixture.build.inline_hook.lock().unwrap() = Some(Arc::new(move |stage| {
+            if stage == InlineOptionsStage::AfterPublish {
+                if let Some(tx) = published_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|error| {
+                        anyhow!("controlled final-lock writer release missing: {error}")
+                    })?;
+            } else if stage == InlineOptionsStage::BeforeCompletionLock {
+                // This boundary is AFTER the old pre-await cancellation check.
+                if let Some(tx) = at_lock_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            Ok(())
+        }));
+        let manager = fixture.build.manager_for(TargetId(1));
+        let mut call = Box::pin(manager.execute_inline_options_header(fixture.action.clone()));
+        tokio::select! {
+            result = &mut call => anyhow::bail!("writer returned before publication control: {result:?}"),
+            result = published_rx => result?,
+        }
+        assert_eq!(
+            std::fs::read(fixture.action.output_path())?,
+            b"// @//:flag\n#define TF_OPTION_VALUE() true\n"
+        );
+        let final_registry_lock = registry.lock().await;
+        release_tx.send(())?;
+        tokio::select! {
+            result = &mut call => anyhow::bail!("writer bypassed held final registry lock: {result:?}"),
+            result = at_lock_rx => result?,
+        }
+        assert!(completed.lock().unwrap().is_empty());
+        drop(call);
+        assert!(*fixture.build.cancelled.borrow());
+        drop(manager);
+        drop(fixture);
+        assert!(
+            weak_build.upgrade().is_some(),
+            "owned worker must retain its lease while final validation waits"
+        );
+        assert!(WorkspaceLease::acquire(&root, NativeCompileMode::Literal).is_err());
+        drop(final_registry_lock);
+        tokio::time::timeout(std::time::Duration::from_secs(10), finished.changed()).await??;
+        assert!(weak_build.upgrade().is_none());
+        assert!(
+            completed.lock().unwrap().is_empty(),
+            "cancellation after the old pre-await check must prevent completion publication"
+        );
+        let _lease = WorkspaceLease::acquire(&root, NativeCompileMode::Literal)?;
+        assert!(!root.join("consumer.o").exists());
+        Ok(())
+    }
+
 }
