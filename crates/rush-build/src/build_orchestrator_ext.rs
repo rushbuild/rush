@@ -1822,9 +1822,9 @@ fn print_analysis_census(graph: &DependencyGraph, build_order: &[Label]) {
     eprintln!("📊 ANALYSIS CENSUS (--analyze-only)");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let total_nodes = graph.nodes().len();
+    let target_nodes = graph.target_node_count();
     let scoped_nodes = build_order.len();
-    eprintln!("Graph nodes (total):         {}", total_nodes);
+    eprintln!("Graph nodes (target view):   {}", target_nodes);
     eprintln!("Build-order nodes (scoped):  {}", scoped_nodes);
 
     // Rule-type histogram across the in-scope nodes (the build_order set
@@ -5475,7 +5475,7 @@ impl BuildOrchestrator {
                     built_providers.len(),
                     cc_count
                 );
-                eprintln!("  graph nodes (total):       {}", graph.nodes().len());
+                eprintln!("  graph nodes (target view): {}", graph.target_node_count());
                 if let Some(kb) = read_self_rss_kb() {
                     eprintln!("  process RSS at this point: {}", fmt_kb(kb));
                 }
@@ -9480,10 +9480,10 @@ impl BuildOrchestrator {
         if graph.has_node(label) {
             return Ok(false);
         }
-        // Only a rule in the SAME package can declare this output.
+        // Inspect the target view only: a rule in the SAME repository/package
+        // can declare this output. This scan is not configured execution.
         let mut producers: Vec<Label> = graph
-            .nodes()
-            .iter()
+            .iter_target_nodes()
             .filter(|(candidate, _)| {
                 candidate.workspace == label.workspace && candidate.package == label.package
             })

@@ -2322,9 +2322,21 @@ impl DependencyGraph {
         self.nodes.get_mut(label)
     }
 
-    /// Get all nodes
-    pub fn nodes(&self) -> &HashMap<Label, DependencyNode> {
-        &self.nodes
+    /// Borrow nodes in the explicit target inspection view, without exposing
+    /// the backing map. Labels and nodes refer to the authoritative store.
+    ///
+    /// The graph currently has one target configuration, so this view includes
+    /// every node. It is not a configured execution order. A future configured
+    /// store must retain an explicit target view rather than choose whichever
+    /// instance of a label happens to be encountered first.
+    pub fn iter_target_nodes(&self) -> impl Iterator<Item = (&Label, &DependencyNode)> + '_ {
+        self.nodes.iter()
+    }
+
+    /// Number of nodes in the same target inspection view as
+    /// [`Self::iter_target_nodes`]. This does not activate configured storage.
+    pub fn target_node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Number of nodes in the graph
