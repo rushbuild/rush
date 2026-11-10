@@ -1767,14 +1767,8 @@ impl BuildRule for CcLibraryRule {
         let copts = extract_string_list(attrs, "copts")?;
         let linkopts = extract_string_list(attrs, "linkopts")?;
         let mut includes = extract_string_list(attrs, "includes")?;
-        let mut defines = extract_string_list(attrs, "defines")?;
-        // `local_defines` apply to THIS target's own sources (Bazel does not propagate
-        // them, unlike `defines`). rush appends them to `defines` so they reach the own
-        // compile; the minor over-propagation to consumers is benign for TF/XLA's value
-        // feature-flags — e.g. xla/stream_executor/cuda:ptx_compiler_support sets
-        // LIBNVPTXCOMPILER_SUPPORT=false via local_defines, undefined (compile error)
-        // without this.
-        defines.extend(extract_string_list(attrs, "local_defines")?);
+        let defines = extract_string_list(attrs, "defines")?;
+        let local_defines = extract_string_list(attrs, "local_defines")?;
         // `data` — runtime files/targets staged into a consumer's runfiles.
         // Bazel republishes a cc_library's `data` through its
         // DefaultInfo.default_runfiles so it flows to any dependent binary/
@@ -1851,6 +1845,7 @@ impl BuildRule for CcLibraryRule {
             strip_include_prefix,
             include_prefix,
             defines,
+            local_defines,
             alwayslink,
             data,
         }))
@@ -1887,6 +1882,8 @@ pub struct CcLibraryInstance {
     /// `#include "third_party/farmhash_gpu/src/farmhash_gpu.h"`.
     include_prefix: Option<String>,
     defines: Vec<String>,
+    /// Used by this library's compile actions, never by dependents.
+    local_defines: Vec<String>,
     /// `alwayslink = 1` — consumers must whole-archive this lib's .a so its
     /// static initializers survive (TF's tf_gen_op_libs sets this on every
     /// `<op>_op_lib` so REGISTER_OP registrations populate the OpRegistry; the
@@ -2852,7 +2849,7 @@ impl RuleInstance for CcLibraryInstance {
                     if is_cuda_source {
                         normalize_cuda_compile_flags(&mut argv_strs);
                     }
-                    for d in crate::providers::merged_compile_defines(&dep_defines, &self.defines) {
+                    for d in crate::providers::merged_compile_defines(&dep_defines, &self.compile_defines()) {
                         argv_strs.push(format!("-D{}", d));
                     }
                     for path in &compile_quote_paths {
@@ -3004,6 +3001,7 @@ impl RuleInstance for CcLibraryInstance {
             include_dirs: direct_include_dirs,
             quote_include_dirs: direct_quote_dirs,
             defines: direct_defines,
+            local_defines: self.local_defines.iter().map(|value| ctx.intern_string(value)).collect(),
             link_fragments: direct_link_fragments,
             linker_inputs: direct_linker_inputs,
             ..DirectCcInfo::default()
@@ -3291,7 +3289,7 @@ impl RuleInstance for CcLibraryInstance {
                 copts: spec_copts,
                 cxxflags: context.toolchain.cxxflags.clone(),
                 cflags: context.toolchain.cflags.clone(),
-                defines: self.defines.clone(),
+                defines: self.compile_defines(),
                 dep_defines: dep_defines.clone(),
                 direct_include_paths: direct_include_paths.clone(),
                 direct_quote_include_paths: compile_quote_paths.clone(),
@@ -3366,6 +3364,10 @@ impl RuleInstance for CcLibraryInstance {
 }
 
 impl CcLibraryInstance {
+    fn compile_defines(&self) -> Vec<String> {
+        crate::providers::merged_compile_defines(&self.defines, &self.local_defines)
+    }
+
     /// Own declared headers, retaining generated file-label identities. A
     /// generated header in srcs also participates; unrelated checked-in private
     /// srcs are left to the include-closure resolver.
@@ -3616,7 +3618,7 @@ impl CcLibraryInstance {
         } else {
             Vec::new()
         };
-        for define in crate::providers::merged_compile_defines(&dep_defines, &self.defines) {
+        for define in crate::providers::merged_compile_defines(&dep_defines, &self.compile_defines()) {
             args.push(format!("-D{}", define));
         }
         for path in runtime_quote_roots(context, Vec::new()).await {
@@ -6932,9 +6934,248 @@ mod cc_binary_response_tests {
             strip_include_prefix: None,
             include_prefix: None,
             defines: Vec::new(),
+            local_defines: Vec::new(),
             alwayslink: false,
             data: Vec::new(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn library_local_defines_stay_private_with_real_compile_parity_and_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("source");
+        let output = temp.path().join("out");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let owner_source = workspace.join("owned.cc");
+        let consumer_source = workspace.join("main.cc");
+        std::fs::write(&owner_source, "#ifndef PRIVATE_VALUE\n#error owner_requires_private_define\n#endif\n#ifndef PUBLIC_VALUE\n#error owner_requires_public_define\n#endif\nint exported_value() { return PRIVATE_VALUE + PUBLIC_VALUE; }\n").unwrap();
+        std::fs::write(&consumer_source, "#ifdef PRIVATE_VALUE\n#error private_define_leaked_to_consumer\n#endif\n#ifndef PUBLIC_VALUE\n#error public_define_was_lost\n#endif\nextern int exported_value();\nextern \"C\" int printf(const char*, ...);\nint main() { printf(\"%d\\n\", exported_value()); return 0; }\n").unwrap();
+        let toolchain = Toolchain::default();
+        let resolver = StubIncludeResolver::new(workspace.clone());
+        let manager = Arc::new(CachingExecutingActionManager::default());
+        let mut owner_keys = Vec::new();
+        let mut consumer_keys = Vec::new();
+        for (pass, private_value) in [40, 40, 41].into_iter().enumerate() {
+            let owner = CcLibraryRule
+                .parse_attributes(&HashMap::from([
+                    ("name".into(), Value::String("owned".into())),
+                    (
+                        "srcs".into(),
+                        Value::List(vec![Value::String("owned.cc".into())]),
+                    ),
+                    (
+                        "defines".into(),
+                        Value::List(vec![Value::String("PUBLIC_VALUE=2".into())]),
+                    ),
+                    (
+                        "local_defines".into(),
+                        Value::List(vec![Value::String(format!(
+                            "PRIVATE_VALUE={private_value}"
+                        ))]),
+                    ),
+                ]))
+                .unwrap();
+            // Use the same native library compilation profile for both sides.
+            // The deps-only binary below performs the real final link; generic
+            // cc_binary's historical runtime compile argv is not spec-admitted.
+            let consumer = CcLibraryRule
+                .parse_attributes(&HashMap::from([
+                    ("name".into(), Value::String("consumer".into())),
+                    (
+                        "srcs".into(),
+                        Value::List(vec![Value::String("main.cc".into())]),
+                    ),
+                    (
+                        "deps".into(),
+                        Value::List(vec![Value::String(":owned".into())]),
+                    ),
+                ]))
+                .unwrap();
+            let mut registry = ArtifactRegistry::new();
+            let owner_provider = Arc::new({
+                let mut ctx = AnalysisContext::new(
+                    TargetId(1),
+                    ConfigId::DEFAULT,
+                    "",
+                    None,
+                    &output,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    &workspace,
+                    &[],
+                );
+                owner.analyze(&mut ctx, &[])
+            });
+            let cc = owner_provider.get_cc_info().unwrap();
+            let public: Vec<_> = cc
+                .compilation
+                .defines
+                .iter()
+                .map(|id| registry.strings().str(id))
+                .collect();
+            let private: Vec<_> = cc
+                .compilation
+                .local_defines
+                .iter()
+                .map(|&id| registry.strings().str(id))
+                .collect();
+            assert_eq!(public, ["PUBLIC_VALUE=2"]);
+            let expected_private = format!("PRIVATE_VALUE={private_value}");
+            assert_eq!(private, [expected_private.as_str()]);
+            let labeled = vec![("//:owned".into(), owner_provider.clone())];
+            let consumer_provider = Arc::new({
+                let mut ctx = AnalysisContext::new(
+                    TargetId(2),
+                    ConfigId::DEFAULT,
+                    "",
+                    None,
+                    &output,
+                    &mut registry,
+                    &resolver,
+                    &toolchain,
+                    &workspace,
+                    &[],
+                )
+                .with_labeled_dep_providers(&labeled);
+                consumer.analyze(&mut ctx, &[owner_provider.clone()])
+            });
+            let pass_a = |target| {
+                registry.declared_actions().find_map(|(id, action)| {
+                (action.owner_target == target && registry.strings().str(action.mnemonic) == "CppCompile")
+                    .then(|| rush_action::command_spec::NormalizedCommandSpec::from_registry_action(&registry, id).unwrap())
+            }).unwrap()
+            };
+            let owner_pass_a = pass_a(TargetId(1));
+            let consumer_pass_a = pass_a(TargetId(2));
+            assert!(owner_pass_a
+                .argv
+                .contains(&format!("-DPRIVATE_VALUE={private_value}")));
+            assert!(!consumer_pass_a
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("-DPRIVATE_VALUE")));
+            let registry = Arc::new(tokio::sync::Mutex::new(registry));
+            let owner_context = BuildContext::new(workspace.clone(), output.clone())
+                .with_package(PathBuf::new())
+                .with_toolchain(toolchain.clone())
+                .with_artifact_registry(registry.clone())
+                .with_materialize_static_libraries(true)
+                .with_action_manager(manager.clone());
+            let owner_specs = owner.build_legacy_command_specs(&owner_context).await;
+            assert_eq!(
+                owner_pass_a,
+                owner_specs
+                    .iter()
+                    .find(|(_, spec)| spec.mnemonic == "CppCompile")
+                    .unwrap()
+                    .1
+            );
+            let request_start = manager.requests.lock().unwrap().len();
+            let artifacts = owner.build(&owner_context).await.unwrap();
+            let consumer_context = BuildContext::new(workspace.clone(), output.clone())
+                .with_package(PathBuf::new())
+                .with_toolchain(toolchain.clone())
+                .with_dependencies(
+                    HashMap::from([("//:owned".into(), NestedSet::new(artifacts, Vec::new()))]),
+                    vec![("//:owned".into(), owner_provider.as_ref().clone())],
+                )
+                .with_artifact_registry(registry.clone())
+                .with_materialize_static_libraries(true)
+                .with_action_manager(manager.clone());
+            let consumer_specs = consumer.build_legacy_command_specs(&consumer_context).await;
+            assert_eq!(
+                consumer_pass_a,
+                consumer_specs
+                    .iter()
+                    .find(|(_, spec)| spec.mnemonic == "CppCompile")
+                    .unwrap()
+                    .1
+            );
+            let consumer_artifacts = consumer.build(&consumer_context).await.unwrap();
+            let runner = CcBinaryRule
+                .parse_attributes(&HashMap::from([
+                    ("name".into(), Value::String("runner".into())),
+                    (
+                        "deps".into(),
+                        Value::List(vec![Value::String(":consumer".into())]),
+                    ),
+                ]))
+                .unwrap();
+            let runner_context = BuildContext::new(workspace.clone(), output.clone())
+                .with_package(PathBuf::new())
+                .with_toolchain(toolchain.clone())
+                .with_dependencies(
+                    HashMap::from([(
+                        "//:consumer".into(),
+                        NestedSet::new(consumer_artifacts, Vec::new()),
+                    )]),
+                    vec![("//:consumer".into(), consumer_provider.as_ref().clone())],
+                )
+                .with_artifact_registry(registry)
+                .with_action_manager(manager.clone());
+            let built = runner.build(&runner_context).await.unwrap();
+            let executable = &built
+                .iter()
+                .find(|artifact| artifact.artifact_type == ArtifactType::Executable)
+                .unwrap()
+                .path;
+            let actual = std::process::Command::new(executable).output().unwrap();
+            assert!(actual.status.success());
+            assert_eq!(
+                String::from_utf8(actual.stdout).unwrap(),
+                format!("{}\n", private_value + 2)
+            );
+            let requests = manager.requests.lock().unwrap()[request_start..].to_vec();
+            let (owner_action, owner_hit) = requests
+                .iter()
+                .find(|(action, _)| {
+                    action.mnemonic == "CppCompile"
+                        && action
+                            .command
+                            .args
+                            .contains(&owner_source.to_string_lossy().into_owned())
+                })
+                .unwrap();
+            let (consumer_action, consumer_hit) = requests
+                .iter()
+                .find(|(action, _)| {
+                    action.mnemonic == "CppCompile"
+                        && action
+                            .command
+                            .args
+                            .contains(&consumer_source.to_string_lossy().into_owned())
+                })
+                .unwrap();
+            for (action, spec) in [
+                (owner_action, &owner_pass_a),
+                (consumer_action, &consumer_pass_a),
+            ] {
+                assert_eq!(action.command.args, spec.argv);
+                assert_eq!(action.command.working_dir, spec.cwd);
+                let mut inputs: Vec<_> = action
+                    .inputs
+                    .iter()
+                    .map(|artifact| match artifact {
+                        ActionArtifact::Source(path) => path.clone(),
+                        _ => panic!("real fixture expects physical inputs"),
+                    })
+                    .collect();
+                inputs.sort();
+                inputs.dedup();
+                assert_eq!(inputs, spec.declared_inputs);
+            }
+            assert_eq!(*owner_hit, pass == 1);
+            assert_eq!(*consumer_hit, pass != 0);
+            owner_keys.push(owner_action.id.clone());
+            consumer_keys.push(consumer_action.id.clone());
+        }
+        assert_eq!(owner_keys[0], owner_keys[1]);
+        assert_ne!(owner_keys[1], owner_keys[2]);
+        assert_eq!(consumer_keys[0], consumer_keys[1]);
+        assert_eq!(consumer_keys[1], consumer_keys[2]);
     }
 
     #[cfg(target_os = "linux")]
@@ -16467,6 +16708,7 @@ mod cc_proto_library_tests {
                 strip_include_prefix: None,
                 include_prefix: None,
                 defines: vec![],
+                local_defines: Vec::new(),
                 alwayslink: false,
                 data: vec![],
             };
