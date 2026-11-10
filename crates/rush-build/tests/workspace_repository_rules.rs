@@ -627,3 +627,167 @@ load("@module_source//:setup.bzl", "SETUP")
         assert_eq!(values["VALUE"], rush_starlark::Value::Int(44));
     }));
 }
+
+/// The analyzer's built-in sources are genuine installation inputs, not a
+/// user-declared archive and not a synthetic cc_flags_supplier implementation.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires explicitly configured RUSH_BAZEL_PATH pointing to Bazel 6.5.0"]
+async fn automatic_bazel_tools_loads_real_supplier_and_revalidates_analyzer_context() {
+    use bytes::Bytes;
+    use rush_command_core::CommandSemantics;
+    use rush_incremental::{tracked, RealTrackedIo};
+    use rush_protocol::command::v1::{EnvironmentVariable, RunRequest};
+    use rush_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::{Arc, Mutex};
+
+    struct Shutdown {
+        binary: PathBuf,
+        output: PathBuf,
+        workspace: PathBuf,
+        environment: Vec<EnvironmentVariable>,
+    }
+    impl Drop for Shutdown {
+        fn drop(&mut self) {
+            use std::ffi::OsStr;
+            let mut command = Command::new(&self.binary);
+            command.args(["--nosystem_rc", "--noworkspace_rc", "--nohome_rc"])
+                .arg("--output_base").arg(&self.output).arg("shutdown")
+                .current_dir(&self.workspace).env_clear();
+            for entry in &self.environment {
+                command.env(OsStr::from_bytes(&entry.name), OsStr::from_bytes(&entry.value));
+            }
+            let _ = command.status();
+        }
+    }
+    let binary = PathBuf::from(std::env::var_os("RUSH_BAZEL_PATH").expect("set exact Bazel 6.5.0"));
+    assert!(binary.is_absolute());
+    let version = Command::new(&binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "bazel 6.5.0");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("WORKSPACE"), "workspace(name = \"builtin_source_control\")\n").unwrap();
+    std::fs::write(root.join("BUILD"), "").unwrap();
+    let adapter = root.join("compatibility");
+    std::fs::create_dir_all(adapter.join("tools/cpp")).unwrap();
+    std::fs::write(adapter.join("tools/cpp/absent_builtin_control.bzl"), "VALUE = 99\n").unwrap();
+    let loader = Arc::new(Mutex::new(rush_starlark::BzlLoader::new_with_global_cache(
+        root.to_owned(), rush_starlark::bzl_loader::GlobalBzlCache::new(),
+    )));
+    loader.lock().unwrap().add_implicit_system_adapter("bazel_tools".into(), adapter.clone());
+    let environment = |home: &std::path::Path, cache: &std::path::Path, tool: &std::path::Path| {
+        let mut entries = std::env::vars_os().filter(|(name, _)| {
+            !["HOME", "XDG_CACHE_HOME", "RUSH_BAZEL_PATH", "RUSH_WORKSPACE_CACHE_ROOT"].iter().any(|key| name == *key)
+        }).map(|(name, value)| EnvironmentVariable {
+            name: Bytes::copy_from_slice(name.as_os_str().as_bytes()),
+            value: Bytes::copy_from_slice(value.as_os_str().as_bytes()),
+        }).collect::<Vec<_>>();
+        for (name, value) in [("HOME", home.to_path_buf()), ("XDG_CACHE_HOME", home.join(".cache")),
+            ("RUSH_BAZEL_PATH", tool.to_path_buf()), ("RUSH_WORKSPACE_CACHE_ROOT", cache.to_path_buf())] {
+            entries.push(EnvironmentVariable { name: Bytes::copy_from_slice(name.as_bytes()), value: Bytes::copy_from_slice(value.as_os_str().as_bytes()) });
+        }
+        entries
+    };
+    let evaluate = |entries: Vec<EnvironmentVariable>, label: &str, symbol: &str| {
+        let request = RunRequest {
+            auth_cookie: Bytes::new(), argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build"), Bytes::from_static(b"//:test")],
+            working_directory: Bytes::copy_from_slice(root.as_os_str().as_bytes()), environment: entries,
+            block_for_lock: true, client_build_id: "builtin-source-control".into(),
+            protocol_major: PROTOCOL_MAJOR, protocol_minor: PROTOCOL_MINOR, workspace_config: vec![],
+        };
+        let io = Arc::new(RealTrackedIo::new(CommandSemantics::from_run_request(&request).unwrap(), root));
+        let values = tokio::task::block_in_place(|| tracked::scope(io.clone(), || {
+            rush_starlark::BzlLoader::load_bzl_from_evaluator(loader.clone(), label, &[(symbol.into(), symbol.into())])
+        }));
+        (values, io)
+    };
+    let mut roots = Vec::new();
+    let mut shutdown = Vec::new();
+    for suffix in ["a", "b"] {
+        let home = root.join(format!("home-{suffix}"));
+        let cache = root.join(format!("cache-{suffix}"));
+        std::fs::create_dir(&home).unwrap();
+        let entries = environment(&home, &cache, &binary);
+        shutdown.push(Shutdown { binary: binary.clone(), output: cache.join("bazel_output_base"), workspace: root.to_owned(), environment: entries.clone() });
+        let (values, io) = evaluate(entries.clone(), "@bazel_tools//tools/cpp:cc_flags_supplier.bzl", "cc_flags_supplier");
+        assert!(values.unwrap().contains_key("cc_flags_supplier"));
+        let actual = loader.lock().unwrap().external_repo_path("bazel_tools").unwrap();
+        assert_ne!(actual, adapter);
+        assert!(loader.lock().unwrap().is_implicit_system_adapter("bazel_tools", &actual));
+        let file = actual.join("tools/cpp/cc_flags_supplier.bzl");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("def _cc_flags_supplier_impl(ctx):"));
+        let manifest = io.manifest();
+        assert!(manifest.deps().iter().any(|dependency| matches!(dependency,
+            rush_incremental::Dependency::ProcessProbe { args, compare_stderr: true, .. }
+                if args.iter().any(|argument| argument == b"install_base"))),
+            "actual analyzer process proof missing");
+        assert!(manifest.deps().iter().any(|dependency| matches!(dependency,
+            rush_incremental::Dependency::FileContent { path, .. } if path == &file)),
+            "actual module input missing");
+        roots.push(actual);
+        // A selected analyzer never falls back to an automatic compatibility
+        // export when the genuine installation does not contain that module.
+        let error = evaluate(entries, "@bazel_tools//tools/cpp:absent_builtin_control.bzl", "VALUE").0.unwrap_err();
+        assert!(format!("{error:#}").contains("absent_builtin_control.bzl"), "{error:#}");
+    }
+    assert_ne!(roots[0], roots[1], "different task HOME/cache contexts reused an old installation");
+    let home = root.join("home-b");
+    let cache = root.join("cache-b");
+    // Removing analyzer selection intentionally returns to native compatibility
+    // policy. The remembered automatic root remains readable, but this command
+    // must not claim a new analyzer-installation proof.
+    let without_analyzer = environment(&home, &cache, &binary).into_iter()
+        .filter(|entry| entry.name.as_ref() != b"RUSH_BAZEL_PATH" && entry.name.as_ref() != b"PATH")
+        .collect();
+    let (compatibility, compatibility_io) = evaluate(without_analyzer, "@bazel_tools//tools/cpp:cc_flags_supplier.bzl", "cc_flags_supplier");
+    assert!(compatibility.unwrap().contains_key("cc_flags_supplier"));
+    assert_eq!(loader.lock().unwrap().external_repo_path("bazel_tools"), Some(roots[1].clone()));
+    assert!(!compatibility_io.manifest().deps().iter().any(|dependency| matches!(dependency,
+        rush_incremental::Dependency::ProcessProbe { args, .. }
+            if args.iter().any(|argument| argument == b"install_base"))),
+        "no-analyzer compatibility reuse was presented as a fresh installation proof");
+    let invalid_tool = root.join("missing-analyzer");
+    let error = evaluate(environment(&home, &cache, &invalid_tool), "@bazel_tools//tools/cpp:cc_flags_supplier.bzl", "cc_flags_supplier").0.unwrap_err();
+    assert!(format!("{error:#}").contains("RUSH_BAZEL_PATH points to a missing"), "{error:#}");
+    // An explicit owner may deliberately provide the very same source path.
+    // That API grants explicit authority even after a tool-context change.
+    loader.lock().unwrap().add_external_repo("bazel_tools".into(), roots[1].clone());
+    assert!(evaluate(environment(&home, &cache, &invalid_tool), "@bazel_tools//tools/cpp:cc_flags_supplier.bzl", "cc_flags_supplier").0.unwrap().contains_key("cc_flags_supplier"));
+
+    // Delegate to the actual pinned analyzer, then atomically replace a tracked
+    // RC input with identical bytes/mode/mtime. A content-only context digest
+    // cannot detect this mutation across the producer's execution bracket.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let rc = root.join(".bazelrc");
+    std::fs::write(&rc, "# same-byte replacement control\n").unwrap();
+    let before_bytes = std::fs::read(&rc).unwrap();
+    let before_stat = std::fs::metadata(&rc).unwrap();
+    let quote = |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let wrapper = root.join("actual-analyzer-with-rc-replacement");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\n{} \"$@\"\nstatus=$?\nif [ \"$status\" -eq 0 ]; then\n/bin/cp -p -- {} {} && /bin/mv -- {} {} || exit 89\nfi\nexit \"$status\"\n",
+        quote(&binary), quote(&rc), quote(&root.join(".bazelrc.replacement")),
+        quote(&root.join(".bazelrc.replacement")), quote(&rc),
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let request = RunRequest {
+        auth_cookie: Bytes::new(), argv: vec![Bytes::from_static(b"rush"), Bytes::from_static(b"build"), Bytes::from_static(b"//:test")],
+        working_directory: Bytes::copy_from_slice(root.as_os_str().as_bytes()),
+        environment: environment(&home, &cache, &wrapper), block_for_lock: true,
+        client_build_id: "builtin-source-bracket-control".into(),
+        protocol_major: PROTOCOL_MAJOR, protocol_minor: PROTOCOL_MINOR, workspace_config: vec![],
+    };
+    let io = Arc::new(RealTrackedIo::new(CommandSemantics::from_run_request(&request).unwrap(), root));
+    let error = tokio::task::block_in_place(|| tracked::scope(io, || {
+        let context = rush_starlark::fetch_strategy::prepare_workspace_repository_fetch(root, &wrapper).unwrap();
+        context.embedded_tools_repository_root(root, &cache.join("bazel_output_base")).unwrap_err()
+    }));
+    assert!(format!("{error:#}").contains("configuration/tool changed while resolving bazel_tools"), "{error:#}");
+    let after_stat = std::fs::metadata(&rc).unwrap();
+    assert_eq!(std::fs::read(&rc).unwrap(), before_bytes);
+    assert_eq!(before_stat.mode(), after_stat.mode());
+    assert_eq!((before_stat.mtime(), before_stat.mtime_nsec()), (after_stat.mtime(), after_stat.mtime_nsec()));
+    assert_ne!(before_stat.ino(), after_stat.ino(), "replacement control did not actually replace the RC file");
+    drop(shutdown);
+}

@@ -40,6 +40,55 @@ impl WorkspaceRepositoryFetchContext {
         }
         Ok(())
     }
+
+    /// Resolve the built-in source tree from the selected analyzer itself.
+    /// Unlike a WORKSPACE repository, bazel_tools is part of the executable's
+    /// installation and has no user repository-rule declaration or marker.
+    /// Keep the successful analyzer result, its full client context and the
+    /// actual source paths as analysis inputs rather than trusting a directory
+    /// left by a previous analyzer invocation.
+    pub fn embedded_tools_repository_root(
+        &self,
+        workspace: &Path,
+        output_base: &Path,
+    ) -> Result<PathBuf> {
+        let mut arguments = self.startup_arguments.iter()
+            .map(|argument| path_identity(Path::new(argument)))
+            .collect::<Result<Vec<_>>>()?;
+        arguments.extend([
+            b"--output_base".to_vec(),
+            path_identity(output_base)?,
+            b"info".to_vec(),
+            b"--noshow_progress".to_vec(),
+            b"install_base".to_vec(),
+        ]);
+        let environment = self.environment.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        // info may unpack the executable's embedded tools. Earlier absent-path
+        // observations remain dependencies but must not mask that mutation.
+        tracked::refresh_filesystem_observations();
+        let output = tracked::probe_process(&self.executable, &arguments, &environment, workspace)
+            .context("query selected analyzer's genuine bazel_tools installation")?;
+        if output.status != 0 {
+            bail!("selected analyzer info install_base failed with status {}: {}",
+                output.status, String::from_utf8_lossy(&output.stderr).trim());
+        }
+        let install = embedded_tools_install_base(&output.stdout)?;
+        let root = tracked::canonicalize(&install.join("embedded_tools"))
+            .context("selected analyzer has no genuine embedded_tools source tree")?;
+        if tracked::metadata_kind(&root) != Some(rush_incremental::FileKind::Dir) {
+            bail!("selected analyzer embedded_tools source root is not a directory");
+        }
+        if !tracked::metadata_full(&root) {
+            bail!("selected analyzer embedded_tools source identity is unavailable");
+        }
+        let current = prepare_workspace_repository_fetch(workspace, &self.executable)?;
+        if current.fingerprint != self.fingerprint
+            || current.consistency_inputs != self.consistency_inputs
+        {
+            bail!("selected analyzer configuration/tool changed while resolving bazel_tools");
+        }
+        Ok(root)
+    }
     /// Restrict this invocation to an exact .bzl source consumer. Graph-target
     /// fetches do not set this purpose and cannot reuse closure-only authority.
     pub fn for_required_module(mut self, repository: &str, label: &str) -> Result<Self> {
@@ -138,6 +187,19 @@ impl WorkspaceRepositoryFetchContext {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn embedded_tools_install_base(stdout: &[u8]) -> Result<PathBuf> {
+    let line = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() || line.contains(&b'\n') || line.contains(&b'\r') || line.contains(&0) {
+        bail!("selected analyzer info install_base returned an ambiguous path");
+    }
+    let install = PathBuf::from(os_string(line)?);
+    if !install.is_absolute() {
+        bail!("selected analyzer info install_base did not return an absolute path");
+    }
+    Ok(install)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1353,6 +1415,14 @@ fn publish_workspace_fetch(
 mod tests {
     use super::*;
     use rush_incremental::{Staleness, TrackedIo};
+
+    #[test]
+    fn embedded_tools_install_base_requires_one_absolute_path() {
+        assert_eq!(embedded_tools_install_base(b"/analyzer installation\n").unwrap(), PathBuf::from("/analyzer installation"));
+        for output in [b"".as_slice(), b"relative\n", b"/one\n/two\n", b"/one\0two\n", b"/one\r/two\n"] {
+            assert!(embedded_tools_install_base(output).is_err(), "{output:?}");
+        }
+    }
 
     fn context() -> WorkspaceRepositoryFetchContext {
         WorkspaceRepositoryFetchContext {

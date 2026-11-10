@@ -20843,6 +20843,35 @@ local_repository(name = "flatbuffers", path = "real")
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn builtin_repository_graph_admission_keeps_explicit_sources_and_active_mirrors() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path();
+        write_file(&root.join("WORKSPACE"), "workspace(name = \"builtin_graph_sources\")\n")?;
+        write_file(&root.join("BUILD"), "filegroup(name = \"main\")\n")?;
+        let orchestrator = BuildOrchestrator::with_workspace(root.to_owned());
+        orchestrator.ensure_tracked_io();
+        let stale = crate::cache_paths::workspace_external_dir(root).join("bazel_tools");
+        let explicit = root.join("provided-tools");
+        write_file(&explicit.join("BUILD"), "filegroup(name = \"actual_source\")\n")?;
+        {
+            let mut loader = orchestrator.bzl_loader.lock().unwrap();
+            assert!(loader.is_implicit_system_adapter("bazel_tools", &stale));
+            loader.add_external_repo("bazel_tools".into(), explicit.clone());
+        }
+        let label = Label::parse("@bazel_tools//:actual_source", None, None)?;
+        assert_eq!(orchestrator.registered_external_repository_path("bazel_tools", &label).await?, Some(explicit.clone()));
+        assert_eq!(orchestrator.external_repo_paths.lock().await.get("bazel_tools"), Some(&explicit));
+        for _ in 0..2 {
+            orchestrator.load_workspace(false).await?;
+            assert_eq!(orchestrator.external_repo_paths.lock().await.get("bazel_tools"), Some(&explicit));
+            let loader = orchestrator.bzl_loader.lock().unwrap();
+            assert_eq!(loader.external_repo_path("bazel_tools"), Some(explicit.clone()));
+            assert!(!loader.is_implicit_system_adapter("bazel_tools", &explicit));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn compatibility_setup_reconciles_explicit_loader_sources_with_stale_adapter_mirrors() -> Result<()> {
         once_cell::sync::Lazy::force(&TEST_CLONE_CACHE);
         let temp = TempDir::new()?;

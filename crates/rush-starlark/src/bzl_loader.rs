@@ -4830,19 +4830,20 @@ impl BzlLoader {
         temp_loader.workspace_root = workspace_root.to_path_buf();
         temp_loader.workspace_repository_context = Some(workspace_root.to_path_buf());
         temp_loader.current_repo_root = workspace_root.to_path_buf();
-        // Legacy WORKSPACE scans use Rush's minimal @bazel_tools repository to
-        // avoid recursive fetch loops. Bzlmod-only workspaces instead register
-        // Bazel's real embedded-tools repository at startup; never overwrite
-        // that shared mapping with the partial compatibility stub.
+        // A scan shares the caller's repository registry. Never replace an
+        // explicit source or an already admitted analyzer source with the
+        // compatibility bootstrap tree. Its automatic origin is preserved so
+        // a selected analyzer must supply genuine embedded tools at use time.
         let bzlmod_only = workspace_root.join("MODULE.bazel").exists()
             && !workspace_root.join("WORKSPACE").exists()
             && !workspace_root.join("WORKSPACE.bazel").exists();
-        if !bzlmod_only {
+        if !bzlmod_only && !temp_loader.external_repos.contains_key("bazel_tools") {
             let bazel_tools_path =
                 cache_backed_external_repo_dir(workspace_root, "bazel_tools");
             temp_loader
                 .external_repos
-                .insert("bazel_tools".to_string(), bazel_tools_path);
+                .insert("bazel_tools".to_string(), bazel_tools_path.clone());
+            temp_loader.implicit_system_adapters.insert(("bazel_tools".to_string(), bazel_tools_path));
         }
         temp_loader.main_workspace_name = self.main_workspace_name.clone();
         temp_loader
@@ -6152,7 +6153,8 @@ impl BzlLoader {
         };
         match (registered, module) {
             (Some(registered), Some(module)) => {
-                if rank(&module) > rank(registered) || (rank(&module) == 1 && rank(registered) == 1) {
+                if rank(&module) > rank(registered) || (rank(&module) == 1 && rank(registered) == 1)
+                    || (name == "bazel_tools" && rank(&module) == 0 && rank(registered) == 0) {
                     Some(module)
                 } else { Some(registered.to_path_buf()) }
             }
@@ -7207,6 +7209,9 @@ impl BzlLoader {
         };
         let legacy_workspace = rush_incremental::tracked::exists(&self.workspace_root.join("WORKSPACE"))
             || rush_incremental::tracked::exists(&self.workspace_root.join("WORKSPACE.bazel"));
+        if repo_name == "bazel_tools" && repo_root_opt.is_none() {
+            repo_root_opt = self.admit_builtin_repository(&repo_name, None)?;
+        }
 
         // A non-empty canonical name resolves directly against the shared
         // bazel output base's external tree — Bazel materialized it there
@@ -7929,6 +7934,53 @@ impl BzlLoader {
         resolve_bazel_binary_for_fetch(workspace_root)
     }
 
+    /// Keep explicitly registered built-in sources authoritative. Automatically
+    /// supplied bazel_tools roots instead belong to the current analyzer, not
+    /// whichever compatibility tree or old installation a mirror remembers.
+    /// Commands without an analyzer retain their existing native compatibility
+    /// policy, including a remembered automatic source. That reuse is not a
+    /// fresh analyzer proof. Selecting an analyzer makes admission strict.
+    pub fn admit_builtin_repository(&self, name: &str, registered: Option<&Path>) -> Result<Option<PathBuf>> {
+        if name != "bazel_tools" {
+            return Ok(registered.map(Path::to_path_buf));
+        }
+        let candidate = self.preferred_registered_repository_path(name, registered);
+        if candidate.as_ref().is_some_and(|path| !self.is_implicit_system_adapter(name, path)) {
+            return Ok(candidate);
+        }
+        let configured = tracked_command_environment("RUSH_BAZEL_PATH")?;
+        let client_path = if configured.is_none() { tracked_command_environment("PATH")? } else { None };
+        if let Some(path) = &client_path {
+            // The no-analyzer compatibility decision is also an input. A new
+            // executable appearing in an unchanged PATH must invalidate it.
+            for directory in std::env::split_paths(OsStr::new(path)) {
+                let directory = if directory.is_absolute() { directory } else { self.workspace_root.join(directory) };
+                for executable in BAZEL_EXECUTABLE_NAMES {
+                    rush_incremental::tracked::metadata_full(&directory.join(executable));
+                }
+            }
+        }
+        let binary = match resolve_bazel_binary_from_command_environment(
+            &self.workspace_root, configured.as_deref(), client_path.as_deref(),
+        ) {
+            Ok(binary) => binary,
+            Err(_) if configured.is_none() => return Ok(candidate),
+            Err(error) => return Err(error),
+        };
+        let context = crate::fetch_strategy::prepare_workspace_repository_fetch(&self.workspace_root, &binary)?;
+        let cache = tracked_command_environment("RUSH_WORKSPACE_CACHE_ROOT")?
+            .map(PathBuf::from).unwrap_or_else(|| self.workspace_root.join(".cache").join("rush"));
+        let output_base = if cache.is_absolute() { cache } else { self.workspace_root.join(cache) }
+            .join("bazel_output_base");
+        let root = context.embedded_tools_repository_root(&self.workspace_root, &output_base)?;
+        // Retain the automatic origin for every admitted installation. A later
+        // command may choose a different tool, HOME or output base; an explicit
+        // owner registration still clears this exact path-bound origin.
+        self.implicit_system_adapters.insert((name.to_string(), root.clone()));
+        self.external_repos.insert(name.to_string(), root.clone());
+        Ok(Some(root))
+    }
+
     /// Materialize a declared legacy WORKSPACE repository with its genuine
     /// repository rule, including patches, overlays and formatted attributes.
     /// Callers register the resulting Bazel-owned source root. This does not
@@ -7976,6 +8028,10 @@ impl BzlLoader {
     }
 
     fn admit_registered_workspace_repository_for_label(&self, repo_name: &str, path: &Path, requested_label: Option<&str>) -> Result<PathBuf> {
+        if repo_name == "bazel_tools" {
+            return self.admit_builtin_repository(repo_name, Some(path))?
+                .ok_or_else(|| anyhow!("bazel_tools has no admitted source root"));
+        }
         let bzlmod_only = self.workspace_root.join("MODULE.bazel").exists()
             && !self.workspace_root.join("WORKSPACE").exists()
             && !self.workspace_root.join("WORKSPACE.bazel").exists();
@@ -9965,6 +10021,21 @@ impl BzlLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_chunk_scan_keeps_active_builtin_source_and_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let active = root.path().join("active-builtin-source");
+        let mut loader = BzlLoader::new(root.path().to_owned());
+        loader.add_implicit_system_adapter("bazel_tools".into(), active.clone());
+        let scan = loader.clone_for_workspace_chunk_scan(root.path());
+        assert_eq!(scan.external_repo_path("bazel_tools"), Some(active.clone()));
+        assert!(scan.is_implicit_system_adapter("bazel_tools", &active));
+        loader.add_external_repo("bazel_tools".into(), active.clone());
+        let explicit_scan = loader.clone_for_workspace_chunk_scan(root.path());
+        assert_eq!(explicit_scan.external_repo_path("bazel_tools"), Some(active.clone()));
+        assert!(!explicit_scan.is_implicit_system_adapter("bazel_tools", &active));
+    }
 
     #[test]
     fn bzl_memory_admission_rejects_unknown_or_invalid_measurements() {

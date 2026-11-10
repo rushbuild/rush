@@ -1215,9 +1215,7 @@ impl BuildOrchestrator {
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
         for (name, path) in &builtin_repos {
-            if name != "bazel_tools" {
-                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
-            }
+            bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
         }
 
         // Phase 5.C.4 commit 7: hold a clone for RushActionManager
@@ -1430,9 +1428,7 @@ impl BuildOrchestrator {
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
         for (name, path) in &builtin_repos {
-            if name != "bazel_tools" {
-                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
-            }
+            bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
         }
 
         let cache = Arc::new(ActionCache::new());
@@ -1607,9 +1603,7 @@ impl BuildOrchestrator {
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
         for (name, path) in &builtin_repos {
-            if name != "bazel_tools" {
-                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
-            }
+            bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
         }
 
         // Phase 5.C.4 commit 7: clone resource_manager for ActionManager.
@@ -1781,9 +1775,7 @@ impl BuildOrchestrator {
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
         for (name, path) in &builtin_repos {
-            if name != "bazel_tools" {
-                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
-            }
+            bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
         }
 
         // Phase 5.C.4 commit 7: clone resource_manager for ActionManager.
@@ -1946,9 +1938,7 @@ impl BuildOrchestrator {
         }
         bzl_loader.set_external_repos(builtin_repos_dashmap);
         for (name, path) in &builtin_repos {
-            if name != "bazel_tools" {
-                bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
-            }
+            bzl_loader.add_implicit_system_adapter(name.clone(), path.clone());
         }
 
         // Phase 5.C.4 commit 7: clone resource_manager for ActionManager.
@@ -2377,11 +2367,13 @@ impl BuildOrchestrator {
                 let mut loader = self.bzl_loader.lock()
                     .map_err(|_| anyhow::anyhow!("BzlLoader lock poisoned while preserving repository source"))?;
                 if let Some(path) = loader.preferred_registered_repository_path(name, paths.get(name).map(PathBuf::as_path))
-                    .filter(|path| !loader.is_implicit_system_adapter(name, path))
+                    .filter(|path| name == "bazel_tools" || !loader.is_implicit_system_adapter(name, path))
                 {
                     paths.insert(name.to_string(), path.clone());
                     if loader.is_managed_workspace_source(name, &path) {
                         loader.add_managed_workspace_source(name.to_string(), path);
+                    } else if loader.is_implicit_system_adapter(name, &path) {
+                        loader.add_implicit_system_adapter(name.to_string(), path);
                     } else {
                         loader.add_external_repo(name.to_string(), path);
                     }
@@ -2410,10 +2402,8 @@ impl BuildOrchestrator {
                 }
 
                 repo_paths.insert(repo_name.to_string(), repo_path.clone());
-                if repo_name != "bazel_tools" {
-                    if let Ok(mut loader) = self.bzl_loader.lock() {
-                        loader.add_implicit_system_adapter(repo_name.to_string(), repo_path.clone());
-                    }
+                if let Ok(mut loader) = self.bzl_loader.lock() {
+                    loader.add_implicit_system_adapter(repo_name.to_string(), repo_path.clone());
                 }
             }
 
@@ -5337,6 +5327,16 @@ cc_library(
         let registered = self.external_repo_paths.lock().await.get(name).cloned();
         let candidate = self.bzl_loader.lock().map_err(|_| anyhow::anyhow!("BzlLoader lock poisoned"))?
             .preferred_registered_repository_path(name, registered.as_deref());
+        if name == "bazel_tools" {
+            let admitted = self.with_tracked_scope(|| {
+                self.bzl_loader.lock().map_err(|_| anyhow::anyhow!("BzlLoader lock poisoned"))?
+                    .admit_builtin_repository(name, candidate.as_deref())
+            })?;
+            if let Some(path) = &admitted {
+                self.external_repo_paths.lock().await.insert(name.to_string(), path.clone());
+            }
+            return Ok(admitted);
+        }
         let declared = self.repository_manager.get_http_archive(name);
         let implicit_or_missing = self.requires_declared_workspace_source_for_path(name, candidate.as_deref());
         if candidate.is_none() && self.has_legacy_workspace() && !implicit_or_missing && name != "bazel_tools" {
