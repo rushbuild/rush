@@ -64,12 +64,29 @@ impl std::hash::Hasher for FxUsizeHasher {
         self.0 = (self.0 ^ i as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
     }
 }
-/// Pointer-identity visited set for estimate_size_internal (fast hasher, not SipHash).
-/// `pub(crate)` so callers sizing many sibling values (e.g. a `.bzl` symbol map)
-/// can thread ONE set through [`Value::estimate_size_shared`] and walk a shared
-/// closure environment only once instead of once per symbol.
-pub(crate) type SizeVisited =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<FxUsizeHasher>>;
+/// Allocation identities used by memory sizing and structural census walks.
+/// The pointee type tags each address, separating a closure wrapper from its
+/// shared globals map and from retained definition metadata. These identities
+/// are process-local accounting state, never analysis or cache keys.
+#[derive(Default)]
+pub struct ValueTraversalVisited {
+    allocations: std::collections::HashSet<
+        (std::any::TypeId, usize),
+        std::hash::BuildHasherDefault<FxUsizeHasher>,
+    >,
+}
+
+impl ValueTraversalVisited {
+    fn insert<T: 'static>(&mut self, allocation: &Arc<T>) -> bool {
+        self.allocations.insert((
+            std::any::TypeId::of::<T>(),
+            Arc::as_ptr(allocation) as usize,
+        ))
+    }
+}
+
+/// Share allocation identities across sibling values in a size estimate.
+pub(crate) type SizeVisited = ValueTraversalVisited;
 
 struct LoadPhaseResult {
     skipped_loads: HashSet<String>,
@@ -1221,8 +1238,7 @@ impl Value {
     }
 
     fn estimate_arc_value(value: &Arc<Value>, visited: &mut SizeVisited) -> usize {
-        let pointer = Arc::as_ptr(value) as usize;
-        if visited.insert(pointer) {
+        if visited.insert(value) {
             value.estimate_size_internal(visited)
         } else {
             std::mem::size_of::<Arc<Value>>()
@@ -1266,8 +1282,7 @@ impl Value {
                 // CRITICAL FIX: Include closure environment size with deduplication!
                 // Closure is now Arc<Environment> to prevent O(n²) memory growth
                 // Check if we've already counted this Arc to avoid double-counting
-                let closure_ptr = Arc::as_ptr(closure) as usize;
-                let closure_size = if visited.insert(closure_ptr) {
+                let closure_size = if visited.insert(closure) {
                     // First time seeing this closure - count it
                     closure.estimate_size_internal(visited)
                 } else {
@@ -1288,13 +1303,13 @@ impl Value {
                 size_of::<Value>() + name.len()
             }
             Value::ImmutableMapping(view) => {
-                if !visited.insert(Arc::as_ptr(view) as usize) { return size_of::<Value>(); }
+                if !visited.insert(view) { return size_of::<Value>(); }
                 size_of::<Value>() + size_of::<ImmutableMapping>()
                     + view.entries.capacity() * (size_of::<String>() + size_of::<Value>())
                     + view.entries.iter().map(|(key,value)| key.capacity() + value.estimate_size_internal(visited)).sum::<usize>()
             }
             Value::ProjectionRule(candidate) => {
-                if !visited.insert(Arc::as_ptr(candidate) as usize) {
+                if !visited.insert(candidate) {
                     return size_of::<Value>();
                 }
                 size_of::<Value>()
@@ -1308,11 +1323,11 @@ impl Value {
                     + candidate
                         .origin
                         .as_ref()
-                        .filter(|origin| visited.insert(Arc::as_ptr(origin) as usize))
+                        .filter(|origin| visited.insert(origin))
                         .map_or(0, |origin| origin.metadata_size())
             }
             Value::AttributeDefinition(attr) => {
-                if !visited.insert(Arc::as_ptr(attr) as usize) {
+                if !visited.insert(attr) {
                     return size_of::<Value>();
                 }
                 size_of::<Value>()
@@ -1323,7 +1338,7 @@ impl Value {
                         .sum::<usize>()
             }
             Value::ModuleExtension(declaration) => {
-                if !visited.insert(Arc::as_ptr(declaration) as usize) {
+                if !visited.insert(declaration) {
                     return size_of::<Value>();
                 }
                 size_of::<Value>() + size_of::<ModuleExtensionDeclaration>()
@@ -1407,8 +1422,8 @@ impl Value {
 /// as the 82GB hog and pointed at the `.bzl` load/eval layer — where each
 /// cached `Value::Function`/`Value::Lambda` retains its `body` AST plus a
 /// `closure: Arc<Environment>` of module globals. This walks a set of
-/// retained values, deduping closure environments by `Arc::as_ptr` (so a
-/// module env shared by N exported functions is counted once), to name
+/// retained values, deduping closure wrappers and their shared globals allocations
+/// separately, to name
 /// which sub-structure dominates: function AST bodies, closure-pinned
 /// module globals, or sheer value count.
 #[derive(Default, Debug, Clone)]
@@ -1424,17 +1439,17 @@ pub struct ValueCensus {
     pub function_body_stmts: usize,
     /// Distinct closure `Arc<Environment>` nodes (ptr-deduped).
     pub unique_closure_envs: usize,
-    /// Sum of var-map entries over the distinct closure environments.
+    /// Sum of entries over distinct globals-map allocations.
     pub closure_env_var_entries: usize,
 }
 
 impl ValueCensus {
     /// Walk an iterator of retained values, accumulating structural counts.
     /// Closure environments (and their parents) are deduped across the whole
-    /// walk via `seen_envs`, so shared module globals are not multiply counted.
+    /// walk via typed allocation identities, so shared globals are counted once.
     pub fn of_values<'a>(values: impl Iterator<Item = &'a Value>) -> ValueCensus {
         let mut stats = ValueCensus::default();
-        let mut seen_envs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut seen_envs: ValueTraversalVisited = ValueTraversalVisited::default();
         stats.accumulate(values, &mut seen_envs);
         stats
     }
@@ -1445,21 +1460,21 @@ impl ValueCensus {
     pub fn accumulate<'a>(
         &mut self,
         values: impl Iterator<Item = &'a Value>,
-        seen_envs: &mut std::collections::HashSet<usize>,
+        seen_envs: &mut ValueTraversalVisited,
     ) {
         for v in values {
             self.walk_value(v, seen_envs);
         }
     }
 
-    fn walk_value(&mut self, v: &Value, seen_envs: &mut std::collections::HashSet<usize>) {
+    fn walk_value(&mut self, v: &Value, seen_envs: &mut ValueTraversalVisited) {
         self.value_nodes += 1;
         if let Value::WorkspaceNativeNamespace { workspace_root, .. } = v {
             self.string_bytes += workspace_root.as_os_str().len();
         }
         match v {
             Value::ImmutableMapping(view) => {
-                if seen_envs.insert(Arc::as_ptr(view) as usize) {
+                if seen_envs.insert(view) {
                     self.dict_entries += view.entries.len();
                     for (key,value) in &view.entries {
                         self.string_bytes += key.len();
@@ -1468,7 +1483,7 @@ impl ValueCensus {
                 }
             }
             Value::ModuleExtension(declaration) => {
-                if seen_envs.insert(Arc::as_ptr(declaration) as usize) {
+                if seen_envs.insert(declaration) {
                     self.string_bytes += declaration.doc.len()
                         + declaration.environ.iter().map(String::len).sum::<usize>()
                         + declaration.source_context.as_ref().map_or(0, String::len);
@@ -1496,8 +1511,7 @@ impl ValueCensus {
             }
             Value::Configurable { left, right, .. } => {
                 for value in [left, right] {
-                    let key = Arc::as_ptr(value) as usize;
-                    if seen_envs.insert(key) {
+                    if seen_envs.insert(value) {
                         self.walk_value(value, seen_envs);
                     }
                 }
@@ -1511,7 +1525,7 @@ impl ValueCensus {
                 }
             }
             Value::ProjectionRule(candidate) => {
-                if seen_envs.insert(Arc::as_ptr(candidate) as usize) {
+                if seen_envs.insert(candidate) {
                     self.walk_value(&candidate.implementation, seen_envs);
                     for value in candidate
                         .attributes
@@ -1523,7 +1537,7 @@ impl ValueCensus {
                 }
             }
             Value::AttributeDefinition(attr) => {
-                if seen_envs.insert(Arc::as_ptr(attr) as usize) {
+                if seen_envs.insert(attr) {
                     for value in attr.arguments.values() {
                         self.walk_value(value, seen_envs);
                     }
@@ -1546,14 +1560,13 @@ impl ValueCensus {
         }
     }
 
-    fn walk_env(&mut self, env: &Arc<Environment>, seen_envs: &mut std::collections::HashSet<usize>) {
-        let key = Arc::as_ptr(env) as usize;
-        if !seen_envs.insert(key) {
+    fn walk_env(&mut self, env: &Arc<Environment>, seen_envs: &mut ValueTraversalVisited) {
+        if !seen_envs.insert(env) {
             return; // shared module env already counted
         }
         self.unique_closure_envs += 1;
         if let Some(context) = &env.definition_label_context {
-            if seen_envs.insert(Arc::as_ptr(context) as usize) {
+            if seen_envs.insert(context) {
                 self.string_bytes += context.repository.as_ref().map_or(0, String::len)
                     + context.package.len()
                     + context.repository_mapping.iter()
@@ -1561,13 +1574,15 @@ impl ValueCensus {
                         .sum::<usize>();
             }
         }
-        // Hold the read guard during recursion: distinct envs have distinct
-        // locks, and the seen_envs short-circuit fires before any re-lock of
-        // this same env, so there is no deadlock.
-        if let Ok(vars) = env.vars.read() {
-            self.closure_env_var_entries += vars.len();
-            for (_name, val) in vars.iter() {
-                self.walk_value(val, seen_envs);
+        // Distinct closure wrappers can share the same globals allocation.
+        // Only the map walk is deduplicated here; wrapper metadata above and
+        // parent traversal below remain independent.
+        if seen_envs.insert(&env.vars) {
+            if let Ok(vars) = env.vars.read() {
+                self.closure_env_var_entries += vars.len();
+                for val in vars.values() {
+                    self.walk_value(val, seen_envs);
+                }
             }
         }
         if let Some(parent) = &env.parent {
@@ -1681,7 +1696,7 @@ impl Environment {
         // Base size of Environment struct
         let mut size = size_of::<Environment>();
         if let Some(context) = &self.definition_label_context {
-            if visited.insert(Arc::as_ptr(context) as usize) {
+            if visited.insert(context) {
                 size += size_of::<DefinitionLabelContext>()
                     + context.repository.as_ref().map_or(0, String::capacity)
                     + context.package.capacity()
@@ -1692,26 +1707,25 @@ impl Environment {
         }
 
         if let Some(origin) = &self.cc_projection_origin {
-            if visited.insert(Arc::as_ptr(origin) as usize) {
+            if visited.insert(origin) {
                 size += origin.metadata_size();
             }
         }
 
-        // Size of vars HashMap (behind Arc<RwLock>)
-        let vars_guard = self.vars.read().unwrap();
-        size += vars_guard.capacity() * (size_of::<String>() + size_of::<Value>());
-        for (key, value) in vars_guard.iter() {
-            size += key.len();
-            // Recursively estimate value size (this may recurse into Function closures)
-            size += value.estimate_size_internal(visited);
+        // Closure wrappers have distinct identities but can share one globals
+        // allocation. Count its storage and values once across the whole walk.
+        if visited.insert(&self.vars) {
+            let vars_guard = self.vars.read().unwrap();
+            size += vars_guard.capacity() * (size_of::<String>() + size_of::<Value>());
+            for (key, value) in vars_guard.iter() {
+                size += key.len();
+                size += value.estimate_size_internal(visited);
+            }
         }
-        drop(vars_guard); // Explicitly drop lock before recursing
 
         // Follow parent chain if not yet visited (cycle detection)
         if let Some(parent) = &self.parent {
-            // Use Arc::as_ptr to get a unique identifier for this environment
-            let parent_ptr = Arc::as_ptr(parent) as usize;
-            if visited.insert(parent_ptr) {
+            if visited.insert(parent) {
                 // Not visited yet - recurse into parent
                 size += parent.estimate_size_internal(visited);
             } else {
@@ -10528,6 +10542,132 @@ filegroup(name = "good_sibling", srcs = [])
             census.unique_closure_envs, 1,
             "shared closure Arc counted once"
         );
+    }
+
+    #[test]
+    fn actual_function_closures_count_shared_globals_once() {
+        fn measured(payload: &str) -> (usize, ValueCensus, usize) {
+            let evaluator = eval(&format!(
+                "payload = {payload:?}\ndef first():\n    return payload\ndef second():\n    return first()\n"
+            )).unwrap();
+            let exported = evaluator.export_environment();
+            let Value::Function { closure: first, .. } = &exported["first"] else {
+                panic!()
+            };
+            let Value::Function {
+                closure: second, ..
+            } = &exported["second"]
+            else {
+                panic!()
+            };
+            assert!(!Arc::ptr_eq(first, second));
+            assert!(Arc::ptr_eq(&first.vars, &second.vars));
+            let vars = first.vars.read().unwrap();
+            let entries = vars.len();
+            let Value::String(owned_payload) = &vars["payload"] else {
+                panic!()
+            };
+            let Value::String(exported_payload) = &exported["payload"] else {
+                panic!()
+            };
+            let allocated_payload_bytes = owned_payload.capacity() + exported_payload.capacity();
+            drop(vars);
+            let mut visited = SizeVisited::default();
+            let size = exported
+                .values()
+                .map(|value| value.estimate_size_shared(&mut visited))
+                .sum();
+            let census = ValueCensus::of_values(exported.values());
+            assert_eq!(census.unique_closure_envs, 2);
+            assert_eq!(census.closure_env_var_entries, entries);
+            assert_eq!(
+                census.function_count, 4,
+                "two exports and two globals entries"
+            );
+            assert_eq!(census.function_body_stmts, 4);
+            (size, census, allocated_payload_bytes)
+        }
+        let (small_size, small_census, small_payload) = measured("small");
+        let (large_size, large_census, large_payload) = measured(&"x".repeat(8192));
+        assert_eq!(large_size - small_size, large_payload - small_payload);
+        assert_eq!(
+            large_census.string_bytes - small_census.string_bytes,
+            2 * (8192 - 5)
+        );
+    }
+
+    #[test]
+    fn shared_globals_keep_distinct_metadata_and_parent_walks() {
+        fn parent(name: &str) -> Arc<Environment> {
+            let mut env = Environment::new();
+            env.define(name.into(), Value::Int(1));
+            Arc::new(env)
+        }
+        fn origin(name: &str) -> Arc<crate::cc_projection_definition::DefinitionOrigin> {
+            crate::cc_projection_definition::DefinitionOrigin::from_source(
+                std::path::Path::new(name),
+                name,
+                "",
+                &parse("").unwrap(),
+            )
+        }
+        let mut left = Environment::new();
+        left.define("shared".into(), Value::String("payload".into()));
+        left.parent = Some(parent("left_parent"));
+        left.cc_projection_origin = Some(origin("left_origin"));
+        let mut right = left.clone();
+        right.parent = Some(parent("right_parent"));
+        right.cc_projection_origin = Some(origin("right_origin"));
+        let context = Arc::new(DefinitionLabelContext {
+            repository: Some("right_repository".into()),
+            package: "right_package".into(),
+            repository_mapping: std::collections::BTreeMap::from([(
+                "alias".into(),
+                "canonical".into(),
+            )]),
+            mapping_is_complete: true,
+        });
+        right.definition_label_context = Some(context.clone());
+        let mut visited = SizeVisited::default();
+        left.estimate_size_internal(&mut visited);
+        let context_size = std::mem::size_of::<DefinitionLabelContext>()
+            + context.repository.as_ref().unwrap().capacity()
+            + context.package.capacity()
+            + context
+                .repository_mapping
+                .iter()
+                .map(|(a, c)| a.capacity() + c.capacity())
+                .sum::<usize>();
+        let expected_second = std::mem::size_of::<Environment>()
+            + context_size
+            + right.cc_projection_origin.as_ref().unwrap().metadata_size()
+            + right.parent.as_ref().unwrap().estimate_size_with_cycles();
+        assert_eq!(right.estimate_size_internal(&mut visited), expected_second);
+        let function = |closure| Value::Function {
+            params: vec![],
+            varargs_param: None,
+            kwargs_param: None,
+            body: vec![],
+            closure,
+        };
+        let functions = [function(Arc::new(left)), function(Arc::new(right))];
+        let census = ValueCensus::of_values(functions.iter());
+        assert_eq!(
+            census.unique_closure_envs, 4,
+            "two wrappers and both parents"
+        );
+        assert_eq!(
+            census.closure_env_var_entries, 3,
+            "one shared map and both parent maps"
+        );
+        let context_bytes = context.repository.as_ref().unwrap().len()
+            + context.package.len()
+            + context
+                .repository_mapping
+                .iter()
+                .map(|(a, c)| a.len() + c.len())
+                .sum::<usize>();
+        assert_eq!(census.string_bytes, "payload".len() + context_bytes);
     }
 
     #[test]

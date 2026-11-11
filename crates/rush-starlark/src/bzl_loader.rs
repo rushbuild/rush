@@ -2048,11 +2048,10 @@ impl GlobalBzlCache {
     /// but small live cache" reading redirects to transient parse/eval
     /// duplication instead. Honest estimate; element bytes are not exact.
     pub fn mem_census(&self) -> String {
-        use std::collections::HashSet;
         use std::fmt::Write as _;
 
         let mut stats = crate::evaluator::ValueCensus::default();
-        let mut seen_envs: HashSet<usize> = HashSet::new();
+        let mut seen_envs = crate::evaluator::ValueTraversalVisited::default();
         let mut entries = 0usize;
         let mut total_symbols = 0usize;
         let mut sum_size_estimate = 0usize;
