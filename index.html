@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-engine="ad87da5188201534d443c40481aba6b57ecc30d6">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -20,16 +20,16 @@ a{color:var(--accent);text-underline-offset:5px}nav div{display:flex;flex-wrap:w
 h1{font-size:clamp(48px,5.6vw,76px);line-height:1.04;letter-spacing:-.055em;margin:24px 0 30px;font-weight:650}h2{font-size:32px;line-height:1.25;letter-spacing:-.025em}h3{font-size:21px}
 .lede{font-size:23px;max-width:710px;color:var(--muted)}.button{display:inline-block;background:var(--accent);color:#162017;padding:12px 22px;border-radius:5px;text-decoration:none;font-weight:650;margin-top:16px}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}.card{padding:25px;background:var(--panel);border:1px solid var(--line);border-radius:8px}.card p,p.note{color:var(--muted)}
-.results-table{max-width:100%;overflow-x:auto;margin:20px 0}table{width:100%;min-width:600px;border-collapse:collapse;font-size:16px}th,td{text-align:left;padding:14px 16px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500}td strong{color:var(--accent);white-space:nowrap}.kernel-results{margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}
+.table-hint{display:none}.results-table{max-width:100%;overflow-x:auto;margin:20px 0}table{width:100%;min-width:600px;border-collapse:collapse;font-size:16px}th,td{text-align:left;padding:14px 16px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500}td strong{color:var(--accent);white-space:nowrap}.kernel-results{margin-top:36px;padding-top:20px;border-top:1px solid var(--line)}
 section{padding:42px 0;border-top:1px solid var(--line)}pre{overflow:auto;background:#0b1113;padding:25px;border:1px solid var(--line);border-radius:7px;font:15px/1.8 ui-monospace,monospace}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:45px}.two>*{min-width:0}.number{color:var(--accent);font:14px ui-monospace,monospace}footer{border-top:1px solid var(--line);color:var(--muted);font-size:14px;padding-bottom:45px}
-@media(max-width:720px){.grid,.two{grid-template-columns:1fr}.hero{grid-template-columns:1fr;padding:36px 0;gap:24px}.hero-art{grid-row:1}.hero-logo{max-width:240px}.lede{font-size:20px}nav{gap:18px}main,nav,footer{padding:20px}}
+@media(max-width:720px){.table-hint{display:block;color:var(--muted);font-size:14px}.grid,.two{grid-template-columns:1fr}.hero{grid-template-columns:1fr;padding:36px 0;gap:24px}.hero-art{grid-row:1}.hero-logo{max-width:240px}.lede{font-size:20px}nav{gap:18px}main,nav,footer{padding:20px}}
 </style>
 </head>
 <body>
 <nav aria-label="Main navigation"><strong>RUSH</strong><div><a href="README.md">Get started</a><a href="buck2.html">Rush vs Buck2</a><a href="docs/status/README.md">Status</a><a href="https://github.com/rushbuild/rush">Source ↗</a></div></nav>
 <main>
-<header class="hero"><div><p class="eyebrow">Rust · incremental builds · experimental source release</p>
+<header class="hero"><div><p class="eyebrow">Rust · incremental builds · experimental source release 2026-11-10</p>
 <h1>Build on what<br>you already know.</h1>
 <p class="lede">Build Bazel-style workspaces with Rust. Reuse analysis and outputs,
 then compare the result with the same targets and toolchains under Bazel.</p>
@@ -37,31 +37,32 @@ then compare the result with the same targets and toolchains under Bazel.</p>
 <p class="note">Early development. Check your rules, toolchain and configuration against your reference build.</p></div>
 <div class="hero-art"><img class="hero-logo" src="images/rush.png" alt="Rush — orange gear-shaped crab in motion" width="737" height="748" fetchpriority="high"></div></header>
 <section id="build-performance" aria-labelledby="performance-title">
-<p class="eyebrow">Experimental release · measured workloads</p><h2 id="performance-title">Compare build times.</h2>
-<p>Choose the workload and operation. Keep unchanged commands, novel edits and cache restoration separate; each measures different work.</p>
-<h3>TensorFlow against Bazel</h3>
-<p>Build pristine TensorFlow 2.17's <code>//tensorflow/core:framework</code> before comparing latency. Use eight CPUs and eight jobs on each host.</p>
-<div class="results-table"><table><thead><tr><th scope="col">Host</th><th scope="col">Rush before</th><th scope="col">Rush current</th><th scope="col">Bazel 6.5.0</th></tr></thead><tbody>
-<tr><td>Host C</td><td>Rule loading fails</td><td>Rule loading fails</td><td>Build completes</td></tr>
-<tr><td>Host D</td><td>Rule loading fails</td><td>Rule loading fails</td><td>Build completes</td></tr>
-</tbody></table></div><p class="note">Both Rush versions stop at undefined <code>JavaInfo</code> before any compiler runs. Assign no speed ratio to failed builds. <a href="docs/benchmarks/tensorflow.md">Inspect exact inputs and the separate imported no-op record.</a> Keep the <a href="docs/status/tensorflow.md">TF 2.15 runtime corpus</a> within its own scope.</p>
-<h3>Modular against Bazel</h3>
-<p>Build one pinned CPU stdlib package, <code>//mojo/stdlib/std:std</code>, with the same Mojo compiler. Compare Rush before the incremental changes with the current engine. Use eight CPUs and eight requested jobs per host.</p>
-<div class="results-table"><table><thead><tr><th scope="col">Host / operation</th><th scope="col">Rush before</th><th scope="col">Rush current</th><th scope="col">Bazel</th></tr></thead><tbody>
-<tr><td>Host C / unchanged command</td><td>3.62 ms</td><td><strong>2.66 ms</strong></td><td>53.57 ms</td></tr>
-<tr><td>Host D / unchanged command</td><td>3.89 ms</td><td><strong>2.93 ms</strong></td><td>56.12 ms</td></tr>
-<tr><td>Host C / clear outputs and engine caches</td><td>14.919 s</td><td>14.783 s</td><td>12.986 s</td></tr>
-<tr><td>Host D / clear outputs and engine caches</td><td>15.398 s</td><td>15.360 s</td><td>13.470 s</td></tr>
-<tr><td>Host C / novel comment edit</td><td>10.822 s</td><td>10.803 s</td><td>10.858 s</td></tr>
-<tr><td>Host D / novel comment edit</td><td>11.222 s</td><td>11.208 s</td><td>11.310 s</td></tr>
-</tbody></table></div><p class="note">Read ten-sample no-op medians and three-sample clean/edit medians within this package scope. All 96 commands pass compiler-count and byte-parity checks. Keep analysis metadata, fetched dependencies and compiler/tool caches for clean commands. Rush before/after clean/edit ranges overlap; infer no broad compilation speedup. Bazel has lower clean-build medians in this package profile. <a href="docs/benchmarks/modular.md">Inspect every sample, ranges, the plot, reproduction steps and separate multi-target records.</a></p>
-<div class="kernel-results"><h3>Linux kernel against GNU Make</h3>
-<p>Use the Linux tree carrying <a href="https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/">Lorenzo Stoakes's v1 build-speedup patches</a>. Require a valid snapshot and exact output parity before timing replay. Keep every mapped-namespace attempt visible:</p>
-<div class="results-table"><table><thead><tr><th scope="col">Host / attempt</th><th scope="col">Make control</th><th scope="col">Rush result</th><th scope="col">Replay</th></tr></thead><tbody>
-<tr><td>Host C / 1</td><td>Completes; 96.44 s</td><td>Assembly refuses an unenforceable directory checkpoint</td><td>Not run</td></tr>
-<tr><td>Host D / 1</td><td>Completes; 98.88 s</td><td>Capture refuses changed directory identity</td><td>Not run</td></tr>
-<tr><td>Host D / 2</td><td>Completes; 98.90 s</td><td>Assembly refuses the same directory checkpoint</td><td>Not run</td></tr>
-</tbody></table></div><p class="note">Use these eight-CPU, seeded-build checks as compatibility evidence. Both completed captures derive 5,684 actions, then refuse the analyzer's <code>init/</code> checkpoint. The login profile also refuses captured group credentials. No snapshot or replay qualifies; assign no fresh Linux speed ratio. <a href="docs/benchmarks/linux.md">Inspect all profiles, setup costs, source recipe, exact seed and the separate 32-job replay record.</a> The report retains the dated upstream patch-status check.</p></div>
+<p class="eyebrow">Rush 2026-11-10 · ad87da5 · measured workloads</p><h2 id="performance-title">Compare build times.</h2>
+<p>Build the named target and require its output checks. Keep unchanged commands, novel edits and cache restoration attached to their measured engine and workload.</p>
+<h3>TensorFlow build performance</h3>
+<p class="table-hint">Scroll each table horizontally to compare all columns.</p>
+<p>Build TensorFlow 2.17 with the default compiler policy, eight CPUs and eight jobs. Run the native Tensor consumer to check serialization, restoration and a row slice with nondefault values.</p>
+<div class="results-table"><table><thead><tr><th scope="col">Case</th><th scope="col">Rush<br><span style="white-space:nowrap">2026-11-10</span></th><th scope="col">Selected work</th><th scope="col">Accepted checks</th></tr></thead><tbody>
+<tr><td>C</td><td>652.786 s</td><td>Native Tensor consumer and framework dependency</td><td>Build and one Tensor program; original source and selected tool/output file checks</td></tr>
+<tr><td>D</td><td>674.906 s</td><td><code>//tensorflow/core:framework</code></td><td>Build; original source and framework object/archive inventory</td></tr>
+</tbody></table></div><p class="note">Use these single shared-system build intervals within their selected-target scopes. Bazel 6.5 supplies configuration queries in this profile; collect matched Bazel build samples before assigning a speed ratio. When Auto selects always-run execution for conditional includes or token pasting, run the selected invocation afresh, including unchanged repeats. <a href="docs/benchmarks/tensorflow.md">Run the exact build and Tensor program checks.</a></p>
+<h3>Modular build performance</h3>
+<p>Build the pinned CPU stdlib package <code>//mojo/stdlib/std:std</code> with the same Mojo compiler. Use eight CPUs and eight jobs per system.</p>
+<div class="results-table"><table><thead><tr><th scope="col">Host / operation</th><th scope="col">Rush<br><span style="white-space:nowrap">2026-11-10</span></th><th scope="col">Bazel 10</th><th scope="col">Rush<br><span style="white-space:nowrap">2026-11-08</span></th></tr></thead><tbody>
+<tr><td>Host C / Clear outputs and engine caches</td><td>34.652 s</td><td>13.626 s</td><td>15.466 s</td></tr>
+<tr><td>Host D / Clear outputs and engine caches</td><td>34.534 s</td><td>14.108 s</td><td>15.944 s</td></tr>
+<tr><td>Host C / Unchanged command</td><td>617.544 ms</td><td>65.840 ms</td><td>3.169 ms</td></tr>
+<tr><td>Host D / Unchanged command</td><td>614.751 ms</td><td>62.398 ms</td><td>3.438 ms</td></tr>
+<tr><td>Host C / Novel comment edit</td><td>11.711 s</td><td>11.163 s</td><td>11.071 s</td></tr>
+<tr><td>Host D / Novel comment edit</td><td>12.279 s</td><td>11.771 s</td><td>11.744 s</td></tr>
+</tbody></table></div><p class="note">All 96 commands pass compiler-count and package-byte checks. Use ten-sample no-op medians and three-sample clean/edit medians. Bazel has lower medians than Rush 2026-11-10 in all six host/mode comparisons. Profile and reduce fresh analysis and input-validation costs while preserving the dependency checks. Run hosts serially after draining task-owned CPU builds on both systems. Background GPU activity was permitted. <a href="docs/benchmarks/modular.md">Inspect every sample, range, dated plot and diagnostic phase.</a></p>
+<div class="kernel-results"><h3>Linux kernel build validation</h3>
+<p>Build the experimental Kbuild capture/replay example with Rush 2026-11-10 (<code>ad87da5</code>). Both systems assemble a fresh version-16 snapshot and execute all 5,685 native actions with zero cache hits. Require full output, hardlink and 4,827-command-record parity against both fresh Make references.</p>
+<div class="results-table"><table><thead><tr><th scope="col">Host</th><th scope="col">Empty-cache native replay</th><th scope="col">Make-j8 control</th><th scope="col">Full output checks</th></tr></thead><tbody>
+<tr><td>Host C</td><td>849.059 s</td><td>106.166 s</td><td>Pass; 12,397 entries</td></tr>
+<tr><td>Host D</td><td>851.792 s</td><td>102.008 s</td><td>Pass; 12,395 entries</td></tr>
+</tbody></table></div><p class="note">These are single controller-observed command intervals. Include graph preparation and collect matched repeated runs before assigning speed ratios. <a href="docs/benchmarks/linux.md">Run the recorded source/seed/tool profile and inspect every phase and pass condition.</a></p>
+<p class="note">Use the tree carrying <a href="https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/">Lorenzo Stoakes's original build-speedup patches</a>. Mainline incorporates a revised subset in the <a href="https://github.com/torvalds/linux/commit/997208ce9f43f01febac956cf9aeffe89945e3c1">first merged batch</a>; read the <a href="https://lore.kernel.org/all/20260923-build-speedup-v4-0-73128809a4a4@kernel.org/">later v4 proposal</a> and the report's dated status check. Keep the measured patched baseline fixed.</p></div>
 <p><a href="docs/status/README.md">Read workload acceptance scopes</a> · <a href="docs/benchmarks/PROVENANCE.md">Inspect measurement provenance</a></p>
 <p><a href="buck2.html">Compare Rush with Buck2 →</a> Read the architecture, local timings and remote backend checks. <a href="docs/remote-execution.md">Execute declared actions on remote workers.</a></p>
 </section>

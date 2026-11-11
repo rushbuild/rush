@@ -14,45 +14,78 @@ toolchain and configuration you use. Validate it against your existing build
 before relying on its results. Use the named workloads and build modes below
 to evaluate the experimental release.
 
-## Compare build times
+## Compare the dated build results
 
+Use **Rush 2026-11-10 (`ad87da5`)**, code revision
+[`ad87da5188201534d443c40481aba6b57ecc30d6`](https://github.com/rushbuild/rush/commit/ad87da5188201534d443c40481aba6b57ecc30d6).
+Build the named target and require its output checks before comparing latency.
 Read [Rush vs Buck2](https://rushbuild.github.io/rush/buck2.html) for the
-architecture, adoption requirements and matched-workload comparison.
+architecture and the separately dated synthetic comparison.
 
-The November 9 checks compare Rush before the incremental changes with the
-current engine on two Linux hosts, using eight CPUs and eight requested jobs.
+### TensorFlow build performance
 
-| Workload and operation | Rush before | Rush current | Bazel reference |
+Build TensorFlow 2.17 with the default compiler policy, eight CPUs and eight
+jobs. Run the native Tensor probe to check serialization, restoration and a
+row slice containing nondefault values.
+
+| Case | Selected target | Rush build interval | Accepted checks |
+| --- | --- | ---: | --- |
+| C | Native Tensor consumer and its framework dependency | 652.786 s | Build, one Tensor program, original source and selected tool/output file checks |
+| D | `//tensorflow/core:framework` | 674.906 s | Build, original source and framework object/archive inventory |
+
+Read the [TensorFlow procedure and data](docs/benchmarks/tensorflow.md).
+Use these single shared-system intervals within their selected-target scopes.
+Bazel 6.5 supplies configuration queries in this profile. Collect matched
+Bazel build samples before assigning a speed ratio. When Auto selects always-run execution for conditional includes or token
+pasting, run the selected invocation afresh, including unchanged repeats.
+
+### Modular build performance
+
+Build `//mojo/stdlib/std:std` with the pinned Mojo compiler. Compare the dated
+Rush revisions and Bazel 10 using eight CPUs and eight jobs on each system.
+
+| Host / operation | Rush 2026-11-08 | Rush 2026-11-10 | Bazel 10 |
 | --- | ---: | ---: | ---: |
-| Modular stdlib package, unchanged command, Host C | 3.62 ms | **2.66 ms** | 53.57 ms |
-| Modular stdlib package, unchanged command, Host D | 3.89 ms | **2.93 ms** | 56.12 ms |
-| TensorFlow 2.17 framework, fresh build, both hosts | Rule loading fails | Rule loading fails | Build completes |
+| Host C / Clear outputs and engine caches | 15.466 s | 34.652 s | 13.626 s |
+| Host D / Clear outputs and engine caches | 15.944 s | 34.534 s | 14.108 s |
+| Host C / Unchanged command | 3.169 ms | 617.544 ms | 65.840 ms |
+| Host D / Unchanged command | 3.438 ms | 614.751 ms | 62.398 ms |
+| Host C / Novel comment edit | 11.071 s | 11.711 s | 11.163 s |
+| Host D / Novel comment edit | 11.744 s | 12.279 s | 11.771 s |
 
-Use the Modular medians within their ten-sample no-op scope. All 96 Modular
-commands pass compiler-count and package-byte checks. Rush before/after clean-output and novel
-comment-edit differences are small with overlapping ranges; these checks
-establish no broad compilation speedup. TensorFlow executes zero compiler
-calls under both Rush versions because `JavaInfo` fails to load. Assign no
-speed ratio to those failed builds.
+All 96 commands pass their compiler-count and package-byte checks: 36
+precompiles and 60 unchanged commands. Read ten-sample no-op medians and
+three-sample clean/edit medians within this package scope. Bazel has lower
+medians than Rush 2026-11-10 in all six host/mode comparisons. Profile and
+reduce fresh analysis and input-validation costs while preserving correctness.
+Run hosts serially after draining task-owned CPU builds on both systems.
+Background GPU activity was permitted in these measurements.
 
-Read the [TensorFlow](docs/benchmarks/tensorflow.md) and
-[Modular](docs/benchmarks/modular.md) reports for every sample, exact engine
-and toolchain pins, configuration, cache controls and separate imported
-multi-target records.
+Read the [Modular report](docs/benchmarks/modular.md) for every sample,
+ranges, the dated plot, diagnostic phases and reproduction instructions.
 
-### Compare the Linux kernel with GNU Make
+### Linux kernel build validation
 
-Require snapshot assembly and exact output parity before comparing Rush
-replay with Make. Fresh eight-CPU checks complete ordinary Make controls.
-Login-profile assembly refuses group credentials. A mapped-namespace profile
-completes capture and graph derivation on both hosts, then refuses an
-unenforceable `init/` directory checkpoint. One capture also refuses a changed
-directory identity; its unchanged-profile repeat reaches the same checkpoint.
-No replay runs and no fresh Linux speed ratio qualifies.
+Build the experimental `kbuild_snapshot_gate` example from Rush 2026-11-10
+(`ad87da5`). Capture the pinned seeded x86-64 build, assemble a fresh
+version-16 snapshot, and execute all 5,685 actions with an empty cache.
+Both systems pass full output and hardlink parity against fresh Make-j8
+and captured Make-j1 references, including all 4,827 persisted command records.
 
-Read the [Linux report](docs/benchmarks/linux.md) for every attempt, commands,
-the exact seed, [Lorenzo Stoakes's v1 baseline patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/)
-and the separate 32-job replay experiment.
+| Host | Make-j8 control | Empty-cache native replay | Full output checks |
+| --- | ---: | ---: | --- |
+| Host C | 106.166 s | 849.059 s | Pass; 12,397 entries |
+| Host D | 102.008 s | 851.792 s | Pass; 12,395 entries |
+
+Read these as single controller-observed command intervals. Include graph
+preparation costs and collect matched repeated runs before assigning speed
+ratios. The [Linux report](docs/benchmarks/linux.md) records every phase,
+source/seed/tool identity, checkpoint scope and pass condition.
+
+Use the measured tree carrying [Lorenzo Stoakes's v1 build-speedup patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/).
+Mainline incorporates a revised subset in the [first merged batch](https://github.com/torvalds/linux/commit/997208ce9f43f01febac956cf9aeffe89945e3c1).
+Keep this patched baseline fixed when interpreting the result; read the
+report's dated upstream check and [later v4 proposal](https://lore.kernel.org/all/20260923-build-speedup-v4-0-73128809a4a4@kernel.org/).
 
 ## Build and try it
 

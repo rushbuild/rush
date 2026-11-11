@@ -7,59 +7,65 @@ state attached to every result.
 ## Rush against Buck2
 
 Build identical generated C++ sources with each engine's native rules on one
-Linux host with the same eight-CPU budget. Rush has lower medians in all eight
+Linux host with the same eight-CPU budget. The November 8 engine has lower medians in all eight
 measured rows at 1,024 and 18,432 headers: clean compilation, unchanged
 commands, source edits and header edits. Read [the 20-sample comparison](buck2.md)
 for all samples, ranges, compiler counts and output checks. The larger edit
 ranges overlap. Keep this synthetic result separate from the workloads below.
 
-## TensorFlow against Bazel
+## TensorFlow build performance
 
-Build pristine TensorFlow 2.17's `//tensorflow/core:framework` with eight CPUs
-and jobs. The November 9 checks fail during rule loading on both hosts with
-both Rush versions; `JavaInfo` is undefined and no compiler runs. Bazel 6.5.0
-completes on both hosts. Read [the build-check report](tensorflow.md) and
-sanitized configuration data. Assign no speed ratio to failed builds.
+Build TensorFlow 2.17 with Rush 2026-11-10 (`ad87da5`), eight CPUs and
+eight jobs. The native Tensor consumer builds in 652.786 s and passes
+one serialization/restoration/slice program. The framework target builds in
+674.906 s and passes original-source and output-inventory checks.
 
-Keep the imported 9.3 ms / 64.2 ms unchanged-command record separate. Its exact
-timing candidate and sample series remain unrecovered; it does not validate
-the current engine.
+Read the [procedure and exact data](tensorflow.md) for both selected-target
+scopes, compiler/tool profiles and input/output checks. Use these single
+shared-system intervals as correctness diagnostics. Collect matched Bazel
+samples before assigning speed ratios. When Auto selects always-run execution for conditional includes or token
+pasting, expect fresh execution for unchanged repeats.
 
-## Modular against Bazel
+## Modular build performance
 
-Build the pinned CPU stdlib package `//mojo/stdlib/std:std`. Compare Rush before
-and after the incremental changes, then use the same Mojo compiler under
-native Bazel. Each no-op median uses ten samples; clean and novel comment-edit
-medians use three each. Use eight CPUs and eight requested jobs on both hosts.
+Build the pinned CPU stdlib package with the same Mojo compiler, eight CPUs
+and eight jobs per system. Compare Rush 2026-11-08 (`b059a25`) with
+Rush 2026-11-10 (`ad87da5`) and Bazel 10.
 
-| Host / operation | Rush before | Rush current | Bazel |
+| Host / operation | Rush 2026-11-08 | Rush 2026-11-10 | Bazel 10 |
 | --- | ---: | ---: | ---: |
-| Host C / unchanged command | 3.62 ms | **2.66 ms** | 53.57 ms |
-| Host D / unchanged command | 3.89 ms | **2.93 ms** | 56.12 ms |
-| Host C / clear engine outputs and caches | 14.919 s | 14.783 s | 12.986 s |
-| Host D / clear engine outputs and caches | 15.398 s | 15.360 s | 13.470 s |
-| Host C / novel comment edit | 10.822 s | 10.803 s | 10.858 s |
-| Host D / novel comment edit | 11.222 s | 11.208 s | 11.310 s |
+| Host C / Clear outputs and engine caches | 15.466 s | 34.652 s | 13.626 s |
+| Host D / Clear outputs and engine caches | 15.944 s | 34.534 s | 14.108 s |
+| Host C / Unchanged command | 3.169 ms | 617.544 ms | 65.840 ms |
+| Host D / Unchanged command | 3.438 ms | 614.751 ms | 62.398 ms |
+| Host C / Novel comment edit | 11.071 s | 11.711 s | 11.163 s |
+| Host D / Novel comment edit | 11.744 s | 12.279 s | 11.771 s |
 
-Read [the complete report and ranges](modular.md), all 96 accepted samples,
-compiler counts, output digests and the reproducible controller. Rush before/after clean/edit
-ranges overlap; use the lower no-op medians within this single-package scope.
-Retain compiler/tool caches and analysis metadata in the clean-output profile.
-Keep the separate 4,175-target and 945-target records attached to their original
-pins and cache limitations.
+Read [every accepted sample and observed range](modular.md). All 96
+commands pass work and package-byte checks. Use ten-sample unchanged-command
+medians and three-sample cleared-output/edit medians. Retain fetched inputs,
+analysis metadata and normal language-tool caches in the cleared-output
+profile. Bazel has lower medians than Rush 2026-11-10 in all six host/mode
+comparisons. Preserve input validation while reducing the recorded costs.
 
 ## Linux against GNU Make
 
-Run the pinned seeded x86-64 build with eight CPUs and Make jobs. Make
-controls complete. Login-profile snapshot assembly refuses group credentials.
-Mapped-namespace captures derive 5,684 actions on both hosts, then refuse an
-unenforceable analyzer directory checkpoint. Retain the changed-directory
-capture refusal and its unchanged-profile repeat as separate attempts.
-No replay runs and no fresh Linux speed ratio qualifies.
+Build the experimental Kbuild capture/replay example with Rush 2026-11-10
+(`ad87da5`) on the recorded seeded x86-64 source. Both fresh captures,
+version-16 snapshots and complete empty-cache native replays pass. Require
+all 5,685 actions, zero cache hits, full output/hardlink parity against
+both Make references and all 4,827 persisted command records.
 
-Read the [Linux report](linux.md) for every phase, exact source/seed/toolchain
-inputs and the separate 32-job, three-pair populated-cache replay record.
-Complete fresh snapshot and parity checks before extending that record.
+| Host | Make-j8 control | Empty-cache native replay | Full output checks |
+| --- | ---: | ---: | --- |
+| Host C | 106.166 s | 849.059 s | Pass; 12,397 entries |
+| Host D | 102.008 s | 851.792 s | Pass; 12,395 entries |
+
+Use these single controller-observed intervals as correctness diagnostics.
+Include capture, graph derivation and snapshot assembly when evaluating
+preparation costs. Collect matched repeated builds before assigning speed
+ratios. Read the [current procedure, phase costs and data](linux.md); keep
+[earlier experiments](history/linux-20261109.md) with their own revisions.
 
 ## Interpret and reproduce the results
 

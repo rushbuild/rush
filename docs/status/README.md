@@ -6,9 +6,9 @@ target, configuration, toolchain and cache scope.
 
 | Workload | Report | Measurement or acceptance scope |
 | --- | --- | --- |
-| TensorFlow | [Build and runtime gates](tensorflow.md) | Current TF 2.17 rule-loading failure on both hosts; separate TF 2.15 runtime and import records |
-| Modular | [Build and artifact coverage](modular.md) | Current CPU package: 96/96 compiler/output checks; separate multi-target and runtime records |
-| Linux kernel | [Replay against GNU Make](../benchmarks/linux.md) | Make controls pass; login group refusal and mapped directory-witness/checkpoint refusals; replay not run |
+| TensorFlow | [Build and runtime gates](tensorflow.md) | TF 2.17 native Tensor consumer and framework build pass; one current runtime program; imported TF 2.15 corpus kept separate |
+| Modular | [Build and artifact coverage](modular.md) | Rush 2026-11-10 CPU package: 96/96 compiler/output checks; slower current medians and diagnostic validation costs recorded |
+| Linux kernel | [Replay against GNU Make](../benchmarks/linux.md) | Rush 2026-11-10: fresh snapshot16 and 5,685-action empty-cache replay pass both systems with full dual-Make/hardlink/4,827-record checks |
 | Remote execution | [REAPI and worker checks](../benchmarks/remote-execution.md) | File actions and native C++ in both host directions; CUDA readback; HIP failure retained |
 | Performance | [Compare build modes](../benchmarks/README.md) | Keep compile, restore, novel edit, repeated edit and no-op separate |
 

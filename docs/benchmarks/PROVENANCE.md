@@ -1,17 +1,53 @@
 # Measurement provenance
 
-Use this record to distinguish a measured workload from validation of a
-particular release candidate. The release presents project measurements;
-the complete workload acceptance matrix for source baseline
-`8c6bb55e39de7d78283a3e57b0b89df11ee773ea` remains open. The November 9 checks
-below exercise the published incremental engine without changing its source.
+Bind each result to its dated Rush code, selected upstream target, tools,
+configuration and output checks. Use the current workload reports to locate
+accepted evidence; keep imported and historical measurements within their
+own source and cache scopes.
+
+## November 10 TensorFlow and Modular checks
+
+Use Rush 2026-11-10, code revision
+`ad87da5188201534d443c40481aba6b57ecc30d6`, source tree
+`87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd`. The source identity mapping
+preserves all 2,090 tracked source files from the measured candidate and
+retains the original executable, controller and evidence digests. Both CPU
+systems pass the 21 selected source, component and release checks. Complete
+broader suites and workload ledgers before expanding those checks' scope.
+
+* [TensorFlow data](data/tensorflow-native-20261110.json) binds two default
+  Auto builds to original TensorFlow 2.17 sources. C builds a native consumer
+  and passes one Tensor serialization/restoration/slice program. D builds
+  the framework and inventories its object/archive subtree. Require the
+  recorded original-source checks on both systems. C also compares selected
+  compiler/SDK inputs across the build and selected source/tool/output files
+  across runtime. Keep those two file-comparison intervals distinct.
+* [Modular data](data/modular-cpu-20261110.json) retains all 96 accepted
+  samples for Rush 2026-11-08, Rush 2026-11-10 and Bazel 10. Require the
+  36 measured precompiles, 60 unchanged commands and exact package bytes.
+  Keep every novel-edit digest, sample range and source-restoration result.
+  Use eight CPUs, eight jobs, a 32 GiB limit and zero swap. Drain task-owned
+  CPU builds on both systems and measure hosts serially. Background GPU
+  activity was permitted; retain that shared-system scope.
+* [The separate Modular diagnostic](data/modular-profile-20261110.json)
+  records three instrumented cold builds, one warm request, the cgroup
+  memory peak and the warm phase ledger. Graph reuse succeeds while input
+  validation dominates the measured request. Preserve validation when
+  reducing that cost. Keep these instrumented rows outside the 96 samples.
+
+Preserve raw paths, source archives, process records and compiler binaries
+outside public Git. Follow the [TensorFlow procedure](tensorflow.md) and
+[Modular controller instructions](../../benchmarks/workloads/README.md)
+with independently supplied tools and fresh task directories. Collect
+matched TensorFlow/Bazel work and complete timing distributions before
+assigning a current speed ratio.
 
 ## November 9 workload checks
 
 Compare Rush `b003cc3a3f068449510ba69e9ef1070c4598cc4a` with engine
 `b059a257874270dbb17ebebeb2bee6f3546688c3` published in `f9d97fe`.
 The before binary was built at `7e185b1049f0253b682ddee3c3de378c263e6f9e`;
-`b003cc3` changes documentation only. The current binary was built at
+`b003cc3` changes documentation only. The after binary was built at
 `b059a25`; `f9d97fe` changes documentation only. Freeze the 2,012-file
 published source archive and verify it on both hosts.
 Use identical before/after executable bytes on both hosts, with task-local
@@ -56,7 +92,31 @@ revalidation. Use distinct bytes for novel-edit samples and retain repeat-edit
 measurements separately. The stdlib runtime summary does not account for
 every built target; recover the case ledger before expanding its denominator.
 
-## Linux
+## November 10 Linux snapshot and replay checks
+
+Use [the current Linux record](data/linux-final-correctness-20261110.json)
+with Rush code `ad87da5` and the pinned v1-patched kernel tree. Build an
+ordinary Make-j8 reference at the future capture output pathname, retain
+it by exclusive rename, then run a fresh Make-j1 observation there.
+Derive 5,685 actions, assemble a new version-16 snapshot and key, and execute
+every action through native replay with an empty cache.
+
+Both systems pass all seven phases, 42 inspected directory checkpoints,
+full output/hardlink parity against both Make references, all 4,827 persisted
+command records and repeated output-stability checks. Require original
+source bytes/modes/links, exact tools, binding and resource checks before
+and after the run. Record local snapshot/key/executable hashes; retain the
+23 original metadata hashes per system. Keep the checkpoint count scoped
+to the inspected action profile and graph-layer maxima as structural data.
+
+The recorded command intervals are single controller-observed correctness
+diagnostics with completion/reap overhead. Include graph preparation and
+collect matched repeated work before assigning a speed ratio. Qualify
+populated-cache, unchanged-command, runtime and boot behavior separately.
+The November 10 upstream check verifies a revised subset of Lorenzo's
+speedup work in mainline; retain the measured v1 tree for these results.
+
+## Historical Linux records
 
 The [November 9 data](data/linux-build-retest-20261109.json) records two
 complete login-profile attempts through snapshot refusal. Make controls,
