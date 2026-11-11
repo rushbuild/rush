@@ -1,0 +1,100 @@
+{
+  "schema": "rush.modular-memory-and-warm-profile.v1",
+  "date": "2026-11-10",
+  "engine_commit": "ad87da5188201534d443c40481aba6b57ecc30d6",
+  "engine_tree": "87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd",
+  "measured_commit": "c63206f79f7b1ce04a634b4e063f9e8bfbadcd15",
+  "host_label": "Host D",
+  "resource_policy": {
+    "cpus": 8,
+    "memory_gib": 32,
+    "swap": 0
+  },
+  "scope": "Three cold diagnostic builds and one warm unchanged command, with diagnostic instrumentation; separate from the 96 accepted comparison samples.",
+  "memory_peak_bytes": 7764697088,
+  "memory_observation": "Own cgroup bookends and lifetime peak; no continuous process sampling.",
+  "memory_events_after": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0",
+  "rows": [
+    {
+      "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a",
+      "engine": "rush-after",
+      "mode": "diagnostic-cold",
+      "mojo_precompiles": 1,
+      "sample": 0,
+      "seconds": 44.75211913,
+      "std_mojoc_bytes": 3265666,
+      "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+      "timing_scope": "diagnostic_only_not_accepted_matrix"
+    },
+    {
+      "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a",
+      "engine": "rush-after",
+      "mode": "diagnostic-cold",
+      "mojo_precompiles": 1,
+      "sample": 1,
+      "seconds": 34.615569007,
+      "std_mojoc_bytes": 3265666,
+      "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+      "timing_scope": "diagnostic_only_not_accepted_matrix"
+    },
+    {
+      "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a",
+      "engine": "rush-after",
+      "mode": "diagnostic-cold",
+      "mojo_precompiles": 1,
+      "sample": 2,
+      "seconds": 34.377094248,
+      "std_mojoc_bytes": 3265666,
+      "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+      "timing_scope": "diagnostic_only_not_accepted_matrix"
+    },
+    {
+      "edit_sha256": "53c9adf91e6e5fd2a8b36ffdab3284d3904943c29ab0e11484bfa0493bc7a73a",
+      "engine": "rush-after",
+      "mode": "diagnostic-noop",
+      "mojo_precompiles": 0,
+      "sample": 0,
+      "seconds": 0.590934406,
+      "std_mojoc_bytes": 3265666,
+      "std_mojoc_sha256": "e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9",
+      "timing_scope": "diagnostic_only_not_accepted_matrix"
+    }
+  ],
+  "warm_request_phases": {
+    "path": "warm",
+    "phases": [
+      {
+        "name": "orchestrator_setup",
+        "ms": 0.179201
+      },
+      {
+        "name": "analysis_key_lookup",
+        "ms": 0.06263
+      },
+      {
+        "name": "manifest_validate",
+        "ms": 581.742885
+      },
+      {
+        "name": "ledger_validate",
+        "ms": 0.06860999999999999
+      },
+      {
+        "name": "execute_analyzed",
+        "ms": 2.9999999999999997e-05
+      }
+    ],
+    "total_ms": 582.0533560000001,
+    "manifest_deps": 1350,
+    "ledger_paths": 254,
+    "ledger_actions": 1,
+    "wavefront_skipped": true,
+    "targets": [
+      "//mojo/stdlib/std:std"
+    ]
+  },
+  "evidence_sha256": {
+    "raw_result": "89b7c238481304e0942fe444aedf8718bee97a5c8b7422dc382f1a76d5a0fb75",
+    "warm_request_phases": "a949fea466a44b49acb30794eb1e6c8141ec07e5eb921de66c50faa1e0ac3da6"
+  }
+}

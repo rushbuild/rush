@@ -1,4 +1,64 @@
-# Compare Modular package builds before extending the workload claim
+# Modular CPU package comparison
+
+Build the CPU stdlib package `//mojo/stdlib/std:std` at Modular commit
+`4e87649567a82e3bdac178ea61d62daddc7477bb`. Compare Rush 2026-11-08
+(`b059a257874270dbb17ebebeb2bee6f3546688c3`) with Rush 2026-11-10
+(`ad87da5188201534d443c40481aba6b57ecc30d6`) and Bazel 10 using the
+same Mojo compiler. Require one precompile for cleared outputs and each
+novel edit, zero for unchanged commands, and identical package bytes.
+
+## November 10 comparison
+
+Each cell is median [minimum, maximum]. Ranges are observed sample
+ranges, not confidence intervals. Both hosts use CPU8, 32 GiB and no
+swap. Run hosts serially after draining task-owned CPU builds on both
+systems. Background GPU activity was permitted.
+
+| Host | Operation | Rush 2026-11-08 | Rush 2026-11-10 | Bazel 10 |
+| --- | --- | ---: | ---: | ---: |
+| Host C | Clear engine outputs/cache (s) | 15.466 [15.359, 15.517] | 34.652 [34.343, 34.834] | 13.626 [13.612, 13.692] |
+| Host C | Unchanged command (ms) | 3.169 [2.701, 3.746] | 617.544 [592.060, 629.986] | 65.840 [55.374, 90.779] |
+| Host C | Novel comment edit (s) | 11.071 [11.018, 11.128] | 11.711 [11.625, 11.713] | 11.163 [11.057, 11.235] |
+| Host D | Clear engine outputs/cache (s) | 15.944 [15.925, 15.978] | 34.534 [34.386, 34.588] | 14.108 [14.095, 14.125] |
+| Host D | Unchanged command (ms) | 3.438 [2.845, 3.953] | 614.751 [585.971, 633.076] | 62.398 [56.611, 90.007] |
+| Host D | Novel comment edit (s) | 11.744 [11.731, 11.772] | 12.279 [12.192, 12.302] | 11.771 [11.751, 11.807] |
+
+Bazel has lower medians than Rush 2026-11-10 in all six host/mode
+comparisons.
+Rush 2026-11-10 also takes longer than the November 8 engine. Keep these
+costs visible while improving fresh analysis and unchanged-command latency.
+
+Read the [separate diagnostic profile](data/modular-profile-20261110.json).
+Three instrumented cold builds and one warm command pass their work and
+package-byte checks under the same 32 GiB limit. The diagnostic cgroup
+peaks at 7,764,697,088 bytes. In its one warm request, graph reuse succeeds
+and input-manifest validation takes 581.743 ms of 582.053 ms in the phase
+ledger. Preserve that validation while removing repeated work. Treat these
+instrumented observations separately from the comparison samples.
+
+![Modular CPU package modes](graphs/modular-cpu-20261110.svg)
+
+Read [all 96 accepted samples](data/modular-cpu-20261110.json), including
+the exact per-host executable and toolchain-tree hashes. There are
+36 measured Mojo precompiles and 60 no-op rows with no precompile.
+Six preceding qualification compiles are excluded. Every measured
+product is 3,265,666 bytes, SHA256
+`e70baa1ba529a4bf5e022f6e2818fd6658b8b764969b9e3e76425920bc6498b9`.
+
+The measured controller is published byte-for-byte with SHA256
+`7bdd77317fdb149f88d8c916f570c143312caedde0032592cf818305503eb30c`. Its pidfd/perf_counter event timer is unchanged.
+Use the [reproduction instructions](../../benchmarks/workloads/README.md),
+including outer process-tree containment on interruption. Preparation,
+bootstrap, failed/cancelled attempts and qualification are not samples.
+Clean commands clear compiled outputs/action caches/CAS but retain
+fetched inputs, analysis metadata and ordinary language-tool caches.
+Novel edits are distinct comments, not semantic application changes.
+
+The following November 9 and older records retain their own engine
+identities, controller hashes and scope; they are not pooled with this
+comparison.
+
+## Historical package comparisons
 
 Build the CPU stdlib package `//mojo/stdlib/std:std` at commit
 `4e87649567a82e3bdac178ea61d62daddc7477bb`. Compare Rush before the incremental

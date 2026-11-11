@@ -7,14 +7,24 @@ contracts before counting a runtime pass.
 
 ## Qualify the current package profile
 
-Run the [two-host CPU stdlib comparison](../benchmarks/modular.md) at source
-`4e87649567`. Both Rush revisions and the pinned Bazel toolchain build the
-single package with matching bytes. All 96 measured commands pass their
-compiler-count/output checks. Current Rush has lower no-op medians; Rush before/after clean
-and comment-edit ranges overlap. Keep this one-package build result separate
-from the multi-target build and GPU runtime ledgers below.
+Build `//mojo/stdlib/std:std` at Modular source `4e87649567` with
+**Rush 2026-11-10 (`ad87da5`)**. The [two-host comparison](../benchmarks/modular.md)
+passes all 96 compiler-count and output-byte checks across Rush 2026-11-08,
+Rush 2026-11-10 and Bazel 10. All 36 measured compiles and 60 unchanged
+commands produce the same package bytes.
 
-## Read the coverage results
+Bazel has lower medians than Rush 2026-11-10 in all six host/mode
+comparisons.
+Rush 2026-11-10 takes 34.652 / 34.534 s for cleared outputs and
+617.544 / 614.751 ms for unchanged commands on C / D. Inspect every sample
+and range in the report. Profile and reduce analysis and validation costs
+while preserving the dependency and artifact checks. Qualify whole-project
+builds and runtime programs separately.
+
+## Read the imported coverage records
+
+Keep these results attached to their original source pins, toolchains and
+target ledgers. Re-run the named cases to extend them to Rush 2026-11-10.
 
 | Scope | Result | Acceptance boundary |
 | --- | --- | --- |
@@ -28,14 +38,6 @@ Do not combine whole-repository and stdlib denominators: they use different
 pins and environments. The stdlib runtime summary identifies 23 failures
 without accounting for every remaining built target. Recover the full ledger
 before expanding its runtime claim.
-
-## Compare build performance
-
-Use the [Modular benchmark tables](../benchmarks/modular.md) to separate
-populated-cache restoration, no-op commands, novel edits and repeated edits.
-A novel one-file edit takes **26.0 s** under Rush versus **30.1 s** under
-Bazel. Repeating an already-cached edit takes **0.15 s** versus roughly
-**13 s**. Clear the actual engine caches before measuring an uncached build.
 
 ## Extend the acceptance scope
 
