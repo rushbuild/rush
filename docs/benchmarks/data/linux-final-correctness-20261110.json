@@ -1,0 +1,407 @@
+{
+  "schema": "rush.linux-final-correctness.v1",
+  "date": "2026-11-10",
+  "measured_engine_commit": "c63206f79f7b1ce04a634b4e063f9e8bfbadcd15",
+  "public_engine_commit": "ad87da5188201534d443c40481aba6b57ecc30d6",
+  "engine_tree": "87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd",
+  "public_commit_mapping_sha256": "1e4aa9a5588b4f8d193be36527fdba63403668b1870b5aa5d502004047998189",
+  "raw_identity_scope": "raw result/binding/executable hashes preserved; no retroactive relabeling",
+  "source": {
+    "kernel_archive_sha256": "f9b92086648ba2f49ff3513416958f4fe5a3cc29ac39a0b8b0e51c46edfe2ae3",
+    "kernel_commit": "35568770debb5fab088d5d6c2b6a535ad6e8cb4d",
+    "kernel_public_base": "28924df2a08f440c73991b83028032c901de2ae4",
+    "kernel_tree": "116df9506075825b4f676ff33443a8f3acbc6e3e",
+    "public_series_verification": {
+      "base": "28924df2a08f440c73991b83028032c901de2ae4",
+      "measured_tip": "35568770debb5fab088d5d6c2b6a535ad6e8cb4d",
+      "patch_count": 23,
+      "public_mbox_sha256": "f6d1f2b19ef0b7083f4589ff8022cc83cfe2a73401399dc58c48e85295c6055d",
+      "public_series": "20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org",
+      "stable_patch_ids": [
+        "0109e6c90edb0328e5d74f48de444182aa4c14d4",
+        "f3740f9cb6528455e1f3425e5f836641148d1840",
+        "8314e18a90416904c7e88e32fd8264135ab70248",
+        "7272feaba3418892c43966b0150fc244b4c1c1e7",
+        "6b2ee4f2beb5604383163362421b6bda6ea448e0",
+        "88ba86e99496160ade7b8d95bd83c110b0eb090e",
+        "ac46ad2868e42a1a3db420e584edd1ece61a1da5",
+        "126fdec25a931eb9ec0aac9889586578b04a7a67",
+        "276cfe9acba771f797aa6683e914076fee677a07",
+        "a7e5db87ed68572fbfe3d30a2770da8be8dea97e",
+        "90ebf8380596facacd2f0d8f545c1bf254c5a2f6",
+        "6a4746e939b3bf329bc250ddcff98926cfc32d77",
+        "ab65470181ec156ac2fa18c2a4efc227cf441036",
+        "a259116799b56618779a17fc238d2a9c61a2e195",
+        "cc3b143e4218a36fcb75dfa3562f1a3eca8fe582",
+        "2c6ff3de126b3063f2f0755aa0f6f60b7d898fe4",
+        "c8c40f24a58579c8809dabb4515f66952734ca0d",
+        "fb714279c60e02b4195306be198f2948c41c72e7",
+        "835f45f17d5be4e41c6a7812ddd28a590c851d8d",
+        "2ae16651aba6543c57a747fee6e24f54549e8451",
+        "760ca3bbd973beb25ea05c314514dd75b93d4895",
+        "b4fb2f3cb3f31704cd18495823b48e5f263ce64c",
+        "a18c1c123f78a5a17eaf1a337536d2b15fcaa9cd"
+      ],
+      "stable_patch_ids_equal": true,
+      "verbatim_patch_ids": [
+        "4dda41e04fd504e445f520836b75d479e7bb8efe",
+        "f1ba7432b12e010c6afb50893050746d13f940ca",
+        "96f0a605f1cdf9c8057421df47b1178b7a939979",
+        "a434f2bb62b2decf35c7e073ded2ead0cb5082a6",
+        "a14a366565f07b93be7cc009a94c79c2234c9584",
+        "8dc037eddab1b70964344971c94375c428be4431",
+        "87dcf8f458298345c4e6028a1e9cb6286464b246",
+        "5a4a8476853a0e99a079e7dc9db2486bc2737923",
+        "0008a9fd9600045cba08177b2f47b306c382c3c3",
+        "a1a5b1d27f39b8b357c27932b296fc1ce4c071f5",
+        "62624989a1fab5c83abda2fc71d9852690043166",
+        "38de8b5504a398af1ab451708699d7a1ca52d0a1",
+        "72c697e268951f93e885af4b005bb05a6b645e6b",
+        "d87cd780ef5cbd425e3a2295d5639eb3c9d4e76d",
+        "f386b0916c18f08b440576e1abb8f29e1ea216ee",
+        "4d4e5b79e6b80ffd103ed04c43e53091f05edd93",
+        "8749d092a27d058b1796ebed3373324b3c223689",
+        "5e0bbe35582e08b06d346e68a3f57b54466c49ff",
+        "3b3764a551a46baa9bb4190cda0431f94129945a",
+        "6bb38f072a16de37f34a479760dc721d5c9487d9",
+        "46be7ab737a2637d9ffeb9aeb0d6447324c7a680",
+        "e418be442c051f2fc7bf0097d40cbf0eb1bae5b6",
+        "250e25c8bd0eb5399a7f86fdb3bb47a885966fa5"
+      ],
+      "verbatim_patch_ids_equal": true
+    },
+    "seed_sha256": "5e0134db8e9bb259ee5133a177f7feed45a11eec67c808adcf0454f1aeb9cfc5",
+    "time_tool_sha256": "6a1994aecdf6bbabe1f220965f5b5c3c5845d04d93afaeed6368b9edac1d9a0a",
+    "versions": {
+      "C": {
+        "ar": "GNU ar (GNU Binutils for Debian) 2.47",
+        "gcc": "gcc (Debian 16.2.0-3) 16.2.0",
+        "ld": "GNU ld (GNU Binutils for Debian) 2.47",
+        "make": "GNU Make 4.4.1"
+      },
+      "D": {
+        "ar": "GNU ar (GNU Binutils for Debian) 2.47",
+        "gcc": "gcc (Debian 15.3.0-2) 15.3.0",
+        "ld": "GNU ld (GNU Binutils for Debian) 2.47",
+        "make": "GNU Make 4.4.1"
+      }
+    }
+  },
+  "hosts": [
+    {
+      "host_label": "Host C",
+      "actions": 5685,
+      "analysis_barriers": 3067,
+      "snapshot_version": 16,
+      "snapshot_bytes": 1085405465,
+      "snapshot_sha256": "ce1c9dc1a6b6f5d437a6739ee4fc56c40fa522930657dfd2eb17577753c2ac72",
+      "key_sha256": "6e8d127e8441dce1ca64dd1e46cbeb14e394bfbcd4ac407184363fe32f35dc78",
+      "gate_sha256": "51ab374f20c50547f9098b5deede37b317de23cf6e53a3f4d76c0373ff4cf410",
+      "directory_checkpoints": 42,
+      "directory_checkpoints_scope": "capflags.c action preflight; not whole-graph count",
+      "directory_profile": "complete-private-enumeration-v1",
+      "mandatory_policy": "procfs-live-clean-entry-v2",
+      "cacheable_directory_action": false,
+      "first_replay": {
+        "command": "replay-clean-commit",
+        "result": {
+          "cache_hits": 0,
+          "executed": 5685,
+          "status": "complete"
+        },
+        "parity": {
+          "make8_vs_capture1": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          },
+          "before_assembly": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          },
+          "native_vs_capture1": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          },
+          "native_vs_make8": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          },
+          "native_inventory_stability": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          },
+          "retained_make8_parity": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          },
+          "retained_make8_stability": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12397,
+            "candidate_entries": 12397
+          }
+        }
+      },
+      "stored_command_projection": {
+        "records": 4827,
+        "native_equals_make8": true,
+        "native_equals_capture1": true,
+        "scope": "persisted .cmd/source/output records, not all transient commands"
+      },
+      "graph_metrics": {
+        "command_count": 5713,
+        "dependency_edges": 105018,
+        "dependency_layer_count": 44,
+        "maximum_dependency_layer_size": 1544,
+        "requested_outputs": 5685,
+        "checkpoint_action_count": 4,
+        "complete_profile_action_count": 2
+      },
+      "graph_width_scope": "dependency-layer maxima are not exact DAG width or runtime concurrency",
+      "normalized_config_sha256": "2b3aa42f486b1b378601154b8a4d50e3952fb6415b65d7ac83e08ce834505ad3",
+      "tools_sha256": {
+        "ar": "ac2b6d5f269e2105f9192b701c3f221829905dd69eac1d539190f92e2b83520d",
+        "gcc": "d85726de39dccd87c573ee63d467caee8e69f56cc2edea710f02d1ba5e0ae477",
+        "ld": "1724aff6c56e26d18176986b42d22e51c0b7c7d9c1540c4f4af0a51bfdee9159",
+        "make": "b5441a23f8354840947d2e9dac7f29c8a42e08cab32c0a93b8a7e9fb9f13103e"
+      },
+      "versions": {
+        "ar": "GNU ar (GNU Binutils for Debian) 2.47",
+        "gcc": "gcc (Debian 16.2.0-3) 16.2.0",
+        "ld": "GNU ld (GNU Binutils for Debian) 2.47",
+        "make": "GNU Make 4.4.1"
+      },
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "capture_make_jobs": 1,
+      "ordinary_make_jobs": 8,
+      "native_replay_cpu_slots": 8,
+      "evidence_sha256": {
+        "request.json": "b85691e725c5538f9d7a1dba5db71468484f3af125ab0968ef77315c86ddb994",
+        "result.json": "18ee89cc144d6ac0f41d9d2835dad6256bf9dc61f78dba3272013ab82055e883",
+        "engine-binding.json": "777172f3978c4f091b27eeddc4ae861246bf71ddb06d49370be083a74fcf1b7c",
+        "source-audit.json": "4f1c0aba2d44d044dd214bd08d0857da6135f29b05d0777a879617f4958acc25",
+        "qualification/exits": "bb691220692dcdde94563f2414176c993ccb72305b9adf38c6f64cbbf406d910",
+        "qualification/source-before.json": "60f2c703e4cdf6bedc16a34bc338fcc47114924c4c8357ba53035ec6527ecbdd",
+        "qualification/source-after.json": "60f2c703e4cdf6bedc16a34bc338fcc47114924c4c8357ba53035ec6527ecbdd",
+        "reference8/status.json": "ac8870afea62e9d167ba8d8ff6c37db3b04533e30452f4c69f60e72c34a81916",
+        "capture/status.json": "32946065b06c9b206f0c7820a579887adf2a256b979865d56a015146ca93a128",
+        "derive/status.json": "54aab208d645f7f8fdeac7a987a0dfe24cb54182611ce842463b10c268dc86ff",
+        "assemble/status.json": "81f09cf06dde626b831a9ce9bb448fd2c10edd2979abb7413dae29c75b1bf13c",
+        "profile-preflight/status.json": "80f0e85e28e811e63b925d4426190ddec5207289a4d6fb9e3173f6d7000381ca",
+        "graph-metrics/status.json": "51e08485ce95976c09f57bb8023007c7bc17278183cbd4991f8978b537ee867c",
+        "replay/status.json": "d442f07dee84a80e4402c5f8db5819fff6196ad175fe831dbf262460b4e5b94e",
+        "reference8-vs-capture1-parity.json": "982750fc7a9a3cf4d2ca3ecbda027e5105a0f7c16513e7b0fa7ba2f9ebae39d8",
+        "before-parity.json": "982750fc7a9a3cf4d2ca3ecbda027e5105a0f7c16513e7b0fa7ba2f9ebae39d8",
+        "replay/private/parity.json": "982750fc7a9a3cf4d2ca3ecbda027e5105a0f7c16513e7b0fa7ba2f9ebae39d8",
+        "replay/private/ordinary-make8-parity.json": "982750fc7a9a3cf4d2ca3ecbda027e5105a0f7c16513e7b0fa7ba2f9ebae39d8",
+        "replay/private/command-inventory-comparison.json": "1aa7f8e436cd119985f0788aab1753518fb8e7222d10598025c6d693d25d4cf8",
+        "source-audit-before.json": "7ee6a6d3bcac6ad4b2e79bffaffbaca10545b42df4f7b5f6ed3dd38f80d634fc",
+        "source-audit-after.json": "7ee6a6d3bcac6ad4b2e79bffaffbaca10545b42df4f7b5f6ed3dd38f80d634fc",
+        "qualification/result.json": "f863991e742c499ea798d4d172725ee1744de0ab55822875c7813f268b867dc1",
+        "source21-proof.json": "8daad969b17247cd93ec58f90499de8962da70e39c71ccdb16c825c178c22c74"
+      },
+      "diagnostic_command_wall_seconds": {
+        "reference8": 106.16616237000562,
+        "capture": 1801.401600776997,
+        "derive": 160.8803958229837,
+        "assemble": 366.9916856160271,
+        "profile-preflight": 0.11480500199832022,
+        "graph-metrics": 9.827991809986997,
+        "replay": 849.058953255997
+      },
+      "diagnostic_samples_per_phase": 1
+    },
+    {
+      "host_label": "Host D",
+      "actions": 5685,
+      "analysis_barriers": 3067,
+      "snapshot_version": 16,
+      "snapshot_bytes": 1085184396,
+      "snapshot_sha256": "738a7e01a9daf5c805e8208c14076fd0bd31dfba0f8c67915255d1c8081159d4",
+      "key_sha256": "dff612f6893ec5f4cadf117bc5a0b81c847eeab18a2c4aab38f461a3112b993e",
+      "gate_sha256": "5822a23a342b7166de2603d249f9198b47853bbc296c4dc5d2dbe58617679436",
+      "directory_checkpoints": 42,
+      "directory_checkpoints_scope": "capflags.c action preflight; not whole-graph count",
+      "directory_profile": "complete-private-enumeration-v1",
+      "mandatory_policy": "procfs-live-clean-entry-v2",
+      "cacheable_directory_action": false,
+      "first_replay": {
+        "command": "replay-clean-commit",
+        "result": {
+          "cache_hits": 0,
+          "executed": 5685,
+          "status": "complete"
+        },
+        "parity": {
+          "make8_vs_capture1": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          },
+          "before_assembly": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          },
+          "native_vs_capture1": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          },
+          "native_vs_make8": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          },
+          "native_inventory_stability": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          },
+          "retained_make8_parity": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          },
+          "retained_make8_stability": {
+            "equal": true,
+            "hardlink_topology_equal": true,
+            "reference_entries": 12395,
+            "candidate_entries": 12395
+          }
+        }
+      },
+      "stored_command_projection": {
+        "records": 4827,
+        "native_equals_make8": true,
+        "native_equals_capture1": true,
+        "scope": "persisted .cmd/source/output records, not all transient commands"
+      },
+      "graph_metrics": {
+        "command_count": 5713,
+        "dependency_edges": 105018,
+        "dependency_layer_count": 44,
+        "maximum_dependency_layer_size": 1544,
+        "requested_outputs": 5685,
+        "checkpoint_action_count": 4,
+        "complete_profile_action_count": 2
+      },
+      "graph_width_scope": "dependency-layer maxima are not exact DAG width or runtime concurrency",
+      "normalized_config_sha256": "2c2f6ab27b11711d2cc5233724c355bd0344bb91f1b68e1e647fcc4da3631941",
+      "tools_sha256": {
+        "ar": "9362baf27fa8d031982fbadfad93763341ab353e0a331615c065159a7100168f",
+        "gcc": "6af941599045237c267fafdc9e41ff8ed2031d94da7809943c21b0ae758400d4",
+        "ld": "2a1b7757aed136b266f6f53cdf88718a7dd8b1b329b8394751a99ac2f27ea970",
+        "make": "b5441a23f8354840947d2e9dac7f29c8a42e08cab32c0a93b8a7e9fb9f13103e"
+      },
+      "versions": {
+        "ar": "GNU ar (GNU Binutils for Debian) 2.47",
+        "gcc": "gcc (Debian 15.3.0-2) 15.3.0",
+        "ld": "GNU ld (GNU Binutils for Debian) 2.47",
+        "make": "GNU Make 4.4.1"
+      },
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "capture_make_jobs": 1,
+      "ordinary_make_jobs": 8,
+      "native_replay_cpu_slots": 8,
+      "evidence_sha256": {
+        "request.json": "e83c83e4d6a57fa06274ccd4323628e4509d3d44dd856b4a5a75e8493b993265",
+        "result.json": "b11f88a0dc6c4f79d9145bd4af48319621d7cc0769b35c89b6a8e139cc852738",
+        "engine-binding.json": "125d94c0f7418fc3045b478a3440e16dd762427190534ef6bd55884a5e0285e4",
+        "source-audit.json": "f30ee92844c3c9c055f2793d3ddc65202c831226c0b936bb5a96396b54eb054e",
+        "qualification/exits": "bb691220692dcdde94563f2414176c993ccb72305b9adf38c6f64cbbf406d910",
+        "qualification/source-before.json": "60f2c703e4cdf6bedc16a34bc338fcc47114924c4c8357ba53035ec6527ecbdd",
+        "qualification/source-after.json": "60f2c703e4cdf6bedc16a34bc338fcc47114924c4c8357ba53035ec6527ecbdd",
+        "reference8/status.json": "5744f30961de115eb5c4ad3d4ef8b3abc9032e5b7e4c81410d62cc9d65665c63",
+        "capture/status.json": "62bb04ae7b65df9819c999f53cdd0445b1a6f9a48957663b06a3b46f7358f266",
+        "derive/status.json": "cdbd4a20dd0b13b68b508e2c464d2cb5a27bee24be64573b48572f61ee269274",
+        "assemble/status.json": "6aedf81ebd2fd5e42559ad9af3e6e23b6cbfad429497816e46145a1dbd703f4c",
+        "profile-preflight/status.json": "359ed85fc0b45aeaece8a5db9a0e772c58ac1a2541fb0769a632460134d9944c",
+        "graph-metrics/status.json": "330864a7e8507707b308b03db131e7e958b60cffae6fba52e58d57d63a5334e9",
+        "replay/status.json": "8492b294c4395a73014568b89831e939ff84ca1ecb00e455d35ad57800e92ab8",
+        "reference8-vs-capture1-parity.json": "0f88259f36646b48d38dedfd4982569e292cfafd26433aebb9c7a2785aa77ce5",
+        "before-parity.json": "0f88259f36646b48d38dedfd4982569e292cfafd26433aebb9c7a2785aa77ce5",
+        "replay/private/parity.json": "0f88259f36646b48d38dedfd4982569e292cfafd26433aebb9c7a2785aa77ce5",
+        "replay/private/ordinary-make8-parity.json": "0f88259f36646b48d38dedfd4982569e292cfafd26433aebb9c7a2785aa77ce5",
+        "replay/private/command-inventory-comparison.json": "1aa7f8e436cd119985f0788aab1753518fb8e7222d10598025c6d693d25d4cf8",
+        "source-audit-before.json": "7ee6a6d3bcac6ad4b2e79bffaffbaca10545b42df4f7b5f6ed3dd38f80d634fc",
+        "source-audit-after.json": "7ee6a6d3bcac6ad4b2e79bffaffbaca10545b42df4f7b5f6ed3dd38f80d634fc",
+        "qualification/result.json": "382769cfff85e24c41544b4fd1d97e090b4aca2655d4490f2e5b242365f1ab8f",
+        "source21-proof.json": "a478baea202e5648c571ec6342e3a42c33c01619fdb06981bc09747b9cf5ec60"
+      },
+      "diagnostic_command_wall_seconds": {
+        "reference8": 102.00762818008661,
+        "capture": 1840.890789882047,
+        "derive": 164.89251864596736,
+        "assemble": 379.2831895459676,
+        "profile-preflight": 0.2160540180047974,
+        "graph-metrics": 9.829404526972212,
+        "replay": 851.7918850790011
+      },
+      "diagnostic_samples_per_phase": 1
+    }
+  ],
+  "release": "2026-11-10",
+  "scope": "fresh Make8 same-path reference, Make1 capture, derived graph, snapshot16 and empty native replay with dual full tree/hardlink/stored-command parity",
+  "timing_scope": "single shared-host correctness diagnostics; no elapsed ratio or final warm/cache claim",
+  "nested_make_scope": "native driver, no top-level Make; exact source-audited link-vmlinux MAKE=: suppression, not zero-Make-process proof",
+  "build_environment_template": {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "TZ": "UTC",
+    "SOURCE_DATE_EPOCH": "1790154919",
+    "KBUILD_BUILD_TIMESTAMP": "@1790154919",
+    "KBUILD_BUILD_USER": "builder",
+    "KBUILD_BUILD_HOST": "builder",
+    "KBUILD_BUILD_VERSION": "1",
+    "HOME": "RUN/home",
+    "TMPDIR": "RUN/capture/obj/.rush-tmp"
+  },
+  "file_creation_mask_octal": "0077",
+  "diagnostic_timer": "Controller monotonic wall interval around the GNU-time-launched command, including completion/reap overhead; single correctness diagnostics, not accepted comparative timing samples.",
+  "resource_policy": {
+    "cpu_slots": 8,
+    "memory_bytes": 34359738368,
+    "swap_bytes": 0,
+    "cpu_weight": 100,
+    "cpu_quota": "unlimited",
+    "background_gpu_activity": "permitted"
+  }
+}

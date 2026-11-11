@@ -1,69 +1,110 @@
-# Qualify Linux snapshots before comparing replay
+# Build and replay Linux
 
-Build the pinned x86-64 Linux tree and require snapshot assembly plus exact
-replay output checks before assigning a current Rush speed result. The
-November 9 two-host check uses engine `b059a25` published in `f9d97fe`,
-eight CPUs, `make -j8` and the supplied configuration seed.
+## Rush 2026-11-10: current-source correctness
 
-## Read the login-credential build check
+Build the Kbuild capture/replay example with **Rush 2026-11-10 (`ad87da5`)**,
+code revision `ad87da5188201534d443c40481aba6b57ecc30d6`, source tree
+`87bb1112a4fe33fd2b3996ee65f4ab06788a5ebd`. Use the source-bound data
+record below for the original build identity and executable digests.
 
-| Host | GNU Make control | Observation / graph derivation | Snapshot assembly | Replay |
-| --- | --- | --- | --- | --- |
-| Host C | Completes in 96.23 s; 12,397 entries | Completes; 5,684 actions | Refuses captured group credentials | Not run |
-| Host D | Completes in 103.65 s; 12,395 entries | Completes; 5,684 actions | Refuses captured group credentials | Not run |
+| Host | Derived actions | Analysis barriers | Empty replay | Persistent entries |
+| --- | ---: | ---: | --- | ---: |
+| Host C | 5,685 | 3,067 | 5,685 executed; 0 hits | 12,397 |
+| Host D | 5,685 | 3,067 | 5,685 executed; 0 hits | 12,395 |
 
-Both assemblies exit 1 with `Kbuild mandatory action credentials are not
-isolatable`, caused by `local isolation cannot preserve distinct group
-identities`. Neither times out or writes a snapshot. Count ordinary Make
-completion separately from Rush replay acceptance. Assign no new Rush/Make
-speed ratio and no before/after Linux improvement to these attempts.
+Build an ordinary Make-j8 reference at the future capture object pathname.
+Retain the complete reference by exclusive rename. Capture a fresh Make-j1
+build at the same pathname with eight available CPUs. Derive the action graph,
+assemble a fresh version-16 snapshot and replay every action directly with
+eight Rush CPU slots and an empty action cache.
 
-The local executor supports equal fixed user/group identities and supplementary
-groups projected to the primary or kernel overflow group. The login profile
-contains group identities that this restricted executor cannot preserve.
-A namespace started only for assembly cannot change the credentials already
-captured in action records. Keep those records intact and start a new capture
-when changing the environment.
+Require full bytes, types, modes, owners, symlink targets and hardlink topology
+equality against both Make references. Compare all 4,827 persisted .cmd/source/output
+records and repeat output walks to verify stability. Validate the full exported
+source archive, tool identities, frozen binding and resource envelope after replay.
 
-Read [the full sanitized data](data/linux-build-retest-20261109.json) for
-commands, source/tool hashes, normalized configurations, phase counts and
-failures. Capture takes 1,275.70 / 1,357.68 s, derivation 241.12 / 252.98 s,
-and failed assembly 2,199.22 / 2,300.08 s on C / D. Treat these as setup and
-single-control diagnostics. Require a cheap credential preflight before
-another expensive capture; assembly currently reaches this refusal late.
+Use the capflags action profile to verify 42 complete directory checkpoints,
+local uncacheable admission and the mandatory live clean-entry policy.
+Scope that checkpoint count to the inspected action. Treat dependency-layer
+maxima as structural graph measurements.
 
-## Read all mapped-namespace attempts
+Run replay through the Rush native driver. Preserve the source-audited exact
+link-vmlinux profile that substitutes the shell builtin `:` for represented
+timestamp work. Measure nested Make processes separately before making a
+process-count claim.
 
-Run every phase, including normalization, the Make control and capture, with
-the outer prefix `unshare --user --map-current-user`. Retain the existing inner
-assembly/replay namespaces and every consistency check. Use fresh roots with
-the same frozen source, gate, seed, tools and CPU budget.
+Read [the dated source-bound record](data/linux-final-correctness-20261110.json)
+for exact executable, snapshot, source, seed and tool/version identities.
+Build the gate with `cargo build --release --locked -p rush-build --example kbuild_snapshot_gate -j8`.
+Apply the 23 ordered public patches and export the kernel tree described in
+the retained source recipe below. Use fresh capture, snapshot and cache roots.
 
-| Host / attempt | Make control | Capture | Derivation | Assembly | Replay |
-| --- | --- | --- | --- | --- | --- |
-| Host C / 1 | Completes; 96.44 s | Completes | 5,684 actions | Refuses `init/` checkpoint | Not run |
-| Host D / 1 | Completes; 98.88 s | Refuses changed directory identity | Not run | Not run | Not run |
-| Host D / 2 | Completes; 98.90 s | Completes | 5,684 actions | Refuses `init/` checkpoint | Not run |
+Scope these records to single shared-host correctness checks under CPU8,
+32 GiB and zero swap. Qualify populated-cache, warm, speed ratios, installation,
+boot and runtime behavior separately before publishing those results.
 
-Keep [all three attempts](data/linux-mapped-retest-20261109.json), including
-the failure and unchanged-profile repeat. Host D's first capture exits 1 at
-491.93 s because an enumerated directory identity changes before witnessing.
-The repeat completes capture and derivation without changing the engine,
-configuration or consistency checks. This repeat establishes no engine fix.
+## Inspect command costs
 
-Both completed captures then reach the same assembly refusal: the analyzer's
-`init/` directory checkpoint is not causally enforceable. Its cross-owner
-provenance includes an unresolved mutation. Assembly takes 2,265.55 s on C
-and 2,393.96 s on D before refusing. Both exit 1 without timeout or
-interruption, write no snapshot and start no replay.
+Each cell is one controller-observed command interval in seconds, including
+completion/reap overhead. Keep the profiles distinct: ordinary Make uses
+eight jobs, capture observes Make with one job, and native replay executes
+the resulting graph with eight available CPU slots. These unpaired
+correctness diagnostics establish no speed ratio. Include graph preparation
+when evaluating the total cost of using a new snapshot.
 
-The mapped credential predicate passes its preliminary check; full snapshot
-and replay acceptance remain unqualified. Require coherent directory
-witnesses and enforceable analyzer/mutation ordering, then repeat capture,
-assembly and complete output parity before timing replay. Preserve refusal
-of unsafe observations. Assign no Linux speed improvement to these results.
+| Phase | Host C | Host D |
+| --- | ---: | ---: |
+| Ordinary Make-j8 reference | 106.166 | 102.008 |
+| Make-j1 observation | 1801.402 | 1840.891 |
+| Graph derivation | 160.880 | 164.893 |
+| Snapshot assembly | 366.992 | 379.283 |
+| Empty-cache native replay | 849.059 | 851.792 |
 
-## Reproduce the pinned source and configuration
+Profile replay admission, analysis barriers and active workers before
+claiming a scheduling advantage. Retain output and dependency checks while
+reducing these costs. Qualify populated-cache and unchanged-command paths
+with separate runs.
+
+## Reproduce the fixed profile
+
+Build the `kbuild_snapshot_gate` example from code revision `ad87da5`.
+Export the exact v1-patched kernel tree using the source recipe below; keep
+the exported source free of Git metadata. Copy the published configuration
+seed and normalize it with the selected compiler through `make olddefconfig`.
+Clear the inherited environment. Use the first eight recorded CPUs,
+umask `0077`, a fresh task home,
+`PATH=/usr/bin:/bin`, `LANG=C`, `LC_ALL=C`, and `TZ=UTC`. Set:
+
+```sh
+export SOURCE_DATE_EPOCH=1790154919
+export KBUILD_BUILD_TIMESTAMP=@1790154919
+export KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=builder
+export KBUILD_BUILD_VERSION=1
+```
+
+Start the whole profile in `unshare --user --map-current-user`, including
+the ordinary reference and observation. Use the same absolute object
+pathname for the Make-j8 reference and fresh Make-j1 capture, retaining
+the complete reference by exclusive rename before capture. Keep the
+managed output root absent until observation creates it. Use goal `all`
+and `--jobserver-style=pipe` for both Make commands.
+
+Run the example's `managed-observe-process`, `derive-graph` and
+`assemble-managed-graph` operations in order. Retain the managed transaction
+and every returned input/snapshot key. Use the recorded stream limits of
+32 GiB, 100,000,000 records, 1,000,000 processes and 64 MiB per frame.
+The public example prints its complete argument syntax. Start assembly
+and replay in the additional current-user namespace used by this profile.
+Keep the captured output root in place for admission, and invoke
+`replay-clean-commit` with a fresh cache. Let the managed operation replace
+and commit its own output root; preserve the original capture records.
+
+Require the complete output, hardlink, command-inventory, source/tool and
+resource checks above. Record new executable and snapshot hashes for each
+independently rebuilt gate. Keep snapshots and keys local to the filesystem
+and tool identities they capture.
+
+## Recreate the kernel source
 
 Fetch Lorenzo's original 23-patch v1 series and apply it to the cover letter's
 base. Keep the measured tree fixed instead of substituting current mainline:
@@ -98,107 +139,21 @@ with its own pinned compiler. Host C uses GCC 16.2.0 and Host D uses GCC
 15.3.0. Both use GNU Make 4.4.1 and Binutils 2.47. Preserve each host's
 normalized digest; call this a seeded x86-64 profile.
 
-Build the release example from Rush `f9d97fe` with:
+## Check Lorenzo's upstream status
 
-```sh
-cargo build --release --locked -p rush-build --example kbuild_snapshot_gate -j8
-```
+As checked on 2026-11-10, Linux mainline contains a revised subset of
+[Lorenzo Stoakes's original 23-patch build-speedup series](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/).
+The [first merged batch](https://github.com/torvalds/linux/commit/997208ce9f43f01febac956cf9aeffe89945e3c1)
+includes symbol-table, toolchain-probe and compression improvements.
+The bounded revision mapping verifies counterparts for original entries
+1–9, 12 and 23. Read the [later v4 cover](https://lore.kernel.org/all/20260923-build-speedup-v4-0-73128809a4a4@kernel.org/)
+for changed or dropped proposals. Keep this measured v1-patched tree fixed;
+run a fresh comparison to evaluate current mainline.
 
-The tested release example has SHA256
-`67d84ddfefdca958442937dc9d205cb43cdbb01f8031d263dfb0f833d2c4395d`. Rebuild with Rust/Cargo 1.90, record the new executable digest and
-repeat the gates; toolchains and build paths can change binary bytes.
-Run commands from the pristine kernel source with the first eight
-allowed CPUs, `make -j8`, umask `0077`, and the recorded fixed timestamp,
-locale, timezone and build labels. Use separate task homes and caches. Expand
-`SOURCE`, `GATE` and `RUN` in the data to canonical absolute paths. Wrap each
-command with GNU `time -v`; the data use its elapsed field at 0.01-second
-resolution. Configuration preparation and output fingerprinting stay outside
-the command interval. Replay uses its native resource admission within the
-eight-CPU affinity limit.
 
-Capture independently on each host: snapshots bind local VFS and tool
-identities. Run managed observation, graph derivation and snapshot assembly
-in order, retaining the explicit outcomes. Use
-`unshare --user --map-current-user` for assembly and replay. Require a complete snapshot
-before timing replay; a successful `capture_uncertified` observation alone
-supplies no replay acceptance.
+## Read earlier experiments
 
-Keep the captured output root in place for snapshot admission. With nonzero
-analysis barriers, `replay-commit` swaps it internally for a clean root and
-commits the completed result. Assembly leaves the replay cache empty. First
-complete an empty-cache replay and require parity against the captured Make
-tree, then time subsequent populated-cache replays separately. Report cache
-hits and remaining executions; infer no compiler count from their aggregate
-alone. Include output swapping and final backup removal in replay timing.
-
-Compare every persistent name, type, mode, owner, symlink target, hardlink
-class and file hash against capture outputs. The separate Make control uses
-a different output path; its success alone establishes no cross-arm byte
-parity. Keep toolchains and normalized configurations attached to each host.
-No exclusive host reservation or full mixed-memory stability qualification
-is claimed. Run no kernel installation, boot or GPU program in this scope.
-
-## Read the separate 32-job replay experiment
-
-Use the same kernel tree, configuration, toolchain and deterministic build
-environment for Rush and GNU Make. The measured tree contains
-[Lorenzo Stoakes's v1 build-speedup patches](https://lore.kernel.org/all/20260908-build-speedup-v1-0-5dc1ac01672d@kernel.org/).
-Keep this baseline fixed when interpreting the results.
-
-### Three-pair experiment
-
-| Arm | Wall times | Median |
-| --- | --- | ---: |
-| Rush, populated-cache replay | 35.98 s, 41.19 s, 40.24 s | **40.24 s** |
-| GNU Make, clean build | 50.92 s, 53.04 s, 50.15 s | **50.92 s** |
-
-The median ratio is **1.27x**, or about **21% less wall time** for Rush.
-Both arms use 32 jobs on one 96-core x86-64 host. Each pair matches 12,397
-persistent output entries, including 11,561 regular files, with zero byte,
-type, mode or symlink-target differences.
-
-Compare these rows as **populated-cache replay versus clean compilation**.
-An empty-cache Rush diagnostic takes 12:02.92. Require a separate matched
-uncached experiment before claiming a compiler-scheduling advantage.
-
-### Account for graph preparation
-
-Run Make under the observer to capture the graph, derive action records,
-assemble a validated snapshot and populate the content-addressed store before
-replay. One complete fixture records 1:12:20 for capture, 6:48.55 for derivation
-and 1:08:15 for assembly. These setup costs are excluded from the replay row.
-
-The kernel baseline is commit
-`35568770debb5fab088d5d6c2b6a535ad6e8cb4d`, tree
-`116df9506075825b4f676ff33443a8f3acbc6e3e`. Use fixed timestamp, build
-user/host labels, locale and timezone for parity. Read the
-[public experiment record](https://github.com/rushbuild/rush-status/blob/26e6a51ee374c5cea6f86d33c7edf3e20923dabc/status/linux.md)
-for candidate limitations and incomplete descriptor-policy validation.
-
-### Check Lorenzo's upstream status
-
-As of 2026-11-07, parts of the speedup work are merged into Linus's mainline.
-The [first Kbuild speedup merge](https://github.com/torvalds/linux/commit/997208ce9f43f01febac956cf9aeffe89945e3c1)
-is an ancestor of mainline commit
-`a41e364995bbcfa627418a70fe913c35b7510728`. Included changes cover
-[compiler and linker probe reuse](https://github.com/torvalds/linux/commit/454e00cf8ee5aff555ad5865b8c3dbf3731afcc9)
-and [parallel kernel compression with pigz](https://github.com/torvalds/linux/commit/48ebe1cbbeb51879ba4d22775fee1654d94d1cc6).
-Do not describe the entire effort as an unmerged proposal. This check does
-not establish that every patch in the original v1 series merged unchanged.
-
-Retain the v1-patched tree for this result. Run a new comparison to make a
-claim against current mainline; do not substitute merged revisions into an
-existing measurement.
-
-### Complete the acceptance gate
-
-Freeze one Rush candidate, kernel tree, configuration and environment.
-Require fresh snapshot assembly and replay to match all output entries.
-Run at least ten balanced alternating pairs, report every sample, and require
-the 95% confidence interval for the paired speedup ratio to stay above 1.0.
-
-Exercise changed source, changed environment, empty cache, corrupt cache and
-interrupted output commits. Require correct rebuilding or refusal before a
-partial output tree becomes visible. Keep graph preparation, unchanged
-commands, incremental builds, cache restores and uncached compilation in
-separate results. The three-pair result does not complete this gate.
+Read the [November 9 report](history/linux-20261109.md) with its recorded
+engine, snapshot and failure scopes. Keep the separate 32-job populated-cache
+comparison attached to that historical record. Use the current checks above
+for Rush 2026-11-10.
