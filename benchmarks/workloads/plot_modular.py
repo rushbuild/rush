@@ -16,7 +16,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     data = json.loads(args.data.read_text())
-    plt.rcParams.update({'svg.hashsalt': 'rush-modular-cpu-20261109',
+    salt = 'rush-modular-cpu-' + data['date'].replace('-', '')
+    plt.rcParams.update({'svg.hashsalt': salt,
                          'svg.fonttype': 'none', 'font.size': 10,
                          'text.color': '#f1f2e9', 'axes.labelcolor': '#f1f2e9',
                          'xtick.color': '#adc0bc', 'ytick.color': '#adc0bc',
@@ -25,6 +26,9 @@ def main():
     engines = [('rush-before', 'Rush before', '#879b99'),
                ('rush-after', 'Rush current', '#ffad5a'),
                ('bazel', 'Bazel', '#65c3b7')]
+    engine_labels = data.get('engine_labels', {})
+    engines = [(key, engine_labels.get(key, label), color)
+               for key, label, color in engines]
     hosts = data['hosts']
     for ax, (mode, title, scale, unit) in zip(axes, [
             ('clean', 'Clear engine outputs/cache · n=3', 1, 'seconds'),
@@ -51,7 +55,8 @@ def main():
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', ncol=3,
                bbox_to_anchor=(.5, .94), facecolor='#182326', edgecolor='#344649')
-    fig.suptitle('Modular stdlib package · CPU8 · median and observed range',
+    title = 'Modular stdlib package · ' + data['date']
+    fig.suptitle(title + ' · CPU8 · median and observed range',
                  color='#f1f2e9', fontsize=14, y=.995)
     fig.text(.5, .015, 'One pinned package; compiler calls and output bytes checked. '
              'Ranges are minima/maxima, not confidence intervals.',
